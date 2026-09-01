@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -13,17 +15,37 @@ from .config import BASELINE
 from .runtime import IngestionRuntime, build_runtime
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.4.0")
-
-
 @lru_cache(maxsize=1)
 def ingestion_runtime() -> IngestionRuntime:
     return build_runtime()
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    runtime = ingestion_runtime()
+    stop_event: asyncio.Event | None = None
+    task: asyncio.Task[None] | None = None
+    enabled = os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+    if enabled:
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(runtime.price_clock.run(stop_event), name="shadow-price-clock")
+    try:
+        yield
+    finally:
+        if stop_event is not None:
+            stop_event.set()
+        if task is not None:
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+app = FastAPI(title="Solana ROI Convergence", version="0.6.0", lifespan=lifespan)
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     runtime = ingestion_runtime()
+    latency = runtime.latency_gate.status()
     return {
         "status": "ok",
         "paper_only": True,
@@ -31,6 +53,8 @@ def health() -> dict[str, object]:
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "risk_entity_plane_connected": True,
         "live_risk_collectors_connected": True,
+        "latency_certified": latency["certified"],
+        "post_risk_execution_price_certified": False,
     }
 
 
@@ -50,8 +74,33 @@ def ingestion_status() -> dict[str, object]:
         "paper_signal_promotion_blocker": runtime.paper_signal_promotion_blocker,
         "risk_entity_plane_connected": True,
         "collectors": runtime.collectors.status(),
+        "latency": runtime.latency_gate.status(),
+        "shadow_price_clock_enabled": os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"},
         "evidence_counts": runtime.store.evidence_counts(),
         "event_chain_valid": runtime.store.verify(),
+    }
+
+
+@app.get("/v1/latency/status")
+def latency_status() -> dict[str, object]:
+    runtime = ingestion_runtime()
+    return {
+        **runtime.latency_gate.status(),
+        "paper_only": True,
+        "paper_signal_promotion_enabled": False,
+        "post_risk_execution_price_certified": False,
+    }
+
+
+@app.get("/v1/price/{token_mint}")
+def price_status(token_mint: str) -> dict[str, object]:
+    runtime = ingestion_runtime()
+    mark = runtime.store.latest_price_mark(token_mint)
+    return {
+        "token_mint": token_mint,
+        "available": mark is not None,
+        "latest_mark": mark,
+        "paper_only": True,
     }
 
 
