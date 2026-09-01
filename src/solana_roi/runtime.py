@@ -10,7 +10,7 @@ from typing import Any
 from .collecting_ingestion import CollectingLiveEvidenceIngestionService
 from .engine import PaperTradingEngine
 from .ingestion import WalletProfile, WalletProfileRegistry
-from .live_collectors import LiveRiskCollectors, build_live_collectors
+from .launch_funding import CompleteLiveRiskCollectors, build_complete_live_collectors
 from .models import WalletTier
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
 from .storage import AppendOnlyEventStore
@@ -23,10 +23,10 @@ class IngestionRuntime:
     registry: WalletProfileRegistry
     entity_resolver: EntityResolver
     risk: TokenRiskIntelligence
-    collectors: LiveRiskCollectors
+    collectors: CompleteLiveRiskCollectors
     service: CollectingLiveEvidenceIngestionService
     paper_signal_promotion_enabled: bool = False
-    paper_signal_promotion_blocker: str = "live risk collectors incomplete: launch and funding remain fail-closed; forward cohort not started"
+    paper_signal_promotion_blocker: str = "risk evidence collection is not yet latency-certified for the forward cohort"
 
 
 def _wallet_profiles_from_env() -> list[WalletProfile]:
@@ -61,7 +61,7 @@ def build_runtime() -> IngestionRuntime:
     policy = RiskPolicy()
     entity_resolver = EntityResolver(store, registry, min_confidence=policy.confirmed_entity_link_confidence)
     risk = TokenRiskIntelligence(store, entity_resolver=entity_resolver, registry=registry, policy=policy)
-    collectors = build_live_collectors(risk)
+    collectors = build_complete_live_collectors(risk)
     service = CollectingLiveEvidenceIngestionService(
         engine=engine,
         store=store,
