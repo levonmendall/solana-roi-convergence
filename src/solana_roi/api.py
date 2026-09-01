@@ -13,7 +13,7 @@ from .config import BASELINE
 from .runtime import IngestionRuntime, build_runtime
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.3.0")
+app = FastAPI(title="Solana ROI Convergence", version="0.4.0")
 
 
 @lru_cache(maxsize=1)
@@ -30,6 +30,7 @@ def health() -> dict[str, object]:
         "strategy_version": BASELINE.version,
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "risk_entity_plane_connected": True,
+        "live_risk_collectors_connected": True,
     }
 
 
@@ -48,6 +49,7 @@ def ingestion_status() -> dict[str, object]:
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "paper_signal_promotion_blocker": runtime.paper_signal_promotion_blocker,
         "risk_entity_plane_connected": True,
+        "collectors": runtime.collectors.status(),
         "evidence_counts": runtime.store.evidence_counts(),
         "event_chain_valid": runtime.store.verify(),
     }

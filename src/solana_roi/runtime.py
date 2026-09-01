@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .collecting_ingestion import CollectingLiveEvidenceIngestionService
 from .engine import PaperTradingEngine
-from .ingestion import LiveEvidenceIngestionService, WalletProfile, WalletProfileRegistry
+from .ingestion import WalletProfile, WalletProfileRegistry
+from .live_collectors import LiveRiskCollectors, build_live_collectors
 from .models import WalletTier
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
 from .storage import AppendOnlyEventStore
@@ -21,9 +23,10 @@ class IngestionRuntime:
     registry: WalletProfileRegistry
     entity_resolver: EntityResolver
     risk: TokenRiskIntelligence
-    service: LiveEvidenceIngestionService
+    collectors: LiveRiskCollectors
+    service: CollectingLiveEvidenceIngestionService
     paper_signal_promotion_enabled: bool = False
-    paper_signal_promotion_blocker: str = "risk/entity intelligence collecting in shadow mode; forward cohort not started"
+    paper_signal_promotion_blocker: str = "live risk collectors incomplete: launch and funding remain fail-closed; forward cohort not started"
 
 
 def _wallet_profiles_from_env() -> list[WalletProfile]:
@@ -56,24 +59,17 @@ def build_runtime() -> IngestionRuntime:
     for profile in _wallet_profiles_from_env():
         registry.register(profile)
     policy = RiskPolicy()
-    entity_resolver = EntityResolver(
-        store,
-        registry,
-        min_confidence=policy.confirmed_entity_link_confidence,
-    )
-    risk = TokenRiskIntelligence(
-        store,
-        entity_resolver=entity_resolver,
-        registry=registry,
-        policy=policy,
-    )
-    service = LiveEvidenceIngestionService(
+    entity_resolver = EntityResolver(store, registry, min_confidence=policy.confirmed_entity_link_confidence)
+    risk = TokenRiskIntelligence(store, entity_resolver=entity_resolver, registry=registry, policy=policy)
+    collectors = build_live_collectors(risk)
+    service = CollectingLiveEvidenceIngestionService(
         engine=engine,
         store=store,
         registry=registry,
         risk_provider=risk,
         entity_resolver=entity_resolver,
         promote_paper_signals=False,
+        collectors=collectors,
     )
     return IngestionRuntime(
         store=store,
@@ -81,5 +77,6 @@ def build_runtime() -> IngestionRuntime:
         registry=registry,
         entity_resolver=entity_resolver,
         risk=risk,
+        collectors=collectors,
         service=service,
     )
