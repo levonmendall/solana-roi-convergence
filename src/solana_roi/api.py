@@ -39,13 +39,14 @@ async def lifespan(app: FastAPI):
                 await task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.7.0", lifespan=lifespan)
 
 
 @app.get("/health")
 def health() -> dict[str, object]:
     runtime = ingestion_runtime()
     latency = runtime.latency_gate.status()
+    quotes = runtime.quote_gate.status()
     return {
         "status": "ok",
         "paper_only": True,
@@ -54,7 +55,8 @@ def health() -> dict[str, object]:
         "risk_entity_plane_connected": True,
         "live_risk_collectors_connected": True,
         "latency_certified": latency["certified"],
-        "post_risk_execution_price_certified": False,
+        "amount_specific_quote_certified": quotes["certified"],
+        "forward_cohort_ready": False,
     }
 
 
@@ -75,6 +77,7 @@ def ingestion_status() -> dict[str, object]:
         "risk_entity_plane_connected": True,
         "collectors": runtime.collectors.status(),
         "latency": runtime.latency_gate.status(),
+        "execution_quotes": runtime.quote_gate.status(),
         "shadow_price_clock_enabled": os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"},
         "evidence_counts": runtime.store.evidence_counts(),
         "event_chain_valid": runtime.store.verify(),
@@ -88,7 +91,18 @@ def latency_status() -> dict[str, object]:
         **runtime.latency_gate.status(),
         "paper_only": True,
         "paper_signal_promotion_enabled": False,
-        "post_risk_execution_price_certified": False,
+    }
+
+
+@app.get("/v1/execution-quote/status")
+def execution_quote_status() -> dict[str, object]:
+    runtime = ingestion_runtime()
+    return {
+        **runtime.quote_gate.status(),
+        "quote_transport": "Jupiter Swap V2 /order quote-only",
+        "jupiter_configured": runtime.quote_handoff.client is not None,
+        "live_transaction_execution_available": False,
+        "paper_only": True,
     }
 
 

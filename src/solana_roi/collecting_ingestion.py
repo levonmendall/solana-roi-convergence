@@ -13,20 +13,41 @@ def _utcnow() -> datetime:
 
 
 class CollectingLiveEvidenceIngestionService(LiveEvidenceIngestionService):
-    """Production shadow service: preserve chronology, refresh risk, then fail closed."""
+    """Production shadow service: preserve chronology, collect risk/quotes, then fail closed."""
 
     def __init__(
         self,
         *args: Any,
         collectors: Any,
         mark_recorder: Any | None = None,
+        quote_handoff: Any | None = None,
         decision_clock: Callable[[], datetime] = _utcnow,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self.collectors = collectors
         self.mark_recorder = mark_recorder
+        self.quote_handoff = quote_handoff
         self.decision_clock = decision_clock
+
+    async def _quote(
+        self,
+        *,
+        token_mint: str,
+        stage: str,
+        fraction: float,
+        scout_reference_price_sol: float,
+        trigger_observed_at: datetime,
+    ) -> Any | None:
+        if self.quote_handoff is None:
+            return None
+        return await self.quote_handoff.observe(
+            token_mint=token_mint,
+            stage=stage,
+            fraction_of_full_position=fraction,
+            scout_reference_price_sol=scout_reference_price_sol,
+            trigger_observed_at=trigger_observed_at,
+        )
 
     async def ingest_swap(self, swap: NormalizedSwap) -> IngestionDecision:
         inserted = self.store.record_swap(
@@ -88,6 +109,7 @@ class CollectingLiveEvidenceIngestionService(LiveEvidenceIngestionService):
 
         scout_wallet = str(first["wallet"])
         scout_entity_id = str(first["entity_id"])
+        scout_reference_price = float(first["reference_price_sol"])
         risk = await self.risk_provider.snapshot(
             swap.token_mint,
             decision_at,
@@ -115,42 +137,50 @@ class CollectingLiveEvidenceIngestionService(LiveEvidenceIngestionService):
         )
 
         if first_claimed_now:
-            touch = WalletTouch(
-                token_mint=swap.token_mint,
-                wallet=swap.wallet,
-                entity_id=effective_entity_id,
-                observed_at=swap.observed_at,
-                reference_price=swap.reference_price_sol,
-                market_cap_usd=None,
-                tier=profile.tier,
-                historically_eligible=profile.historically_eligible,
-            )
-            if self.promote_paper_signals:
-                return self._decision(
-                    swap,
-                    "record_only",
-                    "activation blocked: executable post-risk reference-price handoff is not yet certified",
+            quote = None
+            if risk.clean and profile.tier is WalletTier.S:
+                quote = await self._quote(
+                    token_mint=swap.token_mint,
+                    stage="starter",
+                    fraction=self.engine.config.starter_fraction_of_full_position,
+                    scout_reference_price_sol=scout_reference_price,
+                    trigger_observed_at=swap.observed_at,
                 )
             reason = "shadow first touch; paper cohort disabled"
             if not risk.clean:
                 reason += "; risk_veto:" + ",".join(risk.blockers)
+            elif profile.tier is WalletTier.S:
+                if quote is None:
+                    reason += "; executable quote unavailable"
+                elif not quote.usable:
+                    reason += "; " + quote.reason
+                else:
+                    reason += f"; starter quote captured at {quote.effective_price_sol:.12g} SOL/token"
             return self._decision(swap, "shadow_first_touch", reason)
 
-        confirmation = Confirmation(
-            token_mint=swap.token_mint,
-            wallet=swap.wallet,
-            entity_id=effective_entity_id,
-            observed_at=swap.observed_at,
-            reference_price=swap.reference_price_sol,
-            historically_eligible=profile.historically_eligible,
-        )
-        if self.promote_paper_signals:
-            return self._decision(
-                swap,
-                "record_only",
-                "activation blocked: executable post-risk reference-price handoff is not yet certified",
+        first_tier = WalletTier(str(first["tier"]))
+        quote = None
+        if risk.clean:
+            if first_tier is WalletTier.S:
+                stage = "confirmation_add"
+                fraction = 1.0 - self.engine.config.starter_fraction_of_full_position
+            else:
+                stage = "confirmed_full"
+                fraction = 1.0
+            quote = await self._quote(
+                token_mint=swap.token_mint,
+                stage=stage,
+                fraction=fraction,
+                scout_reference_price_sol=scout_reference_price,
+                trigger_observed_at=swap.observed_at,
             )
         reason = "shadow independent confirmation; paper cohort disabled"
         if not risk.clean:
             reason += "; risk_veto:" + ",".join(risk.blockers)
+        elif quote is None:
+            reason += "; executable quote unavailable"
+        elif not quote.usable:
+            reason += "; " + quote.reason
+        else:
+            reason += f"; executable quote captured at {quote.effective_price_sol:.12g} SOL/token"
         return self._decision(swap, "shadow_confirmation", reason)
