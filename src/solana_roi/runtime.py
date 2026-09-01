@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from .engine import PaperTradingEngine
-from .ingestion import LiveEvidenceIngestionService, UnavailableRiskEvidenceProvider, WalletProfile, WalletProfileRegistry
+from .ingestion import LiveEvidenceIngestionService, WalletProfile, WalletProfileRegistry
 from .models import WalletTier
+from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
 from .storage import AppendOnlyEventStore
 
 
@@ -18,9 +19,11 @@ class IngestionRuntime:
     store: AppendOnlyEventStore
     engine: PaperTradingEngine
     registry: WalletProfileRegistry
+    entity_resolver: EntityResolver
+    risk: TokenRiskIntelligence
     service: LiveEvidenceIngestionService
     paper_signal_promotion_enabled: bool = False
-    paper_signal_promotion_blocker: str = "point-in-time token risk provider not connected"
+    paper_signal_promotion_blocker: str = "risk/entity intelligence collecting in shadow mode; forward cohort not started"
 
 
 def _wallet_profiles_from_env() -> list[WalletProfile]:
@@ -36,10 +39,12 @@ def _wallet_profiles_from_env() -> list[WalletProfile]:
         if not isinstance(item, dict):
             raise ValueError("wallet profile entries must be JSON objects")
         profiles.append(WalletProfile(
-            wallet=str(item["wallet"]), entity_id=str(item["entity_id"]),
+            wallet=str(item["wallet"]),
+            entity_id=str(item["entity_id"]),
             tier=WalletTier(str(item["tier"]).upper()),
             first_touch_sample_size=int(item.get("first_touch_sample_size", 0)),
-            historically_eligible=bool(item.get("historically_eligible", True)), updated_at=now,
+            historically_eligible=bool(item.get("historically_eligible", True)),
+            updated_at=now,
         ))
     return profiles
 
@@ -50,5 +55,31 @@ def build_runtime() -> IngestionRuntime:
     registry = WalletProfileRegistry(store)
     for profile in _wallet_profiles_from_env():
         registry.register(profile)
-    service = LiveEvidenceIngestionService(engine=engine, store=store, registry=registry, risk_provider=UnavailableRiskEvidenceProvider())
-    return IngestionRuntime(store=store, engine=engine, registry=registry, service=service)
+    policy = RiskPolicy()
+    entity_resolver = EntityResolver(
+        store,
+        registry,
+        min_confidence=policy.confirmed_entity_link_confidence,
+    )
+    risk = TokenRiskIntelligence(
+        store,
+        entity_resolver=entity_resolver,
+        registry=registry,
+        policy=policy,
+    )
+    service = LiveEvidenceIngestionService(
+        engine=engine,
+        store=store,
+        registry=registry,
+        risk_provider=risk,
+        entity_resolver=entity_resolver,
+        promote_paper_signals=False,
+    )
+    return IngestionRuntime(
+        store=store,
+        engine=engine,
+        registry=registry,
+        entity_resolver=entity_resolver,
+        risk=risk,
+        service=service,
+    )
