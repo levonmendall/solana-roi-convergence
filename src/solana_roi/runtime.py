@@ -12,21 +12,25 @@ from .engine import PaperTradingEngine
 from .ingestion import WalletProfile, WalletProfileRegistry
 from .launch_funding import CompleteLiveRiskCollectors, build_complete_live_collectors
 from .models import WalletTier
+from .observation import LatencyCertificationGate, ShadowPriceClock, TimedRiskCollectors
+from .observation_store import ObservationEventStore
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
-from .storage import AppendOnlyEventStore
 
 
 @dataclass(slots=True)
 class IngestionRuntime:
-    store: AppendOnlyEventStore
+    store: ObservationEventStore
     engine: PaperTradingEngine
     registry: WalletProfileRegistry
     entity_resolver: EntityResolver
     risk: TokenRiskIntelligence
-    collectors: CompleteLiveRiskCollectors
+    raw_collectors: CompleteLiveRiskCollectors
+    collectors: TimedRiskCollectors
+    price_clock: ShadowPriceClock
+    latency_gate: LatencyCertificationGate
     service: CollectingLiveEvidenceIngestionService
     paper_signal_promotion_enabled: bool = False
-    paper_signal_promotion_blocker: str = "risk evidence collection is not yet latency-certified for the forward cohort"
+    paper_signal_promotion_blocker: str = "latency and post-risk executable-price handoff are not yet certified"
 
 
 def _wallet_profiles_from_env() -> list[WalletProfile]:
@@ -53,7 +57,7 @@ def _wallet_profiles_from_env() -> list[WalletProfile]:
 
 
 def build_runtime() -> IngestionRuntime:
-    store = AppendOnlyEventStore(Path(os.getenv("SOLANA_ROI_DB_PATH", "data/solana-roi.sqlite3")))
+    store = ObservationEventStore(Path(os.getenv("SOLANA_ROI_DB_PATH", "data/solana-roi.sqlite3")))
     engine = PaperTradingEngine(store=store)
     registry = WalletProfileRegistry(store)
     for profile in _wallet_profiles_from_env():
@@ -61,7 +65,16 @@ def build_runtime() -> IngestionRuntime:
     policy = RiskPolicy()
     entity_resolver = EntityResolver(store, registry, min_confidence=policy.confirmed_entity_link_confidence)
     risk = TokenRiskIntelligence(store, entity_resolver=entity_resolver, registry=registry, policy=policy)
-    collectors = build_complete_live_collectors(risk)
+    raw_collectors = build_complete_live_collectors(risk)
+    collectors = TimedRiskCollectors(raw_collectors, risk=risk, store=store)
+    price_clock = ShadowPriceClock(
+        store=store,
+        engine=engine,
+        interval_seconds=float(os.getenv("SOLANA_ROI_SHADOW_CLOCK_SECONDS", "1.0")),
+        tracking_horizon_seconds=float(os.getenv("SOLANA_ROI_PRICE_TRACKING_HORIZON_SECONDS", "300")),
+        drive_paper_engine=False,
+    )
+    latency_gate = LatencyCertificationGate(store)
     service = CollectingLiveEvidenceIngestionService(
         engine=engine,
         store=store,
@@ -70,6 +83,7 @@ def build_runtime() -> IngestionRuntime:
         entity_resolver=entity_resolver,
         promote_paper_signals=False,
         collectors=collectors,
+        mark_recorder=price_clock,
     )
     return IngestionRuntime(
         store=store,
@@ -77,6 +91,9 @@ def build_runtime() -> IngestionRuntime:
         registry=registry,
         entity_resolver=entity_resolver,
         risk=risk,
+        raw_collectors=raw_collectors,
         collectors=collectors,
+        price_clock=price_clock,
+        latency_gate=latency_gate,
         service=service,
     )
