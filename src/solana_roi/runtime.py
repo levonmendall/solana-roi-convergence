@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .activation import CandidateActivationGate, ForwardCohortController, ProgramCoverageCertificationGate
 from .collecting_ingestion import CollectingLiveEvidenceIngestionService
 from .engine import PaperTradingEngine
 from .ingestion import WalletProfile, WalletProfileRegistry
@@ -14,7 +15,7 @@ from .launch_funding import CompleteLiveRiskCollectors, build_complete_live_coll
 from .models import WalletTier
 from .observation import LatencyCertificationGate, ShadowPriceClock, TimedRiskCollectors
 from .observation_store import ObservationEventStore
-from .quote import ExecutableQuoteLedger, JupiterQuoteOnlyClient, QuoteCertificationGate, ShadowExecutableQuoteHandoff
+from .quote import JupiterQuoteOnlyClient, QuoteCertificationGate, ShadowExecutableQuoteHandoff
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
 
 
@@ -31,9 +32,24 @@ class IngestionRuntime:
     latency_gate: LatencyCertificationGate
     quote_handoff: ShadowExecutableQuoteHandoff
     quote_gate: QuoteCertificationGate
+    coverage_gate: ProgramCoverageCertificationGate
+    cohort_controller: ForwardCohortController
+    activation_gate: CandidateActivationGate
     service: CollectingLiveEvidenceIngestionService
-    paper_signal_promotion_enabled: bool = False
-    paper_signal_promotion_blocker: str = "latency and amount-specific executable quote handoff are not yet prospectively certified"
+
+    @property
+    def paper_signal_promotion_enabled(self) -> bool:
+        return self.cohort_controller.is_armed()
+
+    @property
+    def paper_signal_promotion_blocker(self) -> str | None:
+        if self.paper_signal_promotion_enabled:
+            return None
+        status = self.cohort_controller.status()
+        failed = [name for name, passed in status["requirements"].items() if not passed]
+        if not status["manifest_frozen"]:
+            failed.append("strategy_manifest_not_frozen")
+        return ",".join(failed) if failed else "explicit_one_time_arm_required"
 
 
 def _wallet_profiles_from_env() -> list[WalletProfile]:
@@ -78,13 +94,6 @@ def build_runtime() -> IngestionRuntime:
     risk = TokenRiskIntelligence(store, entity_resolver=entity_resolver, registry=registry, policy=policy)
     raw_collectors = build_complete_live_collectors(risk)
     collectors = TimedRiskCollectors(raw_collectors, risk=risk, store=store)
-    price_clock = ShadowPriceClock(
-        store=store,
-        engine=engine,
-        interval_seconds=float(os.getenv("SOLANA_ROI_SHADOW_CLOCK_SECONDS", "1.0")),
-        tracking_horizon_seconds=float(os.getenv("SOLANA_ROI_PRICE_TRACKING_HORIZON_SECONDS", "300")),
-        drive_paper_engine=False,
-    )
     latency_gate = LatencyCertificationGate(store)
     quote_handoff = ShadowExecutableQuoteHandoff(
         store=store,
@@ -93,6 +102,35 @@ def build_runtime() -> IngestionRuntime:
         max_chase_fraction=engine.config.max_chase_fraction,
     )
     quote_gate = QuoteCertificationGate(quote_handoff.ledger)
+    coverage_gate = ProgramCoverageCertificationGate(
+        store,
+        configured_fn=lambda: bool(
+            raw_collectors.coverage_asserted
+            and raw_collectors.launch is not None
+            and raw_collectors.funding is not None
+        ),
+    )
+    cohort_controller = ForwardCohortController(
+        store=store,
+        engine=engine,
+        config=engine.config,
+        risk_policy=policy,
+        latency_gate=latency_gate,
+        quote_gate=quote_gate,
+        coverage_gate=coverage_gate,
+    )
+    activation_gate = CandidateActivationGate(
+        controller=cohort_controller,
+        engine=engine,
+        store=store,
+    )
+    price_clock = ShadowPriceClock(
+        store=store,
+        engine=engine,
+        interval_seconds=float(os.getenv("SOLANA_ROI_SHADOW_CLOCK_SECONDS", "1.0")),
+        tracking_horizon_seconds=float(os.getenv("SOLANA_ROI_PRICE_TRACKING_HORIZON_SECONDS", "300")),
+        drive_paper_engine=cohort_controller.is_armed(),
+    )
     service = CollectingLiveEvidenceIngestionService(
         engine=engine,
         store=store,
@@ -103,6 +141,7 @@ def build_runtime() -> IngestionRuntime:
         collectors=collectors,
         mark_recorder=price_clock,
         quote_handoff=quote_handoff,
+        activation_gate=activation_gate,
     )
     return IngestionRuntime(
         store=store,
@@ -116,5 +155,8 @@ def build_runtime() -> IngestionRuntime:
         latency_gate=latency_gate,
         quote_handoff=quote_handoff,
         quote_gate=quote_gate,
+        coverage_gate=coverage_gate,
+        cohort_controller=cohort_controller,
+        activation_gate=activation_gate,
         service=service,
     )
