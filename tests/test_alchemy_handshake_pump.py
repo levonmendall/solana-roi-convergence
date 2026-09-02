@@ -30,6 +30,48 @@ def test_install_replaces_only_the_alchemy_multiplexed_receive_path():
     assert bool(getattr(multiplex._provider_specific_fanout, "_roi_alchemy_provider_specific", False))
 
 
+def test_cooperative_capacity_drains_lightweight_handlers_without_raising_limit():
+    async def scenario() -> None:
+        handled: list[int] = []
+
+        async def lightweight(index: int) -> None:
+            handled.append(index)
+
+        tasks = {
+            asyncio.create_task(lightweight(index))
+            for index in range(pump.MAX_INFLIGHT_NOTIFICATION_HANDLERS)
+        }
+        assert len(tasks) == pump.MAX_INFLIGHT_NOTIFICATION_HANDLERS
+        assert await pump._cooperative_dispatch_capacity(tasks) is True
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert len(handled) == pump.MAX_INFLIGHT_NOTIFICATION_HANDLERS
+        assert len(tasks) < pump.MAX_INFLIGHT_NOTIFICATION_HANDLERS
+
+    asyncio.run(scenario())
+
+
+def test_cooperative_capacity_still_fails_closed_for_genuinely_blocked_handlers():
+    async def scenario() -> None:
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            await gate.wait()
+
+        tasks = {
+            asyncio.create_task(blocked())
+            for _ in range(pump.MAX_INFLIGHT_NOTIFICATION_HANDLERS)
+        }
+        try:
+            assert await pump._cooperative_dispatch_capacity(tasks) is False
+            assert len(tasks) == pump.MAX_INFLIGHT_NOTIFICATION_HANDLERS
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_ack_reader_is_not_blocked_by_live_notification_handler(monkeypatch):
     async def scenario() -> None:
         stop = asyncio.Event()
@@ -140,5 +182,9 @@ def test_status_reports_alchemy_handshake_pump_without_changing_lease():
     assert policy["alchemy_ack_receive_path"] == "dedicated-websocket-reader"
     assert policy["alchemy_inline_ack_receive_removed"] is True
     assert policy["alchemy_max_inflight_notification_handlers"] == pump.MAX_INFLIGHT_NOTIFICATION_HANDLERS
+    assert policy["alchemy_backpressure_cooperative_drain_before_failure"] is True
+    assert policy["alchemy_backpressure_limit_unchanged"] == pump.MAX_INFLIGHT_NOTIFICATION_HANDLERS
+    assert policy["alchemy_notification_drop_on_backpressure"] is False
+    assert policy["alchemy_backpressure_failure_remains_fail_closed"] is True
     assert policy["alchemy_target_quorum_semantics_unchanged"] is True
     assert policy["live_poll_recoverability_lease_seconds_unchanged"] == 12.0
