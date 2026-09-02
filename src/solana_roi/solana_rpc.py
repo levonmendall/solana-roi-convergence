@@ -86,12 +86,26 @@ def rpc_endpoints_from_env(env: dict[str, str] | None = None) -> tuple[RpcEndpoi
     return tuple(rows)
 
 
+def _new_health_state() -> dict[str, Any]:
+    return {
+        "successes": 0,
+        "failures": 0,
+        "last_latency_ms": None,
+        "ewma_latency_ms": None,
+        "last_error_type": None,
+        "last_success_at_monotonic": None,
+    }
+
+
 class SolanaRpcPool:
     """Redundant read-only Solana JSON-RPC pool with latency hedging.
 
     This client never signs or submits transactions. Read requests are tried on
     independent endpoints, and latency-critical reads are hedged after a short
     delay so a slow free endpoint does not dominate p95/p99 candidate latency.
+    Endpoint ordering is method-specific so one provider's poor performance for a
+    heavy transaction read cannot poison its ordering for lightweight signature or
+    slot reads.
     """
 
     def __init__(
@@ -116,25 +130,42 @@ class SolanaRpcPool:
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
             )
         self._health: dict[str, dict[str, Any]] = {
-            endpoint.name: {
-                "successes": 0,
-                "failures": 0,
-                "last_latency_ms": None,
-                "ewma_latency_ms": None,
-                "last_error_type": None,
-                "last_success_at_monotonic": None,
-            }
-            for endpoint in self.endpoints
+            endpoint.name: _new_health_state() for endpoint in self.endpoints
         }
+        self._method_health: dict[str, dict[str, dict[str, Any]]] = {}
 
-    def _ordered(self) -> list[RpcEndpoint]:
+    def _method_states(self, method: str) -> dict[str, dict[str, Any]]:
+        states = self._method_health.get(method)
+        if states is None:
+            states = {endpoint.name: _new_health_state() for endpoint in self.endpoints}
+            self._method_health[method] = states
+        return states
+
+    @staticmethod
+    def _record_success(state: dict[str, Any], elapsed: float) -> None:
+        state["successes"] = int(state["successes"]) + 1
+        state["last_latency_ms"] = elapsed
+        previous = state["ewma_latency_ms"]
+        state["ewma_latency_ms"] = elapsed if previous is None else 0.8 * float(previous) + 0.2 * elapsed
+        state["last_error_type"] = None
+        state["last_success_at_monotonic"] = time.monotonic()
+
+    @staticmethod
+    def _record_failure(state: dict[str, Any], exc: BaseException) -> None:
+        state["failures"] = int(state["failures"]) + 1
+        state["last_error_type"] = type(exc).__name__
+
+    def _ordered(self, method: str) -> list[RpcEndpoint]:
+        method_states = self._method_states(method)
+
         def score(endpoint: RpcEndpoint) -> tuple[int, float]:
-            state = self._health[endpoint.name]
+            state = method_states[endpoint.name]
             failures = int(state["failures"])
             successes = int(state["successes"])
             failure_penalty = 1 if failures > successes + 2 else 0
             latency = state["ewma_latency_ms"]
             return failure_penalty, float(latency if latency is not None else 1_000.0)
+
         return sorted(self.endpoints, key=score)
 
     async def _call_endpoint(self, endpoint: RpcEndpoint, method: str, params: list[Any]) -> tuple[Any, str, float]:
@@ -145,6 +176,8 @@ class SolanaRpcPool:
             "method": method,
             "params": params,
         }
+        global_state = self._health[endpoint.name]
+        method_state = self._method_states(method)[endpoint.name]
         try:
             response = await self._clients[endpoint.name].post(endpoint.http_url, json=payload)
             response.raise_for_status()
@@ -154,18 +187,12 @@ class SolanaRpcPool:
             if body.get("error"):
                 raise RuntimeError(f"Solana RPC {method} returned an error")
             elapsed = max(0.0, (time.perf_counter() - started) * 1000.0)
-            state = self._health[endpoint.name]
-            state["successes"] = int(state["successes"]) + 1
-            state["last_latency_ms"] = elapsed
-            previous = state["ewma_latency_ms"]
-            state["ewma_latency_ms"] = elapsed if previous is None else 0.8 * float(previous) + 0.2 * elapsed
-            state["last_error_type"] = None
-            state["last_success_at_monotonic"] = time.monotonic()
+            self._record_success(global_state, elapsed)
+            self._record_success(method_state, elapsed)
             return body.get("result"), endpoint.name, elapsed
         except Exception as exc:
-            state = self._health[endpoint.name]
-            state["failures"] = int(state["failures"]) + 1
-            state["last_error_type"] = type(exc).__name__
+            self._record_failure(global_state, exc)
+            self._record_failure(method_state, exc)
             raise
 
     async def call_with_meta(
@@ -175,7 +202,7 @@ class SolanaRpcPool:
         *,
         hedge: bool = False,
     ) -> tuple[Any, str, float]:
-        ordered = self._ordered()
+        ordered = self._ordered(method)
         if len(ordered) == 1 or not hedge:
             last_error: Exception | None = None
             for endpoint in ordered:
@@ -187,13 +214,23 @@ class SolanaRpcPool:
 
         primary = asyncio.create_task(self._call_endpoint(ordered[0], method, params))
         hedge_task: asyncio.Task[tuple[Any, str, float]] | None = None
+        errors: list[Exception] = []
         try:
             done, _ = await asyncio.wait({primary}, timeout=self.hedge_delay_seconds)
             if primary in done:
-                return primary.result()
+                try:
+                    return primary.result()
+                except Exception as exc:
+                    errors.append(exc)
+                    for endpoint in ordered[1:]:
+                        try:
+                            return await self._call_endpoint(endpoint, method, params)
+                        except Exception as fallback_exc:
+                            errors.append(fallback_exc)
+                    raise RuntimeError(f"all Solana RPC endpoints failed for {method}") from errors[-1]
+
             hedge_task = asyncio.create_task(self._call_endpoint(ordered[1], method, params))
             pending: set[asyncio.Task[tuple[Any, str, float]]] = {primary, hedge_task}
-            errors: list[Exception] = []
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
@@ -270,6 +307,13 @@ class SolanaRpcPool:
                 }
                 for endpoint in self.endpoints
             ],
+            "method_health": {
+                method: [
+                    {"name": endpoint.name, **states[endpoint.name]}
+                    for endpoint in self.endpoints
+                ]
+                for method, states in sorted(self._method_health.items())
+            },
         }
 
     def endpoint_summary(self) -> list[dict[str, str]]:
