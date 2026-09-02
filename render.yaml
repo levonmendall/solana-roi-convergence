@@ -27,6 +27,10 @@ services:
         value: "1.0"
       - key: SOLANA_ROI_PRICE_TRACKING_HORIZON_SECONDS
         value: "300"
+      # Frozen public scout cohort used by the v3.1 hypothesis. These are public
+      # Solana addresses only; no key material is stored or accepted.
+      - key: SOLANA_ROI_WALLET_PROFILES_JSON
+        value: '[{"wallet":"4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk","entity_id":"kol:jijo","tier":"S","first_touch_sample_size":191,"historically_eligible":true},{"wallet":"862TYSvRYoiHAK3F3WwTRYAfuGiQaGdxedN9AGvRGWo2","entity_id":"kol:wugi","tier":"S","first_touch_sample_size":52,"historically_eligible":true},{"wallet":"DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt","entity_id":"kol:the-doc","tier":"S","first_touch_sample_size":121,"historically_eligible":true}]'
       - key: HELIUS_API_KEY
         sync: false
       - key: HELIUS_WEBHOOK_AUTH
