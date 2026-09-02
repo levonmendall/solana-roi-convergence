@@ -34,11 +34,19 @@ def _env_true(name: str) -> bool:
 class RuntimeForwardCohortController(ForwardCohortController):
     """Add runtime-only operational invariants to the immutable cohort readiness gate."""
 
+    webhook_queue: DurableHeliusWebhookQueue | None = None
+
     def _base_readiness(self) -> dict[str, Any]:
         status = super()._base_readiness()
         clock_enabled = _env_true("SOLANA_ROI_SHADOW_CLOCK_ENABLED")
+        queue_status = self.webhook_queue.status() if self.webhook_queue is not None else {"pending": 1}
+        queue_drained = int(queue_status.get("pending", 1)) == 0
         status["continuous_price_clock_enabled"] = clock_enabled
+        status["webhook_queue"] = queue_status
         status["requirements"]["continuous_price_clock_enabled"] = clock_enabled
+        # Freeze/arm only on a fully drained durable intake boundary so a queued
+        # earlier swap cannot later invalidate first-touch chronology.
+        status["requirements"]["durable_webhook_queue_drained"] = queue_drained
         status["passed"] = all(bool(value) for value in status["requirements"].values())
         return status
 
@@ -128,6 +136,7 @@ def _shadow_simulator(client: JupiterQuoteOnlyClient | None) -> JupiterShadowTra
 
 def build_runtime() -> IngestionRuntime:
     store = ObservationEventStore(Path(os.getenv("SOLANA_ROI_DB_PATH", "data/solana-roi.sqlite3")))
+    webhook_queue = DurableHeliusWebhookQueue(store)
     engine = DurablePaperTradingEngine(store=store)
     registry = WalletProfileRegistry(store)
     for profile in _wallet_profiles_from_env():
@@ -172,6 +181,7 @@ def build_runtime() -> IngestionRuntime:
         quote_gate=quote_gate,
         coverage_gate=coverage_gate,
     )
+    cohort_controller.webhook_queue = webhook_queue
     activation_gate = CandidateActivationGate(
         controller=cohort_controller,
         engine=engine,
@@ -196,7 +206,6 @@ def build_runtime() -> IngestionRuntime:
         quote_handoff=quote_handoff,
         activation_gate=activation_gate,
     )
-    webhook_queue = DurableHeliusWebhookQueue(store)
     webhook_worker = HeliusWebhookWorker(queue=webhook_queue, service=service)
     return IngestionRuntime(
         store=store,
