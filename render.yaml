@@ -26,13 +26,13 @@ services:
         value: /var/data/solana-roi.sqlite3
       - key: SOLANA_ROI_PROGRAM_WIDE_SWAP_COVERAGE
         value: "true"
-      # Full original seven-program scope now comes directly from standard
-      # Solana WebSockets/RPC. Two independent public endpoints are live at the
-      # same time; candidate hydration is latency-hedged across them.
+      # Full original seven-program scope comes directly from standard Solana
+      # WebSockets/RPC. PublicNode is primary; Solana's documented public mainnet
+      # endpoint is the zero-cost fallback. Both remain read-only and paper-only.
       - key: SOLANA_ROI_DIRECT_SOLANA_ENABLED
         value: "true"
       - key: SOLANA_ROI_RPC_ENDPOINTS_JSON
-        value: '[{"name":"publicnode","http":"https://solana-rpc.publicnode.com","ws":"wss://solana-rpc.publicnode.com"},{"name":"onfinality","http":"https://solana.api.onfinality.io/public","ws":"wss://solana.api.onfinality.io/public-ws"}]'
+        value: '[{"name":"publicnode","http":"https://solana-rpc.publicnode.com","ws":"wss://solana-rpc.publicnode.com"},{"name":"solana-mainnet","http":"https://api.mainnet.solana.com","ws":"wss://api.mainnet.solana.com"}]'
       - key: SOLANA_ROI_RPC_TIMEOUT_SECONDS
         value: "2.5"
       - key: SOLANA_ROI_RPC_HEDGE_DELAY_SECONDS
