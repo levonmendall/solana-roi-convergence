@@ -25,23 +25,28 @@ def ingestion_runtime() -> IngestionRuntime:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     runtime = ingestion_runtime()
-    stop_event: asyncio.Event | None = None
-    task: asyncio.Task[None] | None = None
+    clock_stop: asyncio.Event | None = None
+    clock_task: asyncio.Task[None] | None = None
+    webhook_stop = asyncio.Event()
+    webhook_task = asyncio.create_task(runtime.webhook_worker.run(webhook_stop), name="helius-webhook-worker")
     enabled = os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"}
     if enabled:
-        stop_event = asyncio.Event()
-        task = asyncio.create_task(runtime.price_clock.run(stop_event), name="shadow-price-clock")
+        clock_stop = asyncio.Event()
+        clock_task = asyncio.create_task(runtime.price_clock.run(clock_stop), name="shadow-price-clock")
     try:
         yield
     finally:
-        if stop_event is not None:
-            stop_event.set()
-        if task is not None:
+        webhook_stop.set()
+        if clock_stop is not None:
+            clock_stop.set()
+        if clock_task is not None:
             with suppress(asyncio.CancelledError):
-                await task
+                await clock_task
+        with suppress(asyncio.CancelledError):
+            await webhook_task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.8.0", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.9.0", lifespan=lifespan)
 
 
 class ArmRequest(BaseModel):
@@ -68,6 +73,7 @@ def health() -> dict[str, object]:
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "risk_entity_plane_connected": True,
         "live_risk_collectors_connected": True,
+        "webhook_queue": runtime.webhook_queue.status(),
         "latency_certified": cohort["latency"]["certified"],
         "amount_specific_quote_certified": cohort["execution_quotes"]["certified"],
         "program_wide_coverage_verified": cohort["coverage"]["certified"],
@@ -94,6 +100,7 @@ def ingestion_status() -> dict[str, object]:
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "paper_signal_promotion_blocker": runtime.paper_signal_promotion_blocker,
         "risk_entity_plane_connected": True,
+        "webhook_queue": runtime.webhook_queue.status(),
         "collectors": runtime.collectors.status(),
         "program_coverage": runtime.coverage_gate.status(),
         "latency": runtime.latency_gate.status(),
@@ -121,7 +128,7 @@ def execution_quote_status() -> dict[str, object]:
     runtime = ingestion_runtime()
     return {
         **runtime.quote_gate.status(),
-        "quote_transport": "Jupiter Swap V2 /order quote-only",
+        "quote_transport": "Jupiter Swap V2 /order plus unsigned taker simulation",
         "jupiter_configured": runtime.quote_handoff.client is not None,
         "live_transaction_execution_available": False,
         "paper_only": True,
@@ -216,17 +223,23 @@ def entity_summary(wallet: str) -> dict[str, object]:
 
 
 @app.post("/v1/ingestion/helius")
-async def helius_webhook(payload: Any, authorization: str | None = Header(default=None)) -> dict[str, object]:
+def helius_webhook(payload: Any, authorization: str | None = Header(default=None)) -> dict[str, object]:
     expected = os.getenv("HELIUS_WEBHOOK_AUTH", "").strip()
     if not expected:
         raise HTTPException(status_code=503, detail="Helius webhook authentication is not configured")
     if not hmac.compare_digest(authorization or "", expected):
         raise HTTPException(status_code=401, detail="invalid webhook authorization")
     runtime = ingestion_runtime()
-    decisions = await runtime.service.ingest_webhook(payload)
+    received_at = datetime.now(timezone.utc)
+    try:
+        inbox_id, inserted = runtime.webhook_queue.enqueue(payload, received_at=received_at)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON webhook payload") from exc
     return {
         "accepted": True,
-        "normalized_swap_count": len(decisions),
-        "decisions": [asdict(item) for item in decisions],
+        "durably_queued": True,
+        "duplicate_delivery": not inserted,
+        "inbox_id": inbox_id,
+        "received_at": received_at.isoformat(),
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
     }
