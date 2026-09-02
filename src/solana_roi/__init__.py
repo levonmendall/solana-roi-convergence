@@ -94,6 +94,15 @@ from .poll_pagination_context import install_poll_pagination_context
 
 install_poll_pagination_context()
 
+# A transient multi-page poll exception is also recoverable when the same target
+# has remained continuously observed by the real WebSocket union. Route that case
+# through the existing same-target standby re-arm path instead of letting the poll
+# watermark freeze after the 12-second lease. Any real zero-coverage generation
+# still bypasses this repair and preserves the exact-release fail-closed boundary.
+from .poll_exception_rearm import install_poll_exception_rearm
+
+install_poll_exception_rearm()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
