@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from .activation import ARM_CONFIRMATION
 from .config import BASELINE
+from .deployment import deployment_preflight
 from .runtime import IngestionRuntime, build_runtime
 
 
@@ -46,7 +47,7 @@ async def lifespan(app: FastAPI):
             await webhook_task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.9.0", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.10.0", lifespan=lifespan)
 
 
 class ArmRequest(BaseModel):
@@ -65,11 +66,13 @@ def _require_cohort_admin(authorization: str | None) -> None:
 def health() -> dict[str, object]:
     runtime = ingestion_runtime()
     cohort = runtime.cohort_controller.status()
+    preflight = deployment_preflight()
     return {
         "status": "ok",
         "paper_only": True,
         "live_money_authority": False,
         "strategy_version": BASELINE.version,
+        "deployment_preflight_ready": preflight["ready_for_live_shadow_collection"],
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "risk_entity_plane_connected": True,
         "live_risk_collectors_connected": True,
@@ -81,6 +84,11 @@ def health() -> dict[str, object]:
         "forward_cohort_armed": cohort["armed"],
         "runtime_continuity_ok": cohort["runtime_continuity_ok"],
     }
+
+
+@app.get("/v1/deployment/preflight")
+def deployment_preflight_status() -> dict[str, object]:
+    return deployment_preflight()
 
 
 @app.get("/v1/strategy/baseline")
@@ -106,6 +114,7 @@ def ingestion_status() -> dict[str, object]:
         "latency": runtime.latency_gate.status(),
         "execution_quotes": runtime.quote_gate.status(),
         "forward_cohort": runtime.cohort_controller.status(),
+        "deployment_preflight": deployment_preflight(),
         "shadow_price_clock_enabled": os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"},
         "price_clock_drives_paper_engine": runtime.price_clock.drive_paper_engine,
         "evidence_counts": runtime.store.evidence_counts(),
