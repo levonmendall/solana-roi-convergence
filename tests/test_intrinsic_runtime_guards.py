@@ -18,9 +18,10 @@ def test_guards_install_even_when_legacy_api_entrypoint_is_imported():
     assert bool(getattr(DirectSolanaIngestionPlane._stream_endpoint, "_roi_handshake_pumped", False))
     assert bool(getattr(DirectSolanaIngestionPlane._hydrate_one, "_roi_priority_routed", False))
     assert bool(getattr(DirectSolanaIngestionPlane.run, "_roi_worker_partitioned", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.run, "_roi_target_fanout", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_subscription_telemetry", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_transport_hardened", False))
-    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_handshake_pumped", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_target_fanout", False))
     assert bool(getattr(direct_solana_module.rpc_endpoints_from_env, "_roi_official_secondary", False))
     assert bool(getattr(solana_rpc_module.rpc_endpoints_from_env, "_roi_official_secondary", False))
 
@@ -89,9 +90,12 @@ def test_memory_boundary_is_visible_without_production_wrapper(tmp_path):
     status = DirectSolanaIngestionPlane.status(plane)
     boundary = status["production_memory_boundary"]
     assert boundary["installed_intrinsically"] is True
-    assert boundary["websocket_max_queue"] == 64
+    assert boundary["websocket_topology"] == "one-target-per-websocket"
+    assert boundary["websocket_max_queue"] == 8
+    assert boundary["websocket_max_queue_per_target"] == 8
     assert boundary["websocket_max_size_bytes"] == 1024 * 1024
-    assert boundary["receive_payload_ceiling_bytes_per_provider"] == 64 * 1024 * 1024
+    assert boundary["target_streams_per_provider"] == 10
+    assert boundary["receive_payload_ceiling_bytes_per_provider"] == 80 * 1024 * 1024
     assert boundary["candidate_context_slots"] == 3
     assert boundary["background_context_slots"] == 1
     assert boundary["strategy_scope_reduced"] is False
@@ -102,12 +106,13 @@ def test_memory_boundary_is_visible_without_production_wrapper(tmp_path):
     assert throughput["background_workers"] == 9
     assert throughput["full_raw_market_scope_preserved"] is True
     policy = status["provider_runtime_policy"]
-    assert policy["subscription_setup_mode"] == "sequential_ack_with_bounded_retry"
-    assert policy["high_volume_programs_subscribed_last"] is True
+    assert policy["subscription_topology"] == "one-logsSubscribe-per-websocket"
+    assert policy["provider_ready_requires_all_targets"] is True
+    assert policy["partial_provider_evidence_recorded"] is False
+    assert policy["notification_dispatch_path"] == "serial-isolated-target-stream"
+    assert policy["max_inflight_notification_handlers_per_stream"] == 1
     assert policy["full_target_count_unchanged"] == 10
-    assert policy["ack_receive_path"] == "dedicated-websocket-reader"
-    assert policy["request_id_type_agnostic"] is True
-    assert policy["max_inflight_notification_handlers"] == 32
+    assert status["target_stream_fanout"]["target_count_per_provider"] == 10
 
 
 def test_legacy_health_route_is_constant_time_liveness(monkeypatch):
