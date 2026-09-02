@@ -143,7 +143,7 @@ class CollectingLiveEvidenceIngestionService(LiveEvidenceIngestionService):
             return self._decision(
                 swap,
                 "record_only",
-                "activation blocked: final forward-cohort activation gate has not authorized this candidate",
+                "activation blocked: post-risk reference-price evidence alone cannot authorize paper execution; final forward-cohort activation gate has not authorized this candidate",
             )
 
         if first_claimed_now:
