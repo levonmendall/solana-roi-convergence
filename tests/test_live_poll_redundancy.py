@@ -63,7 +63,7 @@ def test_live_poll_delta_is_oldest_first_and_slot_bounded(monkeypatch):
         assert kwargs["min_context_slot"] == 100
         return pages.pop(0)
 
-    monkeypatch.setattr(live_poll, "_poll_page", fake_page)
+    monkeypatch.setattr("solana_roi.poll_watermark_repair._slot_poll_page", fake_page)
     rows, complete, provider, latency = asyncio.run(
         _fetch_delta(SimpleNamespace(), WatchTarget("program", "a", "RAYDIUM"), 100)
     )
