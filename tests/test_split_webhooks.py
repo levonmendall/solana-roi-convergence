@@ -7,6 +7,7 @@ from solana_roi.split_webhooks import (
     ENHANCED_PROGRAM_ADDRESSES,
     ENHANCED_TRANSACTION_TYPES,
     SplitHeliusWebhookManager,
+    render_service_url_from_env,
 )
 
 
@@ -47,6 +48,17 @@ class FakeClient:
     async def patch(self, url, **kwargs):
         self.patches.append((url, kwargs["json"]))
         return FakeResponse({"webhookID": url.rsplit("/", 1)[-1], "active": True})
+
+
+def test_render_service_url_prefers_full_url_and_falls_back_to_hostname():
+    assert render_service_url_from_env({
+        "RENDER_EXTERNAL_URL": "https://roi.example",
+        "RENDER_EXTERNAL_HOSTNAME": "ignored.example",
+    }) == "https://roi.example"
+    assert render_service_url_from_env({
+        "RENDER_EXTERNAL_HOSTNAME": "roi-fallback.onrender.com",
+    }) == "https://roi-fallback.onrender.com"
+    assert render_service_url_from_env({}) == ""
 
 
 def test_split_sync_updates_old_any_feed_and_creates_raw_pump_feed():
