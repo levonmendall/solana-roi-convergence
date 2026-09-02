@@ -22,6 +22,7 @@ def test_guards_install_even_when_legacy_api_entrypoint_is_imported():
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_subscription_telemetry", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_transport_hardened", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_target_fanout", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_target_quorum", False))
     assert bool(getattr(direct_solana_module.rpc_endpoints_from_env, "_roi_official_secondary", False))
     assert bool(getattr(solana_rpc_module.rpc_endpoints_from_env, "_roi_official_secondary", False))
 
@@ -108,11 +109,19 @@ def test_memory_boundary_is_visible_without_production_wrapper(tmp_path):
     policy = status["provider_runtime_policy"]
     assert policy["subscription_topology"] == "one-logsSubscribe-per-websocket"
     assert policy["provider_ready_requires_all_targets"] is True
-    assert policy["partial_provider_evidence_recorded"] is False
+    assert policy["partial_provider_evidence_recorded"] is True
+    assert policy["acknowledged_partial_provider_target_evidence_recorded"] is True
+    assert policy["continuity_model"] == "all-ten-targets-covered-by-provider-union"
+    assert policy["bulk_gap_backfill_for_certification"] is False
+    assert policy["gap_backfill_candidate_lane_allowed"] is False
     assert policy["notification_dispatch_path"] == "serial-isolated-target-stream"
     assert policy["max_inflight_notification_handlers_per_stream"] == 1
     assert policy["full_target_count_unchanged"] == 10
     assert status["target_stream_fanout"]["target_count_per_provider"] == 10
+    quorum = status["full_scope_target_quorum"]
+    assert quorum["model"] == "per-target-provider-union"
+    assert quorum["target_count"] == 10
+    assert quorum["historical_backfill_can_restore_prospective_continuity"] is False
 
 
 def test_legacy_health_route_is_constant_time_liveness(monkeypatch):

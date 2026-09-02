@@ -19,17 +19,28 @@ def test_run_uses_per_target_fanout_and_keeps_bounded_memory():
     assert bool(getattr(DirectSolanaIngestionPlane.run, "_roi_target_fanout", False))
     assert bool(getattr(DirectSolanaIngestionPlane.run, "_roi_worker_partitioned", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_target_fanout", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_target_quorum", False))
     assert TARGET_WS_MAX_QUEUE == 8
     assert TARGET_WS_MAX_SIZE_BYTES == 1024 * 1024
     assert TARGET_START_STAGGER_SECONDS == 0.10
 
 
-def test_provider_is_live_only_after_every_target_stream_is_live():
+def test_provider_telemetry_is_strict_but_global_continuity_uses_target_coverage():
     async def scenario() -> None:
-        transitions: list[tuple[bool, str | None]] = []
+        provider_states: list[bool] = []
+        outages: list[bool] = []
 
         class Journal:
             def set_provider(self, _provider, *, connected, error_type=None):
+                provider_states.append(bool(connected))
+
+            def mark_outage(self, _started_at):
+                outages.append(True)
+
+            def outage_started_at(self):
+                return None
+
+            def close_outage(self, *, complete, error=None):
                 return None
 
         class Plane:
@@ -38,27 +49,25 @@ def test_provider_is_live_only_after_every_target_stream_is_live():
                 WatchTarget("program", "program-a", "RAYDIUM"),
             )
             journal = Journal()
-            _initial_connection_observed = False
-
-            async def _connection_state(self, _provider, connected, error_type=None):
-                transitions.append((bool(connected), error_type))
-                self._initial_connection_observed = True
 
         plane = Plane()
         endpoint = RpcEndpoint(name="provider-a", http_url="https://example.invalid", ws_url="wss://example.invalid")
         scout, program = plane.watch_targets
 
         await _set_target_state(plane, endpoint, scout, connected=True)
-        assert transitions == []
         assert _provider_event(plane, endpoint.name).is_set() is False
+        assert getattr(plane, "_roi_full_scope_target_coverage_ok") is False
 
         await _set_target_state(plane, endpoint, program, connected=True)
-        assert transitions == [(True, None)]
         assert _provider_event(plane, endpoint.name).is_set() is True
+        assert getattr(plane, "_roi_full_scope_target_coverage_ok") is True
+        assert provider_states[-1] is True
 
         await _set_target_state(plane, endpoint, scout, connected=False, error_type="ConnectionClosedError")
-        assert transitions[-1] == (False, "ConnectionClosedError")
         assert _provider_event(plane, endpoint.name).is_set() is False
+        assert getattr(plane, "_roi_full_scope_target_coverage_ok") is False
+        assert provider_states[-1] is False
+        assert outages == [True]
 
     asyncio.run(scenario())
 

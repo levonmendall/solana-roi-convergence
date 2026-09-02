@@ -32,10 +32,18 @@ install_handshake_pump()
 
 # Free public Solana endpoints proved that one-socket multiplexing is not robust
 # enough for the frozen ten-target feed. Isolate every target on its own bounded
-# WebSocket, and only declare a provider live when all ten target streams are live.
+# WebSocket.
 from .target_stream_fanout import install_target_stream_fanout
 
 install_target_stream_fanout()
+
+# Continuity is a property of full target coverage, not whether one flaky public
+# provider happens to hold all ten streams at the same instant. Use the redundant
+# provider union per target, and never bulk-backfill a prospective timing gap into
+# the hydration/candidate lanes.
+from .target_quorum import install_target_quorum
+
+install_target_quorum()
 
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
