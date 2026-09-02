@@ -241,7 +241,7 @@ def test_frozen_v31_paper_state_machine_s_a_and_exit_semantics(tmp_path):
     assert len(spos.fills) == 2
     assert spos.fills[1].intent is IntentKind.ADD_CONFIRMATION
     units_before_harvest = spos.units
-    s.on_price("s", t0 + timedelta(seconds=20), 1.65)
+    s.on_price("s", t0 + timedelta(seconds=20), 1.66)
     assert spos.harvest_hit is True
     assert pytest.approx(spos.units, rel=1e-9) == units_before_harvest * .30
     assert spos.runner_units == spos.units
