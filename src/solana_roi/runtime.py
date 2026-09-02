@@ -10,9 +10,14 @@ from typing import Any
 from .activation import CandidateActivationGate, ForwardCohortController
 from .certification_epoch import ensure_release_certification_epoch
 from .collecting_ingestion import CollectingLiveEvidenceIngestionService
+from .direct_funding import SolanaRpcFundingCollector
+from .direct_quote import DirectRpcJupiterQuoteClient
+from .direct_risk_collectors import SolanaAuthorityCollector, SolanaDeployerCollector
+from .direct_solana import DirectSolanaIngestionPlane
 from .durable_engine import DurablePaperTradingEngine
 from .ingestion import WalletProfile, WalletProfileRegistry
-from .launch_funding import CompleteLiveRiskCollectors, build_complete_live_collectors
+from .launch_funding import CompleteLiveRiskCollectors, DexScreenerLaunchCollector
+from .live_collectors import DexScreenerLiquidityCollector, PersistedSwapFlowCollector
 from .models import WalletTier
 from .observation import LatencyCertificationGate, ShadowPriceClock, TimedRiskCollectors
 from .observation_store import ObservationEventStore
@@ -24,6 +29,7 @@ from .shadow_execution import (
     ShadowAwareQuoteCertificationGate,
     ShadowWalletExecutableQuoteHandoff,
 )
+from .solana_rpc import SolanaRpcPool, rpc_endpoints_from_env
 from .source_coverage import SourceAwareProgramCoverageCertificationGate
 from .webhook_ingress import CompositeHeliusWebhookIngestion
 from .webhook_queue import DurableHeliusWebhookQueue, HeliusWebhookWorker
@@ -37,18 +43,33 @@ class RuntimeForwardCohortController(ForwardCohortController):
     """Add runtime-only operational invariants to the immutable cohort readiness gate."""
 
     webhook_queue: DurableHeliusWebhookQueue | None = None
+    direct_ingestion: DirectSolanaIngestionPlane | None = None
 
     def _base_readiness(self) -> dict[str, Any]:
         status = super()._base_readiness()
         clock_enabled = _env_true("SOLANA_ROI_SHADOW_CLOCK_ENABLED")
         queue_status = self.webhook_queue.status() if self.webhook_queue is not None else {"pending": 1}
         queue_drained = int(queue_status.get("pending", 1)) == 0
+        direct_status = self.direct_ingestion.status() if self.direct_ingestion is not None else {
+            "enabled": False,
+            "continuity_ok": False,
+            "strategy_scope_reduced": True,
+        }
+        direct_ok = bool(
+            direct_status.get("enabled")
+            and direct_status.get("continuity_ok")
+            and not direct_status.get("strategy_scope_reduced")
+            and len(direct_status.get("full_program_scope") or []) == 7
+        )
         status["continuous_price_clock_enabled"] = clock_enabled
         status["webhook_queue"] = queue_status
+        status["direct_solana"] = direct_status
         status["requirements"]["continuous_price_clock_enabled"] = clock_enabled
-        # Freeze/arm only on a fully drained durable intake boundary so a queued
-        # earlier swap cannot later invalidate first-touch chronology.
+        # Legacy webhook evidence may still exist on disk; it must be fully
+        # drained before freeze so no delayed old observation can alter chronology.
         status["requirements"]["durable_webhook_queue_drained"] = queue_drained
+        # Direct full-scope observation is now a hard operational invariant.
+        status["requirements"]["direct_full_scope_stream_continuity"] = direct_ok
         status["passed"] = all(bool(value) for value in status["requirements"].values())
         return status
 
@@ -60,6 +81,7 @@ class IngestionRuntime:
     registry: WalletProfileRegistry
     entity_resolver: EntityResolver
     risk: TokenRiskIntelligence
+    rpc_pool: SolanaRpcPool
     raw_collectors: CompleteLiveRiskCollectors
     collectors: TimedRiskCollectors
     price_clock: ShadowPriceClock
@@ -70,6 +92,7 @@ class IngestionRuntime:
     cohort_controller: ForwardCohortController
     activation_gate: CandidateActivationGate
     service: CollectingLiveEvidenceIngestionService
+    direct_ingestion: DirectSolanaIngestionPlane
     webhook_queue: DurableHeliusWebhookQueue
     webhook_worker: HeliusWebhookWorker
     certification_epoch: datetime
@@ -112,12 +135,11 @@ def _wallet_profiles_from_env() -> list[WalletProfile]:
     return profiles
 
 
-def _quote_client() -> JupiterQuoteOnlyClient | None:
+def _quote_client(rpc_pool: SolanaRpcPool) -> JupiterQuoteOnlyClient | None:
     jupiter = os.getenv("JUPITER_API_KEY", "").strip()
-    helius = os.getenv("HELIUS_API_KEY", "").strip()
-    if not jupiter or not helius:
+    if not jupiter:
         return None
-    return JupiterQuoteOnlyClient(jupiter_api_key=jupiter, helius_api_key=helius)
+    return DirectRpcJupiterQuoteClient(jupiter_api_key=jupiter, rpc=rpc_pool)
 
 
 def _shadow_simulator(client: JupiterQuoteOnlyClient | None) -> JupiterShadowTransactionSimulator | None:
@@ -143,16 +165,34 @@ def build_runtime() -> IngestionRuntime:
     webhook_queue = DurableHeliusWebhookQueue(store)
     engine = DurablePaperTradingEngine(store=store)
     registry = WalletProfileRegistry(store)
-    for profile in _wallet_profiles_from_env():
+    profiles = _wallet_profiles_from_env()
+    for profile in profiles:
         registry.register(profile)
+
+    rpc_pool = SolanaRpcPool(
+        rpc_endpoints_from_env(),
+        timeout_seconds=float(os.getenv("SOLANA_ROI_RPC_TIMEOUT_SECONDS", "2.5")),
+        hedge_delay_seconds=float(os.getenv("SOLANA_ROI_RPC_HEDGE_DELAY_SECONDS", "0.15")),
+    )
     policy = RiskPolicy()
     entity_resolver = EntityResolver(store, registry, min_confidence=policy.confirmed_entity_link_confidence)
     risk = TokenRiskIntelligence(store, entity_resolver=entity_resolver, registry=registry, policy=policy)
-    raw_collectors = build_complete_live_collectors(risk)
+
+    coverage_enabled = _env_true("SOLANA_ROI_PROGRAM_WIDE_SWAP_COVERAGE")
+    raw_collectors = CompleteLiveRiskCollectors(
+        risk,
+        authority=SolanaAuthorityCollector(risk, rpc_pool),
+        liquidity=DexScreenerLiquidityCollector(risk),
+        deployer=SolanaDeployerCollector(risk, rpc_pool),
+        flow=PersistedSwapFlowCollector(risk),
+        launch=DexScreenerLaunchCollector(risk) if coverage_enabled else None,
+        funding=SolanaRpcFundingCollector(risk, rpc_pool) if coverage_enabled else None,
+        coverage_asserted=coverage_enabled,
+    )
     collectors = TimedRiskCollectors(raw_collectors, risk=risk, store=store)
     latency_gate = LatencyCertificationGate(store, prospective_start_at=certification_epoch)
 
-    quote_client = _quote_client()
+    quote_client = _quote_client(rpc_pool)
     shadow_wallet = os.getenv("SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY", "").strip()
     quote_handoff = ShadowWalletExecutableQuoteHandoff(
         store=store,
@@ -215,6 +255,23 @@ def build_runtime() -> IngestionRuntime:
         quote_handoff=quote_handoff,
         activation_gate=activation_gate,
     )
+    direct_ingestion = DirectSolanaIngestionPlane(
+        store=store,
+        service=service,
+        scout_wallets=tuple(profile.wallet for profile in profiles),
+        rpc_pool=rpc_pool,
+        coverage_status_fn=coverage_gate.status,
+        worker_count=int(os.getenv("SOLANA_ROI_DIRECT_HYDRATION_WORKERS", "12")),
+        market_sample_modulus=int(os.getenv("SOLANA_ROI_DIRECT_MARKET_SAMPLE_MODULUS", "20")),
+        audit_sample_modulus=int(os.getenv("SOLANA_ROI_DIRECT_AUDIT_SAMPLE_MODULUS", "200")),
+        candidate_context_deadline_seconds=float(os.getenv("SOLANA_ROI_DIRECT_CONTEXT_DEADLINE_SECONDS", "3.0")),
+        candidate_context_max_signatures=int(os.getenv("SOLANA_ROI_DIRECT_CONTEXT_MAX_SIGNATURES", "600")),
+        gap_backfill_max_pages=int(os.getenv("SOLANA_ROI_DIRECT_GAP_BACKFILL_MAX_PAGES", "5")),
+    )
+    cohort_controller.direct_ingestion = direct_ingestion
+
+    # Retain the legacy durable webhook queue as a compatibility/fail-closed
+    # intake only. Production no longer depends on Helius webhook management.
     webhook_ingress = CompositeHeliusWebhookIngestion(service)
     webhook_worker = HeliusWebhookWorker(queue=webhook_queue, service=webhook_ingress)
     return IngestionRuntime(
@@ -223,6 +280,7 @@ def build_runtime() -> IngestionRuntime:
         registry=registry,
         entity_resolver=entity_resolver,
         risk=risk,
+        rpc_pool=rpc_pool,
         raw_collectors=raw_collectors,
         collectors=collectors,
         price_clock=price_clock,
@@ -233,6 +291,7 @@ def build_runtime() -> IngestionRuntime:
         cohort_controller=cohort_controller,
         activation_gate=activation_gate,
         service=service,
+        direct_ingestion=direct_ingestion,
         webhook_queue=webhook_queue,
         webhook_worker=webhook_worker,
         certification_epoch=certification_epoch,

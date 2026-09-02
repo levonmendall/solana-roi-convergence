@@ -21,6 +21,31 @@ services:
         value: /var/data/solana-roi.sqlite3
       - key: SOLANA_ROI_PROGRAM_WIDE_SWAP_COVERAGE
         value: "true"
+      # Full original seven-program scope now comes directly from standard
+      # Solana WebSockets/RPC. Two independent public endpoints are live at the
+      # same time; candidate hydration is latency-hedged across them.
+      - key: SOLANA_ROI_DIRECT_SOLANA_ENABLED
+        value: "true"
+      - key: SOLANA_ROI_RPC_ENDPOINTS_JSON
+        value: '[{"name":"publicnode","http":"https://solana-rpc.publicnode.com","ws":"wss://solana-rpc.publicnode.com"},{"name":"onfinality","http":"https://solana.api.onfinality.io/public","ws":"wss://solana.api.onfinality.io/public-ws"}]'
+      - key: SOLANA_ROI_RPC_TIMEOUT_SECONDS
+        value: "2.5"
+      - key: SOLANA_ROI_RPC_HEDGE_DELAY_SECONDS
+        value: "0.15"
+      - key: SOLANA_ROI_DIRECT_HYDRATION_WORKERS
+        value: "12"
+      - key: SOLANA_ROI_DIRECT_MARKET_SAMPLE_MODULUS
+        value: "20"
+      - key: SOLANA_ROI_DIRECT_AUDIT_SAMPLE_MODULUS
+        value: "200"
+      - key: SOLANA_ROI_DIRECT_CONTEXT_DEADLINE_SECONDS
+        value: "3.0"
+      - key: SOLANA_ROI_DIRECT_CONTEXT_MAX_SIGNATURES
+        value: "600"
+      - key: SOLANA_ROI_DIRECT_GAP_BACKFILL_MAX_PAGES
+        value: "5"
+      - key: SOLANA_ROI_DIRECT_RAW_RETENTION_SECONDS
+        value: "900"
       - key: SOLANA_ROI_SHADOW_CLOCK_ENABLED
         value: "true"
       - key: SOLANA_ROI_SHADOW_CLOCK_SECONDS
@@ -31,16 +56,10 @@ services:
       # Solana addresses only; no key material is stored or accepted.
       - key: SOLANA_ROI_WALLET_PROFILES_JSON
         value: '[{"wallet":"4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk","entity_id":"kol:jijo","tier":"S","first_touch_sample_size":191,"historically_eligible":true},{"wallet":"862TYSvRYoiHAK3F3WwTRYAfuGiQaGdxedN9AGvRGWo2","entity_id":"kol:wugi","tier":"S","first_touch_sample_size":52,"historically_eligible":true},{"wallet":"DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt","entity_id":"kol:the-doc","tier":"S","first_touch_sample_size":121,"historically_eligible":true}]'
-      # Provider credentials still require user-owned accounts and are prompted
-      # during initial Blueprint creation. They are never committed.
-      - key: HELIUS_API_KEY
-        sync: false
+      # Jupiter remains the amount-specific quote/simulation provider. Standard
+      # Solana metadata and risk collection no longer require Helius credits.
       - key: JUPITER_API_KEY
         sync: false
-      # Render generates these internal 256-bit secrets. The Helius bootstrap
-      # registers the generated webhook auth header automatically.
-      - key: HELIUS_WEBHOOK_AUTH
-        generateValue: true
       - key: SOLANA_ROI_COHORT_ARM_AUTH
         generateValue: true
       # Public address only. No private key, signer, seed phrase, or mnemonic.
