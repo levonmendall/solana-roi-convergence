@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -8,10 +9,9 @@ from urllib.parse import urljoin
 
 import httpx
 
-from .deployment import FROZEN_PROGRAM_ADDRESSES, PUMP_PROGRAM_ID
+from .deployment import DEFAULT_SCOUT_PROFILES
 
-ENHANCED_PROGRAM_ADDRESSES = tuple(address for address in FROZEN_PROGRAM_ADDRESSES if address != PUMP_PROGRAM_ID)
-ENHANCED_TRANSACTION_TYPES = ("BUY", "SELL", "SWAP")
+SCOUT_TRANSACTION_TYPES = ("ANY",)
 
 
 def render_service_url_from_env(env: dict[str, str] | None = None) -> str:
@@ -27,12 +27,43 @@ def render_service_url_from_env(env: dict[str, str] | None = None) -> str:
     return ""
 
 
+def scout_wallets_from_env(env: dict[str, str] | None = None) -> tuple[str, ...]:
+    """Return only the frozen, historically eligible S/A scout public keys."""
+
+    values = env if env is not None else os.environ
+    raw = str(values.get("SOLANA_ROI_WALLET_PROFILES_JSON") or "").strip()
+    payload: Any = json.loads(raw) if raw else list(DEFAULT_SCOUT_PROFILES)
+    if not isinstance(payload, list):
+        raise ValueError("SOLANA_ROI_WALLET_PROFILES_JSON must be a JSON array")
+    wallets: list[str] = []
+    seen: set[str] = set()
+    for row in payload:
+        if not isinstance(row, dict):
+            raise ValueError("wallet profile entries must be objects")
+        if not bool(row.get("historically_eligible")):
+            continue
+        if str(row.get("tier") or "").upper() not in {"S", "A"}:
+            continue
+        wallet = str(row.get("wallet") or "").strip()
+        if wallet and wallet not in seen:
+            seen.add(wallet)
+            wallets.append(wallet)
+    if not wallets:
+        raise ValueError("at least one frozen eligible scout wallet is required")
+    return tuple(wallets)
+
+
 class SplitHeliusWebhookManager:
-    """Maintain a filtered enhanced feed plus raw Pump.fun feed.
+    """Maintain a credit-efficient permanent scout trigger feed.
+
+    The previous production shape subscribed to program-wide `ANY` traffic and
+    exhausted a 1M-credit Helius Free plan in less than a day. The permanent
+    webhook now contains only the frozen scout wallets. Program-wide evidence
+    remains a separate certification concern and is not implied by this feed.
 
     Helius can transiently rate-limit webhook-management REST calls. Every
-    management operation therefore retries 429/503 responses with bounded
-    exponential backoff and honors Retry-After when supplied by Helius.
+    management operation retries 429/503 responses with bounded exponential
+    backoff and honors Retry-After when supplied by Helius.
     """
 
     API_ROOT = "https://api-mainnet.helius-rpc.com/v0/webhooks"
@@ -70,36 +101,24 @@ class SplitHeliusWebhookManager:
     def _target(service_url: str, path: str) -> str:
         return urljoin(service_url.rstrip("/") + "/", path.lstrip("/"))
 
-    def _desired(self, service_url: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        enhanced = {
+    def _desired(self, service_url: str, scout_wallets: tuple[str, ...]) -> dict[str, Any]:
+        return {
             "webhookURL": self._target(service_url, "/v1/ingestion/helius"),
-            "transactionTypes": list(ENHANCED_TRANSACTION_TYPES),
-            "accountAddresses": list(ENHANCED_PROGRAM_ADDRESSES),
+            "transactionTypes": list(SCOUT_TRANSACTION_TYPES),
+            "accountAddresses": list(scout_wallets),
             "webhookType": "enhanced",
             "authHeader": self.auth_header,
         }
-        pump_raw = {
-            "webhookURL": self._target(service_url, "/v1/ingestion/helius/pump-raw"),
-            "transactionTypes": ["ANY"],
-            "accountAddresses": [PUMP_PROGRAM_ID],
-            "webhookType": "raw",
-            "authHeader": self.auth_header,
-        }
-        return enhanced, pump_raw
 
     @staticmethod
     def _same_config(current: dict[str, Any], desired: dict[str, Any]) -> bool:
-        common = bool(
+        return bool(
             current.get("webhookURL") == desired["webhookURL"]
             and set(current.get("accountAddresses") or []) == set(desired["accountAddresses"])
             and current.get("webhookType") == desired["webhookType"]
             and current.get("authHeader") == desired["authHeader"]
+            and set(current.get("transactionTypes") or []) == set(desired["transactionTypes"])
         )
-        if not common:
-            return False
-        if desired["webhookType"] == "raw":
-            return True
-        return set(current.get("transactionTypes") or []) == set(desired["transactionTypes"])
 
     def _retry_delay(self, response: Any, retry_index: int) -> float:
         headers = getattr(response, "headers", {}) or {}
@@ -131,13 +150,13 @@ class SplitHeliusWebhookManager:
             await self.sleep_fn(delay)
         raise RuntimeError("unreachable Helius management retry state")
 
-    async def _enable(self, webhook_id: str, *, label: str) -> None:
-        self.stage = f"reenable:{label}"
+    async def _set_active(self, webhook_id: str, active: bool, *, label: str) -> None:
+        self.stage = ("reenable:" if active else "disable:") + label
         await self._request(
             "patch",
             f"{self.API_ROOT}/{webhook_id}",
             params=self._params(),
-            json={"active": True},
+            json={"active": active},
         )
 
     async def _upsert(self, webhooks: list[Any], desired: dict[str, Any], *, label: str) -> dict[str, Any]:
@@ -164,7 +183,7 @@ class SplitHeliusWebhookManager:
                 active = bool(payload.get("active", True)) if isinstance(payload, dict) else active
                 action = "updated"
             if not active:
-                await self._enable(webhook_id, label=label)
+                await self._set_active(webhook_id, True, label=label)
                 active = True
                 action = "updated_and_reenabled" if action == "updated" else "reenabled"
             return {"feed": label, "action": action, "webhook_id": webhook_id, "active": active}
@@ -175,7 +194,7 @@ class SplitHeliusWebhookManager:
         webhook_id = str(payload.get("webhookID") or "") if isinstance(payload, dict) else ""
         active = bool(payload.get("active", True)) if isinstance(payload, dict) else True
         if webhook_id and not active:
-            await self._enable(webhook_id, label=label)
+            await self._set_active(webhook_id, True, label=label)
             active = True
         return {
             "feed": label,
@@ -184,24 +203,41 @@ class SplitHeliusWebhookManager:
             "active": active,
         }
 
-    async def sync(self, service_url: str) -> dict[str, Any]:
+    async def _disable_legacy_raw(self, webhooks: list[Any], service_url: str) -> dict[str, Any]:
+        target = self._target(service_url, "/v1/ingestion/helius/pump-raw")
+        matching = [row for row in webhooks if isinstance(row, dict) and row.get("webhookURL") == target]
+        if len(matching) > 1:
+            raise RuntimeError("multiple legacy Pump.fun raw webhooks found; refusing ambiguous mutation")
+        if not matching:
+            return {"feed": "legacy_pump_fun_raw_feed", "action": "absent", "active": False}
+        row = matching[0]
+        webhook_id = str(row.get("webhookID") or "")
+        if not webhook_id:
+            raise RuntimeError("legacy Pump.fun raw webhook has no webhookID")
+        if bool(row.get("active", True)):
+            await self._set_active(webhook_id, False, label="legacy_pump_fun_raw_feed")
+            return {"feed": "legacy_pump_fun_raw_feed", "action": "disabled", "webhook_id": webhook_id, "active": False}
+        return {"feed": "legacy_pump_fun_raw_feed", "action": "already_disabled", "webhook_id": webhook_id, "active": False}
+
+    async def sync(self, service_url: str, *, scout_wallets: tuple[str, ...] | None = None) -> dict[str, Any]:
         if not service_url.startswith("https://"):
             raise ValueError("service URL must be public HTTPS")
+        wallets = scout_wallets or scout_wallets_from_env()
         self.stage = "list_webhooks"
         response = await self._request("get", self.API_ROOT, params=self._params())
         webhooks = response.json()
         if not isinstance(webhooks, list):
             raise RuntimeError("Helius webhook list response is invalid")
-        enhanced, pump_raw = self._desired(service_url)
-        enhanced_result = await self._upsert(webhooks, enhanced, label="enhanced_swap_feed")
-        raw_result = await self._upsert(webhooks, pump_raw, label="pump_fun_raw_feed")
+        desired = self._desired(service_url, wallets)
+        scout_result = await self._upsert(webhooks, desired, label="scout_trigger_feed")
+        legacy_raw_result = await self._disable_legacy_raw(webhooks, service_url)
         self.stage = "complete"
         return {
-            "action": "split_webhooks_synced",
-            "feeds": [enhanced_result, raw_result],
-            "enhanced_program_count": len(ENHANCED_PROGRAM_ADDRESSES),
-            "pump_raw_program_count": 1,
-            "enhanced_transaction_types": list(ENHANCED_TRANSACTION_TYPES),
+            "action": "credit_efficient_webhooks_synced",
+            "feeds": [scout_result, legacy_raw_result],
+            "scout_wallet_count": len(wallets),
+            "transaction_types": list(SCOUT_TRANSACTION_TYPES),
+            "program_wide_coverage_implied": False,
             "management_retry_count": self.management_retry_count,
             "last_retry_status_code": self.last_retry_status_code,
             "last_retry_delay_seconds": self.last_retry_delay_seconds,
@@ -245,7 +281,7 @@ async def auto_sync_split_helius_from_env(*, store: Any | None = None, delay_sec
             "management_retry_count": manager.management_retry_count,
             "last_retry_status_code": manager.last_retry_status_code,
             "last_retry_delay_seconds": manager.last_retry_delay_seconds,
-            "error": "Helius split-webhook bootstrap failed after bounded retry; provider exception text suppressed to protect query-string credentials",
+            "error": "Helius credit-efficient webhook bootstrap failed after bounded retry; provider exception text suppressed to protect query-string credentials",
         }
         if store is not None:
             store.append("helius_split_webhook_bootstrap_failed", observed_at, result)
