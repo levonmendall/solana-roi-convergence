@@ -72,6 +72,10 @@ class CollectingLiveEvidenceIngestionService(LiveEvidenceIngestionService):
     def _cohort_armed(self) -> bool:
         return bool(self.activation_gate is not None and self.activation_gate.controller.is_armed())
 
+    def _chronology_conflict(self, token_mint: str) -> bool:
+        checker = getattr(self.store, "token_first_touch_has_earlier_eligible_swap", None)
+        return bool(callable(checker) and checker(token_mint))
+
     async def ingest_swap(self, swap: NormalizedSwap) -> IngestionDecision:
         inserted = self.store.record_swap(
             signature=swap.signature,
@@ -121,7 +125,7 @@ class CollectingLiveEvidenceIngestionService(LiveEvidenceIngestionService):
         if first is None:
             return self._decision(swap, "record_only", "first-touch claim unresolved")
 
-        if self.store.token_first_touch_has_earlier_eligible_swap(swap.token_mint):
+        if self._chronology_conflict(swap.token_mint):
             return self._decision(swap, "record_only", "first-touch chronology conflict detected from out-of-order eligible evidence")
 
         if not first_claimed_now and self._same_entity(
