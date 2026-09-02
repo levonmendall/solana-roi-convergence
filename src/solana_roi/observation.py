@@ -46,7 +46,13 @@ class LatencyCertificationPolicy:
 
 
 class TimedRiskCollectors:
-    """Wrap risk collectors and publish actual wall-clock completion latency."""
+    """Collect broad coverage while timing only the frozen scout decision path.
+
+    Program-wide traffic is useful for launch/funding coverage, but it is not a
+    candidate. Recording expensive background collection as candidate latency
+    makes the latency gate measure the wrong path. Production therefore records
+    a latency sample only for a historically eligible S/A scout buy.
+    """
 
     def __init__(
         self,
@@ -63,10 +69,34 @@ class TimedRiskCollectors:
         self.now_fn = now_fn
         self.perf_fn = perf_fn
 
+    def _eligible_candidate(self, current_swap: Any) -> bool:
+        if current_swap is None:
+            return True
+        wallet = str(getattr(current_swap, "wallet", "") or "")
+        if not wallet or str(getattr(current_swap, "side", "") or "").lower() != "buy":
+            return False
+        profile = self.store.wallet_profile(wallet)
+        if profile is None:
+            return False
+        return bool(profile["historically_eligible"]) and str(profile["tier"]).upper() in {"S", "A"}
+
     async def refresh(self, mint: str, at: datetime, *, current_swap: Any = None) -> None:
         started_at = self.now_fn()
         started_perf = self.perf_fn()
-        await self.inner.refresh(mint, at, current_swap=current_swap)
+
+        coverage_refresh = getattr(self.inner, "refresh_coverage", None)
+        if callable(coverage_refresh):
+            await coverage_refresh(mint, at, current_swap=current_swap)
+
+        if not self._eligible_candidate(current_swap):
+            return
+
+        candidate_refresh = getattr(self.inner, "refresh_candidate", None)
+        if callable(candidate_refresh):
+            await candidate_refresh(mint, at, current_swap=current_swap)
+        elif not callable(coverage_refresh):
+            await self.inner.refresh(mint, at, current_swap=current_swap)
+
         completed_at = self.now_fn()
         elapsed_ms = max(0.0, (self.perf_fn() - started_perf) * 1000.0)
         readiness = self.risk.readiness(mint, as_of=completed_at)
@@ -93,12 +123,24 @@ class TimedRiskCollectors:
 
 
 class LatencyCertificationGate:
-    def __init__(self, store: ObservationEventStore, *, policy: LatencyCertificationPolicy | None = None):
+    def __init__(
+        self,
+        store: ObservationEventStore,
+        *,
+        policy: LatencyCertificationPolicy | None = None,
+        prospective_start_at: datetime | None = None,
+    ):
         self.store = store
         self.policy = policy or LatencyCertificationPolicy()
+        self.prospective_start_at = prospective_start_at
 
     def status(self, *, limit: int = 500) -> dict[str, object]:
         rows = self.store.recent_risk_refreshes(limit)
+        if self.prospective_start_at is not None:
+            rows = [
+                row for row in rows
+                if datetime.fromisoformat(str(row["completed_at"])) >= self.prospective_start_at
+            ]
         complete_fresh = [row for row in rows if row["complete"] and row["fresh"]]
         e2e = [float(row["end_to_end_ms"]) for row in rows]
         ingestion = [float(row["ingestion_latency_ms"]) for row in rows]
@@ -126,12 +168,14 @@ class LatencyCertificationGate:
             "p95_end_to_end_ms": p95_e2e,
             "p99_end_to_end_ms": p99_e2e,
             "p95_ingestion_ms": p95_ingestion,
+            "prospective_start_at": self.prospective_start_at.isoformat() if self.prospective_start_at else None,
             "requirements": {
                 "min_samples": self.policy.min_samples,
                 "min_complete_fresh_fraction": self.policy.min_complete_fresh_fraction,
                 "max_p95_end_to_end_ms": self.policy.max_p95_end_to_end_ms,
                 "max_p99_end_to_end_ms": self.policy.max_p99_end_to_end_ms,
                 "max_p95_ingestion_ms": self.policy.max_p95_ingestion_ms,
+                "prospective_release_boundary_required": True,
             },
         }
 
