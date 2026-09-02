@@ -24,6 +24,7 @@ from .shadow_execution import (
     ShadowWalletExecutableQuoteHandoff,
 )
 from .source_coverage import SourceAwareProgramCoverageCertificationGate
+from .webhook_queue import DurableHeliusWebhookQueue, HeliusWebhookWorker
 
 
 def _env_true(name: str) -> bool:
@@ -59,6 +60,8 @@ class IngestionRuntime:
     cohort_controller: ForwardCohortController
     activation_gate: CandidateActivationGate
     service: CollectingLiveEvidenceIngestionService
+    webhook_queue: DurableHeliusWebhookQueue
+    webhook_worker: HeliusWebhookWorker
 
     @property
     def paper_signal_promotion_enabled(self) -> bool:
@@ -193,6 +196,8 @@ def build_runtime() -> IngestionRuntime:
         quote_handoff=quote_handoff,
         activation_gate=activation_gate,
     )
+    webhook_queue = DurableHeliusWebhookQueue(store)
+    webhook_worker = HeliusWebhookWorker(queue=webhook_queue, service=service)
     return IngestionRuntime(
         store=store,
         engine=engine,
@@ -209,4 +214,6 @@ def build_runtime() -> IngestionRuntime:
         cohort_controller=cohort_controller,
         activation_gate=activation_gate,
         service=service,
+        webhook_queue=webhook_queue,
+        webhook_worker=webhook_worker,
     )
