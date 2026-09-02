@@ -120,6 +120,15 @@ from .continuity_startup_barrier import install_continuity_startup_barrier
 
 install_continuity_startup_barrier()
 
+# Production telemetry proved the managed Alchemy endpoint is connection-rate
+# limited when all ten frozen targets open separate sockets. Keep PublicNode and
+# Solana mainnet target-isolated, but carry all ten Alchemy logsSubscribe requests
+# on one sequentially acknowledged socket without changing target quorum or memory
+# ceilings.
+from .alchemy_multiplexed_stream import install_alchemy_multiplexed_stream
+
+install_alchemy_multiplexed_stream()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
