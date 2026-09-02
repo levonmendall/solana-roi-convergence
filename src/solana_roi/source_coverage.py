@@ -42,12 +42,7 @@ class SourceAwareCoverageCertificationPolicy(CoverageCertificationPolicy):
 
 
 class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGate):
-    """Require prospective launch evidence and empirical delivery per source.
-
-    A pre-existing pool first seen after startup is not a prospective launch
-    observation. Only pools created on or after the exact-release evidence
-    epoch may enter the 95% near-creation/early-buyer/funding denominator.
-    """
+    """Require prospective launch evidence and empirical live delivery per source."""
 
     def __init__(
         self,
@@ -64,6 +59,13 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
     def source_policy(self) -> SourceAwareCoverageCertificationPolicy:
         return self.policy  # type: ignore[return-value]
 
+    def _has_direct_recovery_ledger(self) -> bool:
+        with self.store._lock:
+            row = self.store.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='direct_solana_hydration_metrics'"
+            ).fetchone()
+        return row is not None
+
     def _source_counts(self) -> dict[str, int]:
         counts = {source: 0 for source in self.source_policy.required_program_sources}
         sql = (
@@ -75,6 +77,14 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
         if self.prospective_start_at is not None:
             sql += " AND received_at>=?"
             args.append(self.prospective_start_at.isoformat())
+        # Gap recovery is authoritative history used to restore chronology, but
+        # it is not proof that the live stream delivered that transaction. Never
+        # allow recovered rows to satisfy empirical per-source delivery.
+        if self._has_direct_recovery_ledger():
+            sql += (
+                " AND NOT EXISTS (SELECT 1 FROM direct_solana_hydration_metrics recovery "
+                "WHERE recovery.signature=normalized_swaps.signature AND recovery.historical_recovery=1)"
+            )
         sql += " GROUP BY source"
         with self.store._lock:
             rows = self.store.db.execute(sql, tuple(args)).fetchall()
@@ -131,6 +141,7 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
         requirements = asdict(self.source_policy)
         requirements["empirical_per_source_delivery_required"] = True
         requirements["prospective_release_boundary_required"] = True
+        requirements["historical_gap_recovery_excluded_from_live_delivery"] = True
         return {
             "certified": certified,
             "configured": configured,
