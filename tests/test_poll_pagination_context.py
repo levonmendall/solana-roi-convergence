@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from solana_roi import live_poll_redundancy as live_poll
+from solana_roi import poll_exception_rearm as exception_rearm
 from solana_roi import poll_pagination_context as pagination
 from solana_roi import poll_watermark_repair as watermark
 from solana_roi.direct_solana import DirectSolanaIngestionPlane, WatchTarget
@@ -130,7 +131,9 @@ def test_true_bounded_overflow_still_fails_closed(monkeypatch):
 
 
 def test_pagination_context_installed_without_replacing_recoverability_worker():
-    assert watermark._slot_fetch_delta is pagination._context_fresh_fetch_delta
-    assert live_poll._fetch_delta is pagination._context_fresh_fetch_delta
+    assert exception_rearm._ORIGINAL_FETCH_DELTA is pagination._context_fresh_fetch_delta
+    assert watermark._slot_fetch_delta is exception_rearm._exception_rearm_fetch_delta
+    assert live_poll._fetch_delta is exception_rearm._exception_rearm_fetch_delta
     assert live_poll._poll_target.__name__ == "_leased_poll_target"
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_poll_pagination_context", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_poll_exception_rearm", False))
