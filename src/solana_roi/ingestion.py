@@ -121,20 +121,27 @@ class WalletProfileRegistry:
 
 
 class HeliusEnhancedWebhookParser:
-    """Normalize unambiguous SOL<->SPL swaps used by the paper system."""
+    """Normalize unambiguous SOL<->SPL trades from supported enhanced webhook types."""
+
+    SWAP_TYPES = {"SWAP", "SWAP_EXACT_OUT", "SWAP_WITH_PRICE_IMPACT"}
+    DIRECT_TRADE_TYPES = {"BUY", "SELL"}
 
     @staticmethod
     def _token_amount(leg: dict[str, Any]) -> float | None:
         raw = leg.get("rawTokenAmount")
-        if not isinstance(raw, dict):
-            return None
+        if isinstance(raw, dict):
+            try:
+                amount = float(raw["tokenAmount"])
+                decimals = int(raw["decimals"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            scaled = amount / (10 ** decimals)
+            return scaled if scaled > 0 else None
         try:
-            amount = float(raw["tokenAmount"])
-            decimals = int(raw["decimals"])
-        except (KeyError, TypeError, ValueError):
+            amount = float(leg.get("tokenAmount") or 0.0)
+        except (TypeError, ValueError):
             return None
-        scaled = amount / (10 ** decimals)
-        return scaled if scaled > 0 else None
+        return amount if amount > 0 else None
 
     @staticmethod
     def _native_sol(leg: dict[str, Any] | None) -> float | None:
@@ -157,6 +164,131 @@ class HeliusEnhancedWebhookParser:
             return next(iter(users))
         return None
 
+    @staticmethod
+    def _source_label(tx: dict[str, Any], tx_type: str) -> str:
+        source = str(tx.get("source") or "UNKNOWN").upper()
+        return f"helius-enhanced-webhook:{source}:{tx_type.lower()}"
+
+    def _from_swap_event(
+        self,
+        tx: dict[str, Any],
+        *,
+        tx_type: str,
+        signature: str,
+        slot: int,
+        observed_at: datetime,
+        received_at: datetime,
+        fee_payer: str,
+    ) -> NormalizedSwap | None:
+        events = tx.get("events")
+        swap = events.get("swap") if isinstance(events, dict) else None
+        if not isinstance(swap, dict):
+            return None
+        native_in = self._native_sol(swap.get("nativeInput"))
+        native_out = self._native_sol(swap.get("nativeOutput"))
+        token_inputs = [row for row in (swap.get("tokenInputs") or []) if isinstance(row, dict)]
+        token_outputs = [row for row in (swap.get("tokenOutputs") or []) if isinstance(row, dict)]
+        if native_in is not None and token_outputs:
+            side, legs, native_amount = "buy", token_outputs, native_in
+        elif native_out is not None and token_inputs:
+            side, legs, native_amount = "sell", token_inputs, native_out
+        else:
+            return None
+        wallet = self._wallet_for_legs(fee_payer, legs)
+        if wallet is None:
+            return None
+        priced_legs: list[tuple[str, float]] = []
+        for leg in legs:
+            amount = self._token_amount(leg)
+            mint = str(leg.get("mint") or "")
+            if amount is not None and mint:
+                priced_legs.append((mint, amount))
+        if len(priced_legs) != 1:
+            return None
+        token_mint, token_amount = priced_legs[0]
+        return NormalizedSwap(
+            signature=signature,
+            slot=slot,
+            observed_at=observed_at,
+            received_at=received_at,
+            wallet=wallet,
+            token_mint=token_mint,
+            side=side,
+            token_amount=token_amount,
+            native_amount_sol=native_amount,
+            reference_price_sol=native_amount / token_amount,
+            source=self._source_label(tx, tx_type),
+        )
+
+    def _from_direct_transfers(
+        self,
+        tx: dict[str, Any],
+        *,
+        tx_type: str,
+        signature: str,
+        slot: int,
+        observed_at: datetime,
+        received_at: datetime,
+        fee_payer: str,
+    ) -> NormalizedSwap | None:
+        """Fail-closed fallback for sources such as PUMP_AMM whose type is BUY/SELL.
+
+        Helius can classify Pump AMM transactions as BUY/SELL rather than SWAP. When
+        no structured swap event is present, derive only a simple one-mint SOL trade
+        from user-level transfers. Ambiguous/multi-mint flow is discarded.
+        """
+        if tx_type not in self.DIRECT_TRADE_TYPES or not fee_payer:
+            return None
+        token_transfers = [row for row in (tx.get("tokenTransfers") or []) if isinstance(row, dict)]
+        native_transfers = [row for row in (tx.get("nativeTransfers") or []) if isinstance(row, dict)]
+        amounts: dict[str, float] = {}
+        if tx_type == "BUY":
+            for row in token_transfers:
+                if str(row.get("toUserAccount") or "") != fee_payer:
+                    continue
+                mint = str(row.get("mint") or "")
+                amount = self._token_amount(row)
+                if mint and amount is not None:
+                    amounts[mint] = amounts.get(mint, 0.0) + amount
+            lamports = sum(
+                float(row.get("amount") or 0.0)
+                for row in native_transfers
+                if str(row.get("fromUserAccount") or "") == fee_payer
+            )
+            side = "buy"
+        else:
+            for row in token_transfers:
+                if str(row.get("fromUserAccount") or "") != fee_payer:
+                    continue
+                mint = str(row.get("mint") or "")
+                amount = self._token_amount(row)
+                if mint and amount is not None:
+                    amounts[mint] = amounts.get(mint, 0.0) + amount
+            lamports = sum(
+                float(row.get("amount") or 0.0)
+                for row in native_transfers
+                if str(row.get("toUserAccount") or "") == fee_payer
+            )
+            side = "sell"
+        nonzero = [(mint, amount) for mint, amount in amounts.items() if amount > 0]
+        native_amount = lamports / LAMPORTS_PER_SOL
+        if len(nonzero) != 1 or native_amount <= 0:
+            return None
+        token_mint, token_amount = nonzero[0]
+        return NormalizedSwap(
+            signature=signature,
+            slot=slot,
+            observed_at=observed_at,
+            received_at=received_at,
+            wallet=fee_payer,
+            token_mint=token_mint,
+            side=side,
+            token_amount=token_amount,
+            native_amount_sol=native_amount,
+            reference_price_sol=native_amount / token_amount,
+            source=self._source_label(tx, tx_type),
+        )
+
     def parse(self, payload: Any, *, received_at: datetime | None = None) -> list[NormalizedSwap]:
         received_at = received_at or datetime.now(timezone.utc)
         transactions = payload if isinstance(payload, list) else [payload]
@@ -164,11 +296,8 @@ class HeliusEnhancedWebhookParser:
         for tx in transactions:
             if not isinstance(tx, dict) or tx.get("transactionError"):
                 continue
-            if str(tx.get("type") or "").upper() not in {"SWAP", "SWAP_EXACT_OUT", "SWAP_WITH_PRICE_IMPACT"}:
-                continue
-            events = tx.get("events")
-            swap = events.get("swap") if isinstance(events, dict) else None
-            if not isinstance(swap, dict):
+            tx_type = str(tx.get("type") or "").upper()
+            if tx_type not in self.SWAP_TYPES | self.DIRECT_TRADE_TYPES:
                 continue
             signature = str(tx.get("signature") or "")
             try:
@@ -180,40 +309,27 @@ class HeliusEnhancedWebhookParser:
                 continue
             observed_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
             fee_payer = str(tx.get("feePayer") or "")
-            native_in = self._native_sol(swap.get("nativeInput"))
-            native_out = self._native_sol(swap.get("nativeOutput"))
-            token_inputs = [row for row in (swap.get("tokenInputs") or []) if isinstance(row, dict)]
-            token_outputs = [row for row in (swap.get("tokenOutputs") or []) if isinstance(row, dict)]
-            if native_in is not None and token_outputs:
-                side, legs, native_amount = "buy", token_outputs, native_in
-            elif native_out is not None and token_inputs:
-                side, legs, native_amount = "sell", token_inputs, native_out
-            else:
-                continue
-            wallet = self._wallet_for_legs(fee_payer, legs)
-            if wallet is None:
-                continue
-            priced_legs: list[tuple[str, float]] = []
-            for leg in legs:
-                amount = self._token_amount(leg)
-                mint = str(leg.get("mint") or "")
-                if amount is not None and mint:
-                    priced_legs.append((mint, amount))
-            if len(priced_legs) != 1:
-                continue
-            token_mint, token_amount = priced_legs[0]
-            rows.append(NormalizedSwap(
+            normalized = self._from_swap_event(
+                tx,
+                tx_type=tx_type,
                 signature=signature,
                 slot=slot,
                 observed_at=observed_at,
                 received_at=received_at,
-                wallet=wallet,
-                token_mint=token_mint,
-                side=side,
-                token_amount=token_amount,
-                native_amount_sol=native_amount,
-                reference_price_sol=native_amount / token_amount,
-            ))
+                fee_payer=fee_payer,
+            )
+            if normalized is None:
+                normalized = self._from_direct_transfers(
+                    tx,
+                    tx_type=tx_type,
+                    signature=signature,
+                    slot=slot,
+                    observed_at=observed_at,
+                    received_at=received_at,
+                    fee_payer=fee_payer,
+                )
+            if normalized is not None:
+                rows.append(normalized)
         return rows
 
 
