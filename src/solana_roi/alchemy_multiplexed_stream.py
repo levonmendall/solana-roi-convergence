@@ -128,8 +128,6 @@ async def _alchemy_multiplexed_stream(self: Any, endpoint: RpcEndpoint, stop: as
 
     while not stop.is_set():
         setup_started = time.monotonic()
-        disconnect_error_type: str | None = None
-        disconnect_error_code: int | None = None
         try:
             async with direct_solana_module.websockets.connect(
                 endpoint.ws_url,
@@ -264,17 +262,14 @@ async def _alchemy_multiplexed_stream(self: Any, endpoint: RpcEndpoint, stop: as
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            disconnect_error_type = type(exc).__name__
-            if isinstance(exc, SubscriptionSetupError):
-                disconnect_error_code = exc.code
-            else:
-                disconnect_error_code = _handshake_status_code(exc)
+            error_type = type(exc).__name__
+            error_code = exc.code if isinstance(exc, SubscriptionSetupError) else _handshake_status_code(exc)
             await _disconnect_targets(
                 self,
                 endpoint,
                 targets,
-                error_type=disconnect_error_type,
-                error_code=disconnect_error_code,
+                error_type=error_type,
+                error_code=error_code,
             )
             if not stop.is_set():
                 await asyncio.sleep(reconnect_backoff)
@@ -314,6 +309,12 @@ def _status_with_alchemy_multiplexing(
         endpoints = tuple(self.endpoints)
         target_count = len(targets)
         alchemy_count = sum(1 for endpoint in endpoints if _is_alchemy_endpoint(endpoint))
+        # Generic/low-level runtimes without Alchemy must retain the pre-existing
+        # isolated topology contract exactly. Mixed telemetry is production-specific
+        # and activates only when an Alchemy endpoint is actually configured.
+        if alchemy_count == 0:
+            return payload
+
         isolated_count = len(endpoints) - alchemy_count
         physical_connections = isolated_count * target_count + alchemy_count
         logical_subscriptions = len(endpoints) * target_count
@@ -376,8 +377,8 @@ def _status_with_alchemy_multiplexing(
                     "subscription_topology": "provider-specific",
                     "public_provider_subscription_topology": ISOLATED_TOPOLOGY,
                     "alchemy_subscription_topology": ALCHEMY_TOPOLOGY,
-                    "alchemy_physical_websocket_count": 1 if alchemy_count else 0,
-                    "alchemy_logs_subscriptions_per_websocket": target_count if alchemy_count else 0,
+                    "alchemy_physical_websocket_count": 1,
+                    "alchemy_logs_subscriptions_per_websocket": target_count,
                     "alchemy_sequential_subscription_ack": True,
                     "alchemy_connection_429_pressure_reduced": True,
                     "alchemy_target_quorum_semantics_unchanged": True,
