@@ -19,6 +19,22 @@ from .quote import JupiterQuoteOnlyClient, QuoteCertificationGate, ShadowExecuta
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
 
 
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+class RuntimeForwardCohortController(ForwardCohortController):
+    """Add runtime-only operational invariants to the immutable cohort readiness gate."""
+
+    def _base_readiness(self) -> dict[str, Any]:
+        status = super()._base_readiness()
+        clock_enabled = _env_true("SOLANA_ROI_SHADOW_CLOCK_ENABLED")
+        status["continuous_price_clock_enabled"] = clock_enabled
+        status["requirements"]["continuous_price_clock_enabled"] = clock_enabled
+        status["passed"] = all(bool(value) for value in status["requirements"].values())
+        return status
+
+
 @dataclass(slots=True)
 class IngestionRuntime:
     store: ObservationEventStore
@@ -110,7 +126,7 @@ def build_runtime() -> IngestionRuntime:
             and raw_collectors.funding is not None
         ),
     )
-    cohort_controller = ForwardCohortController(
+    cohort_controller = RuntimeForwardCohortController(
         store=store,
         engine=engine,
         config=engine.config,
