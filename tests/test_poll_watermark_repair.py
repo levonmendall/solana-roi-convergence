@@ -59,9 +59,10 @@ def test_slot_delta_completes_on_confirmed_slot_boundary_without_signature_curso
             {"signature": "different-old-signature", "slot": 100},
         ], "solana-mainnet", 12.0),
     ]
+    context_slots: list[int] = []
 
     async def fake_page(_self, _target, **kwargs):
-        assert kwargs["min_context_slot"] == 100
+        context_slots.append(int(kwargs["min_context_slot"]))
         return pages.pop(0)
 
     monkeypatch.setattr("solana_roi.poll_watermark_repair._slot_poll_page", fake_page)
@@ -80,6 +81,7 @@ def test_slot_delta_completes_on_confirmed_slot_boundary_without_signature_curso
     assert complete is True
     assert provider == "solana-mainnet"
     assert latency == 12.0
+    assert context_slots == [100, 105]
     assert [row["slot"] for row in rows] == [101, 102, 103, 104, 105]
     assert all(row["signature"] != "different-old-signature" for row in rows)
 
