@@ -136,6 +136,16 @@ class CollectingLiveEvidenceIngestionService(LiveEvidenceIngestionService):
             },
         )
 
+        # `promote_paper_signals` is intentionally not sufficient authority. Until the
+        # candidate-level activation gate exists and explicitly authorizes the frozen
+        # forward cohort, an accidentally enabled promotion flag must still fail closed.
+        if self.promote_paper_signals:
+            return self._decision(
+                swap,
+                "record_only",
+                "activation blocked: final forward-cohort activation gate has not authorized this candidate",
+            )
+
         if first_claimed_now:
             quote = None
             if risk.clean and profile.tier is WalletTier.S:
