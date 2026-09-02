@@ -189,7 +189,6 @@ class ForwardCohortController:
         release_commit = self.release_commit_fn()
         event_chain_valid = self.store.verify()
         genesis_untouched = self._genesis_untouched()
-        state_machine_contract = STATE_MACHINE_CERTIFICATION_ID
         requirements = {
             "program_wide_coverage_verified": bool(coverage["certified"]),
             "latency_certified": bool(latency["certified"]),
@@ -198,7 +197,7 @@ class ForwardCohortController:
             "event_chain_valid": event_chain_valid,
             "genesis_nav_untouched": genesis_untouched,
             "release_commit_bound": release_commit is not None,
-            "paper_state_machine_contract": bool(state_machine_contract),
+            "paper_state_machine_contract": True,
         }
         return {
             "passed": all(requirements.values()),
@@ -207,7 +206,7 @@ class ForwardCohortController:
             "latency": latency,
             "execution_quotes": quotes,
             "release_commit": release_commit,
-            "state_machine_certification_id": state_machine_contract,
+            "state_machine_certification_id": STATE_MACHINE_CERTIFICATION_ID,
         }
 
     def status(self) -> dict[str, Any]:
@@ -354,6 +353,7 @@ class CandidateActivationGate:
         risk: RiskSnapshot | None,
         risk_readiness: dict[str, Any],
         quote: ExecutableQuote | None,
+        risk_completed_at: datetime,
         decision_at: datetime,
         confirmation_observed_at: datetime | None = None,
         confirmation_entity_id: str | None = None,
@@ -391,8 +391,10 @@ class CandidateActivationGate:
         else:
             if not quote.usable or quote.drift_fraction > self.engine.config.max_chase_fraction:
                 blockers.append("executable_quote_exceeds_chase_ceiling")
-            if quote.received_at < decision_at:
-                blockers.append("quote_precedes_final_risk_decision")
+            if quote.received_at < risk_completed_at:
+                blockers.append("quote_precedes_risk_completion")
+            if decision_at < quote.received_at:
+                blockers.append("decision_precedes_executable_quote")
             quote_age = max(0.0, (decision_at - quote.received_at).total_seconds())
             if quote_age > self.max_quote_age_seconds:
                 blockers.append("executable_quote_stale")
@@ -402,6 +404,10 @@ class CandidateActivationGate:
                 blockers.append("quote_not_sized_to_current_nav")
             if quote.requested_notional_usd > self.engine.portfolio.cash_usd + 1e-9:
                 blockers.append("insufficient_paper_buying_power")
+            if quote.quote_latency_ms > self.controller.quote_gate.policy.max_p95_quote_latency_ms:
+                blockers.append("candidate_quote_latency_exceeds_certified_limit")
+            if quote.chain_to_quote_ms > self.controller.quote_gate.policy.max_p99_chain_to_quote_ms:
+                blockers.append("candidate_chain_to_quote_latency_exceeds_certified_limit")
             if quote.chain_to_quote_ms > self.engine.config.confirmation_window_seconds * 1000.0:
                 blockers.append("chain_to_quote_exhausts_confirmation_window")
         global_status = self.controller.status()
@@ -424,6 +430,7 @@ class CandidateActivationGate:
                 "stage": stage,
                 "fraction_of_full_position": fraction_of_full_position,
                 "blockers": list(blockers),
+                "risk_completed_at": risk_completed_at.isoformat(),
                 "quote_received_at": quote.received_at.isoformat() if quote else None,
                 "quote_price_sol": quote.effective_price_sol if quote else None,
                 "scout_reference_price_sol": first_touch.get("reference_price_sol"),
