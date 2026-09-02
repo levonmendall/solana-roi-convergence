@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from solana_roi import live_poll_redundancy as live_poll
+from solana_roi import poll_exception_rearm as exception_rearm
 from solana_roi import poll_pagination_context as pagination
 from solana_roi.direct_solana import DirectSolanaIngestionPlane, WatchTarget
 from solana_roi.poll_watermark_repair import _slot_fetch_delta, _slot_poll_page
@@ -113,6 +114,8 @@ def test_slot_delta_fails_closed_when_bounded_window_never_reaches_watermark(mon
 
 
 def test_slot_watermark_repair_installed_intrinsically():
-    assert live_poll._fetch_delta is pagination._context_fresh_fetch_delta
+    assert exception_rearm._ORIGINAL_FETCH_DELTA is pagination._context_fresh_fetch_delta
+    assert live_poll._fetch_delta is exception_rearm._exception_rearm_fetch_delta
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_slot_watermark_poll", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_poll_pagination_context", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_poll_exception_rearm", False))
