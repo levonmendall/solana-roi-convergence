@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from . import direct_solana as direct_solana_module
+from . import poll_recoverability_lease as lease
 from . import target_quorum
 from . import target_stream_fanout as fanout
 from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
@@ -52,6 +53,11 @@ def _minimum_count(all_keys: set[str], provider_targets: dict[str, set[str]], *,
     return min((sum(1 for rows in providers if key in rows) for key in all_keys), default=0)
 
 
+def _barrier_applicable(self: Any) -> bool:
+    epoch = getattr(self, "_roi_continuity_epoch", None)
+    return isinstance(epoch, dict) and bool(str(epoch.get("release_id") or "").strip())
+
+
 def _barrier_snapshot(self: Any) -> dict[str, Any]:
     _lock, provider_targets, _ready_events, _states = fanout._state_maps(self)
     all_keys = _all_target_keys(self)
@@ -87,6 +93,21 @@ def _wrap_quorum_set_target_state(original: Callable[..., Any]) -> Callable[...,
         error_code: int | None = None,
         error_message: str | None = None,
     ) -> None:
+        # Low-level quorum primitives are also used independently in regressions
+        # and utilities. The startup barrier belongs only to a real exact-release
+        # runtime after target_stream_fanout has created its release epoch.
+        if not _barrier_applicable(self):
+            await original(
+                self,
+                endpoint,
+                target,
+                connected=connected,
+                error_type=error_type,
+                error_code=error_code,
+                error_message=error_message,
+            )
+            return
+
         lock = getattr(self, "_roi_continuity_startup_barrier_lock", None)
         if lock is None:
             lock = asyncio.Lock()
@@ -265,6 +286,9 @@ setattr(_diagnostic_single_target_stream, "_roi_sanitized_handshake_status", Tru
 def _status_with_startup_barrier(original: Callable[[Any], dict[str, Any]]) -> Callable[[Any], dict[str, Any]]:
     def status(self: Any) -> dict[str, Any]:
         payload = original(self)
+        if not _barrier_applicable(self):
+            return payload
+
         snapshot = _barrier_snapshot(self)
         armed = bool(getattr(self, "_roi_continuity_startup_barrier_armed", False))
         unresolved = bool(payload.get("unresolved_gap", True))
@@ -347,6 +371,9 @@ def install_continuity_startup_barrier() -> None:
         wrapped = _wrap_quorum_set_target_state(current_setter)
         target_quorum._quorum_set_target_state = wrapped  # type: ignore[assignment]
         fanout._set_target_state = wrapped  # type: ignore[assignment]
+        # Preserve the intrinsic recoverability-lease contract: the lease module's
+        # exported tracked setter remains exactly the canonical installed setter.
+        lease._tracked_quorum_set_target_state = wrapped  # type: ignore[assignment]
 
     # target_quorum installs its target stream into fanout. Replace that final
     # runtime function with an equivalent implementation that preserves only the
