@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from .activation import ARM_CONFIRMATION
 from .config import BASELINE
-from .deployment import deployment_preflight
+from .deployment import auto_sync_helius_from_env, deployment_preflight
 from .runtime import IngestionRuntime, build_runtime
 
 
@@ -30,6 +30,10 @@ async def lifespan(app: FastAPI):
     clock_task: asyncio.Task[None] | None = None
     webhook_stop = asyncio.Event()
     webhook_task = asyncio.create_task(runtime.webhook_worker.run(webhook_stop), name="helius-webhook-worker")
+    bootstrap_task = asyncio.create_task(
+        auto_sync_helius_from_env(store=runtime.store),
+        name="helius-webhook-bootstrap",
+    )
     enabled = os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"}
     if enabled:
         clock_stop = asyncio.Event()
@@ -45,6 +49,10 @@ async def lifespan(app: FastAPI):
                 await clock_task
         with suppress(asyncio.CancelledError):
             await webhook_task
+        if not bootstrap_task.done():
+            bootstrap_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await bootstrap_task
 
 
 app = FastAPI(title="Solana ROI Convergence", version="0.10.0", lifespan=lifespan)
