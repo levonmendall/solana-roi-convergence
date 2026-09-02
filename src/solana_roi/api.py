@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from .activation import ARM_CONFIRMATION
@@ -240,7 +240,7 @@ def entity_summary(wallet: str) -> dict[str, object]:
 
 
 @app.post("/v1/ingestion/helius")
-def helius_webhook(payload: Any, authorization: str | None = Header(default=None)) -> dict[str, object]:
+def helius_webhook(payload: Any = Body(...), authorization: str | None = Header(default=None)) -> dict[str, object]:
     expected = os.getenv("HELIUS_WEBHOOK_AUTH", "").strip()
     if not expected:
         raise HTTPException(status_code=503, detail="Helius webhook authentication is not configured")
