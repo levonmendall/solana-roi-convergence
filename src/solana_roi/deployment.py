@@ -30,8 +30,6 @@ FROZEN_PROGRAM_ADDRESSES = (
     RAYDIUM_LAUNCHLAB_PROGRAM_ID,
 )
 
-# Public identities selected by the existing ROI Convergence research. The live
-# deployment freezes the exact wallet addresses through SOLANA_ROI_WALLET_PROFILES_JSON.
 DEFAULT_SCOUT_PROFILES = (
     {
         "wallet": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
@@ -83,7 +81,7 @@ def _truthy(value: str | None) -> bool:
 def _profiles_check(raw: str) -> tuple[bool, str]:
     try:
         rows = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         return False, "wallet profile JSON is invalid"
     if not isinstance(rows, list) or not rows:
         return False, "at least one frozen S/A scout profile is required"
@@ -101,7 +99,11 @@ def _profiles_check(raw: str) -> tuple[bool, str]:
         seen.add(wallet)
         if str(row.get("tier") or "").upper() not in {"S", "A"}:
             return False, "deployment scout cohort may contain only frozen S/A profiles"
-        if int(row.get("first_touch_sample_size") or 0) < 30:
+        try:
+            sample_size = int(row.get("first_touch_sample_size") or 0)
+        except (TypeError, ValueError):
+            return False, "deployment scout cohort has an invalid historical sample size"
+        if sample_size < 30:
             return False, "deployment scout cohort requires >=30 historical first touches"
         if not bool(row.get("historically_eligible")):
             return False, "deployment scout cohort includes a non-eligible profile"
@@ -182,12 +184,13 @@ class HeliusWebhookManager:
         }
 
     @staticmethod
-    def _same_public_config(current: dict[str, Any], desired: dict[str, Any]) -> bool:
+    def _same_config(current: dict[str, Any], desired: dict[str, Any]) -> bool:
         return bool(
             current.get("webhookURL") == desired["webhookURL"]
             and set(current.get("transactionTypes") or []) == {"ANY"}
             and set(current.get("accountAddresses") or []) == set(desired["accountAddresses"])
             and current.get("webhookType", "enhanced") == "enhanced"
+            and current.get("authHeader") == desired["authHeader"]
             and current.get("active", True)
         )
 
@@ -209,7 +212,7 @@ class HeliusWebhookManager:
             webhook_id = str(current.get("webhookID") or "")
             if not webhook_id:
                 raise RuntimeError("matching Helius webhook has no webhookID")
-            if self._same_public_config(current, desired):
+            if self._same_config(current, desired):
                 return {"action": "unchanged", "webhook_id": webhook_id, "active": True, "webhook_url": target, "program_count": len(FROZEN_PROGRAM_ADDRESSES)}
             update = await self.client.put(f"{self.API_ROOT}/{webhook_id}", params=self._params(), json=desired)
             update.raise_for_status()
@@ -222,11 +225,7 @@ class HeliusWebhookManager:
 
 
 async def auto_sync_helius_from_env(*, store: Any | None = None, delay_seconds: float = 2.0) -> dict[str, Any]:
-    """After the web process starts, install/update the Helius webhook once.
-
-    Missing credentials are a safe no-op so the Blueprint can be created before
-    secrets are entered. No API key or auth header is ever written to events.
-    """
+    """Install/update the Helius webhook once after the web process starts."""
     await asyncio.sleep(max(0.0, delay_seconds))
     api_key = os.getenv("HELIUS_API_KEY", "").strip()
     auth_header = os.getenv("HELIUS_WEBHOOK_AUTH", "").strip()
@@ -244,7 +243,7 @@ async def auto_sync_helius_from_env(*, store: Any | None = None, delay_seconds: 
         result = {
             "action": "failed",
             "error_type": type(exc).__name__,
-            "error": str(exc)[:300],
+            "error": "Helius webhook bootstrap failed; provider exception text suppressed to protect query-string credentials",
         }
         if store is not None:
             store.append("helius_webhook_bootstrap_failed", observed_at, result)
