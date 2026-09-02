@@ -15,10 +15,12 @@ def test_guards_install_even_when_legacy_api_entrypoint_is_imported():
     assert bool(getattr(direct_solana_module.websockets.connect, "_roi_frame_resilient", False))
     assert bool(getattr(DirectSolanaIngestionPlane._prefill_launch_context, "_roi_memory_bounded", False))
     assert bool(getattr(DirectSolanaIngestionPlane._stream_endpoint, "_roi_sequential_subscription_setup", False))
+    assert bool(getattr(DirectSolanaIngestionPlane._stream_endpoint, "_roi_handshake_pumped", False))
     assert bool(getattr(DirectSolanaIngestionPlane._hydrate_one, "_roi_priority_routed", False))
     assert bool(getattr(DirectSolanaIngestionPlane.run, "_roi_worker_partitioned", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_subscription_telemetry", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_transport_hardened", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_handshake_pumped", False))
     assert bool(getattr(direct_solana_module.rpc_endpoints_from_env, "_roi_official_secondary", False))
     assert bool(getattr(solana_rpc_module.rpc_endpoints_from_env, "_roi_official_secondary", False))
 
@@ -103,6 +105,9 @@ def test_memory_boundary_is_visible_without_production_wrapper(tmp_path):
     assert policy["subscription_setup_mode"] == "sequential_ack_with_bounded_retry"
     assert policy["high_volume_programs_subscribed_last"] is True
     assert policy["full_target_count_unchanged"] == 10
+    assert policy["ack_receive_path"] == "dedicated-websocket-reader"
+    assert policy["request_id_type_agnostic"] is True
+    assert policy["max_inflight_notification_handlers"] == 32
 
 
 def test_legacy_health_route_is_constant_time_liveness(monkeypatch):
