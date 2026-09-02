@@ -20,7 +20,7 @@ def _env():
         "JUPITER_API_KEY": "configured",
         "SOLANA_ROI_COHORT_ARM_AUTH": "configured",
         "SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY": SHADOW_WALLET,
-        "SOLANA_ROI_ALCHEMY_API_KEY": "configured",
+        "SOLANA_ROI_ALCHEMY_API_KEY": "configured-but-idle",
     }
 
 
@@ -28,25 +28,44 @@ def _checks(status):
     return {row["name"]: row for row in status["checks"]}
 
 
-def test_direct_preflight_is_ready_without_helius_credentials():
+def test_direct_preflight_is_ready_without_metered_provider_or_helius_credentials():
     status = deployment_preflight(_env())
     assert status["ready_for_live_shadow_collection"] is True
     assert status["data_plane"] == "direct-standard-solana"
     assert status["provider_enhanced_webhook_required"] is False
     assert status["strategy_scope_reduced"] is False
+    assert status["metered_provider_required"] is False
+    assert status["metered_alchemy_default_enabled"] is False
     assert len(status["program_addresses"]) == 7
-    assert len(status["rpc_endpoints"]) >= 3
+    assert len(status["rpc_endpoints"]) == 2
+    assert [row["name"] for row in status["rpc_endpoints"]] == ["publicnode", "solana-mainnet"]
     assert "HELIUS_API_KEY" not in repr(status)
-    assert "configured" not in repr(status["rpc_endpoints"])
+    assert "configured-but-idle" not in repr(status["rpc_endpoints"])
 
 
-def test_two_rpc_endpoints_fail_independent_quorum():
+def test_two_public_rpc_endpoints_satisfy_independent_continuity_preflight():
     env = _env()
     env.pop("SOLANA_ROI_ALCHEMY_API_KEY")
     status = deployment_preflight(env)
-    assert status["ready_for_live_shadow_collection"] is False
+    assert status["ready_for_live_shadow_collection"] is True
     assert _checks(status)["redundant_standard_rpc"]["ok"] is True
-    assert _checks(status)["independent_standard_rpc_quorum"]["ok"] is False
+    assert _checks(status)["independent_standard_rpc_quorum"]["ok"] is True
+    assert status["continuity_transport_model"] == (
+        "two-public-websocket-providers-plus-continuous-bounded-live-poll"
+    )
+
+
+def test_metered_alchemy_remains_available_only_after_explicit_opt_in():
+    env = _env()
+    env["SOLANA_ROI_ENABLE_METERED_ALCHEMY"] = "true"
+    status = deployment_preflight(env)
+    assert status["ready_for_live_shadow_collection"] is True
+    assert len(status["rpc_endpoints"]) == 3
+    assert [row["name"] for row in status["rpc_endpoints"]] == [
+        "publicnode",
+        "solana-mainnet",
+        "alchemy",
+    ]
 
 
 def test_direct_disabled_fails_preflight_closed():
