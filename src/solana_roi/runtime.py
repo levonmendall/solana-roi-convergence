@@ -7,16 +7,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .activation import CandidateActivationGate, ForwardCohortController, ProgramCoverageCertificationGate
+from .activation import CandidateActivationGate, ForwardCohortController
 from .collecting_ingestion import CollectingLiveEvidenceIngestionService
-from .engine import PaperTradingEngine
+from .durable_engine import DurablePaperTradingEngine
 from .ingestion import WalletProfile, WalletProfileRegistry
 from .launch_funding import CompleteLiveRiskCollectors, build_complete_live_collectors
 from .models import WalletTier
 from .observation import LatencyCertificationGate, ShadowPriceClock, TimedRiskCollectors
 from .observation_store import ObservationEventStore
-from .quote import JupiterQuoteOnlyClient, QuoteCertificationGate, ShadowExecutableQuoteHandoff
+from .quote import JupiterQuoteOnlyClient, QuoteCertificationGate
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
+from .shadow_execution import (
+    JupiterShadowTransactionSimulator,
+    ShadowAwareQuoteCertificationGate,
+    ShadowExecutionCertificationGate,
+    ShadowWalletExecutableQuoteHandoff,
+)
+from .source_coverage import SourceAwareProgramCoverageCertificationGate
 
 
 def _env_true(name: str) -> bool:
@@ -38,7 +45,7 @@ class RuntimeForwardCohortController(ForwardCohortController):
 @dataclass(slots=True)
 class IngestionRuntime:
     store: ObservationEventStore
-    engine: PaperTradingEngine
+    engine: DurablePaperTradingEngine
     registry: WalletProfileRegistry
     entity_resolver: EntityResolver
     risk: TokenRiskIntelligence
@@ -46,9 +53,9 @@ class IngestionRuntime:
     collectors: TimedRiskCollectors
     price_clock: ShadowPriceClock
     latency_gate: LatencyCertificationGate
-    quote_handoff: ShadowExecutableQuoteHandoff
-    quote_gate: QuoteCertificationGate
-    coverage_gate: ProgramCoverageCertificationGate
+    quote_handoff: ShadowWalletExecutableQuoteHandoff
+    quote_gate: ShadowAwareQuoteCertificationGate
+    coverage_gate: SourceAwareProgramCoverageCertificationGate
     cohort_controller: ForwardCohortController
     activation_gate: CandidateActivationGate
     service: CollectingLiveEvidenceIngestionService
@@ -99,9 +106,26 @@ def _quote_client() -> JupiterQuoteOnlyClient | None:
     return JupiterQuoteOnlyClient(jupiter_api_key=jupiter, helius_api_key=helius)
 
 
+def _shadow_simulator(client: JupiterQuoteOnlyClient | None) -> JupiterShadowTransactionSimulator | None:
+    if client is None:
+        return None
+    wallet = os.getenv("SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY", "").strip()
+    if not wallet:
+        return None
+    try:
+        return JupiterShadowTransactionSimulator(
+            jupiter_api_key=client.jupiter_api_key,
+            shadow_wallet_public_key=wallet,
+            http_client=client.client,
+            rpc=client.rpc,
+        )
+    except ValueError:
+        return None
+
+
 def build_runtime() -> IngestionRuntime:
     store = ObservationEventStore(Path(os.getenv("SOLANA_ROI_DB_PATH", "data/solana-roi.sqlite3")))
-    engine = PaperTradingEngine(store=store)
+    engine = DurablePaperTradingEngine(store=store)
     registry = WalletProfileRegistry(store)
     for profile in _wallet_profiles_from_env():
         registry.register(profile)
@@ -111,14 +135,24 @@ def build_runtime() -> IngestionRuntime:
     raw_collectors = build_complete_live_collectors(risk)
     collectors = TimedRiskCollectors(raw_collectors, risk=risk, store=store)
     latency_gate = LatencyCertificationGate(store)
-    quote_handoff = ShadowExecutableQuoteHandoff(
+
+    quote_client = _quote_client()
+    shadow_wallet = os.getenv("SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY", "").strip()
+    quote_handoff = ShadowWalletExecutableQuoteHandoff(
         store=store,
-        client=_quote_client(),
+        client=quote_client,
+        simulator=_shadow_simulator(quote_client),
         full_position_notional_fn=lambda: engine.portfolio.full_position_notional(engine.marks),
         max_chase_fraction=engine.config.max_chase_fraction,
     )
-    quote_gate = QuoteCertificationGate(quote_handoff.ledger)
-    coverage_gate = ProgramCoverageCertificationGate(
+    base_quote_gate = QuoteCertificationGate(quote_handoff.ledger)
+    shadow_gate = ShadowExecutionCertificationGate(
+        quote_handoff.shadow_ledger,
+        shadow_wallet_public_key=shadow_wallet,
+    )
+    quote_gate = ShadowAwareQuoteCertificationGate(base_quote_gate, shadow_gate)
+
+    coverage_gate = SourceAwareProgramCoverageCertificationGate(
         store,
         configured_fn=lambda: bool(
             raw_collectors.coverage_asserted
