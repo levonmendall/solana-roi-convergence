@@ -18,7 +18,11 @@ class FakeRpcPool:
         }
 
 
-def test_default_tertiary_is_wss_only_and_does_not_enter_hydration_pool(tmp_path, monkeypatch):
+async def _close_plane(plane):
+    await plane._dex.aclose()
+
+
+def test_unusable_drpc_public_wss_is_not_trusted_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("SOLANA_ROI_STREAM_ONLY_ENDPOINTS_JSON", raising=False)
     store = ObservationEventStore(tmp_path / "stream-tertiary.sqlite3")
     rpc = FakeRpcPool()
@@ -35,32 +39,22 @@ def test_default_tertiary_is_wss_only_and_does_not_enter_hydration_pool(tmp_path
         endpoints=base,
     )
     try:
-        assert [endpoint.name for endpoint in plane.endpoints] == [
-            "publicnode",
-            "solana-mainnet",
-            "drpc-stream",
-        ]
+        assert [endpoint.name for endpoint in plane.endpoints] == ["publicnode", "solana-mainnet"]
         assert plane.rpc is rpc
         status = plane.status()
         redundancy = status["stream_redundancy"]
-        assert redundancy["stream_provider_count"] == 3
+        assert redundancy["stream_provider_count"] == 2
         assert redundancy["hydration_rpc_provider_count"] == 2
         assert redundancy["drpc_public_http_hydration_retired"] is True
-        assert redundancy["drpc_public_wss_reintroduced_stream_only"] is True
-        assert redundancy["stream_only_providers"] == [
-            {
-                "name": "drpc-stream",
-                "ws_host": "solana.drpc.org",
-                "http_hydration_enabled": False,
-            }
-        ]
-        assert status["target_stream_fanout"]["provider_count"] == 3
-        assert status["target_stream_fanout"]["total_websocket_target_streams"] == 30
+        assert redundancy["drpc_public_wss_default_retired"] is True
+        assert redundancy["stream_only_providers"] == []
+        assert status["target_stream_fanout"]["provider_count"] == 2
+        assert status["target_stream_fanout"]["total_websocket_target_streams"] == 20
         assert status["provider_runtime_policy"]["stream_and_hydration_provider_sets_decoupled"] is True
         assert status["provider_runtime_policy"]["tertiary_stream_can_authorize_hydration"] is False
-        assert status["production_memory_boundary"]["receive_payload_ceiling_bytes_all_providers"] == 240 * 1024 * 1024
+        assert status["production_memory_boundary"]["receive_payload_ceiling_bytes_all_providers"] == 160 * 1024 * 1024
     finally:
-        asyncio.run(plane._dex.aclose())
+        asyncio.run(_close_plane(plane))
 
 
 def test_stream_only_endpoint_override_is_validated_without_touching_base_rpc_env():
@@ -80,6 +74,5 @@ def test_stream_only_endpoint_override_is_validated_without_touching_base_rpc_en
 def test_stream_redundancy_guards_install_intrinsically():
     assert bool(getattr(DirectSolanaIngestionPlane.__init__, "_roi_stream_tertiary", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_stream_tertiary", False))
-    # The new outer status wrapper must preserve all existing safety markers.
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_target_quorum", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_memory_bounded", False))
