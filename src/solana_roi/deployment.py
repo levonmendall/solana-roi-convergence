@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import urljoin
 
@@ -217,3 +219,33 @@ class HeliusWebhookManager:
         create.raise_for_status()
         result = create.json()
         return {"action": "created", "webhook_id": str(result.get("webhookID") or ""), "active": bool(result.get("active", True)), "webhook_url": target, "program_count": len(FROZEN_PROGRAM_ADDRESSES)}
+
+
+async def auto_sync_helius_from_env(*, store: Any | None = None, delay_seconds: float = 2.0) -> dict[str, Any]:
+    """After the web process starts, install/update the Helius webhook once.
+
+    Missing credentials are a safe no-op so the Blueprint can be created before
+    secrets are entered. No API key or auth header is ever written to events.
+    """
+    await asyncio.sleep(max(0.0, delay_seconds))
+    api_key = os.getenv("HELIUS_API_KEY", "").strip()
+    auth_header = os.getenv("HELIUS_WEBHOOK_AUTH", "").strip()
+    service_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if not api_key or not auth_header or not service_url:
+        return {"action": "skipped", "reason": "Helius credentials or Render external URL unavailable"}
+    manager = HeliusWebhookManager(api_key=api_key, auth_header=auth_header)
+    observed_at = datetime.now(timezone.utc).isoformat()
+    try:
+        result = await manager.sync(service_url)
+        if store is not None:
+            store.append("helius_webhook_bootstrap", observed_at, result)
+        return result
+    except Exception as exc:
+        result = {
+            "action": "failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:300],
+        }
+        if store is not None:
+            store.append("helius_webhook_bootstrap_failed", observed_at, result)
+        return result
