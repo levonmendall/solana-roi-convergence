@@ -45,6 +45,13 @@ from .target_quorum import install_target_quorum
 
 install_target_quorum()
 
+# The current two no-SLA public peers can still overlap on the same target outage.
+# Add a third best-effort WSS observer without putting its previously unreliable
+# shared HTTP service back into hydration/risk/quote RPC selection.
+from .stream_redundancy import install_stream_redundancy
+
+install_stream_redundancy()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
