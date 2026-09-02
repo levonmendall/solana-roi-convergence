@@ -12,16 +12,12 @@ from .certification_epoch import ensure_release_certification_epoch
 from .collecting_ingestion import CollectingLiveEvidenceIngestionService
 from .direct_funding import SolanaRpcFundingCollector
 from .direct_quote import DirectRpcJupiterQuoteClient
+from .direct_risk_collectors import SolanaAuthorityCollector, SolanaDeployerCollector
 from .direct_solana import DirectSolanaIngestionPlane
 from .durable_engine import DurablePaperTradingEngine
 from .ingestion import WalletProfile, WalletProfileRegistry
 from .launch_funding import CompleteLiveRiskCollectors, DexScreenerLaunchCollector
-from .live_collectors import (
-    DexScreenerLiquidityCollector,
-    HeliusAuthorityCollector,
-    HeliusDeployerCollector,
-    PersistedSwapFlowCollector,
-)
+from .live_collectors import DexScreenerLiquidityCollector, PersistedSwapFlowCollector
 from .models import WalletTier
 from .observation import LatencyCertificationGate, ShadowPriceClock, TimedRiskCollectors
 from .observation_store import ObservationEventStore
@@ -185,9 +181,9 @@ def build_runtime() -> IngestionRuntime:
     coverage_enabled = _env_true("SOLANA_ROI_PROGRAM_WIDE_SWAP_COVERAGE")
     raw_collectors = CompleteLiveRiskCollectors(
         risk,
-        authority=HeliusAuthorityCollector(risk, rpc_pool),
+        authority=SolanaAuthorityCollector(risk, rpc_pool),
         liquidity=DexScreenerLiquidityCollector(risk),
-        deployer=HeliusDeployerCollector(risk, rpc_pool),
+        deployer=SolanaDeployerCollector(risk, rpc_pool),
         flow=PersistedSwapFlowCollector(risk),
         launch=DexScreenerLaunchCollector(risk) if coverage_enabled else None,
         funding=SolanaRpcFundingCollector(risk, rpc_pool) if coverage_enabled else None,
