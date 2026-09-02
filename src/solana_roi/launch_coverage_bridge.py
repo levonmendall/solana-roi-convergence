@@ -12,7 +12,7 @@ from .observation import WSOL_MINT
 LAUNCH_WINDOW_SECONDS = 8.0
 LAUNCH_CONTEXT_SIGNATURE_LIMIT = 96
 LAUNCH_CONTEXT_CONCURRENCY = 8
-LAUNCH_CONTEXT_DEADLINE_SECONDS = 5.0
+LAUNCH_CONTEXT_DEADLINE_SECONDS = 35.0
 LAUNCH_PAIR_LOOKUP_ATTEMPTS = 5
 LAUNCH_PAIR_LOOKUP_INITIAL_DELAY_SECONDS = 0.5
 LAUNCH_BRIDGE_MAX_ATTEMPTS = 4
@@ -86,6 +86,23 @@ def launch_mint_from_transaction(transaction: Any) -> str | None:
     return next(iter(newly_visible)) if len(newly_visible) == 1 else None
 
 
+def launch_created_at_from_transaction(transaction: Any) -> datetime | None:
+    """Return the confirmed chain timestamp for a proven launch transaction."""
+
+    if not isinstance(transaction, dict):
+        return None
+    try:
+        block_time = float(transaction.get("blockTime") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if block_time <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(block_time, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 async def _pair_created_at_ready(self: Any, mint: str) -> datetime | None:
     delay = LAUNCH_PAIR_LOOKUP_INITIAL_DELAY_SECONDS
     for attempt in range(LAUNCH_PAIR_LOOKUP_ATTEMPTS):
@@ -101,13 +118,33 @@ async def _pair_created_at_ready(self: Any, mint: str) -> datetime | None:
     return None
 
 
-def _coverage_row_exists(self: Any, mint: str) -> bool:
+def _raw_collectors(self: Any) -> Any:
+    timed = getattr(self.service, "collectors", None)
+    return getattr(timed, "inner", timed)
+
+
+def _seed_launch_created_at(self: Any, mint: str, created_at: datetime) -> bool:
+    launch = getattr(_raw_collectors(self), "launch", None)
+    seed = getattr(launch, "seed_created_at", None)
+    if not callable(seed):
+        return False
+    seed(mint, created_at)
+    return True
+
+
+def _coverage_row_exists(self: Any, mint: str, *, since: datetime) -> bool:
     with self.store._lock:
         row = self.store.db.execute(
-            "SELECT 1 FROM program_coverage_observations WHERE token_mint=? LIMIT 1",
-            (mint,),
+            "SELECT 1 FROM program_coverage_observations "
+            "WHERE token_mint=? AND assessed_at>=? LIMIT 1",
+            (mint, since.isoformat()),
         ).fetchone()
     return row is not None
+
+
+def _increment(self: Any, name: str, amount: int = 1) -> None:
+    attr = f"_roi_launch_bridge_{name}"
+    setattr(self, attr, int(getattr(self, attr, 0) or 0) + int(amount))
 
 
 async def _hydrate_mint_launch_context(
@@ -117,12 +154,12 @@ async def _hydrate_mint_launch_context(
     source: str,
     launch_signature: str,
     created_at: datetime,
-) -> int:
-    """Hydrate only transactions that touched the newly created mint.
+) -> tuple[int, bool, int]:
+    """Hydrate immutable launch-window transactions for one newly created mint.
 
-    This replaces the old need to sample a whole Pump/Raydium program firehose.
-    The standard RPC query is bounded to one recent-address page and each returned
-    transaction must still normalize to the exact launch mint.
+    Event eligibility remains permanently bounded to the existing eight-second
+    chain-time window. Retrieval may finish later and is retried by the durable
+    hydration queue; delayed RPC completion never widens the evidence window.
     """
 
     window_start = created_at - timedelta(seconds=1.0)
@@ -131,11 +168,15 @@ async def _hydrate_mint_launch_context(
     if now < window_end:
         await asyncio.sleep((window_end - now).total_seconds())
 
+    _increment(self, "signature_queries")
     rows, _provider, _latency = await self.rpc.get_signatures_for_address(
         mint,
         limit=LAUNCH_CONTEXT_SIGNATURE_LIMIT,
-        hedge=False,
+        hedge=True,
     )
+    _increment(self, "signature_queries_ok")
+    _increment(self, "signature_rows", len(rows))
+
     candidates: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -152,19 +193,23 @@ async def _hydrate_mint_launch_context(
         observed_at = datetime.fromtimestamp(block_time, tz=timezone.utc)
         if window_start <= observed_at <= window_end + timedelta(seconds=1.0):
             candidates.append(row)
+    _increment(self, "window_candidate_rows", len(candidates))
 
     semaphore = asyncio.Semaphore(LAUNCH_CONTEXT_CONCURRENCY)
     persisted = 0
+    rpc_failures = 0
     persisted_lock = asyncio.Lock()
 
     async def hydrate(row: dict[str, Any]) -> None:
-        nonlocal persisted
+        nonlocal persisted, rpc_failures
         async with semaphore:
             signature = str(row["signature"])
             block_time = int(row.get("blockTime") or 0)
             trigger = datetime.fromtimestamp(block_time, tz=timezone.utc)
+            _increment(self, "transaction_hydrations_attempted")
             try:
-                result, provider, latency = await self.rpc.get_transaction(signature, hedge=False)
+                result, provider, latency = await self.rpc.get_transaction(signature, hedge=True)
+                _increment(self, "transaction_hydrations_ok")
                 swap = direct_solana_module.normalize_standard_transaction(
                     result,
                     signature=signature,
@@ -172,6 +217,7 @@ async def _hydrate_mint_launch_context(
                     source_hint=source,
                 )
                 if swap is None or str(swap.token_mint) != mint:
+                    _increment(self, "normalization_misses")
                     return
                 self._persist_context_swap(swap)
                 self.journal.record_hydration(
@@ -185,36 +231,42 @@ async def _hydrate_mint_launch_context(
                     candidate_context_prefilled=True,
                     historical_recovery=False,
                 )
+                _increment(self, "normalization_matches")
                 async with persisted_lock:
                     persisted += 1
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                return
+                async with persisted_lock:
+                    rpc_failures += 1
+                _increment(self, "context_rpc_failures")
 
     tasks = [asyncio.create_task(hydrate(row)) for row in candidates]
     if not tasks:
-        return 0
+        return 0, True, 0
+
+    timed_out = False
     try:
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=LAUNCH_CONTEXT_DEADLINE_SECONDS)
     except asyncio.TimeoutError:
+        timed_out = True
+        _increment(self, "context_timeouts")
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-    return persisted
+
+    complete = not timed_out and rpc_failures == 0
+    if not complete:
+        _increment(self, "context_incomplete")
+    return persisted, complete, len(candidates)
 
 
 async def _refresh_coverage_only(self: Any, mint: str, at: datetime) -> None:
-    timed = getattr(self.service, "collectors", None)
-    raw = getattr(timed, "inner", timed)
-    refresh = getattr(raw, "refresh_coverage", None)
+    refresh = getattr(_raw_collectors(self), "refresh_coverage", None)
     if not callable(refresh):
         raise RuntimeError("coverage collector unavailable")
     await refresh(mint, at, current_swap=None)
-
-
-def _increment(self: Any, name: str, amount: int = 1) -> None:
-    attr = f"_roi_launch_bridge_{name}"
-    setattr(self, attr, int(getattr(self, attr, 0) or 0) + int(amount))
 
 
 async def _hydrate_prospective_launch(
@@ -231,7 +283,7 @@ async def _hydrate_prospective_launch(
     try:
         result, provider, latency = await self._get_transaction_ready(
             signature,
-            hedge=False,
+            hedge=True,
             attempts=4,
         )
         if result is None:
@@ -252,28 +304,38 @@ async def _hydrate_prospective_launch(
             return
         _increment(self, "mint_resolved")
 
-        created_at = await _pair_created_at_ready(self, mint)
-        if created_at is None:
-            self.journal.record_hydration(
-                signature=signature,
-                source=source or None,
-                trigger_received_at=trigger,
-                hydrated_at=direct_solana_module.utcnow(),
-                rpc_provider=provider,
-                rpc_latency_ms=latency,
-                normalized=False,
-                candidate_context_prefilled=False,
-                historical_recovery=False,
-            )
-            self.journal.finish(
-                signature,
-                error="launch pair creation metadata not yet available",
-                retry=attempts < LAUNCH_BRIDGE_MAX_ATTEMPTS,
-            )
-            _increment(self, "failed")
-            return
+        created_at = launch_created_at_from_transaction(result)
+        if created_at is not None:
+            _increment(self, "chain_created_at")
+            if _seed_launch_created_at(self, mint, created_at):
+                _increment(self, "collector_timestamp_seeded")
+        else:
+            _increment(self, "pair_time_fallback_attempted")
+            created_at = await _pair_created_at_ready(self, mint)
+            if created_at is None:
+                self.journal.record_hydration(
+                    signature=signature,
+                    source=source or None,
+                    trigger_received_at=trigger,
+                    hydrated_at=direct_solana_module.utcnow(),
+                    rpc_provider=provider,
+                    rpc_latency_ms=latency,
+                    normalized=False,
+                    candidate_context_prefilled=False,
+                    historical_recovery=False,
+                )
+                self.journal.finish(
+                    signature,
+                    error="launch creation timestamp not yet available",
+                    retry=attempts < LAUNCH_BRIDGE_MAX_ATTEMPTS,
+                )
+                _increment(self, "failed")
+                return
+            _increment(self, "pair_time_fallback_resolved")
+            if _seed_launch_created_at(self, mint, created_at):
+                _increment(self, "collector_timestamp_seeded")
 
-        context_count = await _hydrate_mint_launch_context(
+        context_count, context_complete, _candidate_count = await _hydrate_mint_launch_context(
             self,
             mint=mint,
             source=source,
@@ -284,10 +346,12 @@ async def _hydrate_prospective_launch(
             _increment(self, "context_swaps", context_count)
 
         assessed_at = direct_solana_module.utcnow()
+        _increment(self, "coverage_refresh_attempted")
         await _refresh_coverage_only(self, mint, assessed_at)
-        coverage_recorded = _coverage_row_exists(self, mint)
+        coverage_recorded = _coverage_row_exists(self, mint, since=trigger)
         if coverage_recorded:
             _increment(self, "coverage_rows")
+            _increment(self, "coverage_refresh_recorded")
 
         self.journal.record_hydration(
             signature=signature,
@@ -300,13 +364,17 @@ async def _hydrate_prospective_launch(
             candidate_context_prefilled=context_count > 0,
             historical_recovery=False,
         )
-        if coverage_recorded:
+        if coverage_recorded and context_complete:
             self.journal.finish(signature)
             return
 
+        if not context_complete:
+            error = "launch context acquisition incomplete; immutable launch window retained"
+        else:
+            error = "launch coverage observation not yet recordable"
         self.journal.finish(
             signature,
-            error="launch coverage observation not yet recordable",
+            error=error,
             retry=attempts < LAUNCH_BRIDGE_MAX_ATTEMPTS,
         )
         _increment(self, "failed")
@@ -345,17 +413,38 @@ def _status_with_launch_bridge(
         payload = original(self)
         payload["launch_coverage_bridge"] = {
             "enabled": True,
-            "source":"standard-solana-rpc-mint-address-context",
+            "source": "standard-solana-rpc-mint-address-context",
             "non_swap_launch_transactions_supported": True,
-            "mint_resolution":"initializeMint-or-unique-new-postTokenBalance",
+            "mint_resolution": "initializeMint-or-unique-new-postTokenBalance",
+            "creation_time_source": "confirmed-chain-blockTime-with-dexscreener-fallback",
             "launch_window_seconds": LAUNCH_WINDOW_SECONDS,
+            "event_time_window_immutable": True,
+            "retrieval_after_window_allowed": True,
             "mint_signature_limit": LAUNCH_CONTEXT_SIGNATURE_LIMIT,
             "context_concurrency": LAUNCH_CONTEXT_CONCURRENCY,
             "context_deadline_seconds": LAUNCH_CONTEXT_DEADLINE_SECONDS,
+            "rpc_hedging": True,
             "attempted": int(getattr(self, "_roi_launch_bridge_attempted", 0) or 0),
             "mint_resolved": int(getattr(self, "_roi_launch_bridge_mint_resolved", 0) or 0),
             "mint_unresolved": int(getattr(self, "_roi_launch_bridge_mint_unresolved", 0) or 0),
+            "chain_created_at": int(getattr(self, "_roi_launch_bridge_chain_created_at", 0) or 0),
+            "pair_time_fallback_attempted": int(getattr(self, "_roi_launch_bridge_pair_time_fallback_attempted", 0) or 0),
+            "pair_time_fallback_resolved": int(getattr(self, "_roi_launch_bridge_pair_time_fallback_resolved", 0) or 0),
+            "collector_timestamp_seeded": int(getattr(self, "_roi_launch_bridge_collector_timestamp_seeded", 0) or 0),
+            "signature_queries": int(getattr(self, "_roi_launch_bridge_signature_queries", 0) or 0),
+            "signature_queries_ok": int(getattr(self, "_roi_launch_bridge_signature_queries_ok", 0) or 0),
+            "signature_rows": int(getattr(self, "_roi_launch_bridge_signature_rows", 0) or 0),
+            "window_candidate_rows": int(getattr(self, "_roi_launch_bridge_window_candidate_rows", 0) or 0),
+            "transaction_hydrations_attempted": int(getattr(self, "_roi_launch_bridge_transaction_hydrations_attempted", 0) or 0),
+            "transaction_hydrations_ok": int(getattr(self, "_roi_launch_bridge_transaction_hydrations_ok", 0) or 0),
+            "context_rpc_failures": int(getattr(self, "_roi_launch_bridge_context_rpc_failures", 0) or 0),
+            "normalization_matches": int(getattr(self, "_roi_launch_bridge_normalization_matches", 0) or 0),
+            "normalization_misses": int(getattr(self, "_roi_launch_bridge_normalization_misses", 0) or 0),
+            "context_timeouts": int(getattr(self, "_roi_launch_bridge_context_timeouts", 0) or 0),
+            "context_incomplete": int(getattr(self, "_roi_launch_bridge_context_incomplete", 0) or 0),
             "context_swaps": int(getattr(self, "_roi_launch_bridge_context_swaps", 0) or 0),
+            "coverage_refresh_attempted": int(getattr(self, "_roi_launch_bridge_coverage_refresh_attempted", 0) or 0),
+            "coverage_refresh_recorded": int(getattr(self, "_roi_launch_bridge_coverage_refresh_recorded", 0) or 0),
             "coverage_rows": int(getattr(self, "_roi_launch_bridge_coverage_rows", 0) or 0),
             "failed": int(getattr(self, "_roi_launch_bridge_failed", 0) or 0),
             "candidate_activation_from_launch_bridge": False,
@@ -367,9 +456,10 @@ def _status_with_launch_bridge(
         if isinstance(throughput, dict):
             throughput.update(
                 {
-                    "launch_context_scope":"mint-address-only",
+                    "launch_context_scope": "mint-address-only",
                     "program_firehose_reopened_for_launch_context": False,
                     "non_swap_launch_coverage_bridge": True,
+                    "launch_context_retrieval_retries_preserve_event_window": True,
                 }
             )
         return payload
@@ -396,5 +486,6 @@ __all__ = [
     "LAUNCH_CONTEXT_SIGNATURE_LIMIT",
     "LAUNCH_WINDOW_SECONDS",
     "install_launch_coverage_bridge",
+    "launch_created_at_from_transaction",
     "launch_mint_from_transaction",
 ]

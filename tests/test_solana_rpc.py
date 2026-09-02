@@ -59,6 +59,21 @@ def test_latency_hedge_accepts_first_valid_secondary_response():
     assert fast.calls == 1
 
 
+def test_hedged_request_falls_back_when_primary_fails_before_hedge_delay():
+    failed = FakeClient(None, error=RuntimeError("primary down"))
+    good = FakeClient(321)
+    pool = SolanaRpcPool(
+        _endpoints(),
+        hedge_delay_seconds=0.05,
+        clients={"slow": failed, "fast": good},
+    )
+    result, provider, _latency = asyncio.run(pool.call_with_meta("getSlot", [], hedge=True))
+    assert result == 321
+    assert provider == "fast"
+    assert failed.calls == 1
+    assert good.calls == 1
+
+
 def test_nonhedged_request_falls_back_after_primary_failure():
     failed = FakeClient(None, error=RuntimeError("down"))
     good = FakeClient(123)
@@ -71,6 +86,36 @@ def test_nonhedged_request_falls_back_after_primary_failure():
     assert provider == "fast"
     assert failed.calls == 1
     assert good.calls == 1
+
+
+def test_method_specific_health_does_not_cross_poison_provider_ordering():
+    first = FakeClient(None, error=RuntimeError("slot path down"))
+    second = FakeClient(123)
+    pool = SolanaRpcPool(
+        _endpoints(),
+        clients={"slow": first, "fast": second},
+    )
+
+    result, provider, _latency = asyncio.run(pool.call_with_meta("getSlot", [], hedge=False))
+    assert result == 123
+    assert provider == "fast"
+    assert first.calls == 1
+    assert second.calls == 1
+
+    # The first provider is healthy for a different RPC method. Global latency
+    # history from getSlot must not make getBalance skip it.
+    first.error = None
+    first.result = 456
+    result, provider, _latency = asyncio.run(pool.call_with_meta("getBalance", [], hedge=False))
+    assert result == 456
+    assert provider == "slow"
+    assert first.calls == 2
+    assert second.calls == 1
+
+    status = pool.status()
+    assert set(status["method_health"]) == {"getBalance", "getSlot"}
+    assert status["method_health"]["getSlot"][0]["failures"] == 1
+    assert status["method_health"]["getBalance"][0]["successes"] == 1
 
 
 def test_endpoint_configuration_rejects_duplicates_and_requires_secure_transports():

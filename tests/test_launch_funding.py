@@ -21,6 +21,11 @@ class LaunchHttp:
         return FakeResponse([{"chainId":"solana","pairCreatedAt":self.created_ms,"liquidity":{"usd":5000}}])
 
 
+class NoLaunchHttp:
+    async def get(self, url, **kwargs):
+        raise AssertionError("seeded chain timestamp must bypass external pair discovery")
+
+
 class FundingHttp:
     def __init__(self, transfers):
         self.transfers = transfers
@@ -56,6 +61,28 @@ def test_launch_requires_pair_alignment_and_flags_same_slot_cluster(tmp_path):
     row = store.latest_risk_evidence("mint", RiskDimension.LAUNCH.value, as_of_received_at=at.isoformat())
     assert row["payload"]["bundled_launch"] is True
     assert row["payload"]["sniper_heavy"] is True
+
+
+def test_seeded_chain_timestamp_removes_pair_indexer_from_critical_path(tmp_path):
+    store, risk = _risk(tmp_path)
+    created = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=12)
+    for i, wallet in enumerate(("a", "b", "c")):
+        _swap(
+            store,
+            sig=f"seeded-{i}",
+            mint="mint",
+            wallet=wallet,
+            side="buy",
+            slot=11,
+            at=created + timedelta(seconds=1 + i * 0.1),
+            sol=1.0,
+        )
+    collector = DexScreenerLaunchCollector(risk, client=NoLaunchHttp())
+    collector.seed_created_at("mint", created)
+    at = created + timedelta(seconds=10)
+    assert asyncio.run(collector.collect("mint", at))
+    row = store.latest_risk_evidence("mint", RiskDimension.LAUNCH.value, as_of_received_at=at.isoformat())
+    assert row is not None
 
 
 def test_launch_refuses_stream_that_started_late(tmp_path):
