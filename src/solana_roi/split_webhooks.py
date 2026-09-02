@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin
 
 import httpx
@@ -15,13 +15,7 @@ ENHANCED_TRANSACTION_TYPES = ("BUY", "SELL", "SWAP")
 
 
 def render_service_url_from_env(env: dict[str, str] | None = None) -> str:
-    """Resolve Render's public HTTPS URL without requiring one specific default variable.
-
-    Render documents both RENDER_EXTERNAL_URL and RENDER_EXTERNAL_HOSTNAME for web
-    services. Prefer the full URL, but derive it from the hostname when needed.
-    This keeps Helius bootstrap fail-closed while avoiding a silent skip when one
-    Render-provided alias is unexpectedly absent.
-    """
+    """Resolve Render's public HTTPS URL without requiring one specific default variable."""
 
     values = env if env is not None else os.environ
     external_url = str(values.get("RENDER_EXTERNAL_URL") or "").strip()
@@ -34,22 +28,40 @@ def render_service_url_from_env(env: dict[str, str] | None = None) -> str:
 
 
 class SplitHeliusWebhookManager:
-    """Maintain a low-noise enhanced feed plus raw Pump.fun feed.
+    """Maintain a filtered enhanced feed plus raw Pump.fun feed.
 
-    Helius Enhanced exposes PUMP_AMM BUY/SELL and RAYDIUM SWAP, but does not
-    expose a PUMP_FUN source parser. Pump bonding-curve traffic therefore uses
-    a raw webhook and is parsed locally from official Pump discriminators.
+    Helius can transiently rate-limit webhook-management REST calls. Every
+    management operation therefore retries 429/503 responses with bounded
+    exponential backoff and honors Retry-After when supplied by Helius.
     """
 
     API_ROOT = "https://api-mainnet.helius-rpc.com/v0/webhooks"
+    RETRYABLE_STATUS_CODES = frozenset({429, 503})
 
-    def __init__(self, *, api_key: str, auth_header: str, client: Any | None = None):
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        auth_header: str,
+        client: Any | None = None,
+        sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        max_retries: int = 5,
+        initial_backoff_seconds: float = 1.0,
+        max_backoff_seconds: float = 30.0,
+    ):
         if not api_key or not auth_header:
             raise ValueError("HELIUS_API_KEY and HELIUS_WEBHOOK_AUTH are required")
         self.api_key = api_key
         self.auth_header = auth_header
         self.client = client or httpx.AsyncClient(timeout=10.0)
+        self.sleep_fn = sleep_fn
+        self.max_retries = max(0, int(max_retries))
+        self.initial_backoff_seconds = max(0.0, float(initial_backoff_seconds))
+        self.max_backoff_seconds = max(self.initial_backoff_seconds, float(max_backoff_seconds))
         self.stage = "initialized"
+        self.management_retry_count = 0
+        self.last_retry_status_code: int | None = None
+        self.last_retry_delay_seconds: float | None = None
 
     def _params(self) -> dict[str, str]:
         return {"api-key": self.api_key}
@@ -68,9 +80,6 @@ class SplitHeliusWebhookManager:
         }
         pump_raw = {
             "webhookURL": self._target(service_url, "/v1/ingestion/helius/pump-raw"),
-            # Helius documents transactionTypes as enhanced-only; ANY is kept in
-            # the request schema while raw delivery is governed by the program
-            # address and webhookType=raw.
             "transactionTypes": ["ANY"],
             "accountAddresses": [PUMP_PROGRAM_ID],
             "webhookType": "raw",
@@ -92,14 +101,44 @@ class SplitHeliusWebhookManager:
             return True
         return set(current.get("transactionTypes") or []) == set(desired["transactionTypes"])
 
+    def _retry_delay(self, response: Any, retry_index: int) -> float:
+        headers = getattr(response, "headers", {}) or {}
+        raw_retry_after = headers.get("retry-after") if hasattr(headers, "get") else None
+        if raw_retry_after is not None:
+            try:
+                retry_after = float(raw_retry_after)
+                if retry_after >= 0.0:
+                    return min(retry_after, self.max_backoff_seconds)
+            except (TypeError, ValueError):
+                pass
+        delay = self.initial_backoff_seconds * (2 ** retry_index)
+        return min(delay, self.max_backoff_seconds)
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> Any:
+        request = getattr(self.client, method)
+        for retry_index in range(self.max_retries + 1):
+            response = await request(url, **kwargs)
+            status_code = int(getattr(response, "status_code", 200))
+            if status_code not in self.RETRYABLE_STATUS_CODES:
+                response.raise_for_status()
+                return response
+            if retry_index >= self.max_retries:
+                response.raise_for_status()
+            delay = self._retry_delay(response, retry_index)
+            self.management_retry_count += 1
+            self.last_retry_status_code = status_code
+            self.last_retry_delay_seconds = delay
+            await self.sleep_fn(delay)
+        raise RuntimeError("unreachable Helius management retry state")
+
     async def _enable(self, webhook_id: str, *, label: str) -> None:
         self.stage = f"reenable:{label}"
-        response = await self.client.patch(
+        await self._request(
+            "patch",
             f"{self.API_ROOT}/{webhook_id}",
             params=self._params(),
             json={"active": True},
         )
-        response.raise_for_status()
 
     async def _upsert(self, webhooks: list[Any], desired: dict[str, Any], *, label: str) -> dict[str, Any]:
         target = desired["webhookURL"]
@@ -115,8 +154,12 @@ class SplitHeliusWebhookManager:
             active = bool(current.get("active", True))
             if not self._same_config(current, desired):
                 self.stage = f"update:{label}"
-                response = await self.client.put(f"{self.API_ROOT}/{webhook_id}", params=self._params(), json=desired)
-                response.raise_for_status()
+                response = await self._request(
+                    "put",
+                    f"{self.API_ROOT}/{webhook_id}",
+                    params=self._params(),
+                    json=desired,
+                )
                 payload = response.json()
                 active = bool(payload.get("active", True)) if isinstance(payload, dict) else active
                 action = "updated"
@@ -125,9 +168,9 @@ class SplitHeliusWebhookManager:
                 active = True
                 action = "updated_and_reenabled" if action == "updated" else "reenabled"
             return {"feed": label, "action": action, "webhook_id": webhook_id, "active": active}
+
         self.stage = f"create:{label}"
-        response = await self.client.post(self.API_ROOT, params=self._params(), json=desired)
-        response.raise_for_status()
+        response = await self._request("post", self.API_ROOT, params=self._params(), json=desired)
         payload = response.json()
         webhook_id = str(payload.get("webhookID") or "") if isinstance(payload, dict) else ""
         active = bool(payload.get("active", True)) if isinstance(payload, dict) else True
@@ -145,8 +188,7 @@ class SplitHeliusWebhookManager:
         if not service_url.startswith("https://"):
             raise ValueError("service URL must be public HTTPS")
         self.stage = "list_webhooks"
-        response = await self.client.get(self.API_ROOT, params=self._params())
-        response.raise_for_status()
+        response = await self._request("get", self.API_ROOT, params=self._params())
         webhooks = response.json()
         if not isinstance(webhooks, list):
             raise RuntimeError("Helius webhook list response is invalid")
@@ -160,6 +202,9 @@ class SplitHeliusWebhookManager:
             "enhanced_program_count": len(ENHANCED_PROGRAM_ADDRESSES),
             "pump_raw_program_count": 1,
             "enhanced_transaction_types": list(ENHANCED_TRANSACTION_TYPES),
+            "management_retry_count": self.management_retry_count,
+            "last_retry_status_code": self.last_retry_status_code,
+            "last_retry_delay_seconds": self.last_retry_delay_seconds,
         }
 
 
@@ -181,6 +226,7 @@ async def auto_sync_split_helius_from_env(*, store: Any | None = None, delay_sec
         if store is not None:
             store.append("helius_split_webhook_bootstrap_skipped", observed_at, result)
         return result
+
     manager = SplitHeliusWebhookManager(api_key=api_key, auth_header=auth_header)
     try:
         result = await manager.sync(service_url)
@@ -196,7 +242,10 @@ async def auto_sync_split_helius_from_env(*, store: Any | None = None, delay_sec
             "stage": manager.stage,
             "error_type": type(exc).__name__,
             "http_status_code": status_code,
-            "error": "Helius split-webhook bootstrap failed; provider exception text suppressed to protect query-string credentials",
+            "management_retry_count": manager.management_retry_count,
+            "last_retry_status_code": manager.last_retry_status_code,
+            "last_retry_delay_seconds": manager.last_retry_delay_seconds,
+            "error": "Helius split-webhook bootstrap failed after bounded retry; provider exception text suppressed to protect query-string credentials",
         }
         if store is not None:
             store.append("helius_split_webhook_bootstrap_failed", observed_at, result)

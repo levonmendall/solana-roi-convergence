@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
+
 from solana_roi.deployment import FROZEN_PROGRAM_ADDRESSES, PUMP_PROGRAM_ID
 from solana_roi.split_webhooks import (
     ENHANCED_PROGRAM_ADDRESSES,
@@ -12,10 +14,16 @@ from solana_roi.split_webhooks import (
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, *, status_code=200, headers=None):
         self.payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self):
+        if self.status_code >= 400:
+            request = httpx.Request("GET", "https://api-mainnet.helius-rpc.com/v0/webhooks")
+            response = httpx.Response(self.status_code, request=request)
+            raise httpx.HTTPStatusError("fake Helius error", request=request, response=response)
         return None
 
     def json(self):
@@ -28,8 +36,10 @@ class FakeClient:
         self.posts = []
         self.puts = []
         self.patches = []
+        self.get_calls = 0
 
     async def get(self, url, **kwargs):
+        self.get_calls += 1
         assert "api-key" in kwargs["params"]
         return FakeResponse(self.existing)
 
@@ -48,6 +58,40 @@ class FakeClient:
     async def patch(self, url, **kwargs):
         self.patches.append((url, kwargs["json"]))
         return FakeResponse({"webhookID": url.rsplit("/", 1)[-1], "active": True})
+
+
+class RateLimitedListClient(FakeClient):
+    def __init__(self, existing=None):
+        super().__init__(existing)
+        self.responses = [
+            FakeResponse({"error": "rate limited"}, status_code=429, headers={"retry-after": "0.25"}),
+            FakeResponse({"error": "rate limited"}, status_code=429),
+            FakeResponse(self.existing),
+        ]
+
+    async def get(self, url, **kwargs):
+        self.get_calls += 1
+        assert "api-key" in kwargs["params"]
+        return self.responses.pop(0)
+
+
+class RateLimitedMutationClient(FakeClient):
+    def __init__(self, existing=None):
+        super().__init__(existing)
+        self.put_attempts = 0
+        self.post_attempts = 0
+
+    async def put(self, url, **kwargs):
+        self.put_attempts += 1
+        if self.put_attempts == 1:
+            return FakeResponse({"error": "rate limited"}, status_code=429, headers={"retry-after": "0"})
+        return await super().put(url, **kwargs)
+
+    async def post(self, url, **kwargs):
+        self.post_attempts += 1
+        if self.post_attempts == 1:
+            return FakeResponse({"error": "unavailable"}, status_code=503, headers={"retry-after": "0"})
+        return await super().post(url, **kwargs)
 
 
 def test_render_service_url_prefers_full_url_and_falls_back_to_hostname():
@@ -149,3 +193,54 @@ def test_auth_rotation_updates_both_feeds_without_exposing_secret_in_result():
     assert len(client.puts) == 2
     assert all(row[1]["authHeader"] == "new-secret" for row in client.puts)
     assert "new-secret" not in repr(result)
+
+
+def test_rate_limited_list_honors_retry_after_and_recovers():
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    client = RateLimitedListClient([])
+    manager = SplitHeliusWebhookManager(
+        api_key="k",
+        auth_header="secret",
+        client=client,
+        sleep_fn=fake_sleep,
+        initial_backoff_seconds=1.0,
+    )
+    result = asyncio.run(manager.sync("https://roi.example"))
+    assert client.get_calls == 3
+    assert sleeps == [0.25, 2.0]
+    assert result["management_retry_count"] == 2
+    assert result["last_retry_status_code"] == 429
+
+
+def test_rate_limited_mutations_retry_before_updating_and_creating():
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    target = "https://roi.example/v1/ingestion/helius"
+    existing = [{
+        "webhookID": "old-id",
+        "webhookURL": target,
+        "transactionTypes": ["ANY"],
+        "accountAddresses": list(FROZEN_PROGRAM_ADDRESSES),
+        "webhookType": "enhanced",
+        "authHeader": "secret",
+        "active": True,
+    }]
+    client = RateLimitedMutationClient(existing)
+    manager = SplitHeliusWebhookManager(
+        api_key="k",
+        auth_header="secret",
+        client=client,
+        sleep_fn=fake_sleep,
+    )
+    result = asyncio.run(manager.sync("https://roi.example"))
+    assert client.put_attempts == 2
+    assert client.post_attempts == 2
+    assert sleeps == [0.0, 0.0]
+    assert result["management_retry_count"] == 2
