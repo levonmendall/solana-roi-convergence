@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from solana_roi import live_poll_redundancy as live_poll
+from solana_roi import poll_pagination_context as pagination
 from solana_roi.direct_solana import DirectSolanaIngestionPlane, WatchTarget
 from solana_roi.poll_watermark_repair import _slot_fetch_delta, _slot_poll_page
 
@@ -58,9 +59,10 @@ def test_slot_delta_completes_on_confirmed_slot_boundary_without_signature_curso
             {"signature": "different-old-signature", "slot": 100},
         ], "solana-mainnet", 12.0),
     ]
+    context_slots: list[int] = []
 
     async def fake_page(_self, _target, **kwargs):
-        assert kwargs["min_context_slot"] == 100
+        context_slots.append(int(kwargs["min_context_slot"]))
         return pages.pop(0)
 
     monkeypatch.setattr("solana_roi.poll_watermark_repair._slot_poll_page", fake_page)
@@ -79,6 +81,7 @@ def test_slot_delta_completes_on_confirmed_slot_boundary_without_signature_curso
     assert complete is True
     assert provider == "solana-mainnet"
     assert latency == 12.0
+    assert context_slots == [100, 105]
     assert [row["slot"] for row in rows] == [101, 102, 103, 104, 105]
     assert all(row["signature"] != "different-old-signature" for row in rows)
 
@@ -110,5 +113,6 @@ def test_slot_delta_fails_closed_when_bounded_window_never_reaches_watermark(mon
 
 
 def test_slot_watermark_repair_installed_intrinsically():
-    assert live_poll._fetch_delta is _slot_fetch_delta
+    assert live_poll._fetch_delta is pagination._context_fresh_fetch_delta
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_slot_watermark_poll", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_poll_pagination_context", False))
