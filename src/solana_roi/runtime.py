@@ -45,18 +45,27 @@ class RuntimeForwardCohortController(ForwardCohortController):
     webhook_queue: DurableHeliusWebhookQueue | None = None
     direct_ingestion: DirectSolanaIngestionPlane | None = None
 
-    def _direct_stream_continuity_ok(self) -> bool:
-        direct_status = self.direct_ingestion.status() if self.direct_ingestion is not None else {
-            "enabled": False,
-            "continuity_ok": False,
-            "strategy_scope_reduced": True,
-        }
+    def _direct_stream_status(self) -> dict[str, Any]:
+        if self.direct_ingestion is None:
+            return {
+                "enabled": False,
+                "continuity_ok": False,
+                "strategy_scope_reduced": True,
+                "full_program_scope": [],
+            }
+        return self.direct_ingestion.status()
+
+    @staticmethod
+    def _direct_stream_status_ok(direct_status: dict[str, Any]) -> bool:
         return bool(
             direct_status.get("enabled")
             and direct_status.get("continuity_ok")
             and not direct_status.get("strategy_scope_reduced")
             and len(direct_status.get("full_program_scope") or []) == 7
         )
+
+    def _direct_stream_continuity_ok(self) -> bool:
+        return self._direct_stream_status_ok(self._direct_stream_status())
 
     def runtime_continuity_ok(self) -> bool:
         """Require both durable paper state and live full-scope data-plane continuity.
@@ -72,17 +81,8 @@ class RuntimeForwardCohortController(ForwardCohortController):
         clock_enabled = _env_true("SOLANA_ROI_SHADOW_CLOCK_ENABLED")
         queue_status = self.webhook_queue.status() if self.webhook_queue is not None else {"pending": 1}
         queue_drained = int(queue_status.get("pending", 1)) == 0
-        direct_status = self.direct_ingestion.status() if self.direct_ingestion is not None else {
-            "enabled": False,
-            "continuity_ok": False,
-            "strategy_scope_reduced": True,
-        }
-        direct_ok = bool(
-            direct_status.get("enabled")
-            and direct_status.get("continuity_ok")
-            and not direct_status.get("strategy_scope_reduced")
-            and len(direct_status.get("full_program_scope") or []) == 7
-        )
+        direct_status = self._direct_stream_status()
+        direct_ok = self._direct_stream_status_ok(direct_status)
         status["continuous_price_clock_enabled"] = clock_enabled
         status["webhook_queue"] = queue_status
         status["direct_solana"] = direct_status
