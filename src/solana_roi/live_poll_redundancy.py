@@ -101,8 +101,8 @@ async def _record_poll_rows(self: Any, target: WatchTarget, rows: list[dict[str,
             )
         else:
             # A poll-only program signature is hydrated so its transaction logs can
-            # determine whether it is a launch. Non-launch swaps stay lightweight in
-            # the runtime guard; launch/scout activity retains the full deep path.
+            # determine whether it is a launch. Non-launch swaps stay lightweight;
+            # launch/scout activity retains the full deep-analysis path.
             self.journal.enqueue(
                 signature=signature,
                 slot=slot,
@@ -117,42 +117,53 @@ async def _record_poll_rows(self: Any, target: WatchTarget, rows: list[dict[str,
 async def _poll_target(self: Any, target: WatchTarget, stop: asyncio.Event) -> None:
     state = _poll_state(self)
     key = _poll_target_key(target)
-    cursor: str | None = None
+    cursor = ""
+    initialized = False
     failures = 0
+    poll_only_total = 0
     while not stop.is_set():
         started = time.monotonic()
         try:
             first_page, provider, latency = await _poll_page(self, target)
             newest = str(first_page[0].get("signature") or "") if first_page else ""
-            if cursor is None:
+            if not initialized:
                 # Establish a prospective baseline only. Existing signatures are
-                # historical and must never be relabeled as live observations.
-                cursor = newest or None
+                # historical and must never be relabeled as live observations. An
+                # empty baseline is still valid; the first later signature is new.
+                cursor = newest
+                initialized = True
+                failures = 0
                 state[key] = {
                     "connected": True,
-                    "baseline_established": cursor is not None,
+                    "baseline_established": True,
                     "last_provider": provider,
                     "last_latency_ms": latency,
                     "last_success_at": direct_solana_module.utcnow().isoformat(),
-                    "poll_only_receipts": 0,
+                    "poll_only_receipts_total": poll_only_total,
                     "cursor_overflow": False,
                     "failures": failures,
                 }
                 await target_quorum._quorum_set_target_state(self, _POLL_ENDPOINT, target, connected=True)
             elif newest and newest != cursor:
-                pages = [first_page]
-                found = any(str(row.get("signature") or "") == cursor for row in first_page)
-                before = str(first_page[-1].get("signature") or "") if first_page else None
-                for _ in range(1, POLL_CURSOR_MAX_PAGES):
-                    if found or not before:
-                        break
-                    page, provider, latency = await _poll_page(self, target, before=before)
-                    if not page:
-                        break
-                    pages.append(page)
-                    found = any(str(row.get("signature") or "") == cursor for row in page)
-                    before = str(page[-1].get("signature") or "")
-                new_rows, found = _new_rows_until_cursor(pages, cursor)
+                if not cursor:
+                    # The baseline was empty, so every signature in the first
+                    # non-empty page was created after prospective polling began.
+                    new_rows = list(reversed(first_page))
+                    found = True
+                else:
+                    pages = [first_page]
+                    found = any(str(row.get("signature") or "") == cursor for row in first_page)
+                    before = str(first_page[-1].get("signature") or "") if first_page else None
+                    for _ in range(1, POLL_CURSOR_MAX_PAGES):
+                        if found or not before:
+                            break
+                        page, provider, latency = await _poll_page(self, target, before=before)
+                        if not page:
+                            break
+                        pages.append(page)
+                        found = any(str(row.get("signature") or "") == cursor for row in page)
+                        before = str(page[-1].get("signature") or "")
+                    new_rows, found = _new_rows_until_cursor(pages, cursor)
                 if not found:
                     state[key] = {
                         "connected": False,
@@ -160,7 +171,7 @@ async def _poll_target(self: Any, target: WatchTarget, stop: asyncio.Event) -> N
                         "last_provider": provider,
                         "last_latency_ms": latency,
                         "last_success_at": direct_solana_module.utcnow().isoformat(),
-                        "poll_only_receipts": 0,
+                        "poll_only_receipts_total": poll_only_total,
                         "cursor_overflow": True,
                         "failures": failures,
                     }
@@ -175,6 +186,7 @@ async def _poll_target(self: Any, target: WatchTarget, stop: asyncio.Event) -> N
                     cursor = newest
                 else:
                     inserted = await _record_poll_rows(self, target, new_rows)
+                    poll_only_total += inserted
                     cursor = newest
                     failures = 0
                     state[key] = {
@@ -183,7 +195,7 @@ async def _poll_target(self: Any, target: WatchTarget, stop: asyncio.Event) -> N
                         "last_provider": provider,
                         "last_latency_ms": latency,
                         "last_success_at": direct_solana_module.utcnow().isoformat(),
-                        "poll_only_receipts": inserted,
+                        "poll_only_receipts_total": poll_only_total,
                         "cursor_overflow": False,
                         "failures": failures,
                     }
@@ -192,11 +204,11 @@ async def _poll_target(self: Any, target: WatchTarget, stop: asyncio.Event) -> N
                 failures = 0
                 state[key] = {
                     "connected": True,
-                    "baseline_established": cursor is not None,
+                    "baseline_established": True,
                     "last_provider": provider,
                     "last_latency_ms": latency,
                     "last_success_at": direct_solana_module.utcnow().isoformat(),
-                    "poll_only_receipts": 0,
+                    "poll_only_receipts_total": poll_only_total,
                     "cursor_overflow": False,
                     "failures": failures,
                 }
@@ -209,11 +221,11 @@ async def _poll_target(self: Any, target: WatchTarget, stop: asyncio.Event) -> N
             previous_success = previous.get("last_success_at") if isinstance(previous, dict) else None
             state[key] = {
                 "connected": False,
-                "baseline_established": cursor is not None,
+                "baseline_established": initialized,
                 "last_provider": None,
                 "last_latency_ms": None,
                 "last_success_at": previous_success,
-                "poll_only_receipts": 0,
+                "poll_only_receipts_total": poll_only_total,
                 "cursor_overflow": False,
                 "failures": failures,
                 "last_error_type": type(exc).__name__,
@@ -227,6 +239,87 @@ async def _poll_target(self: Any, target: WatchTarget, stop: asyncio.Event) -> N
             )
         elapsed = max(0.0, time.monotonic() - started)
         await asyncio.sleep(max(0.05, POLL_INTERVAL_SECONDS - elapsed))
+
+
+def _transaction_logs(result: Any) -> list[str]:
+    if not isinstance(result, dict):
+        return []
+    meta = result.get("meta")
+    if not isinstance(meta, dict):
+        return []
+    logs = meta.get("logMessages")
+    return [str(row) for row in logs] if isinstance(logs, list) else []
+
+
+def _wrap_hydrate(original: Callable[[Any, dict[str, Any]], Any]) -> Callable[[Any, dict[str, Any]], Any]:
+    async def hydrate(self: Any, row: dict[str, Any]) -> None:
+        if str(row.get("reason") or "") != "live_poll_fallback":
+            await original(self, row)
+            return
+
+        signature = str(row["signature"])
+        trigger = direct_solana_module.datetime.fromisoformat(str(row["trigger_received_at"]))
+        source_hint = str(row.get("source_hint") or "") or None
+        try:
+            result, provider, latency = await self._get_transaction_ready(
+                signature,
+                hedge=False,
+                attempts=4,
+            )
+            if result is None:
+                attempts = int(row.get("attempts") or 0) + 1
+                self.journal.finish(
+                    signature,
+                    error="confirmed live-poll transaction not yet available",
+                    retry=attempts < 3,
+                )
+                return
+
+            launch_like = bool(self._launch_like(_transaction_logs(result)))
+            swap = direct_solana_module.normalize_standard_transaction(
+                result,
+                signature=signature,
+                trigger_received_at=trigger,
+                source_hint=source_hint,
+            )
+            context_prefilled = False
+            if swap is not None:
+                profile = self.service.registry.get(swap.wallet)
+                if launch_like or profile is not None:
+                    needs_context = bool(launch_like or (profile is not None and swap.side == "buy"))
+                    if needs_context:
+                        context_prefilled = await self._prefill_launch_context(swap)
+                    await self.service.ingest_swap(swap)
+                else:
+                    self._persist_context_swap(swap)
+
+            source = swap.source.split(":")[1] if swap is not None and ":" in swap.source else source_hint
+            self.journal.record_hydration(
+                signature=signature,
+                source=source,
+                trigger_received_at=trigger,
+                hydrated_at=direct_solana_module.utcnow(),
+                rpc_provider=provider,
+                rpc_latency_ms=latency,
+                normalized=swap is not None,
+                candidate_context_prefilled=context_prefilled,
+                historical_recovery=False,
+            )
+            self.journal.finish(signature)
+        except Exception as exc:
+            attempts = int(row.get("attempts") or 0) + 1
+            self.journal.finish(
+                signature,
+                error=f"{type(exc).__name__}: live-poll hydration failed closed",
+                retry=attempts < 3,
+            )
+
+    try:
+        hydrate.__dict__.update(getattr(original, "__dict__", {}))
+    except Exception:
+        pass
+    setattr(hydrate, "_roi_live_poll_hydrate", True)
+    return hydrate
 
 
 def _wrap_run(original: Callable[[Any, asyncio.Event], Any]) -> Callable[[Any, asyncio.Event], Any]:
@@ -267,6 +360,7 @@ def _status_with_live_poll(original: Callable[[Any], dict[str, Any]]) -> Callabl
             "poll_interval_seconds": POLL_INTERVAL_SECONDS,
             "page_limit": POLL_LIMIT,
             "max_cursor_pages": POLL_CURSOR_MAX_PAGES,
+            "theoretical_poll_requests_per_second": len(tuple(self.watch_targets)) / POLL_INTERVAL_SECONDS,
             "historical_backfill": False,
             "poll_only_program_signatures_hydrated_for_launch_detection": True,
             "signing_available": False,
@@ -294,6 +388,10 @@ def _status_with_live_poll(original: Callable[[Any], dict[str, Any]]) -> Callabl
 
 
 def install_live_poll_redundancy() -> None:
+    current_hydrate = DirectSolanaIngestionPlane._hydrate_one
+    if not bool(getattr(current_hydrate, "_roi_live_poll_hydrate", False)):
+        DirectSolanaIngestionPlane._hydrate_one = _wrap_hydrate(current_hydrate)  # type: ignore[method-assign]
+
     current_run = DirectSolanaIngestionPlane.run
     if not bool(getattr(current_run, "_roi_live_poll_redundancy", False)):
         DirectSolanaIngestionPlane.run = _wrap_run(current_run)  # type: ignore[method-assign]
