@@ -50,8 +50,10 @@ class TimedRiskCollectors:
 
     Program-wide traffic is useful for launch/funding coverage, but it is not a
     candidate. Recording expensive background collection as candidate latency
-    makes the latency gate measure the wrong path. Production therefore records
-    a latency sample only for a historically eligible S/A scout buy.
+    makes the latency gate measure the wrong path. Production collectors expose
+    refresh_coverage/refresh_candidate, so only historically eligible S/A scout
+    buys are timed. Generic/offline collectors retain their historical full
+    refresh behavior for deterministic regression and replay compatibility.
     """
 
     def __init__(
@@ -87,14 +89,16 @@ class TimedRiskCollectors:
         coverage_refresh = getattr(self.inner, "refresh_coverage", None)
         if callable(coverage_refresh):
             await coverage_refresh(mint, at, current_swap=current_swap)
-
-        if not self._eligible_candidate(current_swap):
-            return
-
-        candidate_refresh = getattr(self.inner, "refresh_candidate", None)
-        if callable(candidate_refresh):
-            await candidate_refresh(mint, at, current_swap=current_swap)
-        elif not callable(coverage_refresh):
+            if not self._eligible_candidate(current_swap):
+                return
+            candidate_refresh = getattr(self.inner, "refresh_candidate", None)
+            if callable(candidate_refresh):
+                await candidate_refresh(mint, at, current_swap=current_swap)
+            else:
+                await self.inner.refresh(mint, at, current_swap=current_swap)
+        else:
+            # Generic/offline collector contract predates production split
+            # collection and remains a fully timed refresh.
             await self.inner.refresh(mint, at, current_swap=current_swap)
 
         completed_at = self.now_fn()
