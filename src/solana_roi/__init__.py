@@ -111,6 +111,15 @@ from .poll_chain_head_rearm import install_poll_chain_head_rearm
 
 install_poll_chain_head_rearm()
 
+# Polling baselines can become ready before the real WebSocket fanout during process
+# startup. Do not let that warm-up ordering arm the prospective outage clock. The
+# final continuity barrier requires all poll baselines plus real WebSocket coverage
+# of every frozen target, keeps synthetic polling out of provider-independence
+# counts, and exposes only sanitized HTTP status codes for failed WS handshakes.
+from .continuity_startup_barrier import install_continuity_startup_barrier
+
+install_continuity_startup_barrier()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
