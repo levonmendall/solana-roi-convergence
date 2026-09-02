@@ -37,6 +37,23 @@ class DexScreenerLaunchCollector:
         self.policy = policy or LaunchFundingPolicy()
         self._created_at_cache: dict[str, datetime] = {}
 
+    def seed_created_at(self, mint: str, created_at: datetime) -> None:
+        """Install an authoritative on-chain creation timestamp when one is known.
+
+        The launch bridge can prove a creation transaction before an indexing API
+        discovers the pair. Keeping that chain timestamp in the existing collector
+        cache removes the external indexer from the critical coverage path without
+        changing the eight-second event-time launch window.
+        """
+
+        if created_at.tzinfo is None:
+            normalized = created_at.replace(tzinfo=timezone.utc)
+        else:
+            normalized = created_at.astimezone(timezone.utc)
+        current = self._created_at_cache.get(mint)
+        if current is None or normalized < current:
+            self._created_at_cache[mint] = normalized
+
     def _early_rows(self, mint: str, *, start: datetime, end: datetime, decision_at: datetime) -> list[dict[str, Any]]:
         with self.store._lock:
             rows = self.store.db.execute(
