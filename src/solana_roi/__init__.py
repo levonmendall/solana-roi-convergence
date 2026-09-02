@@ -60,6 +60,14 @@ from .live_poll_redundancy import install_live_poll_redundancy
 
 install_live_poll_redundancy()
 
+# Public load-balanced RPC backends cannot be assumed to recognize the exact same
+# signature cursor on every request. Use a confirmed-slot watermark instead: it is
+# provider-agnostic, bounded, and still fails closed if more than the allowed live
+# delta accumulates between observations.
+from .poll_watermark_repair import install_poll_watermark_repair
+
+install_poll_watermark_repair()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.

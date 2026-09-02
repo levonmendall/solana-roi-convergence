@@ -21,7 +21,7 @@ from solana_roi.live_poll_redundancy import (
 )
 
 
-def test_live_poll_uses_server_side_until_cursor(monkeypatch):
+def test_live_poll_uses_confirmed_slot_watermark(monkeypatch):
     captured: dict[str, object] = {}
 
     class Pool:
@@ -29,13 +29,13 @@ def test_live_poll_uses_server_side_until_cursor(monkeypatch):
             captured["method"] = method
             captured["params"] = params
             captured["hedge"] = hedge
-            return [{"signature": "new", "slot": 1}], "publicnode", 12.0
+            return [{"signature": "new", "slot": 124}], "publicnode", 12.0
 
     monkeypatch.setattr(live_poll, "_poll_rpc", lambda _self: Pool())
     plane = SimpleNamespace()
     target = WatchTarget("program", "program-a", "PUMP_AMM")
     rows, provider, latency = asyncio.run(
-        _poll_page(plane, target, before="before-sig", until="cursor-sig", limit=1000)
+        _poll_page(plane, target, before="before-sig", min_context_slot=123, limit=1000)
     )
 
     assert rows[0]["signature"] == "new"
@@ -46,21 +46,26 @@ def test_live_poll_uses_server_side_until_cursor(monkeypatch):
     config = captured["params"][1]
     assert config["limit"] == 1000
     assert config["before"] == "before-sig"
-    assert config["until"] == "cursor-sig"
+    assert config["minContextSlot"] == 123
+    assert "until" not in config
 
 
-def test_live_poll_delta_is_oldest_first_and_bounded(monkeypatch):
+def test_live_poll_delta_is_oldest_first_and_slot_bounded(monkeypatch):
     pages = [
-        ([{"signature": "new-4"}, {"signature": "new-3"}], "publicnode", 10.0),
+        ([
+            {"signature": "new-4", "slot": 104},
+            {"signature": "new-3", "slot": 103},
+            {"signature": "old-different-signature", "slot": 100},
+        ], "publicnode", 10.0),
     ]
 
     async def fake_page(_self, _target, **kwargs):
-        assert kwargs["until"] == "cursor"
+        assert kwargs["min_context_slot"] == 100
         return pages.pop(0)
 
-    monkeypatch.setattr(live_poll, "_poll_page", fake_page)
+    monkeypatch.setattr("solana_roi.poll_watermark_repair._slot_poll_page", fake_page)
     rows, complete, provider, latency = asyncio.run(
-        _fetch_delta(SimpleNamespace(), WatchTarget("program", "a", "RAYDIUM"), "cursor")
+        _fetch_delta(SimpleNamespace(), WatchTarget("program", "a", "RAYDIUM"), 100)
     )
     assert complete is True
     assert provider == "publicnode"
