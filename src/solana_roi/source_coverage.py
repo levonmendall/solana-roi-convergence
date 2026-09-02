@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any
 
 from .activation import CoverageCertificationPolicy, ProgramCoverageCertificationGate
 from .observation_store import ObservationEventStore
 
-# Frozen v3.1 mainnet launch/swap program set. Helius source labels collapse the
-# Raydium programs into RAYDIUM, so certification is source-aware while the
-# exact program IDs remain frozen into the manifest via the policy.
+# Frozen v3.1 mainnet launch/swap program set. Helius Enhanced covers Pump AMM
+# and Raydium. Pump bonding-curve trades are collected from Helius raw webhook
+# transactions and normalized locally, while the exact IDs remain frozen into
+# the immutable certification policy.
 FROZEN_SUPPORTED_PROGRAM_IDS_BY_SOURCE: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "PUMP_FUN",
@@ -41,11 +43,11 @@ class SourceAwareCoverageCertificationPolicy(CoverageCertificationPolicy):
 
 
 class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGate):
-    """Require empirical delivery from every frozen supported source.
+    """Require prospective launch evidence and empirical delivery per source.
 
-    Aggregate launch/funding counts alone are insufficient because one healthy
-    venue must never certify a missing venue. Source evidence is derived only
-    from normalized swaps that actually traversed the Helius webhook parser.
+    A pre-existing pool first seen after startup is not a prospective launch
+    observation. Only pools created on or after the exact-release evidence
+    epoch may enter the 95% near-creation/early-buyer/funding denominator.
     """
 
     def __init__(
@@ -54,8 +56,10 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
         *,
         configured_fn,
         policy: SourceAwareCoverageCertificationPolicy | None = None,
+        prospective_start_at: datetime | None = None,
     ):
         super().__init__(store, configured_fn=configured_fn, policy=policy or SourceAwareCoverageCertificationPolicy())
+        self.prospective_start_at = prospective_start_at
 
     @property
     def source_policy(self) -> SourceAwareCoverageCertificationPolicy:
@@ -63,11 +67,17 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
 
     def _source_counts(self) -> dict[str, int]:
         counts = {source: 0 for source in self.source_policy.required_program_sources}
+        sql = (
+            "SELECT source, COUNT(*) AS n FROM normalized_swaps WHERE "
+            "(source LIKE 'helius-enhanced-webhook:%' OR source LIKE 'helius-raw-webhook:%')"
+        )
+        args: list[Any] = []
+        if self.prospective_start_at is not None:
+            sql += " AND received_at>=?"
+            args.append(self.prospective_start_at.isoformat())
+        sql += " GROUP BY source"
         with self.store._lock:
-            rows = self.store.db.execute(
-                "SELECT source, COUNT(*) AS n FROM normalized_swaps "
-                "WHERE source LIKE 'helius-enhanced-webhook:%' GROUP BY source"
-            ).fetchall()
+            rows = self.store.db.execute(sql, tuple(args)).fetchall()
         for row in rows:
             raw = str(row["source"])
             parts = raw.split(":")
@@ -78,28 +88,68 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
                 counts[source] += int(row["n"])
         return counts
 
+    def _prospective_rows(self, limit: int) -> list[dict[str, Any]]:
+        rows = self.store.recent_program_coverage(limit)
+        if self.prospective_start_at is None:
+            return rows
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                created_at = datetime.fromisoformat(str(row["pair_created_at"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if created_at >= self.prospective_start_at:
+                result.append(row)
+        return result
+
     def status(self, *, limit: int = 500) -> dict[str, object]:
-        base = super().status(limit=limit)
+        rows = self._prospective_rows(limit)
+        configured = bool(self.configured_fn())
+        near = [row for row in rows if row["launch_near_creation"]]
+        early = [row for row in rows if row["early_buyers_complete"]]
+        funded = [row for row in rows if row["funding_complete"]]
+        chronology_conflicts = self.store.first_touch_chronology_conflicts()
+        total = len(rows)
+        near_fraction = len(near) / total if total else 0.0
+        early_fraction = len(early) / total if total else 0.0
+        funding_fraction = len(funded) / total if total else 0.0
         counts = self._source_counts()
         missing = [
             source
             for source in self.source_policy.required_program_sources
             if counts.get(source, 0) < self.source_policy.min_normalized_swaps_per_source
         ]
-        requirements = dict(base.get("requirements") or {})
-        requirements.update(asdict(self.source_policy))
-        requirements["empirical_per_source_delivery_required"] = True
-        base.update(
-            {
-                "certified": bool(base["certified"] and not missing),
-                "program_source_counts": counts,
-                "missing_or_under_sampled_program_sources": missing,
-                "required_program_sources": list(self.source_policy.required_program_sources),
-                "frozen_program_ids_by_source": {
-                    source: list(program_ids)
-                    for source, program_ids in self.source_policy.frozen_program_ids_by_source
-                },
-                "requirements": requirements,
-            }
+        certified = bool(
+            configured
+            and total >= self.source_policy.min_samples
+            and near_fraction >= self.source_policy.min_near_creation_fraction
+            and early_fraction >= self.source_policy.min_early_buyer_complete_fraction
+            and funding_fraction >= self.source_policy.min_funding_complete_fraction
+            and chronology_conflicts == 0
+            and not missing
         )
-        return base
+        requirements = asdict(self.source_policy)
+        requirements["empirical_per_source_delivery_required"] = True
+        requirements["prospective_release_boundary_required"] = True
+        return {
+            "certified": certified,
+            "configured": configured,
+            "configuration_is_not_certification": True,
+            "sample_count": total,
+            "near_creation_count": len(near),
+            "near_creation_fraction": near_fraction,
+            "early_buyer_complete_count": len(early),
+            "early_buyer_complete_fraction": early_fraction,
+            "funding_complete_count": len(funded),
+            "funding_complete_fraction": funding_fraction,
+            "first_touch_chronology_conflicts": chronology_conflicts,
+            "program_source_counts": counts,
+            "missing_or_under_sampled_program_sources": missing,
+            "required_program_sources": list(self.source_policy.required_program_sources),
+            "frozen_program_ids_by_source": {
+                source: list(program_ids)
+                for source, program_ids in self.source_policy.frozen_program_ids_by_source
+            },
+            "prospective_start_at": self.prospective_start_at.isoformat() if self.prospective_start_at else None,
+            "requirements": requirements,
+        }
