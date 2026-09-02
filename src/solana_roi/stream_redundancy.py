@@ -10,18 +10,11 @@ from .direct_solana import DirectSolanaIngestionPlane
 from .solana_rpc import RpcEndpoint
 
 
-# dRPC's shared HTTP endpoint was previously retired from the hydration pool after
-# production returned zero successful HTTP reads. Its documented public WebSocket
-# remains useful as a best-effort *stream-only* third observer now that every
-# target is isolated on its own WebSocket and subscription identifiers are fully
-# provider-agnostic. It is never used for hydration/risk/quote RPC calls here.
-_DEFAULT_STREAM_ONLY_ENDPOINTS: tuple[RpcEndpoint, ...] = (
-    RpcEndpoint(
-        name="drpc-stream",
-        http_url="https://solana.drpc.org/",
-        ws_url="wss://solana.drpc.org",
-    ),
-)
+# No unauthenticated tertiary WSS is trusted by default. Production proved the
+# shared dRPC public WSS could not establish any of the ten required subscriptions.
+# A future managed/free WSS endpoint can still be supplied explicitly through the
+# environment without putting it into the HTTP hydration/risk/quote pool.
+_DEFAULT_STREAM_ONLY_ENDPOINTS: tuple[RpcEndpoint, ...] = ()
 
 
 def stream_only_endpoints_from_env(env: dict[str, str] | None = None) -> tuple[RpcEndpoint, ...]:
@@ -104,7 +97,8 @@ def _status_with_stream_redundancy(original: Callable[[Any], dict[str, Any]]) ->
             ],
             "hydration_rpc_provider_count": int(rpc_status.get("endpoint_count") or 0),
             "drpc_public_http_hydration_retired": True,
-            "drpc_public_wss_reintroduced_stream_only": "drpc-stream" in stream_only_names,
+            "drpc_public_wss_default_retired": True,
+            "explicit_stream_only_override_supported": True,
             "strategy_scope_reduced": False,
         }
         policy = payload.setdefault("provider_runtime_policy", {})
@@ -119,9 +113,6 @@ def _status_with_stream_redundancy(original: Callable[[Any], dict[str, Any]]) ->
             )
         return payload
 
-    # Preserve the marker contract accumulated by all previously installed status
-    # wrappers so production.py cannot mistake this richer wrapper for an unguarded
-    # status implementation and overwrite it later.
     try:
         status.__dict__.update(getattr(original, "__dict__", {}))
     except Exception:
