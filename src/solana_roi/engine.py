@@ -25,19 +25,19 @@ class PaperTradingEngine:
             self.store.append(event_type, observed_at.isoformat(), payload)
 
     def on_first_touch(self, touch: WalletTouch, risk: RiskSnapshot, *, execution_price: float | None = None) -> None:
-        self.marks[touch.token_mint] = touch.reference_price
-        self._append("first_touch", touch.observed_at, {"touch": asdict(touch), "risk": asdict(risk), "strategy_version": self.config.version})
         fill_reference = execution_price if execution_price is not None else touch.reference_price
+        self.marks[touch.token_mint] = fill_reference
+        self._append("first_touch", touch.observed_at, {"touch": asdict(touch), "risk": asdict(risk), "strategy_version": self.config.version})
         for intent in self.strategy.first_touch(touch, risk):
             self.portfolio.apply(intent, scout_wallet=touch.wallet, reference_price=fill_reference)
             self._append("trade_intent", intent.observed_at, {**asdict(intent), "execution_reference_price": fill_reference})
 
     def on_confirmation(self, confirmation: Confirmation, risk: RiskSnapshot, *, execution_price: float | None = None) -> None:
-        self.marks[confirmation.token_mint] = confirmation.reference_price
+        fill_reference = execution_price if execution_price is not None else confirmation.reference_price
+        self.marks[confirmation.token_mint] = fill_reference
         self._append("confirmation", confirmation.observed_at, {"confirmation": asdict(confirmation), "risk": asdict(risk)})
         candidate = self.strategy.candidates.get(confirmation.token_mint)
         scout_wallet = candidate.scout_wallet if candidate else confirmation.wallet
-        fill_reference = execution_price if execution_price is not None else confirmation.reference_price
         for intent in self.strategy.confirm(confirmation, risk):
             self.portfolio.apply(intent, scout_wallet=scout_wallet, reference_price=fill_reference)
             self._append("trade_intent", intent.observed_at, {**asdict(intent), "execution_reference_price": fill_reference})
