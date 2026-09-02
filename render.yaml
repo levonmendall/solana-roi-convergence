@@ -31,13 +31,18 @@ services:
       # Solana addresses only; no key material is stored or accepted.
       - key: SOLANA_ROI_WALLET_PROFILES_JSON
         value: '[{"wallet":"4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk","entity_id":"kol:jijo","tier":"S","first_touch_sample_size":191,"historically_eligible":true},{"wallet":"862TYSvRYoiHAK3F3WwTRYAfuGiQaGdxedN9AGvRGWo2","entity_id":"kol:wugi","tier":"S","first_touch_sample_size":52,"historically_eligible":true},{"wallet":"DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt","entity_id":"kol:the-doc","tier":"S","first_touch_sample_size":121,"historically_eligible":true}]'
+      # Provider credentials still require user-owned accounts and are prompted
+      # during initial Blueprint creation. They are never committed.
       - key: HELIUS_API_KEY
-        sync: false
-      - key: HELIUS_WEBHOOK_AUTH
         sync: false
       - key: JUPITER_API_KEY
         sync: false
+      # Render generates these internal 256-bit secrets. The Helius bootstrap
+      # registers the generated webhook auth header automatically.
+      - key: HELIUS_WEBHOOK_AUTH
+        generateValue: true
       - key: SOLANA_ROI_COHORT_ARM_AUTH
-        sync: false
+        generateValue: true
+      # Public address only. No private key, signer, seed phrase, or mnemonic.
       - key: SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY
         sync: false
