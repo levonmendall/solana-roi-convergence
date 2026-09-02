@@ -177,7 +177,7 @@ def test_alchemy_connection_429_is_sanitized_and_fails_all_targets_closed(monkey
 
 
 def test_status_reports_twenty_one_physical_connections_and_thirty_logical_subscriptions():
-    endpoints = (
+    configured_endpoints = (
         RpcEndpoint("publicnode", "https://public.invalid", "wss://public.invalid"),
         RpcEndpoint("solana-mainnet", "https://solana.invalid", "wss://solana.invalid"),
         _alchemy(),
@@ -185,20 +185,22 @@ def test_status_reports_twenty_one_physical_connections_and_thirty_logical_subsc
 
     class Plane:
         watch_targets = _targets()
-        endpoints = endpoints
+
+    plane = Plane()
+    plane.endpoints = configured_endpoints
 
     original = lambda _self: {
         "target_stream_fanout": {
             "providers": {
                 endpoint.name: {"ready": False, "connected_target_count": 0, "target_count": 10}
-                for endpoint in endpoints
+                for endpoint in configured_endpoints
             }
         },
         "subscription_setup": {"alchemy": {}},
         "production_memory_boundary": {},
         "provider_runtime_policy": {},
     }
-    status = multiplex._status_with_alchemy_multiplexing(original)(Plane())
+    status = multiplex._status_with_alchemy_multiplexing(original)(plane)
 
     stream = status["target_stream_fanout"]
     assert stream["total_websocket_connections"] == 21
