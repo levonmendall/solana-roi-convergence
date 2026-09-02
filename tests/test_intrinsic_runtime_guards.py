@@ -4,6 +4,7 @@ import json
 
 from solana_roi import api
 from solana_roi import direct_solana as direct_solana_module
+from solana_roi import solana_rpc as solana_rpc_module
 from solana_roi.direct_solana import DirectSolanaIngestionPlane
 
 
@@ -12,11 +13,14 @@ def test_guards_install_even_when_legacy_api_entrypoint_is_imported():
     assert bool(getattr(direct_solana_module.websockets.connect, "_roi_memory_bounded", False))
     assert bool(getattr(DirectSolanaIngestionPlane._prefill_launch_context, "_roi_memory_bounded", False))
     assert bool(getattr(DirectSolanaIngestionPlane._stream_endpoint, "_roi_stream_guarded", False))
+    assert bool(getattr(DirectSolanaIngestionPlane._hydrate_one, "_roi_priority_routed", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.run, "_roi_worker_partitioned", False))
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_memory_bounded", False))
     assert bool(getattr(direct_solana_module.rpc_endpoints_from_env, "_roi_provider_repair", False))
+    assert bool(getattr(solana_rpc_module.rpc_endpoints_from_env, "_roi_provider_repair", False))
 
 
-def test_known_failing_public_onfinality_is_replaced_without_touching_primary():
+def test_known_failing_public_onfinality_is_replaced_for_stream_and_rpc_pool():
     env = {
         "SOLANA_ROI_RPC_ENDPOINTS_JSON": json.dumps(
             [
@@ -33,11 +37,13 @@ def test_known_failing_public_onfinality_is_replaced_without_touching_primary():
             ]
         )
     }
-    endpoints = direct_solana_module.rpc_endpoints_from_env(env)
-    assert [endpoint.name for endpoint in endpoints] == ["publicnode", "drpc"]
-    assert endpoints[0].http_url == "https://solana-rpc.publicnode.com"
-    assert endpoints[1].http_url == "https://solana.drpc.org/"
-    assert endpoints[1].ws_url == "wss://solana.drpc.org"
+    stream_endpoints = direct_solana_module.rpc_endpoints_from_env(env)
+    rpc_endpoints = solana_rpc_module.rpc_endpoints_from_env(env)
+    assert [endpoint.name for endpoint in stream_endpoints] == ["publicnode", "drpc"]
+    assert stream_endpoints == rpc_endpoints
+    assert stream_endpoints[0].http_url == "https://solana-rpc.publicnode.com"
+    assert stream_endpoints[1].http_url == "https://solana.drpc.org/"
+    assert stream_endpoints[1].ws_url == "wss://solana.drpc.org"
 
 
 def test_memory_boundary_is_visible_without_production_wrapper():
@@ -53,6 +59,7 @@ def test_memory_boundary_is_visible_without_production_wrapper():
                 "connected_provider_count": 1,
                 "continuity_ok": True,
                 "unresolved_gap": False,
+                "provider_states": [],
             }
 
     plane = object.__new__(DirectSolanaIngestionPlane)
@@ -60,6 +67,7 @@ def test_memory_boundary_is_visible_without_production_wrapper():
     plane.scout_wallets = ("a", "b", "c")
     plane.rpc = Rpc()
     plane.journal = Journal()
+    plane.endpoints = ()
     plane.candidate_context_max_signatures = 600
     plane.worker_count = 12
 
@@ -73,6 +81,10 @@ def test_memory_boundary_is_visible_without_production_wrapper():
     assert boundary["strategy_scope_reduced"] is False
     assert boundary["context_signature_limit_unchanged"] == 600
     assert boundary["hydration_worker_count_unchanged"] == 12
+    throughput = status["throughput_policy"]
+    assert throughput["candidate_reserved_workers"] == 3
+    assert throughput["background_workers"] == 9
+    assert throughput["full_raw_market_scope_preserved"] is True
 
 
 def test_legacy_health_route_is_constant_time_liveness(monkeypatch):
