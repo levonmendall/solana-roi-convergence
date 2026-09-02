@@ -146,6 +146,15 @@ from .public_data_economics import install_public_data_economics
 
 install_public_data_economics()
 
+# A precise launch transaction is usually a creation transaction rather than a
+# simple swap, so it cannot pass the normal swap parser. Resolve its mint directly
+# from standard transaction metadata, hydrate only that mint's launch-window
+# signatures, and publish coverage evidence through the existing launch/funding
+# collectors without creating candidate, latency, quote, or paper authority.
+from .launch_coverage_bridge import install_launch_coverage_bridge
+
+install_launch_coverage_bridge()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
