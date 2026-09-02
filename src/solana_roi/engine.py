@@ -47,6 +47,9 @@ class PaperTradingEngine:
         self._append("price", observed_at, {"token_mint": token_mint, "reference_price": reference_price})
         candidate = self.strategy.candidates.get(token_mint)
         scout_wallet = candidate.scout_wallet if candidate else "unknown"
+        position = self.portfolio.positions.get(token_mint)
+        if position is not None and position.is_open and position.harvest_hit:
+            position.high_water_price = max(position.high_water_price or reference_price, reference_price)
         before_closed = len(self.portfolio.closed)
         for intent in self.strategy.on_clock(token_mint, observed_at, reference_price):
             self.portfolio.apply(intent, scout_wallet=scout_wallet, reference_price=reference_price)
