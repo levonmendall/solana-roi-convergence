@@ -4,10 +4,21 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from . import direct_solana as direct_solana_module
 from .direct_solana import DirectSolanaIngestionPlane
 
 
 NotificationHandler = Callable[[Any, str, dict[int, Any], dict[str, Any]], Awaitable[None]]
+ContextPrefill = Callable[[Any, Any], Awaitable[bool]]
+
+# These are hard production memory ceilings, not strategy/sample ceilings.
+# The raw Solana feed remains full-scope; when a provider outruns the process,
+# WebSocket/TCP backpressure or a reconnect invokes the existing durable gap
+# recovery path instead of accumulating an effectively unbounded receive buffer.
+DIRECT_WS_MAX_QUEUE = 64
+DIRECT_WS_MAX_SIZE_BYTES = 256 * 1024
+DIRECT_CANDIDATE_CONTEXT_SLOTS = 3
+DIRECT_BACKGROUND_CONTEXT_SLOTS = 1
 
 
 def _cooperative_handler(original: NotificationHandler) -> NotificationHandler:
@@ -33,6 +44,76 @@ def _cooperative_handler(original: NotificationHandler) -> NotificationHandler:
     return handle
 
 
+def _bounded_ws_connect(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Clamp receive buffering without narrowing subscriptions or dropping data."""
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        requested_queue = kwargs.get("max_queue")
+        requested_size = kwargs.get("max_size")
+        kwargs["max_queue"] = DIRECT_WS_MAX_QUEUE if requested_queue is None else min(
+            int(requested_queue), DIRECT_WS_MAX_QUEUE
+        )
+        kwargs["max_size"] = DIRECT_WS_MAX_SIZE_BYTES if requested_size is None else min(
+            int(requested_size), DIRECT_WS_MAX_SIZE_BYTES
+        )
+        return original(*args, **kwargs)
+
+    setattr(connect, "_roi_memory_bounded", True)
+    return connect
+
+
+def _bounded_context_prefill(original: ContextPrefill) -> ContextPrefill:
+    """Prevent twelve hydrators from multiplying full context fanout concurrently.
+
+    Candidate/scout work has dedicated capacity so background certification can
+    never consume the candidate fast path. The original per-context behavior is
+    unchanged: up to 600 signatures, 24 inner RPC operations, and the existing
+    three-second context deadline remain authoritative.
+    """
+
+    async def prefill(self: Any, candidate: Any) -> bool:
+        critical = False
+        try:
+            profile = self.service.registry.get(candidate.wallet)
+            critical = bool(profile is not None and str(candidate.side).lower() == "buy")
+        except Exception:
+            # Classification uncertainty is background-only; it must never gain
+            # candidate-reserved capacity by accident.
+            critical = False
+
+        attribute = "_roi_candidate_context_gate" if critical else "_roi_background_context_gate"
+        slots = DIRECT_CANDIDATE_CONTEXT_SLOTS if critical else DIRECT_BACKGROUND_CONTEXT_SLOTS
+        gate = getattr(self, attribute, None)
+        if gate is None:
+            gate = asyncio.Semaphore(slots)
+            setattr(self, attribute, gate)
+        async with gate:
+            return await original(self, candidate)
+
+    setattr(prefill, "_roi_memory_bounded", True)
+    return prefill
+
+
+def _bounded_status(original: Callable[[Any], dict[str, Any]]) -> Callable[[Any], dict[str, Any]]:
+    """Expose the installed memory envelope in direct-Solana telemetry."""
+
+    def status(self: Any) -> dict[str, Any]:
+        payload = original(self)
+        payload["production_memory_boundary"] = {
+            "websocket_max_queue": DIRECT_WS_MAX_QUEUE,
+            "websocket_max_size_bytes": DIRECT_WS_MAX_SIZE_BYTES,
+            "candidate_context_slots": DIRECT_CANDIDATE_CONTEXT_SLOTS,
+            "background_context_slots": DIRECT_BACKGROUND_CONTEXT_SLOTS,
+            "strategy_scope_reduced": False,
+            "context_signature_limit_unchanged": int(self.candidate_context_max_signatures),
+            "hydration_worker_count_unchanged": int(self.worker_count),
+        }
+        return payload
+
+    setattr(status, "_roi_memory_bounded", True)
+    return status
+
+
 def install_direct_stream_fairness() -> None:
     """Install the production scheduling guard exactly once."""
 
@@ -42,10 +123,32 @@ def install_direct_stream_fairness() -> None:
     DirectSolanaIngestionPlane._handle_notification = _cooperative_handler(current)  # type: ignore[method-assign]
 
 
+def install_direct_stream_memory_bounds() -> None:
+    """Install bounded buffering/fanout guards exactly once."""
+
+    current_connect = direct_solana_module.websockets.connect
+    if not bool(getattr(current_connect, "_roi_memory_bounded", False)):
+        direct_solana_module.websockets.connect = _bounded_ws_connect(current_connect)  # type: ignore[assignment]
+
+    current_prefill = DirectSolanaIngestionPlane._prefill_launch_context
+    if not bool(getattr(current_prefill, "_roi_memory_bounded", False)):
+        DirectSolanaIngestionPlane._prefill_launch_context = _bounded_context_prefill(current_prefill)  # type: ignore[method-assign]
+
+    current_status = DirectSolanaIngestionPlane.status
+    if not bool(getattr(current_status, "_roi_memory_bounded", False)):
+        DirectSolanaIngestionPlane.status = _bounded_status(current_status)  # type: ignore[method-assign]
+
+
 # Install before importing the FastAPI runtime so every production instance uses
-# the fair-scheduling handler without changing strategy, sampling, or scope.
+# fair scheduling and bounded memory without changing strategy, sampling, scope,
+# certification thresholds, signing, submission, or paper-only authority.
 install_direct_stream_fairness()
+install_direct_stream_memory_bounds()
 
 from .api import app as app  # noqa: E402  (installation must happen first)
 
-__all__ = ["app", "install_direct_stream_fairness"]
+__all__ = [
+    "app",
+    "install_direct_stream_fairness",
+    "install_direct_stream_memory_bounds",
+]
