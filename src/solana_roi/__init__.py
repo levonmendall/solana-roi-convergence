@@ -16,13 +16,19 @@ from .stream_resilience import install_stream_resilience
 
 install_stream_resilience()
 
-# The final transport layer preserves every frozen program/scout subscription but
-# establishes low-volume targets first and permits large-yet-bounded Solana log
-# frames. This avoids setup starvation and frame-limit disconnects without
-# reopening the former unbounded receive-buffer memory shape.
+# The transport layer preserves every frozen program/scout subscription while
+# establishing low-volume targets first and permitting large-yet-bounded Solana
+# log frames.
 from .transport_hardening import install_transport_hardening
 
 install_transport_hardening()
+
+# A dedicated WebSocket reader resolves subscription acknowledgements separately
+# from live notification processing. This prevents high-volume Solana traffic from
+# starving the remaining handshake while retaining bounded fail-closed dispatch.
+from .handshake_pump import install_handshake_pump
+
+install_handshake_pump()
 
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
