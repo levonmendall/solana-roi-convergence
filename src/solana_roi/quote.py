@@ -277,12 +277,24 @@ class QuoteCertificationPolicy:
 
 
 class QuoteCertificationGate:
-    def __init__(self, ledger: ExecutableQuoteLedger, *, policy: QuoteCertificationPolicy | None = None):
+    def __init__(
+        self,
+        ledger: ExecutableQuoteLedger,
+        *,
+        policy: QuoteCertificationPolicy | None = None,
+        prospective_start_at: datetime | None = None,
+    ):
         self.ledger = ledger
         self.policy = policy or QuoteCertificationPolicy()
+        self.prospective_start_at = prospective_start_at
 
     def status(self, limit: int = 500) -> dict[str, object]:
         rows = self.ledger.recent(limit)
+        if self.prospective_start_at is not None:
+            rows = [
+                row for row in rows
+                if datetime.fromisoformat(str(row["received_at"])) >= self.prospective_start_at
+            ]
         usable = [row for row in rows if row["usable"]]
         success_fraction = len(usable) / len(rows) if rows else 0.0
         quote_latencies = [float(row["quote_latency_ms"]) for row in rows]
@@ -306,6 +318,10 @@ class QuoteCertificationGate:
             "p95_quote_latency_ms": p95_quote,
             "p95_chain_to_quote_ms": p95_chain,
             "p99_chain_to_quote_ms": p99_chain,
+            "prospective_start_at": self.prospective_start_at.isoformat() if self.prospective_start_at else None,
             "measurement_path": "chain event -> complete/fresh risk decision -> amount-specific executable quote available",
-            "requirements": asdict(self.policy),
+            "requirements": {
+                **asdict(self.policy),
+                "prospective_release_boundary_required": True,
+            },
         }

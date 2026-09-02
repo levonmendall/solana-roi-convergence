@@ -7,7 +7,8 @@ import os
 from dataclasses import asdict
 
 from .config import BASELINE
-from .deployment import HeliusWebhookManager, deployment_preflight
+from .deployment import deployment_preflight
+from .split_webhooks import SplitHeliusWebhookManager
 
 
 def main() -> int:
@@ -32,7 +33,7 @@ def main() -> int:
         service_url = str(args.service_url or "").strip()
         if not service_url:
             parser.error("--service-url or RENDER_EXTERNAL_URL is required")
-        manager = HeliusWebhookManager(
+        manager = SplitHeliusWebhookManager(
             api_key=os.getenv("HELIUS_API_KEY", "").strip(),
             auth_header=os.getenv("HELIUS_WEBHOOK_AUTH", "").strip(),
         )

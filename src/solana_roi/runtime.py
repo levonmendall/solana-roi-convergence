@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .activation import CandidateActivationGate, ForwardCohortController
+from .certification_epoch import ensure_release_certification_epoch
 from .collecting_ingestion import CollectingLiveEvidenceIngestionService
 from .durable_engine import DurablePaperTradingEngine
 from .ingestion import WalletProfile, WalletProfileRegistry
@@ -15,15 +16,16 @@ from .launch_funding import CompleteLiveRiskCollectors, build_complete_live_coll
 from .models import WalletTier
 from .observation import LatencyCertificationGate, ShadowPriceClock, TimedRiskCollectors
 from .observation_store import ObservationEventStore
+from .prospective_shadow import ProspectiveShadowExecutionCertificationGate
 from .quote import JupiterQuoteOnlyClient, QuoteCertificationGate
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
 from .shadow_execution import (
     JupiterShadowTransactionSimulator,
     ShadowAwareQuoteCertificationGate,
-    ShadowExecutionCertificationGate,
     ShadowWalletExecutableQuoteHandoff,
 )
 from .source_coverage import SourceAwareProgramCoverageCertificationGate
+from .webhook_ingress import CompositeHeliusWebhookIngestion
 from .webhook_queue import DurableHeliusWebhookQueue, HeliusWebhookWorker
 
 
@@ -70,6 +72,7 @@ class IngestionRuntime:
     service: CollectingLiveEvidenceIngestionService
     webhook_queue: DurableHeliusWebhookQueue
     webhook_worker: HeliusWebhookWorker
+    certification_epoch: datetime
 
     @property
     def paper_signal_promotion_enabled(self) -> bool:
@@ -136,6 +139,7 @@ def _shadow_simulator(client: JupiterQuoteOnlyClient | None) -> JupiterShadowTra
 
 def build_runtime() -> IngestionRuntime:
     store = ObservationEventStore(Path(os.getenv("SOLANA_ROI_DB_PATH", "data/solana-roi.sqlite3")))
+    certification_epoch = ensure_release_certification_epoch(store)
     webhook_queue = DurableHeliusWebhookQueue(store)
     engine = DurablePaperTradingEngine(store=store)
     registry = WalletProfileRegistry(store)
@@ -146,7 +150,7 @@ def build_runtime() -> IngestionRuntime:
     risk = TokenRiskIntelligence(store, entity_resolver=entity_resolver, registry=registry, policy=policy)
     raw_collectors = build_complete_live_collectors(risk)
     collectors = TimedRiskCollectors(raw_collectors, risk=risk, store=store)
-    latency_gate = LatencyCertificationGate(store)
+    latency_gate = LatencyCertificationGate(store, prospective_start_at=certification_epoch)
 
     quote_client = _quote_client()
     shadow_wallet = os.getenv("SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY", "").strip()
@@ -157,10 +161,14 @@ def build_runtime() -> IngestionRuntime:
         full_position_notional_fn=lambda: engine.portfolio.full_position_notional(engine.marks),
         max_chase_fraction=engine.config.max_chase_fraction,
     )
-    base_quote_gate = QuoteCertificationGate(quote_handoff.ledger)
-    shadow_gate = ShadowExecutionCertificationGate(
+    base_quote_gate = QuoteCertificationGate(
+        quote_handoff.ledger,
+        prospective_start_at=certification_epoch,
+    )
+    shadow_gate = ProspectiveShadowExecutionCertificationGate(
         quote_handoff.shadow_ledger,
         shadow_wallet_public_key=shadow_wallet,
+        prospective_start_at=certification_epoch,
     )
     quote_gate = ShadowAwareQuoteCertificationGate(base_quote_gate, shadow_gate)
 
@@ -171,6 +179,7 @@ def build_runtime() -> IngestionRuntime:
             and raw_collectors.launch is not None
             and raw_collectors.funding is not None
         ),
+        prospective_start_at=certification_epoch,
     )
     cohort_controller = RuntimeForwardCohortController(
         store=store,
@@ -206,7 +215,8 @@ def build_runtime() -> IngestionRuntime:
         quote_handoff=quote_handoff,
         activation_gate=activation_gate,
     )
-    webhook_worker = HeliusWebhookWorker(queue=webhook_queue, service=service)
+    webhook_ingress = CompositeHeliusWebhookIngestion(service)
+    webhook_worker = HeliusWebhookWorker(queue=webhook_queue, service=webhook_ingress)
     return IngestionRuntime(
         store=store,
         engine=engine,
@@ -225,4 +235,5 @@ def build_runtime() -> IngestionRuntime:
         service=service,
         webhook_queue=webhook_queue,
         webhook_worker=webhook_worker,
+        certification_epoch=certification_epoch,
     )

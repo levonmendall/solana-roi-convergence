@@ -7,8 +7,8 @@ from typing import Any
 
 import httpx
 
-from .live_collectors import LiveRiskCollectors, build_live_collectors
-from .risk import EntityLink, FundingEvidence, LaunchEvidence, TokenRiskIntelligence
+from .live_collectors import LiveRiskCollectors, _fresh, build_live_collectors
+from .risk import EntityLink, FundingEvidence, LaunchEvidence, RiskDimension, TokenRiskIntelligence
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +35,7 @@ class DexScreenerLaunchCollector:
         self.risk, self.store = risk, risk.store
         self.client = client or httpx.AsyncClient(timeout=1.5)
         self.policy = policy or LaunchFundingPolicy()
+        self._created_at_cache: dict[str, datetime] = {}
 
     def _early_rows(self, mint: str, *, start: datetime, end: datetime, decision_at: datetime) -> list[dict[str, Any]]:
         with self.store._lock:
@@ -46,12 +47,15 @@ class DexScreenerLaunchCollector:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    async def collect(self, mint: str, at: datetime) -> bool:
+    async def _created_at(self, mint: str) -> datetime | None:
+        cached = self._created_at_cache.get(mint)
+        if cached is not None:
+            return cached
         response = await self.client.get(f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}", headers={"Accept": "application/json"})
         response.raise_for_status()
         pairs = response.json()
         if not isinstance(pairs, list):
-            return False
+            return None
         candidates = []
         for row in pairs:
             if not isinstance(row, dict) or row.get("chainId") != "solana" or row.get("pairCreatedAt") is None:
@@ -65,8 +69,17 @@ class DexScreenerLaunchCollector:
             if usd > 0:
                 candidates.append((usd, created))
         if not candidates:
-            return False
+            return None
         _, created_at = max(candidates, key=lambda item: item[0])
+        self._created_at_cache[mint] = created_at
+        return created_at
+
+    async def collect(self, mint: str, at: datetime) -> bool:
+        if _fresh(self.risk, mint, RiskDimension.LAUNCH, at):
+            return True
+        created_at = await self._created_at(mint)
+        if created_at is None:
+            return False
         if at < created_at + timedelta(seconds=self.policy.launch_window_seconds):
             return False
         rows = self._early_rows(
@@ -214,6 +227,8 @@ class HeliusFundingCollector:
         return best
 
     async def collect(self, mint: str, at: datetime) -> bool:
+        if _fresh(self.risk, mint, RiskDimension.FUNDING, at):
+            return True
         buyers = self._early_buyers(mint, at)
         if len(buyers) < 3:
             return False
@@ -262,16 +277,39 @@ class CompleteLiveRiskCollectors(LiveRiskCollectors):
         super().__init__(*args, **kwargs)
         self.launch, self.funding, self.coverage_asserted = launch, funding, coverage_asserted
 
-    async def refresh(self, mint: str, at: datetime, *, current_swap: Any = None) -> None:
+    async def _safe_bool(self, name: str, mint: str, at: datetime, awaitable: Any) -> bool:
+        try:
+            return bool(await awaitable)
+        except Exception as exc:
+            self.risk.store.append(
+                "risk_collector_error",
+                at.isoformat(),
+                {"collector": name, "token_mint": mint, "error_type": type(exc).__name__, "error": str(exc)[:500]},
+            )
+            return False
+
+    async def refresh_coverage(self, mint: str, at: datetime, *, current_swap: Any = None) -> None:
+        """Collect prospective launch/funding evidence for program-wide traffic.
+
+        Funding history is intentionally attempted only after launch evidence is
+        demonstrably near-creation and early-buyer complete. This prevents old
+        background pools from consuming the candidate latency budget.
+        """
+        if not self.coverage_asserted or self.launch is None:
+            return
+        launch_ok = await self._safe_bool("launch", mint, at, self.launch.collect(mint, at))
+        if launch_ok and self.funding is not None:
+            await self._safe_bool("funding", mint, at, self.funding.collect(mint, at))
+
+    async def refresh_candidate(self, mint: str, at: datetime, *, current_swap: Any = None) -> None:
+        """Refresh the four dynamic dimensions; launch/funding are pre-collected."""
         await super().refresh(mint, at, current_swap=current_swap)
-        tasks = []
-        if self.coverage_asserted and self.launch is not None:
-            tasks.append(self._safe("launch", mint, at, self.launch.collect(mint, at)))
-        if self.coverage_asserted and self.funding is not None:
-            tasks.append(self._safe("funding", mint, at, self.funding.collect(mint, at)))
-        if tasks:
-            import asyncio
-            await asyncio.gather(*tasks)
+
+    async def refresh(self, mint: str, at: datetime, *, current_swap: Any = None) -> None:
+        # Backward-compatible full refresh for offline/tests. Production timing
+        # uses refresh_coverage + refresh_candidate through TimedRiskCollectors.
+        await self.refresh_coverage(mint, at, current_swap=current_swap)
+        await self.refresh_candidate(mint, at, current_swap=current_swap)
 
     def status(self) -> dict[str, object]:
         base = super().status()

@@ -14,8 +14,9 @@ from pydantic import BaseModel
 
 from .activation import ARM_CONFIRMATION
 from .config import BASELINE
-from .deployment import auto_sync_helius_from_env, deployment_preflight
+from .deployment import deployment_preflight
 from .runtime import IngestionRuntime, build_runtime
+from .split_webhooks import auto_sync_split_helius_from_env
 
 
 @lru_cache(maxsize=1)
@@ -31,8 +32,8 @@ async def lifespan(app: FastAPI):
     webhook_stop = asyncio.Event()
     webhook_task = asyncio.create_task(runtime.webhook_worker.run(webhook_stop), name="helius-webhook-worker")
     bootstrap_task = asyncio.create_task(
-        auto_sync_helius_from_env(store=runtime.store),
-        name="helius-webhook-bootstrap",
+        auto_sync_split_helius_from_env(store=runtime.store),
+        name="helius-split-webhook-bootstrap",
     )
     enabled = os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"}
     if enabled:
@@ -55,7 +56,7 @@ async def lifespan(app: FastAPI):
             await bootstrap_task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.10.0", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.11.0", lifespan=lifespan)
 
 
 class ArmRequest(BaseModel):
@@ -68,6 +69,33 @@ def _require_cohort_admin(authorization: str | None) -> None:
         raise HTTPException(status_code=503, detail="forward cohort administrative authorization is not configured")
     if not hmac.compare_digest(authorization or "", expected):
         raise HTTPException(status_code=401, detail="invalid forward cohort administrative authorization")
+
+
+def _require_helius(authorization: str | None) -> None:
+    expected = os.getenv("HELIUS_WEBHOOK_AUTH", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Helius webhook authentication is not configured")
+    if not hmac.compare_digest(authorization or "", expected):
+        raise HTTPException(status_code=401, detail="invalid webhook authorization")
+
+
+def _enqueue_helius(payload: Any, authorization: str | None, *, feed: str) -> dict[str, object]:
+    _require_helius(authorization)
+    runtime = ingestion_runtime()
+    received_at = datetime.now(timezone.utc)
+    try:
+        inbox_id, inserted = runtime.webhook_queue.enqueue(payload, received_at=received_at)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON webhook payload") from exc
+    return {
+        "accepted": True,
+        "durably_queued": True,
+        "duplicate_delivery": not inserted,
+        "inbox_id": inbox_id,
+        "received_at": received_at.isoformat(),
+        "feed": feed,
+        "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
+    }
 
 
 @app.get("/health")
@@ -123,6 +151,7 @@ def ingestion_status() -> dict[str, object]:
         "execution_quotes": runtime.quote_gate.status(),
         "forward_cohort": runtime.cohort_controller.status(),
         "deployment_preflight": deployment_preflight(),
+        "certification_epoch": runtime.certification_epoch.isoformat(),
         "shadow_price_clock_enabled": os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"},
         "price_clock_drives_paper_engine": runtime.price_clock.drive_paper_engine,
         "evidence_counts": runtime.store.evidence_counts(),
@@ -241,22 +270,9 @@ def entity_summary(wallet: str) -> dict[str, object]:
 
 @app.post("/v1/ingestion/helius")
 def helius_webhook(payload: Any = Body(...), authorization: str | None = Header(default=None)) -> dict[str, object]:
-    expected = os.getenv("HELIUS_WEBHOOK_AUTH", "").strip()
-    if not expected:
-        raise HTTPException(status_code=503, detail="Helius webhook authentication is not configured")
-    if not hmac.compare_digest(authorization or "", expected):
-        raise HTTPException(status_code=401, detail="invalid webhook authorization")
-    runtime = ingestion_runtime()
-    received_at = datetime.now(timezone.utc)
-    try:
-        inbox_id, inserted = runtime.webhook_queue.enqueue(payload, received_at=received_at)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="invalid JSON webhook payload") from exc
-    return {
-        "accepted": True,
-        "durably_queued": True,
-        "duplicate_delivery": not inserted,
-        "inbox_id": inbox_id,
-        "received_at": received_at.isoformat(),
-        "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
-    }
+    return _enqueue_helius(payload, authorization, feed="enhanced")
+
+
+@app.post("/v1/ingestion/helius/pump-raw")
+def helius_pump_raw_webhook(payload: Any = Body(...), authorization: str | None = Header(default=None)) -> dict[str, object]:
+    return _enqueue_helius(payload, authorization, feed="pump_fun_raw")
