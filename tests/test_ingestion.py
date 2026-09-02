@@ -23,6 +23,57 @@ def test_helius_parser_normalizes_sol_buy():
     assert rows[0].reference_price_sol == 0.5
 
 
+def test_helius_parser_normalizes_pump_amm_buy_without_swap_event():
+    payload = [{
+        "type":"BUY","source":"PUMP_AMM","signature":"pump-buy","slot":124,"timestamp":1788283200,"feePayer":"wallet",
+        "nativeTransfers":[
+            {"fromUserAccount":"wallet","toUserAccount":"pool","amount":900_000_000},
+            {"fromUserAccount":"wallet","toUserAccount":"fee","amount":100_000_000},
+        ],
+        "tokenTransfers":[
+            {"fromUserAccount":"pool","toUserAccount":"wallet","mint":"pump-mint","tokenAmount":2000.0},
+        ],
+    }]
+    rows = HeliusEnhancedWebhookParser().parse(payload, received_at=datetime(2026,9,1,12,0,1,tzinfo=timezone.utc))
+    assert len(rows) == 1
+    assert rows[0].side == "buy"
+    assert rows[0].native_amount_sol == 1.0
+    assert rows[0].token_amount == 2000.0
+    assert rows[0].reference_price_sol == 0.0005
+    assert rows[0].source == "helius-enhanced-webhook:PUMP_AMM:buy"
+
+
+def test_helius_parser_normalizes_pump_amm_sell_without_swap_event():
+    payload = [{
+        "type":"SELL","source":"PUMP_AMM","signature":"pump-sell","slot":125,"timestamp":1788283200,"feePayer":"wallet",
+        "nativeTransfers":[
+            {"fromUserAccount":"pool","toUserAccount":"wallet","amount":950_000_000},
+        ],
+        "tokenTransfers":[
+            {"fromUserAccount":"wallet","toUserAccount":"pool","mint":"pump-mint","tokenAmount":2000.0},
+        ],
+    }]
+    rows = HeliusEnhancedWebhookParser().parse(payload, received_at=datetime(2026,9,1,12,0,1,tzinfo=timezone.utc))
+    assert len(rows) == 1
+    assert rows[0].side == "sell"
+    assert rows[0].native_amount_sol == 0.95
+    assert rows[0].token_amount == 2000.0
+    assert rows[0].source == "helius-enhanced-webhook:PUMP_AMM:sell"
+
+
+def test_helius_direct_trade_fails_closed_on_multi_mint_flow():
+    payload = [{
+        "type":"BUY","source":"PUMP_AMM","signature":"ambiguous","slot":126,"timestamp":1788283200,"feePayer":"wallet",
+        "nativeTransfers":[{"fromUserAccount":"wallet","toUserAccount":"pool","amount":1_000_000_000}],
+        "tokenTransfers":[
+            {"fromUserAccount":"pool","toUserAccount":"wallet","mint":"mint-a","tokenAmount":1000.0},
+            {"fromUserAccount":"pool","toUserAccount":"wallet","mint":"mint-b","tokenAmount":1.0},
+        ],
+    }]
+    rows = HeliusEnhancedWebhookParser().parse(payload, received_at=datetime(2026,9,1,12,0,1,tzinfo=timezone.utc))
+    assert rows == []
+
+
 def test_risk_unavailable_is_record_only(tmp_path):
     store = AppendOnlyEventStore(tmp_path / "e.sqlite3")
     registry = WalletProfileRegistry(store)

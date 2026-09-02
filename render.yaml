@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: solana-roi-convergence
+    runtime: python
+    plan: 1c-2g
+    buildCommand: pip install -e .
+    startCommand: uvicorn solana_roi.api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeployTrigger: off
+    numInstances: 1
+    disk:
+      name: roi-convergence-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PAPER_ONLY
+        value: "true"
+      - key: SOLANA_NETWORK
+        value: mainnet-beta
+      - key: SOLANA_ROI_DB_PATH
+        value: /var/data/solana-roi.sqlite3
+      - key: SOLANA_ROI_PROGRAM_WIDE_SWAP_COVERAGE
+        value: "true"
+      - key: SOLANA_ROI_SHADOW_CLOCK_ENABLED
+        value: "true"
+      - key: SOLANA_ROI_SHADOW_CLOCK_SECONDS
+        value: "1.0"
+      - key: SOLANA_ROI_PRICE_TRACKING_HORIZON_SECONDS
+        value: "300"
+      - key: HELIUS_API_KEY
+        sync: false
+      - key: HELIUS_WEBHOOK_AUTH
+        sync: false
+      - key: JUPITER_API_KEY
+        sync: false
+      - key: SOLANA_ROI_COHORT_ARM_AUTH
+        sync: false
+      - key: SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY
+        sync: false
