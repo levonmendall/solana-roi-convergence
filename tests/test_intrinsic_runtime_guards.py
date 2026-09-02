@@ -6,21 +6,22 @@ from solana_roi import api
 from solana_roi import direct_solana as direct_solana_module
 from solana_roi import solana_rpc as solana_rpc_module
 from solana_roi.direct_solana import DirectSolanaIngestionPlane
+from solana_roi.observation_store import ObservationEventStore
 
 
 def test_guards_install_even_when_legacy_api_entrypoint_is_imported():
     assert bool(getattr(DirectSolanaIngestionPlane._handle_notification, "_roi_cooperative_yield", False))
     assert bool(getattr(direct_solana_module.websockets.connect, "_roi_memory_bounded", False))
     assert bool(getattr(DirectSolanaIngestionPlane._prefill_launch_context, "_roi_memory_bounded", False))
-    assert bool(getattr(DirectSolanaIngestionPlane._stream_endpoint, "_roi_stream_guarded", False))
+    assert bool(getattr(DirectSolanaIngestionPlane._stream_endpoint, "_roi_sequential_subscription_setup", False))
     assert bool(getattr(DirectSolanaIngestionPlane._hydrate_one, "_roi_priority_routed", False))
     assert bool(getattr(DirectSolanaIngestionPlane.run, "_roi_worker_partitioned", False))
-    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_memory_bounded", False))
-    assert bool(getattr(direct_solana_module.rpc_endpoints_from_env, "_roi_provider_repair", False))
-    assert bool(getattr(solana_rpc_module.rpc_endpoints_from_env, "_roi_provider_repair", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_subscription_telemetry", False))
+    assert bool(getattr(direct_solana_module.rpc_endpoints_from_env, "_roi_official_secondary", False))
+    assert bool(getattr(solana_rpc_module.rpc_endpoints_from_env, "_roi_official_secondary", False))
 
 
-def test_known_failing_public_onfinality_is_replaced_for_stream_and_rpc_pool():
+def test_known_failed_shared_secondary_is_replaced_for_stream_and_rpc_pool():
     env = {
         "SOLANA_ROI_RPC_ENDPOINTS_JSON": json.dumps(
             [
@@ -39,14 +40,14 @@ def test_known_failing_public_onfinality_is_replaced_for_stream_and_rpc_pool():
     }
     stream_endpoints = direct_solana_module.rpc_endpoints_from_env(env)
     rpc_endpoints = solana_rpc_module.rpc_endpoints_from_env(env)
-    assert [endpoint.name for endpoint in stream_endpoints] == ["publicnode", "drpc"]
+    assert [endpoint.name for endpoint in stream_endpoints] == ["publicnode", "solana-mainnet"]
     assert stream_endpoints == rpc_endpoints
     assert stream_endpoints[0].http_url == "https://solana-rpc.publicnode.com"
-    assert stream_endpoints[1].http_url == "https://solana.drpc.org/"
-    assert stream_endpoints[1].ws_url == "wss://solana.drpc.org"
+    assert stream_endpoints[1].http_url == "https://api.mainnet.solana.com"
+    assert stream_endpoints[1].ws_url == "wss://api.mainnet.solana.com"
 
 
-def test_memory_boundary_is_visible_without_production_wrapper():
+def test_memory_boundary_is_visible_without_production_wrapper(tmp_path):
     class Rpc:
         @staticmethod
         def status():
@@ -62,11 +63,21 @@ def test_memory_boundary_is_visible_without_production_wrapper():
                 "provider_states": [],
             }
 
+    store = ObservationEventStore(tmp_path / "intrinsic-status.sqlite3")
+    with store._lock, store.db:
+        store.db.execute(
+            "CREATE TABLE IF NOT EXISTS direct_solana_hydration_metrics ("
+            "signature TEXT PRIMARY KEY, source TEXT, trigger_received_at TEXT NOT NULL, hydrated_at TEXT NOT NULL, "
+            "rpc_provider TEXT, rpc_latency_ms REAL, total_hydration_ms REAL NOT NULL, normalized INTEGER NOT NULL, "
+            "candidate_context_prefilled INTEGER NOT NULL DEFAULT 0, historical_recovery INTEGER NOT NULL DEFAULT 0)"
+        )
+
     plane = object.__new__(DirectSolanaIngestionPlane)
     plane.enabled = True
     plane.scout_wallets = ("a", "b", "c")
     plane.rpc = Rpc()
     plane.journal = Journal()
+    plane.store = store
     plane.endpoints = ()
     plane.candidate_context_max_signatures = 600
     plane.worker_count = 12
@@ -85,6 +96,7 @@ def test_memory_boundary_is_visible_without_production_wrapper():
     assert throughput["candidate_reserved_workers"] == 3
     assert throughput["background_workers"] == 9
     assert throughput["full_raw_market_scope_preserved"] is True
+    assert status["provider_runtime_policy"]["subscription_setup_mode"] == "sequential_ack_with_bounded_retry"
 
 
 def test_legacy_health_route_is_constant_time_liveness(monkeypatch):
