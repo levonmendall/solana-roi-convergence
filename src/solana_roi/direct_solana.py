@@ -41,17 +41,12 @@ class WatchTarget:
 
 
 class DirectSolanaJournal:
-    """Compact durable receipt journal plus restart-safe hydration queue.
-
-    Raw full-market receipts are kept only for a short candidate-reconstruction
-    window. Per-minute counts and rolling signature digests are retained, which
-    proves prospective full-scope observation without storing a million verbose
-    webhook payloads per day.
-    """
+    """Compact durable full-market receipt journal and hydration queue."""
 
     def __init__(self, store: Any, *, raw_retention_seconds: float = 900.0):
         self.store = store
         self.raw_retention_seconds = max(120.0, float(raw_retention_seconds))
+        now = utcnow().isoformat()
         with store._lock, store.db:
             store.db.execute(
                 "CREATE TABLE IF NOT EXISTS direct_solana_recent_receipts ("
@@ -83,8 +78,17 @@ class DirectSolanaJournal:
                 "CREATE TABLE IF NOT EXISTS direct_solana_hydration_metrics ("
                 "signature TEXT PRIMARY KEY, source TEXT, trigger_received_at TEXT NOT NULL, "
                 "hydrated_at TEXT NOT NULL, rpc_provider TEXT, rpc_latency_ms REAL, total_hydration_ms REAL NOT NULL, "
-                "normalized INTEGER NOT NULL, candidate_context_prefilled INTEGER NOT NULL DEFAULT 0)"
+                "normalized INTEGER NOT NULL, candidate_context_prefilled INTEGER NOT NULL DEFAULT 0, "
+                "historical_recovery INTEGER NOT NULL DEFAULT 0)"
             )
+            columns = {
+                str(row["name"])
+                for row in store.db.execute("PRAGMA table_info(direct_solana_hydration_metrics)").fetchall()
+            }
+            if "historical_recovery" not in columns:
+                store.db.execute(
+                    "ALTER TABLE direct_solana_hydration_metrics ADD COLUMN historical_recovery INTEGER NOT NULL DEFAULT 0"
+                )
             store.db.execute(
                 "CREATE TABLE IF NOT EXISTS direct_solana_provider_state ("
                 "provider TEXT PRIMARY KEY, connected INTEGER NOT NULL, connected_at TEXT, last_message_at TEXT, "
@@ -98,42 +102,26 @@ class DirectSolanaJournal:
             store.db.execute(
                 "INSERT OR IGNORE INTO direct_solana_global_state(id, unresolved_gap) VALUES (1, 0)"
             )
-            # Any item interrupted by a process restart is safe to replay.
+            store.db.execute("UPDATE direct_solana_provider_state SET connected=0")
             store.db.execute(
                 "UPDATE direct_solana_hydration_queue SET status='pending', updated_at=? WHERE status='processing'",
-                (utcnow().isoformat(),),
+                (now,),
             )
         self._receipt_inserts = 0
 
-    def record_receipt(
-        self,
-        *,
-        signature: str,
-        source_key: str,
-        slot: int,
-        received_at: datetime,
-        launch_like: bool,
-    ) -> bool:
+    def record_receipt(self, *, signature: str, source_key: str, slot: int, received_at: datetime, launch_like: bool) -> bool:
         expires_at = received_at + timedelta(seconds=self.raw_retention_seconds)
         with self.store._lock, self.store.db:
             cur = self.store.db.execute(
                 "INSERT OR IGNORE INTO direct_solana_recent_receipts("
                 "signature, source_key, slot, received_at, launch_like, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    signature,
-                    source_key,
-                    int(slot),
-                    received_at.isoformat(),
-                    1 if launch_like else 0,
-                    expires_at.isoformat(),
-                ),
+                (signature, source_key, int(slot), received_at.isoformat(), 1 if launch_like else 0, expires_at.isoformat()),
             )
             inserted = cur.rowcount == 1
             if inserted and source_key in {"PUMP_FUN", "PUMP_AMM", "RAYDIUM"}:
                 bucket = received_at.replace(second=0, microsecond=0).isoformat()
                 row = self.store.db.execute(
-                    "SELECT receipt_count, first_received_at, rolling_sha256 FROM direct_solana_minute_receipts "
-                    "WHERE bucket=? AND source=?",
+                    "SELECT receipt_count, rolling_sha256 FROM direct_solana_minute_receipts WHERE bucket=? AND source=?",
                     (bucket, source_key),
                 ).fetchone()
                 previous = str(row["rolling_sha256"]) if row is not None else ""
@@ -157,26 +145,15 @@ class DirectSolanaJournal:
                 self._receipt_inserts += 1
                 if self._receipt_inserts % 500 == 0:
                     self.store.db.execute(
-                        "DELETE FROM direct_solana_recent_receipts WHERE expires_at<?",
-                        (received_at.isoformat(),),
+                        "DELETE FROM direct_solana_recent_receipts WHERE expires_at<?", (received_at.isoformat(),)
                     )
         return inserted
 
-    def enqueue(
-        self,
-        *,
-        signature: str,
-        slot: int,
-        trigger_received_at: datetime,
-        source_hint: str | None,
-        priority: int,
-        reason: str,
-    ) -> None:
+    def enqueue(self, *, signature: str, slot: int, trigger_received_at: datetime, source_hint: str | None, priority: int, reason: str) -> None:
         now = utcnow().isoformat()
         with self.store._lock, self.store.db:
             row = self.store.db.execute(
-                "SELECT priority, source_hint, status FROM direct_solana_hydration_queue WHERE signature=?",
-                (signature,),
+                "SELECT priority, source_hint, status FROM direct_solana_hydration_queue WHERE signature=?", (signature,)
             ).fetchone()
             if row is None:
                 self.store.db.execute(
@@ -188,15 +165,14 @@ class DirectSolanaJournal:
                 return
             new_priority = min(int(row["priority"]), int(priority))
             existing_hint = str(row["source_hint"] or "") or None
-            merged_hint = existing_hint or source_hint
             status = str(row["status"])
             self.store.db.execute(
-                "UPDATE direct_solana_hydration_queue SET source_hint=?, priority=?, reason=?, "
-                "status=?, updated_at=? WHERE signature=?",
+                "UPDATE direct_solana_hydration_queue SET source_hint=?, priority=?, reason=?, status=?, updated_at=? "
+                "WHERE signature=?",
                 (
-                    merged_hint,
+                    existing_hint or source_hint,
                     new_priority,
-                    reason if new_priority == int(priority) else reason,
+                    reason,
                     "pending" if status == "failed" and priority <= 2 else status,
                     now,
                     signature,
@@ -215,8 +191,7 @@ class DirectSolanaJournal:
                 return None
             self.store.db.execute(
                 "UPDATE direct_solana_hydration_queue SET status='processing', attempts=attempts+1, updated_at=? "
-                "WHERE signature=? AND status='pending'",
-                (now, str(row["signature"])),
+                "WHERE signature=? AND status='pending'", (now, str(row["signature"]))
             )
             return dict(row)
 
@@ -228,53 +203,27 @@ class DirectSolanaJournal:
             )
 
     def record_hydration(
-        self,
-        *,
-        signature: str,
-        source: str | None,
-        trigger_received_at: datetime,
-        hydrated_at: datetime,
-        rpc_provider: str | None,
-        rpc_latency_ms: float | None,
-        normalized: bool,
-        candidate_context_prefilled: bool = False,
+        self, *, signature: str, source: str | None, trigger_received_at: datetime, hydrated_at: datetime,
+        rpc_provider: str | None, rpc_latency_ms: float | None, normalized: bool,
+        candidate_context_prefilled: bool = False, historical_recovery: bool = False,
     ) -> None:
         total_ms = max(0.0, (hydrated_at - trigger_received_at).total_seconds() * 1000.0)
         with self.store._lock, self.store.db:
             self.store.db.execute(
                 "INSERT INTO direct_solana_hydration_metrics("
-                "signature, source, trigger_received_at, hydrated_at, rpc_provider, rpc_latency_ms, "
-                "total_hydration_ms, normalized, candidate_context_prefilled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "signature, source, trigger_received_at, hydrated_at, rpc_provider, rpc_latency_ms, total_hydration_ms, "
+                "normalized, candidate_context_prefilled, historical_recovery) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(signature) DO UPDATE SET source=excluded.source, hydrated_at=excluded.hydrated_at, "
                 "rpc_provider=excluded.rpc_provider, rpc_latency_ms=excluded.rpc_latency_ms, "
                 "total_hydration_ms=excluded.total_hydration_ms, normalized=excluded.normalized, "
-                "candidate_context_prefilled=MAX(candidate_context_prefilled, excluded.candidate_context_prefilled)",
-                (
-                    signature,
-                    source,
-                    trigger_received_at.isoformat(),
-                    hydrated_at.isoformat(),
-                    rpc_provider,
-                    rpc_latency_ms,
-                    total_ms,
-                    1 if normalized else 0,
-                    1 if candidate_context_prefilled else 0,
-                ),
+                "candidate_context_prefilled=MAX(candidate_context_prefilled, excluded.candidate_context_prefilled), "
+                "historical_recovery=MAX(historical_recovery, excluded.historical_recovery)",
+                (signature, source, trigger_received_at.isoformat(), hydrated_at.isoformat(), rpc_provider, rpc_latency_ms,
+                 total_ms, 1 if normalized else 0, 1 if candidate_context_prefilled else 0, 1 if historical_recovery else 0),
             )
 
-    def recent_source_signatures(
-        self,
-        source: str,
-        *,
-        start: datetime,
-        end: datetime,
-        exclude_signature: str | None = None,
-        limit: int = 600,
-    ) -> list[dict[str, Any]]:
-        sql = (
-            "SELECT signature, slot, received_at FROM direct_solana_recent_receipts "
-            "WHERE source_key=? AND received_at>=? AND received_at<=?"
-        )
+    def recent_source_signatures(self, source: str, *, start: datetime, end: datetime, exclude_signature: str | None = None, limit: int = 600) -> list[dict[str, Any]]:
+        sql = "SELECT signature, slot, received_at FROM direct_solana_recent_receipts WHERE source_key=? AND received_at>=? AND received_at<=?"
         args: list[Any] = [source, start.isoformat(), end.isoformat()]
         if exclude_signature:
             sql += " AND signature<>?"
@@ -289,8 +238,7 @@ class DirectSolanaJournal:
         now = utcnow().isoformat()
         with self.store._lock, self.store.db:
             row = self.store.db.execute(
-                "SELECT connected, reconnect_count FROM direct_solana_provider_state WHERE provider=?",
-                (provider,),
+                "SELECT connected, reconnect_count FROM direct_solana_provider_state WHERE provider=?", (provider,)
             ).fetchone()
             reconnects = int(row["reconnect_count"]) if row is not None else 0
             was_connected = bool(row["connected"]) if row is not None else False
@@ -300,25 +248,21 @@ class DirectSolanaJournal:
                 "INSERT INTO direct_solana_provider_state("
                 "provider, connected, connected_at, last_message_at, reconnect_count, last_error_type) "
                 "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET "
-                "connected=excluded.connected, connected_at=CASE WHEN excluded.connected=1 THEN excluded.connected_at "
-                "ELSE connected_at END, last_message_at=CASE WHEN excluded.connected=1 THEN excluded.last_message_at "
-                "ELSE last_message_at END, reconnect_count=excluded.reconnect_count, "
-                "last_error_type=excluded.last_error_type",
+                "connected=excluded.connected, connected_at=CASE WHEN excluded.connected=1 THEN excluded.connected_at ELSE connected_at END, "
+                "last_message_at=CASE WHEN excluded.connected=1 THEN excluded.last_message_at ELSE last_message_at END, "
+                "reconnect_count=excluded.reconnect_count, last_error_type=excluded.last_error_type",
                 (provider, 1 if connected else 0, now if connected else None, now if connected else None, reconnects, error_type),
             )
 
     def touch_provider(self, provider: str, received_at: datetime) -> None:
         with self.store._lock, self.store.db:
             self.store.db.execute(
-                "UPDATE direct_solana_provider_state SET last_message_at=? WHERE provider=?",
-                (received_at.isoformat(), provider),
+                "UPDATE direct_solana_provider_state SET last_message_at=? WHERE provider=?", (received_at.isoformat(), provider)
             )
 
     def connected_provider_count(self) -> int:
         with self.store._lock:
-            row = self.store.db.execute(
-                "SELECT COUNT(*) AS n FROM direct_solana_provider_state WHERE connected=1"
-            ).fetchone()
+            row = self.store.db.execute("SELECT COUNT(*) AS n FROM direct_solana_provider_state WHERE connected=1").fetchone()
         return int(row["n"]) if row is not None else 0
 
     def mark_outage(self, started_at: datetime) -> None:
@@ -330,9 +274,7 @@ class DirectSolanaJournal:
 
     def outage_started_at(self) -> datetime | None:
         with self.store._lock:
-            row = self.store.db.execute(
-                "SELECT outage_started_at FROM direct_solana_global_state WHERE id=1"
-            ).fetchone()
+            row = self.store.db.execute("SELECT outage_started_at FROM direct_solana_global_state WHERE id=1").fetchone()
         raw = str(row["outage_started_at"] or "") if row is not None else ""
         return datetime.fromisoformat(raw) if raw else None
 
@@ -345,26 +287,21 @@ class DirectSolanaJournal:
             )
 
     def status(self) -> dict[str, Any]:
+        now = utcnow()
         with self.store._lock:
             providers = [dict(row) for row in self.store.db.execute(
-                "SELECT provider, connected, connected_at, last_message_at, reconnect_count, last_error_type "
-                "FROM direct_solana_provider_state ORDER BY provider"
+                "SELECT provider, connected, connected_at, last_message_at, reconnect_count, last_error_type FROM direct_solana_provider_state ORDER BY provider"
             ).fetchall()]
             global_row = self.store.db.execute(
-                "SELECT outage_started_at, unresolved_gap, last_backfill_complete_at, last_backfill_error "
-                "FROM direct_solana_global_state WHERE id=1"
+                "SELECT outage_started_at, unresolved_gap, last_backfill_complete_at, last_backfill_error FROM direct_solana_global_state WHERE id=1"
             ).fetchone()
-            queue_rows = self.store.db.execute(
-                "SELECT status, COUNT(*) AS n FROM direct_solana_hydration_queue GROUP BY status"
-            ).fetchall()
+            queue_rows = self.store.db.execute("SELECT status, COUNT(*) AS n FROM direct_solana_hydration_queue GROUP BY status").fetchall()
             source_rows = self.store.db.execute(
-                "SELECT source, SUM(receipt_count) AS n FROM direct_solana_minute_receipts "
-                "WHERE bucket>=? GROUP BY source",
-                ((utcnow() - timedelta(hours=1)).replace(second=0, microsecond=0).isoformat(),),
+                "SELECT source, SUM(receipt_count) AS n FROM direct_solana_minute_receipts WHERE bucket>=? GROUP BY source",
+                ((now - timedelta(hours=1)).replace(second=0, microsecond=0).isoformat(),),
             ).fetchall()
             metrics = [dict(row) for row in self.store.db.execute(
-                "SELECT total_hydration_ms, normalized FROM direct_solana_hydration_metrics "
-                "ORDER BY hydrated_at DESC LIMIT 500"
+                "SELECT total_hydration_ms, normalized FROM direct_solana_hydration_metrics WHERE historical_recovery=0 ORDER BY hydrated_at DESC LIMIT 500"
             ).fetchall()]
         values = sorted(float(row["total_hydration_ms"]) for row in metrics)
         p95 = values[min(len(values) - 1, int((len(values) - 1) * 0.95))] if values else None
@@ -372,15 +309,18 @@ class DirectSolanaJournal:
         sources = {str(row["source"]): int(row["n"]) for row in source_rows}
         unresolved = bool(global_row["unresolved_gap"]) if global_row is not None else True
         connected = sum(1 for row in providers if bool(row["connected"]))
+        outage_started = str(global_row["outage_started_at"] or "") if global_row is not None else ""
+        backfill_at = str(global_row["last_backfill_complete_at"] or "") if global_row is not None else ""
+        backfill_error = str(global_row["last_backfill_error"] or "") if global_row is not None else ""
         return {
             "durable": True,
             "connected_provider_count": connected,
             "provider_states": providers,
             "continuity_ok": connected >= 1 and not unresolved,
             "unresolved_gap": unresolved,
-            "outage_started_at": str(global_row["outage_started_at"] or "") or None if global_row is not None else None,
-            "last_backfill_complete_at": str(global_row["last_backfill_complete_at"] or "") or None if global_row is not None else None,
-            "last_backfill_error": str(global_row["last_backfill_error"] or "") or None if global_row is not None else None,
+            "outage_started_at": outage_started or None,
+            "last_backfill_complete_at": backfill_at or None,
+            "last_backfill_error": backfill_error or None,
             "hydration_queue": queue,
             "raw_receipts_last_hour_by_source": sources,
             "hydration_sample_count": len(metrics),
@@ -390,29 +330,13 @@ class DirectSolanaJournal:
 
 
 class DirectSolanaIngestionPlane:
-    """Full-scope processed stream with prioritized authoritative hydration.
-
-    Every frozen program is observed continuously at processed commitment. Scout
-    signatures are hydrated first and hedged across independent RPC endpoints.
-    Background market transactions are deterministically sampled for empirical
-    certification, while the complete compact receipt journal remains available
-    to reconstruct the launch window around a candidate before its risk decision.
-    """
+    """Full-scope processed stream with prioritized confirmed hydration."""
 
     def __init__(
-        self,
-        *,
-        store: Any,
-        service: Any,
-        scout_wallets: tuple[str, ...],
-        rpc_pool: SolanaRpcPool | None = None,
-        endpoints: tuple[RpcEndpoint, ...] | None = None,
-        coverage_status_fn: Callable[[], dict[str, Any]] | None = None,
-        worker_count: int = 12,
-        market_sample_modulus: int = 20,
-        audit_sample_modulus: int = 200,
-        candidate_context_deadline_seconds: float = 3.0,
-        candidate_context_max_signatures: int = 600,
+        self, *, store: Any, service: Any, scout_wallets: tuple[str, ...], rpc_pool: SolanaRpcPool | None = None,
+        endpoints: tuple[RpcEndpoint, ...] | None = None, coverage_status_fn: Callable[[], dict[str, Any]] | None = None,
+        worker_count: int = 12, market_sample_modulus: int = 20, audit_sample_modulus: int = 200,
+        candidate_context_deadline_seconds: float = 3.0, candidate_context_max_signatures: int = 600,
         gap_backfill_max_pages: int = 5,
     ):
         self.store = store
@@ -427,10 +351,7 @@ class DirectSolanaIngestionPlane:
         self.candidate_context_deadline_seconds = max(0.5, float(candidate_context_deadline_seconds))
         self.candidate_context_max_signatures = max(50, int(candidate_context_max_signatures))
         self.gap_backfill_max_pages = max(1, int(gap_backfill_max_pages))
-        self.journal = DirectSolanaJournal(
-            store,
-            raw_retention_seconds=float(os.getenv("SOLANA_ROI_DIRECT_RAW_RETENTION_SECONDS", "900")),
-        )
+        self.journal = DirectSolanaJournal(store, raw_retention_seconds=float(os.getenv("SOLANA_ROI_DIRECT_RAW_RETENTION_SECONDS", "900")))
         self._connection_lock = asyncio.Lock()
         self._connected: set[str] = set()
         self._initial_connection_observed = False
@@ -440,11 +361,8 @@ class DirectSolanaIngestionPlane:
 
     @property
     def watch_targets(self) -> tuple[WatchTarget, ...]:
-        programs = tuple(
-            WatchTarget(kind="program", address=address, source_hint=PROGRAM_SOURCE_BY_ID[address])
-            for address in FROZEN_PROGRAM_ADDRESSES
-        )
-        scouts = tuple(WatchTarget(kind="scout", address=wallet, source_hint=None) for wallet in self.scout_wallets)
+        programs = tuple(WatchTarget("program", address, PROGRAM_SOURCE_BY_ID[address]) for address in FROZEN_PROGRAM_ADDRESSES)
+        scouts = tuple(WatchTarget("scout", wallet, None) for wallet in self.scout_wallets)
         return programs + scouts
 
     @staticmethod
@@ -500,12 +418,7 @@ class DirectSolanaIngestionPlane:
                 before: str | None = None
                 reached_boundary = False
                 for _ in range(self.gap_backfill_max_pages):
-                    rows, _provider, _latency = await self.rpc.get_signatures_for_address(
-                        target.address,
-                        before=before,
-                        limit=1000,
-                        hedge=False,
-                    )
+                    rows, _provider, _latency = await self.rpc.get_signatures_for_address(target.address, before=before, limit=1000, hedge=False)
                     if not rows:
                         reached_boundary = True
                         break
@@ -521,14 +434,10 @@ class DirectSolanaIngestionPlane:
                             break
                         if not signature or row.get("err") is not None:
                             continue
-                        trigger = datetime.fromtimestamp(block_time, tz=timezone.utc) if block_time else utcnow()
+                        chain_time = datetime.fromtimestamp(block_time, tz=timezone.utc) if block_time else utcnow()
                         self.journal.enqueue(
-                            signature=signature,
-                            slot=slot,
-                            trigger_received_at=trigger,
-                            source_hint=target.source_hint,
-                            priority=2 if target.kind == "scout" else 15,
-                            reason="gap_backfill",
+                            signature=signature, slot=slot, trigger_received_at=chain_time, source_hint=target.source_hint,
+                            priority=2 if target.kind == "scout" else 15, reason="gap_backfill",
                         )
                     if reached_boundary:
                         break
@@ -550,31 +459,16 @@ class DirectSolanaIngestionPlane:
         backoff = 0.25
         while not stop.is_set():
             try:
-                async with websockets.connect(
-                    endpoint.ws_url,
-                    ping_interval=15,
-                    ping_timeout=15,
-                    close_timeout=2,
-                    max_queue=8192,
-                    max_size=4 * 1024 * 1024,
-                ) as ws:
+                async with websockets.connect(endpoint.ws_url, ping_interval=15, ping_timeout=15, close_timeout=2, max_queue=8192, max_size=4 * 1024 * 1024) as ws:
                     await self._connection_state(endpoint.name, True)
                     backoff = 0.25
                     request_targets: dict[int, WatchTarget] = {}
                     subscription_targets: dict[int, WatchTarget] = {}
-                    next_id = 1
-                    for target in self.watch_targets:
-                        request_id = next_id
-                        next_id += 1
+                    for request_id, target in enumerate(self.watch_targets, start=1):
                         request_targets[request_id] = target
                         await ws.send(json.dumps({
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "method": "logsSubscribe",
-                            "params": [
-                                {"mentions": [target.address]},
-                                {"commitment": "processed"},
-                            ],
+                            "jsonrpc": "2.0", "id": request_id, "method": "logsSubscribe",
+                            "params": [{"mentions": [target.address]}, {"commitment": "processed"}],
                         }))
                     pending_acks = set(request_targets)
                     buffered: list[dict[str, Any]] = []
@@ -598,25 +492,18 @@ class DirectSolanaIngestionPlane:
                             pong = await ws.ping()
                             await asyncio.wait_for(pong, timeout=5.0)
                             continue
-                        message = json.loads(raw)
-                        await self._handle_notification(endpoint.name, subscription_targets, message)
+                        await self._handle_notification(endpoint.name, subscription_targets, json.loads(raw))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 await self._connection_state(endpoint.name, False, type(exc).__name__)
-                if stop.is_set():
-                    break
-                await asyncio.sleep(backoff)
-                backoff = min(10.0, backoff * 2.0)
+                if not stop.is_set():
+                    await asyncio.sleep(backoff)
+                    backoff = min(10.0, backoff * 2.0)
             else:
                 await self._connection_state(endpoint.name, False, None)
 
-    async def _handle_notification(
-        self,
-        provider: str,
-        subscription_targets: dict[int, WatchTarget],
-        message: dict[str, Any],
-    ) -> None:
+    async def _handle_notification(self, provider: str, subscription_targets: dict[int, WatchTarget], message: dict[str, Any]) -> None:
         if message.get("method") != "logsNotification":
             return
         params = message.get("params")
@@ -625,9 +512,8 @@ class DirectSolanaIngestionPlane:
         try:
             subscription = int(params["subscription"])
             result = params["result"]
-            context = result["context"]
+            slot = int(result["context"]["slot"])
             value = result["value"]
-            slot = int(context["slot"])
             signature = str(value["signature"])
         except (KeyError, TypeError, ValueError):
             return
@@ -636,47 +522,23 @@ class DirectSolanaIngestionPlane:
             return
         received_at = utcnow()
         self.journal.touch_provider(provider, received_at)
-        logs = value.get("logs") if isinstance(value, dict) else []
-        launch_like = self._launch_like(logs)
+        launch_like = self._launch_like(value.get("logs") if isinstance(value, dict) else [])
         source_key = target.source_hint or f"SCOUT:{target.address}"
-        inserted = self.journal.record_receipt(
-            signature=signature,
-            source_key=source_key,
-            slot=slot,
-            received_at=received_at,
-            launch_like=launch_like,
-        )
+        inserted = self.journal.record_receipt(signature=signature, source_key=source_key, slot=slot, received_at=received_at, launch_like=launch_like)
         if not inserted or value.get("err") is not None:
             return
         if target.kind == "scout":
-            self.journal.enqueue(
-                signature=signature,
-                slot=slot,
-                trigger_received_at=received_at,
-                source_hint=None,
-                priority=0,
-                reason="frozen_scout_processed_trigger",
-            )
+            self.journal.enqueue(signature=signature, slot=slot, trigger_received_at=received_at, source_hint=None, priority=0, reason="frozen_scout_processed_trigger")
             return
         source = str(target.source_hint)
         modulus = self.market_sample_modulus if self._coverage_needs_more(source) else self.audit_sample_modulus
         if launch_like or self._sample(signature, modulus):
             self.journal.enqueue(
-                signature=signature,
-                slot=slot,
-                trigger_received_at=received_at,
-                source_hint=source,
-                priority=10 if launch_like else 20,
-                reason="prospective_launch" if launch_like else "deterministic_market_sample",
+                signature=signature, slot=slot, trigger_received_at=received_at, source_hint=source,
+                priority=10 if launch_like else 20, reason="prospective_launch" if launch_like else "deterministic_market_sample",
             )
 
-    async def _get_transaction_ready(
-        self,
-        signature: str,
-        *,
-        hedge: bool,
-        attempts: int,
-    ) -> tuple[Any, str | None, float | None]:
+    async def _get_transaction_ready(self, signature: str, *, hedge: bool, attempts: int) -> tuple[Any, str | None, float | None]:
         last_error: Exception | None = None
         for index in range(max(1, attempts)):
             try:
@@ -712,23 +574,15 @@ class DirectSolanaIngestionPlane:
 
     def _persist_context_swap(self, swap: NormalizedSwap) -> None:
         inserted = self.store.record_swap(
-            signature=swap.signature,
-            slot=swap.slot,
-            observed_at=swap.observed_at.isoformat(),
-            received_at=swap.received_at.isoformat(),
-            wallet=swap.wallet,
-            token_mint=swap.token_mint,
-            side=swap.side,
-            token_amount=swap.token_amount,
-            native_amount_sol=swap.native_amount_sol,
-            reference_price_sol=swap.reference_price_sol,
-            ingestion_latency_ms=swap.ingestion_latency_ms,
-            source=swap.source,
+            signature=swap.signature, slot=swap.slot, observed_at=swap.observed_at.isoformat(), received_at=swap.received_at.isoformat(),
+            wallet=swap.wallet, token_mint=swap.token_mint, side=swap.side, token_amount=swap.token_amount,
+            native_amount_sol=swap.native_amount_sol, reference_price_sol=swap.reference_price_sol,
+            ingestion_latency_ms=swap.ingestion_latency_ms, source=swap.source,
         )
         if inserted:
             self.store.append("normalized_swap", swap.received_at.isoformat(), asdict(swap))
 
-    async def _prefill_candidate_context(self, candidate: NormalizedSwap) -> bool:
+    async def _prefill_launch_context(self, candidate: NormalizedSwap) -> bool:
         parts = candidate.source.split(":")
         if len(parts) < 3:
             return False
@@ -740,15 +594,11 @@ class DirectSolanaIngestionPlane:
         if created_at is None:
             return False
         launch_window_end = created_at + timedelta(seconds=8.0)
-        # If the launch window is still in progress, do not invent future data.
         if candidate.received_at < launch_window_end:
             return False
         rows = self.journal.recent_source_signatures(
-            source,
-            start=created_at - timedelta(seconds=1.0),
-            end=launch_window_end,
-            exclude_signature=candidate.signature,
-            limit=self.candidate_context_max_signatures,
+            source, start=created_at - timedelta(seconds=1.0), end=launch_window_end,
+            exclude_signature=candidate.signature, limit=self.candidate_context_max_signatures,
         )
         if not rows:
             return False
@@ -759,28 +609,13 @@ class DirectSolanaIngestionPlane:
                 signature = str(row["signature"])
                 trigger = datetime.fromisoformat(str(row["received_at"]))
                 try:
-                    result, provider, latency = await self._get_transaction_ready(
-                        signature,
-                        hedge=False,
-                        attempts=3,
-                    )
-                    swap = normalize_standard_transaction(
-                        result,
-                        signature=signature,
-                        trigger_received_at=trigger,
-                        source_hint=source,
-                    )
+                    result, provider, latency = await self._get_transaction_ready(signature, hedge=False, attempts=3)
+                    swap = normalize_standard_transaction(result, signature=signature, trigger_received_at=trigger, source_hint=source)
                     if swap is not None and swap.token_mint == candidate.token_mint:
                         self._persist_context_swap(swap)
                         self.journal.record_hydration(
-                            signature=signature,
-                            source=source,
-                            trigger_received_at=trigger,
-                            hydrated_at=utcnow(),
-                            rpc_provider=provider,
-                            rpc_latency_ms=latency,
-                            normalized=True,
-                            candidate_context_prefilled=True,
+                            signature=signature, source=source, trigger_received_at=trigger, hydrated_at=utcnow(),
+                            rpc_provider=provider, rpc_latency_ms=latency, normalized=True, candidate_context_prefilled=True,
                         )
                 except Exception:
                     return
@@ -800,51 +635,43 @@ class DirectSolanaIngestionPlane:
         signature = str(row["signature"])
         trigger = datetime.fromisoformat(str(row["trigger_received_at"]))
         priority = int(row["priority"])
+        reason = str(row["reason"])
         source_hint = str(row["source_hint"] or "") or None
+        historical_recovery = reason == "gap_backfill"
         try:
             result, provider, latency = await self._get_transaction_ready(
-                signature,
-                hedge=priority <= 2,
-                attempts=8 if priority <= 2 else 4,
+                signature, hedge=priority <= 2 and not historical_recovery, attempts=8 if priority <= 2 else 4
             )
             if result is None:
                 attempts = int(row["attempts"]) + 1
-                self.journal.finish(
-                    signature,
-                    error="confirmed transaction not yet available",
-                    retry=priority <= 2 and attempts < 5,
-                )
+                self.journal.finish(signature, error="confirmed transaction not yet available", retry=priority <= 2 and attempts < 5)
                 return
-            swap = normalize_standard_transaction(
-                result,
-                signature=signature,
-                trigger_received_at=trigger,
-                source_hint=source_hint,
-            )
+            swap = normalize_standard_transaction(result, signature=signature, trigger_received_at=trigger, source_hint=source_hint)
             context_prefilled = False
-            if swap is not None and self.service.registry.get(swap.wallet) is not None and swap.side == "buy":
-                context_prefilled = await self._prefill_candidate_context(swap)
             if swap is not None:
-                await self.service.ingest_swap(swap)
+                if historical_recovery:
+                    self._persist_context_swap(swap)
+                else:
+                    profile = self.service.registry.get(swap.wallet)
+                    needs_context = bool(
+                        (profile is not None and swap.side == "buy") or reason == "prospective_launch"
+                        or (source_hint is not None and self._coverage_needs_more(source_hint))
+                    )
+                    if needs_context:
+                        context_prefilled = await self._prefill_launch_context(swap)
+                    await self.service.ingest_swap(swap)
             source = swap.source.split(":")[1] if swap is not None and ":" in swap.source else source_hint
             self.journal.record_hydration(
-                signature=signature,
-                source=source,
-                trigger_received_at=trigger,
-                hydrated_at=utcnow(),
-                rpc_provider=provider,
-                rpc_latency_ms=latency,
-                normalized=swap is not None,
-                candidate_context_prefilled=context_prefilled,
+                signature=signature, source=source, trigger_received_at=trigger, hydrated_at=utcnow(), rpc_provider=provider,
+                rpc_latency_ms=latency, normalized=swap is not None, candidate_context_prefilled=context_prefilled,
+                historical_recovery=historical_recovery,
             )
             self.journal.finish(signature)
         except Exception as exc:
             attempts = int(row["attempts"]) + 1
-            retry = priority <= 2 and attempts < 5
             self.journal.finish(
-                signature,
-                error=f"{type(exc).__name__}: direct hydration failed closed",
-                retry=retry,
+                signature, error=f"{type(exc).__name__}: direct hydration failed closed",
+                retry=priority <= 2 and attempts < 5,
             )
 
     async def _worker(self, stop: asyncio.Event) -> None:
@@ -859,14 +686,8 @@ class DirectSolanaIngestionPlane:
         if not self.enabled:
             await stop.wait()
             return
-        tasks = [
-            asyncio.create_task(self._stream_endpoint(endpoint, stop), name=f"direct-solana-ws:{endpoint.name}")
-            for endpoint in self.endpoints
-        ]
-        tasks.extend(
-            asyncio.create_task(self._worker(stop), name=f"direct-solana-hydrator:{index}")
-            for index in range(self.worker_count)
-        )
+        tasks = [asyncio.create_task(self._stream_endpoint(endpoint, stop), name=f"direct-solana-ws:{endpoint.name}") for endpoint in self.endpoints]
+        tasks.extend(asyncio.create_task(self._worker(stop), name=f"direct-solana-hydrator:{index}") for index in range(self.worker_count))
         try:
             await stop.wait()
         finally:
@@ -877,7 +698,6 @@ class DirectSolanaIngestionPlane:
                 self.journal.set_provider(endpoint.name, connected=False)
 
     def status(self) -> dict[str, Any]:
-        journal = self.journal.status()
         return {
             "enabled": self.enabled,
             "transport": "standard-solana-json-rpc+logsSubscribe",
@@ -890,5 +710,5 @@ class DirectSolanaIngestionPlane:
             "signing_available": False,
             "transaction_submission_available": False,
             "rpc_pool": self.rpc.status(),
-            **journal,
+            **self.journal.status(),
         }
