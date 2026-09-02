@@ -119,29 +119,15 @@ def _latest_helius_bootstrap(runtime: IngestionRuntime) -> dict[str, object]:
 
 @app.get("/health")
 def health() -> dict[str, object]:
-    runtime = ingestion_runtime()
-    cohort = runtime.cohort_controller.status()
-    preflight = deployment_preflight()
-    direct = runtime.direct_ingestion.status()
+    # Render liveness must never contend on the SQLite evidence plane or execute
+    # certification/readiness scans. Deep health remains under the explicit
+    # status endpoints; this route proves only that the HTTP process can answer.
     return {
         "status": "ok",
+        "liveness_only": True,
         "paper_only": True,
         "live_money_authority": False,
         "strategy_version": BASELINE.version,
-        "deployment_preflight_ready": preflight["ready_for_live_shadow_collection"],
-        "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
-        "risk_entity_plane_connected": True,
-        "live_risk_collectors_connected": True,
-        "direct_solana_enabled": direct["enabled"],
-        "direct_solana_continuity_ok": direct["continuity_ok"],
-        "direct_solana_connected_providers": direct["connected_provider_count"],
-        "webhook_queue": runtime.webhook_queue.status(),
-        "latency_certified": cohort["latency"]["certified"],
-        "amount_specific_quote_certified": cohort["execution_quotes"]["certified"],
-        "program_wide_coverage_verified": cohort["coverage"]["certified"],
-        "forward_cohort_ready": cohort["forward_cohort_ready"],
-        "forward_cohort_armed": cohort["armed"],
-        "runtime_continuity_ok": cohort["runtime_continuity_ok"],
     }
 
 
