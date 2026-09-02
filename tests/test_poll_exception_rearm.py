@@ -8,7 +8,6 @@ import pytest
 from solana_roi import live_poll_redundancy as live_poll
 from solana_roi import poll_exception_rearm as repair
 from solana_roi import poll_recoverability_lease as lease
-from solana_roi import poll_standby_rearm as standby
 from solana_roi import poll_watermark_repair as watermark
 from solana_roi import target_quorum
 from solana_roi.direct_solana import DirectSolanaIngestionPlane, WatchTarget
@@ -50,16 +49,19 @@ def test_recoverable_delta_exception_uses_existing_same_target_standby_rearm(mon
     target = WatchTarget("program", "program-a", "PUMP_FUN")
     stop = asyncio.Event()
     quorum_calls: list[bool] = []
-    page_calls = 0
 
     async def fake_page(*_args, **_kwargs):
-        nonlocal page_calls
-        page_calls += 1
-        slot = 100 if page_calls == 1 else 200
-        return [{"signature": f"s{slot}", "slot": slot}], "publicnode", 5.0
+        return [{"signature": "s100", "slot": 100}], "publicnode", 5.0
 
     async def failing_delta(*_args, **_kwargs):
         raise TimeoutError("transient paginated read failure")
+
+    class Pool:
+        async def call_with_meta(self, method, params, *, hedge):
+            assert method == "getSlot"
+            assert params == [{"commitment": "confirmed"}]
+            assert hedge is True
+            return 200, "solana-mainnet", 4.0
 
     async def fake_quorum(*_args, connected, **_kwargs):
         quorum_calls.append(bool(connected))
@@ -69,6 +71,7 @@ def test_recoverable_delta_exception_uses_existing_same_target_standby_rearm(mon
     monkeypatch.setattr(repair, "_ORIGINAL_FETCH_DELTA", failing_delta)
     monkeypatch.setattr(watermark, "_slot_fetch_delta", repair._exception_rearm_fetch_delta)
     monkeypatch.setattr(watermark, "_slot_poll_page", fake_page)
+    monkeypatch.setattr(live_poll, "_poll_rpc", lambda _self: Pool())
     monkeypatch.setattr(live_poll, "_ws_target_covered", lambda *_args: True)
     monkeypatch.setattr(target_quorum, "_quorum_set_target_state", fake_quorum)
     monkeypatch.setattr(live_poll, "POLL_INTERVAL_SECONDS", 0.01)
