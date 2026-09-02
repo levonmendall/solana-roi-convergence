@@ -88,6 +88,15 @@ def test_render_preflight_requires_persistent_disk_release_and_rejects_private_k
     assert {"persistent_sqlite", "release_commit", "no_private_key_material"} <= failed
 
 
+def test_preflight_fails_closed_on_malformed_scout_sample_size():
+    env = _complete_env()
+    env["SOLANA_ROI_WALLET_PROFILES_JSON"] = '[{"wallet":"11111111111111111111111111111111","entity_id":"x","tier":"S","first_touch_sample_size":"bad","historically_eligible":true}]'
+    status = deployment_preflight(env)
+    assert status["ready_for_live_shadow_collection"] is False
+    check = next(row for row in status["checks"] if row["name"] == "frozen_scout_cohort")
+    assert check["ok"] is False
+
+
 def test_helius_sync_creates_exact_program_wide_enhanced_webhook():
     client = FakeClient()
     manager = HeliusWebhookManager(api_key="k", auth_header="secret", client=client)
@@ -101,7 +110,7 @@ def test_helius_sync_creates_exact_program_wide_enhanced_webhook():
     assert desired["authHeader"] == "secret"
 
 
-def test_helius_sync_is_idempotent_when_public_configuration_matches():
+def test_helius_sync_is_idempotent_when_complete_configuration_matches():
     target = "https://roi.example/v1/ingestion/helius"
     existing = [{
         "webhookID": "existing-id",
@@ -109,6 +118,7 @@ def test_helius_sync_is_idempotent_when_public_configuration_matches():
         "transactionTypes": ["ANY"],
         "accountAddresses": list(FROZEN_PROGRAM_ADDRESSES),
         "webhookType": "enhanced",
+        "authHeader": "secret",
         "active": True,
     }]
     client = FakeClient(existing)
@@ -118,3 +128,23 @@ def test_helius_sync_is_idempotent_when_public_configuration_matches():
     assert result["webhook_id"] == "existing-id"
     assert client.posts == []
     assert client.puts == []
+
+
+def test_helius_sync_updates_when_auth_header_rotates():
+    target = "https://roi.example/v1/ingestion/helius"
+    existing = [{
+        "webhookID": "existing-id",
+        "webhookURL": target,
+        "transactionTypes": ["ANY"],
+        "accountAddresses": list(FROZEN_PROGRAM_ADDRESSES),
+        "webhookType": "enhanced",
+        "authHeader": "old-secret",
+        "active": True,
+    }]
+    client = FakeClient(existing)
+    manager = HeliusWebhookManager(api_key="k", auth_header="new-secret", client=client)
+    result = asyncio.run(manager.sync("https://roi.example"))
+    assert result["action"] == "updated"
+    assert client.posts == []
+    assert len(client.puts) == 1
+    assert client.puts[0][1]["authHeader"] == "new-secret"
