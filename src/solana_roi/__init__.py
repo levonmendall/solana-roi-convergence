@@ -23,12 +23,19 @@ from .transport_hardening import install_transport_hardening
 
 install_transport_hardening()
 
-# A dedicated WebSocket reader resolves subscription acknowledgements separately
-# from live notification processing. This prevents high-volume Solana traffic from
-# starving the remaining handshake while retaining bounded fail-closed dispatch.
+# Keep the multiplexed handshake implementation available as a compatibility
+# fallback, but the final production run topology below does not depend on a
+# provider accepting ten subscriptions on one public WebSocket.
 from .handshake_pump import install_handshake_pump
 
 install_handshake_pump()
+
+# Free public Solana endpoints proved that one-socket multiplexing is not robust
+# enough for the frozen ten-target feed. Isolate every target on its own bounded
+# WebSocket, and only declare a provider live when all ten target streams are live.
+from .target_stream_fanout import install_target_stream_fanout
+
+install_target_stream_fanout()
 
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
