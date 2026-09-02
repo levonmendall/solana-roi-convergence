@@ -27,12 +27,15 @@ services:
       - key: SOLANA_ROI_PROGRAM_WIDE_SWAP_COVERAGE
         value: "true"
       # Full original seven-program scope comes directly from standard Solana
-      # WebSockets/RPC. PublicNode is primary; Solana's documented public mainnet
-      # endpoint is the zero-cost fallback. Both remain read-only and paper-only.
+      # WebSockets/RPC. PublicNode and Solana public mainnet remain the two base
+      # providers. A secret-backed Alchemy endpoint is appended at runtime as the
+      # independent third prospective continuity observer. All remain read-only.
       - key: SOLANA_ROI_DIRECT_SOLANA_ENABLED
         value: "true"
       - key: SOLANA_ROI_RPC_ENDPOINTS_JSON
         value: '[{"name":"publicnode","http":"https://solana-rpc.publicnode.com","ws":"wss://solana-rpc.publicnode.com"},{"name":"solana-mainnet","http":"https://api.mainnet.solana.com","ws":"wss://api.mainnet.solana.com"}]'
+      - key: SOLANA_ROI_ALCHEMY_API_KEY
+        sync: false
       - key: SOLANA_ROI_RPC_TIMEOUT_SECONDS
         value: "2.5"
       - key: SOLANA_ROI_RPC_HEDGE_DELAY_SECONDS
@@ -62,7 +65,7 @@ services:
       - key: SOLANA_ROI_WALLET_PROFILES_JSON
         value: '[{"wallet":"4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk","entity_id":"kol:jijo","tier":"S","first_touch_sample_size":191,"historically_eligible":true},{"wallet":"862TYSvRYoiHAK3F3WwTRYAfuGiQaGdxedN9AGvRGWo2","entity_id":"kol:wugi","tier":"S","first_touch_sample_size":52,"historically_eligible":true},{"wallet":"DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt","entity_id":"kol:the-doc","tier":"S","first_touch_sample_size":121,"historically_eligible":true}]'
       # Jupiter remains the amount-specific quote/simulation provider. Standard
-      # Solana metadata and risk collection no longer require Helius credits.
+      # Solana metadata and risk collection do not require Helius.
       - key: JUPITER_API_KEY
         sync: false
       - key: SOLANA_ROI_COHORT_ARM_AUTH

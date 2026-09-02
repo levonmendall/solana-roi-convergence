@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -32,32 +33,56 @@ DEFAULT_RPC_ENDPOINTS: tuple[RpcEndpoint, ...] = (
 )
 
 
+def _alchemy_endpoint_from_env(values: dict[str, str]) -> RpcEndpoint | None:
+    token = str(values.get("SOLANA_ROI_ALCHEMY_API_KEY") or "").strip()
+    if not token:
+        return None
+    encoded_token = quote(token, safe="")
+    return RpcEndpoint(
+        name="alchemy",
+        http_url=f"https://solana-mainnet.g.alchemy.com/v2/{encoded_token}",
+        ws_url=f"wss://solana-mainnet.streaming.alchemy.com/v2/{encoded_token}",
+    )
+
+
 def rpc_endpoints_from_env(env: dict[str, str] | None = None) -> tuple[RpcEndpoint, ...]:
     values = env if env is not None else os.environ
     raw = str(values.get("SOLANA_ROI_RPC_ENDPOINTS_JSON") or "").strip()
     if not raw:
-        return DEFAULT_RPC_ENDPOINTS
-    payload = json.loads(raw)
-    if not isinstance(payload, list) or not payload:
-        raise ValueError("SOLANA_ROI_RPC_ENDPOINTS_JSON must be a non-empty JSON array")
-    rows: list[RpcEndpoint] = []
-    seen_names: set[str] = set()
-    seen_http: set[str] = set()
-    seen_ws: set[str] = set()
-    for item in payload:
-        if not isinstance(item, dict):
-            raise ValueError("RPC endpoint entries must be objects")
-        name = str(item.get("name") or "").strip()
-        http_url = str(item.get("http") or item.get("http_url") or "").strip()
-        ws_url = str(item.get("ws") or item.get("ws_url") or "").strip()
-        if not name or not http_url.startswith("https://") or not ws_url.startswith("wss://"):
-            raise ValueError("each RPC endpoint requires name, https http URL, and wss URL")
-        if name in seen_names or http_url in seen_http or ws_url in seen_ws:
-            raise ValueError("RPC endpoints must be distinct")
-        seen_names.add(name)
-        seen_http.add(http_url)
-        seen_ws.add(ws_url)
-        rows.append(RpcEndpoint(name=name, http_url=http_url, ws_url=ws_url))
+        rows = list(DEFAULT_RPC_ENDPOINTS)
+    else:
+        payload = json.loads(raw)
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("SOLANA_ROI_RPC_ENDPOINTS_JSON must be a non-empty JSON array")
+        rows = []
+        seen_names: set[str] = set()
+        seen_http: set[str] = set()
+        seen_ws: set[str] = set()
+        for item in payload:
+            if not isinstance(item, dict):
+                raise ValueError("RPC endpoint entries must be objects")
+            name = str(item.get("name") or "").strip()
+            http_url = str(item.get("http") or item.get("http_url") or "").strip()
+            ws_url = str(item.get("ws") or item.get("ws_url") or "").strip()
+            if not name or not http_url.startswith("https://") or not ws_url.startswith("wss://"):
+                raise ValueError("each RPC endpoint requires name, https http URL, and wss URL")
+            if name in seen_names or http_url in seen_http or ws_url in seen_ws:
+                raise ValueError("RPC endpoints must be distinct")
+            seen_names.add(name)
+            seen_http.add(http_url)
+            seen_ws.add(ws_url)
+            rows.append(RpcEndpoint(name=name, http_url=http_url, ws_url=ws_url))
+
+    alchemy = _alchemy_endpoint_from_env(dict(values))
+    if alchemy is not None:
+        explicit_alchemy = any(
+            endpoint.name == "alchemy"
+            or endpoint.http_url.split("/", 3)[2].endswith(".alchemy.com")
+            or endpoint.ws_url.split("/", 3)[2].endswith(".alchemy.com")
+            for endpoint in rows
+        )
+        if not explicit_alchemy:
+            rows.append(alchemy)
     return tuple(rows)
 
 

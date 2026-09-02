@@ -47,6 +47,11 @@ def deployment_preflight(env: Mapping[str, str] | None = None) -> dict[str, Any]
         len(endpoints) >= 2,
         "at least two distinct standard Solana HTTP/WebSocket endpoints are required",
     ))
+    checks.append(PreflightCheck(
+        "independent_standard_rpc_quorum",
+        len(endpoints) >= 3,
+        "at least three distinct standard Solana HTTP/WebSocket providers are required for prospective continuity",
+    ))
 
     if _truthy(values.get("RENDER")):
         persistent = str(values.get("SOLANA_ROI_DB_PATH") or "").startswith("/var/data/")

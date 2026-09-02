@@ -88,6 +88,45 @@ def test_endpoint_configuration_rejects_duplicates_and_requires_secure_transport
         rpc_endpoints_from_env({"SOLANA_ROI_RPC_ENDPOINTS_JSON": insecure})
 
 
+def test_alchemy_observer_is_appended_from_secret_without_changing_base_endpoints():
+    base = json.dumps([
+        {"name": "a", "http": "https://a.example", "ws": "wss://a.example"},
+        {"name": "b", "http": "https://b.example", "ws": "wss://b.example"},
+    ])
+    secret = "test-secret"
+    endpoints = rpc_endpoints_from_env({
+        "SOLANA_ROI_RPC_ENDPOINTS_JSON": base,
+        "SOLANA_ROI_ALCHEMY_API_KEY": secret,
+    })
+    assert [endpoint.name for endpoint in endpoints] == ["a", "b", "alchemy"]
+    assert endpoints[2].http_url == f"https://solana-mainnet.g.alchemy.com/v2/{secret}"
+    assert endpoints[2].ws_url == f"wss://solana-mainnet.streaming.alchemy.com/v2/{secret}"
+
+    pool = SolanaRpcPool(
+        endpoints,
+        clients={endpoint.name: FakeClient(1) for endpoint in endpoints},
+    )
+    status = pool.status()
+    assert status["endpoint_count"] == 3
+    assert status["endpoints"][2]["http_host"] == "solana-mainnet.g.alchemy.com"
+    assert status["endpoints"][2]["ws_host"] == "solana-mainnet.streaming.alchemy.com"
+    assert secret not in repr(status)
+
+
+def test_alchemy_observer_is_not_duplicated_when_explicitly_configured():
+    explicit = json.dumps([
+        {"name": "a", "http": "https://a.example", "ws": "wss://a.example"},
+        {"name": "b", "http": "https://b.example", "ws": "wss://b.example"},
+        {"name": "alchemy", "http": "https://solana-mainnet.g.alchemy.com/v2/external", "ws": "wss://solana-mainnet.streaming.alchemy.com/v2/external"},
+    ])
+    endpoints = rpc_endpoints_from_env({
+        "SOLANA_ROI_RPC_ENDPOINTS_JSON": explicit,
+        "SOLANA_ROI_ALCHEMY_API_KEY": "ignored-because-explicit",
+    })
+    assert len(endpoints) == 3
+    assert [endpoint.name for endpoint in endpoints].count("alchemy") == 1
+
+
 def test_status_exposes_hosts_not_full_endpoint_urls():
     endpoints = (
         RpcEndpoint("keyed", "https://rpc.example/path?api-key=super-secret", "wss://ws.example/path?key=hidden"),
