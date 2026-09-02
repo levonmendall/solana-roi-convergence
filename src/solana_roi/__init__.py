@@ -68,6 +68,14 @@ from .poll_watermark_repair import install_poll_watermark_repair
 
 install_poll_watermark_repair()
 
+# If the bounded polling delta overflows while the same frozen target is still
+# covered by a real WebSocket, re-baseline only the standby poll watermark from
+# the current confirmed head. This never restores an invalid prospective gap; it
+# only prevents a safely redundant polling lane from remaining frozen forever.
+from .poll_standby_rearm import install_poll_standby_rearm
+
+install_poll_standby_rearm()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
