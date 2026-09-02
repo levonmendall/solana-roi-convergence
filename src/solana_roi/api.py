@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from .activation import ARM_CONFIRMATION
 from .config import BASELINE
-from .deployment import deployment_preflight
+from .direct_deployment import deployment_preflight
 from .runtime import IngestionRuntime, build_runtime
 
 
