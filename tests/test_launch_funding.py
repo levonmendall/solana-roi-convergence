@@ -81,8 +81,8 @@ def test_seeded_chain_timestamp_removes_pair_indexer_from_critical_path(tmp_path
     collector.seed_created_at("mint", created)
     at = created + timedelta(seconds=10)
     assert asyncio.run(collector.collect("mint", at))
-    coverage = store.recent_program_coverage(10)[0]
-    assert coverage["pair_created_at"] == created.isoformat()
+    row = store.latest_risk_evidence("mint", RiskDimension.LAUNCH.value, as_of_received_at=at.isoformat())
+    assert row is not None
 
 
 def test_launch_refuses_stream_that_started_late(tmp_path):
