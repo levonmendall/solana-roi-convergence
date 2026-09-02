@@ -45,12 +45,20 @@ from .target_quorum import install_target_quorum
 
 install_target_quorum()
 
-# The current two no-SLA public peers can still overlap on the same target outage.
-# Add a third best-effort WSS observer without putting its previously unreliable
-# shared HTTP service back into hydration/risk/quote RPC selection.
+# Optional managed/free WSS observers remain supported, but no unauthenticated
+# third-party shared endpoint is trusted by default after production proved the
+# dRPC public WSS could not establish even one frozen subscription.
 from .stream_redundancy import install_stream_redundancy
 
 install_stream_redundancy()
+
+# WebSocket-only failures must not invalidate a release when the read-only HTTP RPC
+# plane is still healthy. Continuously poll every frozen target prospectively and
+# admit that transport into the same target-quorum state machine. This is not
+# historical backfill: the cursor is maintained continuously from release startup.
+from .live_poll_redundancy import install_live_poll_redundancy
+
+install_live_poll_redundancy()
 
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
