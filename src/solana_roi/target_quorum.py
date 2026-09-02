@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import suppress
 from typing import Any, Callable
 
 from . import direct_solana as direct_solana_module
@@ -148,14 +147,16 @@ async def _quorum_set_target_state(
         setattr(self, "_roi_full_scope_target_count", len(all_keys))
 
     # Provider-level telemetry remains strict: a provider is 'connected' only at
-    # 10/10. This does not control full-scope continuity anymore; the target union
-    # below does.
+    # 10/10. This no longer defines full-scope continuity; the target union does.
     if provider_to_full:
         self.journal.set_provider(provider, connected=True, error_type=None)
     elif provider_from_full:
         self.journal.set_provider(provider, connected=False, error_type=error_type)
-    elif not connected and not bool(getattr(self, "_roi_provider_ever_full", {}).get(provider, False)):
-        self.journal.set_provider(provider, connected=False, error_type=error_type)
+    else:
+        ever_full = getattr(self, "_roi_provider_ever_full", None)
+        if not isinstance(ever_full, dict) or not bool(ever_full.get(provider, False)):
+            if not connected:
+                self.journal.set_provider(provider, connected=False, error_type=error_type)
 
     ever_full = getattr(self, "_roi_provider_ever_full", None)
     if not isinstance(ever_full, dict):
@@ -306,10 +307,7 @@ def _status_with_quorum(original: Callable[[Any], dict[str, Any]]) -> Callable[[
             "target_count": len(all_keys),
             "coverage_ok": coverage_ok,
             "minimum_live_provider_count_per_target": min(
-                (
-                    sum(1 for rows in provider_targets.values() if key in rows)
-                    for key in all_keys
-                ),
+                (sum(1 for rows in provider_targets.values() if key in rows) for key in all_keys),
                 default=0,
             ),
             "historical_backfill_can_restore_prospective_continuity": False,
@@ -327,8 +325,18 @@ def _status_with_quorum(original: Callable[[Any], dict[str, Any]]) -> Callable[[
             )
         return payload
 
+    # Preserve the marker contract accumulated by the intrinsic status wrappers;
+    # production.py and regressions use these markers to avoid re-wrapping and
+    # hiding richer telemetry depending on import order.
+    for marker in (
+        "_roi_memory_bounded",
+        "_roi_subscription_telemetry",
+        "_roi_transport_hardened",
+        "_roi_handshake_pumped",
+        "_roi_target_fanout",
+    ):
+        setattr(status, marker, True)
     setattr(status, "_roi_target_quorum", True)
-    setattr(status, "_roi_memory_bounded", True)
     return status
 
 
