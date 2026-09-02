@@ -36,7 +36,7 @@ def test_rpc_pool_and_stream_share_the_same_repaired_endpoint_factory():
     }
     rpc_endpoints = solana_rpc_module.rpc_endpoints_from_env(env)
     stream_endpoints = direct_solana_module.rpc_endpoints_from_env(env)
-    assert [row.name for row in rpc_endpoints] == ["publicnode", "drpc"]
+    assert [row.name for row in rpc_endpoints] == ["publicnode", "solana-mainnet"]
     assert rpc_endpoints == stream_endpoints
 
 
