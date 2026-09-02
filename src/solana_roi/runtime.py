@@ -14,6 +14,7 @@ from .launch_funding import CompleteLiveRiskCollectors, build_complete_live_coll
 from .models import WalletTier
 from .observation import LatencyCertificationGate, ShadowPriceClock, TimedRiskCollectors
 from .observation_store import ObservationEventStore
+from .quote import ExecutableQuoteLedger, JupiterQuoteOnlyClient, QuoteCertificationGate, ShadowExecutableQuoteHandoff
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
 
 
@@ -28,9 +29,11 @@ class IngestionRuntime:
     collectors: TimedRiskCollectors
     price_clock: ShadowPriceClock
     latency_gate: LatencyCertificationGate
+    quote_handoff: ShadowExecutableQuoteHandoff
+    quote_gate: QuoteCertificationGate
     service: CollectingLiveEvidenceIngestionService
     paper_signal_promotion_enabled: bool = False
-    paper_signal_promotion_blocker: str = "latency and post-risk executable-price handoff are not yet certified"
+    paper_signal_promotion_blocker: str = "latency and amount-specific executable quote handoff are not yet prospectively certified"
 
 
 def _wallet_profiles_from_env() -> list[WalletProfile]:
@@ -56,6 +59,14 @@ def _wallet_profiles_from_env() -> list[WalletProfile]:
     return profiles
 
 
+def _quote_client() -> JupiterQuoteOnlyClient | None:
+    jupiter = os.getenv("JUPITER_API_KEY", "").strip()
+    helius = os.getenv("HELIUS_API_KEY", "").strip()
+    if not jupiter or not helius:
+        return None
+    return JupiterQuoteOnlyClient(jupiter_api_key=jupiter, helius_api_key=helius)
+
+
 def build_runtime() -> IngestionRuntime:
     store = ObservationEventStore(Path(os.getenv("SOLANA_ROI_DB_PATH", "data/solana-roi.sqlite3")))
     engine = PaperTradingEngine(store=store)
@@ -75,6 +86,13 @@ def build_runtime() -> IngestionRuntime:
         drive_paper_engine=False,
     )
     latency_gate = LatencyCertificationGate(store)
+    quote_handoff = ShadowExecutableQuoteHandoff(
+        store=store,
+        client=_quote_client(),
+        full_position_notional_fn=lambda: engine.portfolio.full_position_notional(engine.marks),
+        max_chase_fraction=engine.config.max_chase_fraction,
+    )
+    quote_gate = QuoteCertificationGate(quote_handoff.ledger)
     service = CollectingLiveEvidenceIngestionService(
         engine=engine,
         store=store,
@@ -84,6 +102,7 @@ def build_runtime() -> IngestionRuntime:
         promote_paper_signals=False,
         collectors=collectors,
         mark_recorder=price_clock,
+        quote_handoff=quote_handoff,
     )
     return IngestionRuntime(
         store=store,
@@ -95,5 +114,7 @@ def build_runtime() -> IngestionRuntime:
         collectors=collectors,
         price_clock=price_clock,
         latency_gate=latency_gate,
+        quote_handoff=quote_handoff,
+        quote_gate=quote_gate,
         service=service,
     )
