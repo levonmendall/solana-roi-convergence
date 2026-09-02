@@ -88,7 +88,19 @@ def test_endpoint_configuration_rejects_duplicates_and_requires_secure_transport
         rpc_endpoints_from_env({"SOLANA_ROI_RPC_ENDPOINTS_JSON": insecure})
 
 
-def test_alchemy_observer_is_appended_from_secret_without_changing_base_endpoints():
+def test_alchemy_secret_is_idle_by_default_without_changing_public_endpoints():
+    base = json.dumps([
+        {"name": "a", "http": "https://a.example", "ws": "wss://a.example"},
+        {"name": "b", "http": "https://b.example", "ws": "wss://b.example"},
+    ])
+    endpoints = rpc_endpoints_from_env({
+        "SOLANA_ROI_RPC_ENDPOINTS_JSON": base,
+        "SOLANA_ROI_ALCHEMY_API_KEY": "configured-but-idle",
+    })
+    assert [endpoint.name for endpoint in endpoints] == ["a", "b"]
+
+
+def test_alchemy_can_be_explicitly_opted_in_without_exposing_secret_in_status():
     base = json.dumps([
         {"name": "a", "http": "https://a.example", "ws": "wss://a.example"},
         {"name": "b", "http": "https://b.example", "ws": "wss://b.example"},
@@ -97,6 +109,7 @@ def test_alchemy_observer_is_appended_from_secret_without_changing_base_endpoint
     endpoints = rpc_endpoints_from_env({
         "SOLANA_ROI_RPC_ENDPOINTS_JSON": base,
         "SOLANA_ROI_ALCHEMY_API_KEY": secret,
+        "SOLANA_ROI_ENABLE_METERED_ALCHEMY": "true",
     })
     assert [endpoint.name for endpoint in endpoints] == ["a", "b", "alchemy"]
     assert endpoints[2].http_url == f"https://solana-mainnet.g.alchemy.com/v2/{secret}"
@@ -113,7 +126,7 @@ def test_alchemy_observer_is_appended_from_secret_without_changing_base_endpoint
     assert secret not in repr(status)
 
 
-def test_alchemy_observer_is_not_duplicated_when_explicitly_configured():
+def test_explicit_alchemy_endpoint_is_also_idle_without_metered_opt_in():
     explicit = json.dumps([
         {"name": "a", "http": "https://a.example", "ws": "wss://a.example"},
         {"name": "b", "http": "https://b.example", "ws": "wss://b.example"},
@@ -123,8 +136,15 @@ def test_alchemy_observer_is_not_duplicated_when_explicitly_configured():
         "SOLANA_ROI_RPC_ENDPOINTS_JSON": explicit,
         "SOLANA_ROI_ALCHEMY_API_KEY": "ignored-because-explicit",
     })
-    assert len(endpoints) == 3
-    assert [endpoint.name for endpoint in endpoints].count("alchemy") == 1
+    assert [endpoint.name for endpoint in endpoints] == ["a", "b"]
+
+    opted_in = rpc_endpoints_from_env({
+        "SOLANA_ROI_RPC_ENDPOINTS_JSON": explicit,
+        "SOLANA_ROI_ALCHEMY_API_KEY": "ignored-because-explicit",
+        "SOLANA_ROI_ENABLE_METERED_ALCHEMY": "true",
+    })
+    assert len(opted_in) == 3
+    assert [endpoint.name for endpoint in opted_in].count("alchemy") == 1
 
 
 def test_status_exposes_hosts_not_full_endpoint_urls():
