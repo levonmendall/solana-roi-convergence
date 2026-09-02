@@ -64,9 +64,9 @@ def test_standard_rpc_parser_reads_inner_system_transfer_and_ignores_outbound():
 
 class NeverReachesBoundaryRpc:
     async def get_signatures_for_address(self, _wallet, *, before=None, limit=1000, hedge=False):
-        # One recent row on every page. A one-page policy therefore cannot prove
-        # complete coverage of the configured lookback and must fail closed.
-        return ([{"signature": "recent", "blockTime": 1_788_321_600, "err": None}], "rpc-a", 1.0)
+        # 2026-09-01 is inside the seven-day lookback but does not reach its
+        # lower boundary. A one-page policy therefore cannot prove completeness.
+        return ([{"signature": "recent", "blockTime": 1_788_220_800, "err": None}], "rpc-a", 1.0)
 
 
 def test_funding_history_is_incomplete_when_bounded_pagination_cannot_reach_lookback():
