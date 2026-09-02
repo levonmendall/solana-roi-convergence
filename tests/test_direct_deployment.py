@@ -20,6 +20,7 @@ def _env():
         "JUPITER_API_KEY": "configured",
         "SOLANA_ROI_COHORT_ARM_AUTH": "configured",
         "SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY": SHADOW_WALLET,
+        "SOLANA_ROI_ALCHEMY_API_KEY": "configured",
     }
 
 
@@ -34,8 +35,18 @@ def test_direct_preflight_is_ready_without_helius_credentials():
     assert status["provider_enhanced_webhook_required"] is False
     assert status["strategy_scope_reduced"] is False
     assert len(status["program_addresses"]) == 7
-    assert len(status["rpc_endpoints"]) >= 2
+    assert len(status["rpc_endpoints"]) >= 3
     assert "HELIUS_API_KEY" not in repr(status)
+    assert "configured" not in repr(status["rpc_endpoints"])
+
+
+def test_two_rpc_endpoints_fail_independent_quorum():
+    env = _env()
+    env.pop("SOLANA_ROI_ALCHEMY_API_KEY")
+    status = deployment_preflight(env)
+    assert status["ready_for_live_shadow_collection"] is False
+    assert _checks(status)["redundant_standard_rpc"]["ok"] is True
+    assert _checks(status)["independent_standard_rpc_quorum"]["ok"] is False
 
 
 def test_direct_disabled_fails_preflight_closed():
@@ -48,12 +59,14 @@ def test_direct_disabled_fails_preflight_closed():
 
 def test_single_rpc_endpoint_fails_redundancy_preflight():
     env = _env()
+    env.pop("SOLANA_ROI_ALCHEMY_API_KEY")
     env["SOLANA_ROI_RPC_ENDPOINTS_JSON"] = json.dumps([
         {"name": "only", "http": "https://only.example", "ws": "wss://only.example"},
     ])
     status = deployment_preflight(env)
     assert status["ready_for_live_shadow_collection"] is False
     assert _checks(status)["redundant_standard_rpc"]["ok"] is False
+    assert _checks(status)["independent_standard_rpc_quorum"]["ok"] is False
 
 
 def test_private_key_material_still_fails_closed():
