@@ -137,6 +137,15 @@ from .alchemy_handshake_pump import install_alchemy_handshake_pump
 
 install_alchemy_handshake_pump()
 
+# Commercial RPC capacity is optional, not a prerequisite for observing a public
+# blockchain. By default leave a configured Alchemy key completely idle, preserve
+# the two public full-scope WebSocket providers plus continuous bounded polling,
+# and hydrate ordinary program traffic only while a source is below the unchanged
+# empirical delivery minimum. Launches and scout activity remain fully hydrated.
+from .public_data_economics import install_public_data_economics
+
+install_public_data_economics()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
