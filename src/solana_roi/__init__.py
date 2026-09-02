@@ -76,6 +76,15 @@ from .poll_standby_rearm import install_poll_standby_rearm
 
 install_poll_standby_rearm()
 
+# A failed HTTP poll does not itself prove a data gap: the next bounded read can
+# still recover every signature since the last confirmed watermark. Keep that
+# target provisionally covered for a short fixed lease, but fail the exact release
+# closed if the bounded delta becomes unrecoverable or the lease expires after a
+# real WebSocket zero-coverage interval.
+from .poll_recoverability_lease import install_poll_recoverability_lease
+
+install_poll_recoverability_lease()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.

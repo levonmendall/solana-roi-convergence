@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from solana_roi import live_poll_redundancy as live_poll
+from solana_roi import poll_recoverability_lease as recoverability
 from solana_roi import poll_standby_rearm as rearm
 from solana_roi import poll_watermark_repair as watermark
 from solana_roi.direct_solana import DirectSolanaIngestionPlane, WatchTarget
@@ -60,6 +61,7 @@ def test_overflow_rearm_rejects_nonadvancing_head(monkeypatch):
     assert result is None
 
 
-def test_poll_standby_rearm_installed_intrinsically():
-    assert live_poll._poll_target is rearm._standby_poll_target
+def test_poll_standby_rearm_remains_installed_beneath_recoverability_lease():
+    assert live_poll._poll_target is recoverability._leased_poll_target
     assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_poll_standby_rearm", False))
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_poll_recoverability_lease", False))
