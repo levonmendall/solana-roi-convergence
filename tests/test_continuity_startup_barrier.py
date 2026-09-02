@@ -26,6 +26,10 @@ def _plane(tmp_path):
     plane = Plane()
     plane.store = store
     plane.journal = DirectSolanaJournal(store)
+    # The production barrier is intentionally scoped to a real exact-release
+    # runtime. Low-level quorum utilities without an epoch retain their original
+    # semantics and existing regression contract.
+    plane._roi_continuity_epoch = {"release_id": "test-release"}
     return plane
 
 
