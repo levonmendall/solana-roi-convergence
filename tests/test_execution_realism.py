@@ -65,7 +65,7 @@ class FakeSimulator:
             transaction_size_bytes=800,
             last_valid_block_height=123,
             router="iris-taker",
-            order_out_token_units=20_000_000 / 1_000_000,
+            order_out_token_units=20.0,
             order_effective_price_sol=0.0011,
             order_drift_fraction=0.10,
             signature_fee_lamports=5_000,
@@ -96,26 +96,29 @@ def _intent() -> TradeIntent:
     return TradeIntent(IntentKind.OPEN_STARTER, "MINT", T0, fraction_of_full_position=0.30)
 
 
+async def _quote_then_apply(handoff: ShadowWalletExecutableQuoteHandoff):
+    quote = await handoff.observe(
+        token_mint="MINT",
+        stage="starter",
+        fraction_of_full_position=0.30,
+        scout_reference_price_sol=0.001,
+        trigger_observed_at=T0,
+    )
+    assert quote is not None
+    portfolio = PaperPortfolio()
+    portfolio.apply(_intent(), scout_wallet="scout", reference_price=quote.effective_price_sol)
+    return quote, portfolio
+
+
 def test_successful_shadow_order_drives_exact_entry_price_and_network_cash_cost(tmp_path):
     store, handoff = _handoff(tmp_path)
-    quote = asyncio.run(
-        handoff.observe(
-            token_mint="MINT",
-            stage="starter",
-            fraction_of_full_position=0.30,
-            scout_reference_price_sol=0.001,
-            trigger_observed_at=T0,
-        )
-    )
-    assert quote is not None and quote.usable is True
+    quote, portfolio = asyncio.run(_quote_then_apply(handoff))
+    assert quote.usable is True
     assert quote.effective_price_sol == pytest.approx(0.0011)
     assert quote.output_token_units == pytest.approx(20.0)
     assert quote.router == "iris-taker"
 
-    portfolio = PaperPortfolio()
-    portfolio.apply(_intent(), scout_wallet="scout", reference_price=quote.effective_price_sol)
     fill = portfolio.positions["MINT"].fills[-1]
-
     expected_network_fee_usd = (5_000 + 200_000 + 2_039_280) / 1_000_000_000 * 200.0
     assert fill.fill_price == pytest.approx(0.0011)
     assert fill.fill_price != pytest.approx(0.0011 * 1.025)
@@ -137,22 +140,12 @@ def test_successful_shadow_order_drives_exact_entry_price_and_network_cash_cost(
 
 def test_failed_simulation_never_unlocks_exact_fill_accounting(tmp_path):
     _store, handoff = _handoff(tmp_path, simulation_ok=False)
-    quote = asyncio.run(
-        handoff.observe(
-            token_mint="MINT",
-            stage="starter",
-            fraction_of_full_position=0.30,
-            scout_reference_price_sol=0.001,
-            trigger_observed_at=T0,
-        )
-    )
-    assert quote is not None and quote.usable is False
+    quote, portfolio = asyncio.run(_quote_then_apply(handoff))
+    assert quote.usable is False
 
-    # Production activation will reject this quote. Even if a caller bypasses the
-    # activation gate in a unit test, the exact observed-fill context is absent and
-    # the old conservative fallback remains in force.
-    portfolio = PaperPortfolio()
-    portfolio.apply(_intent(), scout_wallet="scout", reference_price=quote.effective_price_sol)
+    # Production activation rejects this quote. Even inside the same coroutine,
+    # failed simulation never publishes exact-fill context, so a forced unit-test
+    # apply can only use the conservative fallback.
     fill = portfolio.positions["MINT"].fills[-1]
     assert fill.fill_price == pytest.approx(quote.effective_price_sol * 1.025)
 
