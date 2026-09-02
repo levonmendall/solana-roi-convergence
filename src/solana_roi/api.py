@@ -17,7 +17,6 @@ from .activation import ARM_CONFIRMATION
 from .config import BASELINE
 from .deployment import deployment_preflight
 from .runtime import IngestionRuntime, build_runtime
-from .split_webhooks import auto_sync_split_helius_from_env
 
 
 @lru_cache(maxsize=1)
@@ -31,11 +30,9 @@ async def lifespan(app: FastAPI):
     clock_stop: asyncio.Event | None = None
     clock_task: asyncio.Task[None] | None = None
     webhook_stop = asyncio.Event()
-    webhook_task = asyncio.create_task(runtime.webhook_worker.run(webhook_stop), name="helius-webhook-worker")
-    bootstrap_task = asyncio.create_task(
-        auto_sync_split_helius_from_env(store=runtime.store),
-        name="helius-split-webhook-bootstrap",
-    )
+    direct_stop = asyncio.Event()
+    webhook_task = asyncio.create_task(runtime.webhook_worker.run(webhook_stop), name="legacy-helius-webhook-worker")
+    direct_task = asyncio.create_task(runtime.direct_ingestion.run(direct_stop), name="direct-solana-ingestion")
     enabled = os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"}
     if enabled:
         clock_stop = asyncio.Event()
@@ -43,6 +40,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        direct_stop.set()
         webhook_stop.set()
         if clock_stop is not None:
             clock_stop.set()
@@ -50,14 +48,12 @@ async def lifespan(app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await clock_task
         with suppress(asyncio.CancelledError):
-            await webhook_task
-        if not bootstrap_task.done():
-            bootstrap_task.cancel()
+            await direct_task
         with suppress(asyncio.CancelledError):
-            await bootstrap_task
+            await webhook_task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.11.1", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.12.0", lifespan=lifespan)
 
 
 class ArmRequest(BaseModel):
@@ -75,7 +71,7 @@ def _require_cohort_admin(authorization: str | None) -> None:
 def _require_helius(authorization: str | None) -> None:
     expected = os.getenv("HELIUS_WEBHOOK_AUTH", "").strip()
     if not expected:
-        raise HTTPException(status_code=503, detail="Helius webhook authentication is not configured")
+        raise HTTPException(status_code=503, detail="legacy Helius webhook authentication is not configured")
     if not hmac.compare_digest(authorization or "", expected):
         raise HTTPException(status_code=401, detail="invalid webhook authorization")
 
@@ -95,6 +91,7 @@ def _enqueue_helius(payload: Any, authorization: str | None, *, feed: str) -> di
         "inbox_id": inbox_id,
         "received_at": received_at.isoformat(),
         "feed": feed,
+        "legacy_compatibility_path": True,
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
     }
 
@@ -108,13 +105,15 @@ def _latest_helius_bootstrap(runtime: IngestionRuntime) -> dict[str, object]:
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
     if row is None:
-        return {"available": False, "state": "not_observed"}
+        return {"available": False, "state": "not_observed", "legacy_only": True}
     payload = json.loads(str(row["payload_json"]))
     return {
         "available": True,
         "state": str(row["event_type"]),
         "observed_at": str(row["observed_at"]),
         "result": payload if isinstance(payload, dict) else {},
+        "legacy_only": True,
+        "production_data_plane": False,
     }
 
 
@@ -123,6 +122,7 @@ def health() -> dict[str, object]:
     runtime = ingestion_runtime()
     cohort = runtime.cohort_controller.status()
     preflight = deployment_preflight()
+    direct = runtime.direct_ingestion.status()
     return {
         "status": "ok",
         "paper_only": True,
@@ -132,6 +132,9 @@ def health() -> dict[str, object]:
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "risk_entity_plane_connected": True,
         "live_risk_collectors_connected": True,
+        "direct_solana_enabled": direct["enabled"],
+        "direct_solana_continuity_ok": direct["continuity_ok"],
+        "direct_solana_connected_providers": direct["connected_provider_count"],
         "webhook_queue": runtime.webhook_queue.status(),
         "latency_certified": cohort["latency"]["certified"],
         "amount_specific_quote_certified": cohort["execution_quotes"]["certified"],
@@ -152,6 +155,11 @@ def helius_bootstrap_status() -> dict[str, object]:
     return _latest_helius_bootstrap(ingestion_runtime())
 
 
+@app.get("/v1/direct-solana/status")
+def direct_solana_status() -> dict[str, object]:
+    return {**ingestion_runtime().direct_ingestion.status(), "paper_only": True}
+
+
 @app.get("/v1/strategy/baseline")
 def strategy_baseline() -> dict[str, object]:
     return asdict(BASELINE)
@@ -169,6 +177,8 @@ def ingestion_status() -> dict[str, object]:
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "paper_signal_promotion_blocker": runtime.paper_signal_promotion_blocker,
         "risk_entity_plane_connected": True,
+        "data_plane": "direct-solana",
+        "direct_solana": runtime.direct_ingestion.status(),
         "webhook_queue": runtime.webhook_queue.status(),
         "helius_webhook_bootstrap": _latest_helius_bootstrap(runtime),
         "collectors": runtime.collectors.status(),
@@ -201,6 +211,7 @@ def execution_quote_status() -> dict[str, object]:
     return {
         **runtime.quote_gate.status(),
         "quote_transport": "Jupiter Swap V2 /order plus unsigned taker simulation",
+        "solana_metadata_transport": "redundant-standard-json-rpc",
         "jupiter_configured": runtime.quote_handoff.client is not None,
         "live_transaction_execution_available": False,
         "paper_only": True,
