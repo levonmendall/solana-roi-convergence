@@ -28,14 +28,15 @@ def _seed_launch_coverage(store: ObservationEventStore, now: datetime, *, count:
 
 def _seed_source(store: ObservationEventStore, source: str, now: datetime, *, raw: bool = False) -> None:
     prefix = "helius-raw-webhook" if raw else "helius-enhanced-webhook"
+    epoch_tag = int(now.timestamp() * 1000)
     for i in range(10):
         store.record_swap(
-            signature=f"{source}-{raw}-{i}",
-            slot=i + 1,
+            signature=f"{source}-{raw}-{epoch_tag}-{i}",
+            slot=epoch_tag + i + 1,
             observed_at=(now + timedelta(milliseconds=i)).isoformat(),
             received_at=(now + timedelta(milliseconds=i + 1)).isoformat(),
-            wallet=f"wallet-{source}-{i}",
-            token_mint=f"mint-{source}-{i}",
+            wallet=f"wallet-{source}-{epoch_tag}-{i}",
+            token_mint=f"mint-{source}-{epoch_tag}-{i}",
             side="buy",
             token_amount=1000,
             native_amount_sol=1,
