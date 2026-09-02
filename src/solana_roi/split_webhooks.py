@@ -45,32 +45,40 @@ class SplitHeliusWebhookManager:
             "accountAddresses": list(ENHANCED_PROGRAM_ADDRESSES),
             "webhookType": "enhanced",
             "authHeader": self.auth_header,
-            "active": True,
         }
         pump_raw = {
             "webhookURL": self._target(service_url, "/v1/ingestion/helius/pump-raw"),
+            # Helius documents transactionTypes as enhanced-only; ANY is kept in
+            # the request schema while raw delivery is governed by the program
+            # address and webhookType=raw.
             "transactionTypes": ["ANY"],
             "accountAddresses": [PUMP_PROGRAM_ID],
             "webhookType": "raw",
             "authHeader": self.auth_header,
-            "active": True,
         }
         return enhanced, pump_raw
 
     @staticmethod
-    def _same(current: dict[str, Any], desired: dict[str, Any]) -> bool:
+    def _same_config(current: dict[str, Any], desired: dict[str, Any]) -> bool:
         common = bool(
             current.get("webhookURL") == desired["webhookURL"]
             and set(current.get("accountAddresses") or []) == set(desired["accountAddresses"])
             and current.get("webhookType") == desired["webhookType"]
             and current.get("authHeader") == desired["authHeader"]
-            and current.get("active", True)
         )
         if not common:
             return False
         if desired["webhookType"] == "raw":
             return True
         return set(current.get("transactionTypes") or []) == set(desired["transactionTypes"])
+
+    async def _enable(self, webhook_id: str) -> None:
+        response = await self.client.patch(
+            f"{self.API_ROOT}/{webhook_id}",
+            params=self._params(),
+            json={"active": True},
+        )
+        response.raise_for_status()
 
     async def _upsert(self, webhooks: list[Any], desired: dict[str, Any], *, label: str) -> dict[str, Any]:
         target = desired["webhookURL"]
@@ -82,25 +90,32 @@ class SplitHeliusWebhookManager:
             webhook_id = str(current.get("webhookID") or "")
             if not webhook_id:
                 raise RuntimeError(f"matching {label} webhook has no webhookID")
-            if self._same(current, desired):
-                return {"feed": label, "action": "unchanged", "webhook_id": webhook_id, "active": True}
-            response = await self.client.put(f"{self.API_ROOT}/{webhook_id}", params=self._params(), json=desired)
-            response.raise_for_status()
-            payload = response.json()
-            return {
-                "feed": label,
-                "action": "updated",
-                "webhook_id": str(payload.get("webhookID") or webhook_id) if isinstance(payload, dict) else webhook_id,
-                "active": bool(payload.get("active", True)) if isinstance(payload, dict) else True,
-            }
+            action = "unchanged"
+            active = bool(current.get("active", True))
+            if not self._same_config(current, desired):
+                response = await self.client.put(f"{self.API_ROOT}/{webhook_id}", params=self._params(), json=desired)
+                response.raise_for_status()
+                payload = response.json()
+                active = bool(payload.get("active", True)) if isinstance(payload, dict) else active
+                action = "updated"
+            if not active:
+                await self._enable(webhook_id)
+                active = True
+                action = "updated_and_reenabled" if action == "updated" else "reenabled"
+            return {"feed": label, "action": action, "webhook_id": webhook_id, "active": active}
         response = await self.client.post(self.API_ROOT, params=self._params(), json=desired)
         response.raise_for_status()
         payload = response.json()
+        webhook_id = str(payload.get("webhookID") or "") if isinstance(payload, dict) else ""
+        active = bool(payload.get("active", True)) if isinstance(payload, dict) else True
+        if webhook_id and not active:
+            await self._enable(webhook_id)
+            active = True
         return {
             "feed": label,
-            "action": "created",
-            "webhook_id": str(payload.get("webhookID") or "") if isinstance(payload, dict) else "",
-            "active": bool(payload.get("active", True)) if isinstance(payload, dict) else True,
+            "action": "created" if active else "created_inactive",
+            "webhook_id": webhook_id,
+            "active": active,
         }
 
     async def sync(self, service_url: str) -> dict[str, Any]:
@@ -113,8 +128,6 @@ class SplitHeliusWebhookManager:
             raise RuntimeError("Helius webhook list response is invalid")
         enhanced, pump_raw = self._desired(service_url)
         enhanced_result = await self._upsert(webhooks, enhanced, label="enhanced_swap_feed")
-        # Include a synthetic representation of the first mutation so a just-
-        # created/updated enhanced endpoint cannot be mistaken for the raw URL.
         raw_result = await self._upsert(webhooks, pump_raw, label="pump_fun_raw_feed")
         return {
             "action": "split_webhooks_synced",
