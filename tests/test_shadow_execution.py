@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import datetime, timezone
 
@@ -80,9 +81,7 @@ def test_shadow_wallet_public_key_is_identity_only_and_unsigned_simulation_succe
         http_client=FakeHttp(),
         rpc=FakeRpc(),
     )
-    observation = pytest.run(asyncio=False) if False else None
 
-    import asyncio
     result = asyncio.run(simulator.observe(_quote(datetime(2026, 9, 1, tzinfo=timezone.utc))))
     assert result.transaction_built is True
     assert result.simulation_ok is True
