@@ -7,10 +7,9 @@ from typing import Any
 from .activation import CoverageCertificationPolicy, ProgramCoverageCertificationGate
 from .observation_store import ObservationEventStore
 
-# Frozen v3.1 mainnet launch/swap program set. Helius Enhanced covers Pump AMM
-# and Raydium. Pump bonding-curve trades are collected from Helius raw webhook
-# transactions and normalized locally, while the exact IDs remain frozen into
-# the immutable certification policy.
+# Frozen v3.1 mainnet launch/swap program set. The transport is intentionally
+# independent of these IDs: direct Solana RPC observes and normalizes the exact
+# same immutable Pump.fun, Pump AMM and Raydium scope locally.
 FROZEN_SUPPORTED_PROGRAM_IDS_BY_SOURCE: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "PUMP_FUN",
@@ -69,7 +68,8 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
         counts = {source: 0 for source in self.source_policy.required_program_sources}
         sql = (
             "SELECT source, COUNT(*) AS n FROM normalized_swaps WHERE "
-            "(source LIKE 'helius-enhanced-webhook:%' OR source LIKE 'helius-raw-webhook:%')"
+            "(source LIKE 'solana-direct:%' OR source LIKE 'helius-enhanced-webhook:%' "
+            "OR source LIKE 'helius-raw-webhook:%')"
         )
         args: list[Any] = []
         if self.prospective_start_at is not None:
