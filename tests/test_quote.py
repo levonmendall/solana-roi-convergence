@@ -127,3 +127,24 @@ def test_clean_s_tier_shadow_touch_requests_starter_quote(tmp_path):
     assert quote.calls[0]["stage"] == "starter"
     assert quote.calls[0]["fraction_of_full_position"] == .3
     assert engine.portfolio.positions == {}
+
+
+def test_premature_paper_promotion_flag_still_fails_closed(tmp_path):
+    store = ObservationEventStore(tmp_path / "q.sqlite3")
+    engine = PaperTradingEngine(store=store)
+    now = datetime.now(timezone.utc)
+    registry = WalletProfileRegistry(store)
+    registry.register(WalletProfile("scout","entity",WalletTier.S,100,True,now))
+    quote = FakeQuoteHandoff()
+    service = CollectingLiveEvidenceIngestionService(
+        engine=engine, store=store, registry=registry,
+        risk_provider=StaticRiskEvidenceProvider(RiskSnapshot(observed_at=now)),
+        collectors=FakeCollectors(), quote_handoff=quote, promote_paper_signals=True,
+        decision_clock=lambda: now,
+    )
+    swap = NormalizedSwap("sig-promote",1,now,now,"scout","mint-promote","buy",1000,1,0.001)
+    decision = asyncio.run(service.ingest_swap(swap))
+    assert decision.decision == "record_only"
+    assert "final forward-cohort activation gate" in decision.reason
+    assert quote.calls == []
+    assert engine.portfolio.positions == {}
