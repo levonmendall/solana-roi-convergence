@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import os
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
@@ -56,7 +57,7 @@ async def lifespan(app: FastAPI):
             await bootstrap_task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.11.0", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.11.1", lifespan=lifespan)
 
 
 class ArmRequest(BaseModel):
@@ -98,6 +99,25 @@ def _enqueue_helius(payload: Any, authorization: str | None, *, feed: str) -> di
     }
 
 
+def _latest_helius_bootstrap(runtime: IngestionRuntime) -> dict[str, object]:
+    with runtime.store._lock:
+        row = runtime.store.db.execute(
+            "SELECT event_type, observed_at, payload_json FROM events "
+            "WHERE event_type IN ('helius_split_webhook_bootstrap', "
+            "'helius_split_webhook_bootstrap_failed', 'helius_split_webhook_bootstrap_skipped') "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return {"available": False, "state": "not_observed"}
+    payload = json.loads(str(row["payload_json"]))
+    return {
+        "available": True,
+        "state": str(row["event_type"]),
+        "observed_at": str(row["observed_at"]),
+        "result": payload if isinstance(payload, dict) else {},
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     runtime = ingestion_runtime()
@@ -127,6 +147,11 @@ def deployment_preflight_status() -> dict[str, object]:
     return deployment_preflight()
 
 
+@app.get("/v1/deployment/helius-bootstrap")
+def helius_bootstrap_status() -> dict[str, object]:
+    return _latest_helius_bootstrap(ingestion_runtime())
+
+
 @app.get("/v1/strategy/baseline")
 def strategy_baseline() -> dict[str, object]:
     return asdict(BASELINE)
@@ -145,6 +170,7 @@ def ingestion_status() -> dict[str, object]:
         "paper_signal_promotion_blocker": runtime.paper_signal_promotion_blocker,
         "risk_entity_plane_connected": True,
         "webhook_queue": runtime.webhook_queue.status(),
+        "helius_webhook_bootstrap": _latest_helius_bootstrap(runtime),
         "collectors": runtime.collectors.status(),
         "program_coverage": runtime.coverage_gate.status(),
         "latency": runtime.latency_gate.status(),
