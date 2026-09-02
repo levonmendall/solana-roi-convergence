@@ -129,6 +129,14 @@ from .alchemy_multiplexed_stream import install_alchemy_multiplexed_stream
 
 install_alchemy_multiplexed_stream()
 
+# Production then proved that multiplexing alone is insufficient when live Solana
+# notifications share the same inline receive/dispatch loop as the remaining
+# subscription acknowledgements. Give the single Alchemy socket a dedicated reader
+# so ACK futures resolve independently while notification handlers remain bounded.
+from .alchemy_handshake_pump import install_alchemy_handshake_pump
+
+install_alchemy_handshake_pump()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.

@@ -58,17 +58,19 @@ def test_alchemy_uses_one_websocket_for_all_ten_sequential_subscriptions(monkeyp
 
         class FakeWs:
             def __init__(self):
-                self.responses: list[str] = []
+                self.responses: asyncio.Queue[str] = asyncio.Queue()
                 self.sent: list[dict[str, object]] = []
 
             async def send(self, raw: str) -> None:
                 payload = json.loads(raw)
                 self.sent.append(payload)
                 request_id = int(payload["id"])
-                self.responses.append(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": 1000 + request_id}))
+                await self.responses.put(
+                    json.dumps({"jsonrpc": "2.0", "id": request_id, "result": 1000 + request_id})
+                )
 
             async def recv(self) -> str:
-                response = self.responses.pop(0)
+                response = await self.responses.get()
                 if len(self.sent) == 10:
                     stop.set()
                 return response
