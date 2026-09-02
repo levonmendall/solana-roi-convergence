@@ -103,6 +103,14 @@ from .poll_exception_rearm import install_poll_exception_rearm
 
 install_poll_exception_rearm()
 
+# The same-target re-arm itself must not depend on a possibly stale target-specific
+# signature head from a load-balanced public backend. Once uninterrupted WebSocket
+# authority is proven, move only the standby baseline to the hedged confirmed chain
+# slot so future fallback observation starts prospectively from a current point.
+from .poll_chain_head_rearm import install_poll_chain_head_rearm
+
+install_poll_chain_head_rearm()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
