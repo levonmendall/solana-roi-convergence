@@ -45,6 +45,28 @@ class RuntimeForwardCohortController(ForwardCohortController):
     webhook_queue: DurableHeliusWebhookQueue | None = None
     direct_ingestion: DirectSolanaIngestionPlane | None = None
 
+    def _direct_stream_continuity_ok(self) -> bool:
+        direct_status = self.direct_ingestion.status() if self.direct_ingestion is not None else {
+            "enabled": False,
+            "continuity_ok": False,
+            "strategy_scope_reduced": True,
+        }
+        return bool(
+            direct_status.get("enabled")
+            and direct_status.get("continuity_ok")
+            and not direct_status.get("strategy_scope_reduced")
+            and len(direct_status.get("full_program_scope") or []) == 7
+        )
+
+    def runtime_continuity_ok(self) -> bool:
+        """Require both durable paper state and live full-scope data-plane continuity.
+
+        CandidateActivationGate calls this method immediately before every paper
+        authorization. A direct-stream loss therefore fails closed even after the
+        cohort has already been frozen and armed.
+        """
+        return bool(super().runtime_continuity_ok() and self._direct_stream_continuity_ok())
+
     def _base_readiness(self) -> dict[str, Any]:
         status = super()._base_readiness()
         clock_enabled = _env_true("SOLANA_ROI_SHADOW_CLOCK_ENABLED")
