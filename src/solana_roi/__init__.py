@@ -9,6 +9,13 @@ from .runtime_guards import install_runtime_guards
 
 install_runtime_guards()
 
+# Provider/subscription resilience is also entrypoint-independent. It is applied
+# after the generic guards so the final runtime uses sequential subscription
+# acknowledgement and the repaired zero-cost secondary provider everywhere.
+from .stream_resilience import install_stream_resilience
+
+install_stream_resilience()
+
 from .config import BASELINE, StrategyConfig
 
 __all__ = ["BASELINE", "StrategyConfig"]
