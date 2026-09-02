@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+from solana_roi import live_poll_redundancy as live_poll
+from solana_roi import poll_chain_head_rearm as chain_rearm
+from solana_roi import poll_standby_rearm as standby
+from solana_roi.direct_solana import DirectSolanaIngestionPlane, WatchTarget
+
+
+def test_chain_head_rearm_requires_same_target_websocket(monkeypatch):
+    target = WatchTarget("program", "program-a", "PUMP_FUN")
+    called = False
+
+    class Pool:
+        async def call_with_meta(self, *_args, **_kwargs):
+            nonlocal called
+            called = True
+            return 200, "publicnode", 5.0
+
+    monkeypatch.setattr(live_poll, "_ws_target_covered", lambda *_args: False)
+    monkeypatch.setattr(live_poll, "_poll_rpc", lambda _self: Pool())
+
+    result = asyncio.run(chain_rearm._try_rearm_from_confirmed_chain_head(SimpleNamespace(), target, 100))
+    assert result is None
+    assert called is False
+
+
+def test_chain_head_rearm_uses_hedged_confirmed_getslot(monkeypatch):
+    target = WatchTarget("program", "program-a", "PUMP_AMM")
+    captured: dict[str, object] = {}
+
+    class Pool:
+        async def call_with_meta(self, method, params, *, hedge):
+            captured["method"] = method
+            captured["params"] = params
+            captured["hedge"] = hedge
+            return 250, "solana-mainnet", 7.5
+
+    monkeypatch.setattr(live_poll, "_ws_target_covered", lambda *_args: True)
+    monkeypatch.setattr(live_poll, "_poll_rpc", lambda _self: Pool())
+
+    plane = SimpleNamespace()
+    result = asyncio.run(chain_rearm._try_rearm_from_confirmed_chain_head(plane, target, 100))
+
+    assert result == (250, "solana-mainnet", 7.5)
+    assert captured["method"] == "getSlot"
+    assert captured["params"] == [{"commitment": "confirmed"}]
+    assert captured["hedge"] is True
+    key = live_poll._poll_target_key(target)
+    assert plane._roi_poll_overflow_rearms[key] == 1
+
+
+def test_chain_head_rearm_rejects_nonadvancing_slot(monkeypatch):
+    target = WatchTarget("scout", "wallet-a", None)
+
+    class Pool:
+        async def call_with_meta(self, *_args, **_kwargs):
+            return 100, "publicnode", 3.0
+
+    monkeypatch.setattr(live_poll, "_ws_target_covered", lambda *_args: True)
+    monkeypatch.setattr(live_poll, "_poll_rpc", lambda _self: Pool())
+
+    result = asyncio.run(chain_rearm._try_rearm_from_confirmed_chain_head(SimpleNamespace(), target, 100))
+    assert result is None
+
+
+def test_chain_head_rearm_installed_intrinsically():
+    assert standby._try_rearm_under_websocket is chain_rearm._try_rearm_from_confirmed_chain_head
+    assert bool(getattr(DirectSolanaIngestionPlane.status, "_roi_poll_chain_head_rearm", False))
