@@ -75,6 +75,28 @@ def _record_setup(
     }
 
 
+async def _cooperative_dispatch_capacity(dispatch_tasks: set[asyncio.Task[Any]]) -> bool:
+    """Give already-scheduled lightweight handlers one turn before declaring saturation.
+
+    ``DirectSolanaIngestionPlane._handle_notification`` is intentionally lightweight
+    and currently contains no internal await. A WebSocket reader can still consume
+    many already-buffered frames in one event-loop turn, schedule the handlers, and
+    reach the fixed task cap before any scheduled handler gets a chance to run.
+
+    Yield exactly once, prune tasks that completed during that cooperative turn, and
+    keep the existing cap authoritative. If the set is still full afterwards, the
+    caller fails closed exactly as before. No queue, task, or memory ceiling changes.
+    """
+
+    if len(dispatch_tasks) < MAX_INFLIGHT_NOTIFICATION_HANDLERS:
+        return True
+    await asyncio.sleep(0)
+    for task in tuple(dispatch_tasks):
+        if task.done():
+            dispatch_tasks.discard(task)
+    return len(dispatch_tasks) < MAX_INFLIGHT_NOTIFICATION_HANDLERS
+
+
 async def _pumped_alchemy_multiplexed_stream(
     self: Any,
     endpoint: RpcEndpoint,
@@ -182,7 +204,7 @@ async def _pumped_alchemy_multiplexed_stream(
 
                         if message.get("method") != "logsNotification":
                             continue
-                        if len(dispatch_tasks) >= MAX_INFLIGHT_NOTIFICATION_HANDLERS:
+                        if not await _cooperative_dispatch_capacity(dispatch_tasks):
                             raise NotificationDispatchBackpressureError(
                                 "Alchemy notification handlers exceeded bounded in-flight capacity"
                             )
@@ -424,6 +446,10 @@ def _status_with_alchemy_handshake_pump(
                     "alchemy_notification_dispatch_path": "bounded-concurrent-handlers",
                     "alchemy_max_inflight_notification_handlers": MAX_INFLIGHT_NOTIFICATION_HANDLERS,
                     "alchemy_inline_ack_receive_removed": True,
+                    "alchemy_backpressure_cooperative_drain_before_failure": True,
+                    "alchemy_backpressure_limit_unchanged": MAX_INFLIGHT_NOTIFICATION_HANDLERS,
+                    "alchemy_notification_drop_on_backpressure": False,
+                    "alchemy_backpressure_failure_remains_fail_closed": True,
                     "alchemy_target_quorum_semantics_unchanged": True,
                     "live_poll_recoverability_lease_seconds_unchanged": 12.0,
                 }
@@ -449,6 +475,7 @@ def install_alchemy_handshake_pump() -> None:
 
 
 __all__ = [
+    "_cooperative_dispatch_capacity",
     "_pumped_alchemy_multiplexed_stream",
     "install_alchemy_handshake_pump",
 ]
