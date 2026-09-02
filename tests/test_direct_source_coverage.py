@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from solana_roi.direct_solana import DirectSolanaJournal
 from solana_roi.observation_store import ObservationEventStore
 from solana_roi.source_coverage import SourceAwareProgramCoverageCertificationGate
 
@@ -65,3 +66,36 @@ def test_direct_transport_counts_without_changing_existing_certification_thresho
     assert status["program_source_counts"] == {"PUMP_FUN": 10, "PUMP_AMM": 10, "RAYDIUM": 10}
     assert status["requirements"]["min_samples"] == 100
     assert status["requirements"]["min_normalized_swaps_per_source"] == 10
+    assert status["requirements"]["historical_gap_recovery_excluded_from_live_delivery"] is True
+
+
+def test_gap_recovered_swaps_restore_history_but_cannot_satisfy_live_source_gate(tmp_path):
+    store = ObservationEventStore(tmp_path / "recovery-coverage.sqlite3")
+    epoch = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    _seed_launches(store, epoch)
+    for source in ("PUMP_FUN", "PUMP_AMM", "RAYDIUM"):
+        _seed_direct_source(store, source, epoch)
+
+    journal = DirectSolanaJournal(store)
+    for index in range(10):
+        observed = epoch + timedelta(milliseconds=index + 1)
+        journal.record_hydration(
+            signature=f"direct-PUMP_FUN-{index}",
+            source="PUMP_FUN",
+            trigger_received_at=observed,
+            hydrated_at=observed + timedelta(seconds=1),
+            rpc_provider="recovery-rpc",
+            rpc_latency_ms=10.0,
+            normalized=True,
+            historical_recovery=True,
+        )
+
+    gate = SourceAwareProgramCoverageCertificationGate(
+        store,
+        configured_fn=lambda: True,
+        prospective_start_at=epoch,
+    )
+    status = gate.status()
+    assert status["certified"] is False
+    assert status["program_source_counts"] == {"PUMP_FUN": 0, "PUMP_AMM": 10, "RAYDIUM": 10}
+    assert status["missing_or_under_sampled_program_sources"] == ["PUMP_FUN"]
