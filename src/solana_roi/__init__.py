@@ -85,6 +85,15 @@ from .poll_recoverability_lease import install_poll_recoverability_lease
 
 install_poll_recoverability_lease()
 
+# Multi-page getSignaturesForAddress requests can be routed to different backend
+# nodes even on the same public RPC hostname. Raise minContextSlot to the newest
+# slot already observed in the current delta before requesting each later page so
+# the next backend must be fresh enough to understand the preceding `before`
+# signature. This preserves the hard bounded delta while preventing false overflow.
+from .poll_pagination_context import install_poll_pagination_context
+
+install_poll_pagination_context()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
