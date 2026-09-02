@@ -8,7 +8,7 @@ from .storage import AppendOnlyEventStore
 
 
 class ObservationEventStore(AppendOnlyEventStore):
-    """Append-only evidence store extended with latency measurements and price marks."""
+    """Append-only evidence store extended with latency, coverage, and price measurements."""
 
     def __init__(self, path="data/solana-roi.sqlite3"):
         super().__init__(path)
@@ -28,6 +28,14 @@ class ObservationEventStore(AppendOnlyEventStore):
                 "source TEXT NOT NULL, source_ref TEXT, UNIQUE(token_mint, observed_at, source, source_ref))"
             )
             self.db.execute(
+                "CREATE TABLE IF NOT EXISTS program_coverage_observations ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, token_mint TEXT NOT NULL UNIQUE, "
+                "pair_created_at TEXT NOT NULL, assessed_at TEXT NOT NULL, launch_lag_ms REAL, "
+                "launch_near_creation INTEGER NOT NULL, early_buy_count INTEGER NOT NULL, "
+                "early_buyer_count INTEGER NOT NULL, early_buyers_complete INTEGER NOT NULL, "
+                "funding_complete INTEGER NOT NULL DEFAULT 0)"
+            )
+            self.db.execute(
                 "CREATE INDEX IF NOT EXISTS ix_risk_refresh_completed ON risk_refresh_measurements(completed_at)"
             )
             self.db.execute(
@@ -35,6 +43,9 @@ class ObservationEventStore(AppendOnlyEventStore):
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS ix_price_marks_token_time ON price_marks(token_mint, received_at)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_program_coverage_assessed ON program_coverage_observations(assessed_at)"
             )
 
     def record_risk_refresh(
@@ -108,6 +119,112 @@ class ObservationEventStore(AppendOnlyEventStore):
             result.append(item)
         return result
 
+    def record_program_coverage(
+        self,
+        *,
+        token_mint: str,
+        pair_created_at: str,
+        assessed_at: str,
+        launch_lag_ms: float | None,
+        launch_near_creation: bool,
+        early_buy_count: int,
+        early_buyer_count: int,
+        early_buyers_complete: bool,
+    ) -> None:
+        with self._lock, self.db:
+            self.db.execute(
+                "INSERT INTO program_coverage_observations("
+                "token_mint, pair_created_at, assessed_at, launch_lag_ms, launch_near_creation, "
+                "early_buy_count, early_buyer_count, early_buyers_complete, funding_complete) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) "
+                "ON CONFLICT(token_mint) DO UPDATE SET "
+                "pair_created_at=excluded.pair_created_at, assessed_at=excluded.assessed_at, "
+                "launch_lag_ms=excluded.launch_lag_ms, launch_near_creation=excluded.launch_near_creation, "
+                "early_buy_count=excluded.early_buy_count, early_buyer_count=excluded.early_buyer_count, "
+                "early_buyers_complete=excluded.early_buyers_complete",
+                (
+                    token_mint,
+                    pair_created_at,
+                    assessed_at,
+                    float(launch_lag_ms) if launch_lag_ms is not None else None,
+                    1 if launch_near_creation else 0,
+                    int(early_buy_count),
+                    int(early_buyer_count),
+                    1 if early_buyers_complete else 0,
+                ),
+            )
+        self.append(
+            "program_coverage_observation",
+            assessed_at,
+            {
+                "token_mint": token_mint,
+                "pair_created_at": pair_created_at,
+                "launch_lag_ms": launch_lag_ms,
+                "launch_near_creation": launch_near_creation,
+                "early_buy_count": early_buy_count,
+                "early_buyer_count": early_buyer_count,
+                "early_buyers_complete": early_buyers_complete,
+            },
+        )
+
+    def mark_program_coverage_funding_complete(self, token_mint: str, *, assessed_at: str) -> None:
+        with self._lock, self.db:
+            self.db.execute(
+                "UPDATE program_coverage_observations SET funding_complete=1, assessed_at=? WHERE token_mint=?",
+                (assessed_at, token_mint),
+            )
+        self.append(
+            "program_coverage_funding_complete",
+            assessed_at,
+            {"token_mint": token_mint, "funding_complete": True},
+        )
+
+    def recent_program_coverage(self, limit: int = 500) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT token_mint, pair_created_at, assessed_at, launch_lag_ms, launch_near_creation, "
+                "early_buy_count, early_buyer_count, early_buyers_complete, funding_complete "
+                "FROM program_coverage_observations ORDER BY assessed_at DESC, id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["launch_near_creation"] = bool(item["launch_near_creation"])
+            item["early_buyers_complete"] = bool(item["early_buyers_complete"])
+            item["funding_complete"] = bool(item["funding_complete"])
+            result.append(item)
+        return result
+
+    def first_touch_chronology_conflicts(self) -> int:
+        with self._lock:
+            row = self.db.execute(
+                "SELECT COUNT(*) FROM token_first_touches t WHERE EXISTS ("
+                "SELECT 1 FROM normalized_swaps s JOIN wallet_profiles w ON w.wallet=s.wallet "
+                "WHERE s.token_mint=t.token_mint AND s.side='buy' AND w.historically_eligible=1 "
+                "AND w.tier IN ('S','A') AND julianday(s.observed_at) < julianday(t.observed_at))"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def token_first_touch_has_earlier_eligible_swap(self, token_mint: str) -> bool:
+        with self._lock:
+            row = self.db.execute(
+                "SELECT 1 FROM token_first_touches t WHERE t.token_mint=? AND EXISTS ("
+                "SELECT 1 FROM normalized_swaps s JOIN wallet_profiles w ON w.wallet=s.wallet "
+                "WHERE s.token_mint=t.token_mint AND s.side='buy' AND w.historically_eligible=1 "
+                "AND w.tier IN ('S','A') AND julianday(s.observed_at) < julianday(t.observed_at)) LIMIT 1",
+                (token_mint,),
+            ).fetchone()
+        return row is not None
+
+    def paper_entry_authorization_count(self) -> int:
+        with self._lock:
+            row = self.db.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type='candidate_activation_decision' "
+                "AND payload_json LIKE '%\"code\":\"PAPER_ENTRY_AUTHORIZED\"%'"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     def record_price_mark(
         self,
         *,
@@ -180,4 +297,5 @@ class ObservationEventStore(AppendOnlyEventStore):
         with self._lock:
             counts["risk_refresh_measurements"] = int(self.db.execute("SELECT COUNT(*) FROM risk_refresh_measurements").fetchone()[0])
             counts["price_marks"] = int(self.db.execute("SELECT COUNT(*) FROM price_marks").fetchone()[0])
+            counts["program_coverage_observations"] = int(self.db.execute("SELECT COUNT(*) FROM program_coverage_observations").fetchone()[0])
         return counts

@@ -273,6 +273,7 @@ class QuoteCertificationPolicy:
     min_quote_success_fraction: float = 0.95
     max_p95_quote_latency_ms: float = 2_000.0
     max_p95_chain_to_quote_ms: float = 5_000.0
+    max_p99_chain_to_quote_ms: float = 10_000.0
 
 
 class QuoteCertificationGate:
@@ -284,13 +285,17 @@ class QuoteCertificationGate:
         rows = self.ledger.recent(limit)
         usable = [row for row in rows if row["usable"]]
         success_fraction = len(usable) / len(rows) if rows else 0.0
-        p95_quote = _percentile([float(row["quote_latency_ms"]) for row in rows], 0.95)
-        p95_chain = _percentile([float(row["chain_to_quote_ms"]) for row in rows], 0.95)
+        quote_latencies = [float(row["quote_latency_ms"]) for row in rows]
+        chain_to_quote = [float(row["chain_to_quote_ms"]) for row in rows]
+        p95_quote = _percentile(quote_latencies, 0.95)
+        p95_chain = _percentile(chain_to_quote, 0.95)
+        p99_chain = _percentile(chain_to_quote, 0.99)
         certified = bool(
             len(rows) >= self.policy.min_samples
             and success_fraction >= self.policy.min_quote_success_fraction
             and p95_quote is not None and p95_quote <= self.policy.max_p95_quote_latency_ms
             and p95_chain is not None and p95_chain <= self.policy.max_p95_chain_to_quote_ms
+            and p99_chain is not None and p99_chain <= self.policy.max_p99_chain_to_quote_ms
         )
         return {
             "certified": certified,
@@ -300,5 +305,7 @@ class QuoteCertificationGate:
             "usable_fraction": success_fraction,
             "p95_quote_latency_ms": p95_quote,
             "p95_chain_to_quote_ms": p95_chain,
+            "p99_chain_to_quote_ms": p99_chain,
+            "measurement_path": "chain event -> complete/fresh risk decision -> amount-specific executable quote available",
             "requirements": asdict(self.policy),
         }

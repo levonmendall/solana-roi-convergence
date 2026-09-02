@@ -10,7 +10,9 @@ from functools import lru_cache
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
 
+from .activation import ARM_CONFIRMATION
 from .config import BASELINE
 from .runtime import IngestionRuntime, build_runtime
 
@@ -39,24 +41,39 @@ async def lifespan(app: FastAPI):
                 await task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.8.0", lifespan=lifespan)
+
+
+class ArmRequest(BaseModel):
+    confirmation: str
+
+
+def _require_cohort_admin(authorization: str | None) -> None:
+    expected = os.getenv("SOLANA_ROI_COHORT_ARM_AUTH", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="forward cohort administrative authorization is not configured")
+    if not hmac.compare_digest(authorization or "", expected):
+        raise HTTPException(status_code=401, detail="invalid forward cohort administrative authorization")
 
 
 @app.get("/health")
 def health() -> dict[str, object]:
     runtime = ingestion_runtime()
-    latency = runtime.latency_gate.status()
-    quotes = runtime.quote_gate.status()
+    cohort = runtime.cohort_controller.status()
     return {
         "status": "ok",
         "paper_only": True,
+        "live_money_authority": False,
         "strategy_version": BASELINE.version,
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "risk_entity_plane_connected": True,
         "live_risk_collectors_connected": True,
-        "latency_certified": latency["certified"],
-        "amount_specific_quote_certified": quotes["certified"],
-        "forward_cohort_ready": False,
+        "latency_certified": cohort["latency"]["certified"],
+        "amount_specific_quote_certified": cohort["execution_quotes"]["certified"],
+        "program_wide_coverage_verified": cohort["coverage"]["certified"],
+        "forward_cohort_ready": cohort["forward_cohort_ready"],
+        "forward_cohort_armed": cohort["armed"],
+        "runtime_continuity_ok": cohort["runtime_continuity_ok"],
     }
 
 
@@ -70,15 +87,20 @@ def ingestion_status() -> dict[str, object]:
     runtime = ingestion_runtime()
     return {
         "paper_only": True,
+        "live_money_authority": False,
         "strategy_version": BASELINE.version,
         "paper_nav_usd": runtime.engine.nav_usd,
+        "paper_cash_usd": runtime.engine.portfolio.cash_usd,
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
         "paper_signal_promotion_blocker": runtime.paper_signal_promotion_blocker,
         "risk_entity_plane_connected": True,
         "collectors": runtime.collectors.status(),
+        "program_coverage": runtime.coverage_gate.status(),
         "latency": runtime.latency_gate.status(),
         "execution_quotes": runtime.quote_gate.status(),
+        "forward_cohort": runtime.cohort_controller.status(),
         "shadow_price_clock_enabled": os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"},
+        "price_clock_drives_paper_engine": runtime.price_clock.drive_paper_engine,
         "evidence_counts": runtime.store.evidence_counts(),
         "event_chain_valid": runtime.store.verify(),
     }
@@ -90,7 +112,7 @@ def latency_status() -> dict[str, object]:
     return {
         **runtime.latency_gate.status(),
         "paper_only": True,
-        "paper_signal_promotion_enabled": False,
+        "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
     }
 
 
@@ -103,6 +125,52 @@ def execution_quote_status() -> dict[str, object]:
         "jupiter_configured": runtime.quote_handoff.client is not None,
         "live_transaction_execution_available": False,
         "paper_only": True,
+    }
+
+
+@app.get("/v1/program-coverage/status")
+def program_coverage_status() -> dict[str, object]:
+    runtime = ingestion_runtime()
+    return {**runtime.coverage_gate.status(), "paper_only": True}
+
+
+@app.get("/v1/forward-cohort/status")
+def forward_cohort_status() -> dict[str, object]:
+    return ingestion_runtime().cohort_controller.status()
+
+
+@app.post("/v1/forward-cohort/freeze")
+def freeze_forward_cohort(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    _require_cohort_admin(authorization)
+    runtime = ingestion_runtime()
+    try:
+        manifest = runtime.cohort_controller.freeze_manifest()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "frozen": True,
+        "manifest_sha256": manifest.get("manifest_sha256"),
+        "release_commit": manifest.get("release_commit"),
+        "forward_cohort": runtime.cohort_controller.status(),
+    }
+
+
+@app.post("/v1/forward-cohort/arm")
+def arm_forward_cohort(request: ArmRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    _require_cohort_admin(authorization)
+    runtime = ingestion_runtime()
+    try:
+        arm = runtime.cohort_controller.arm(request.confirmation)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    runtime.price_clock.drive_paper_engine = True
+    return {
+        "armed": True,
+        "armed_at": arm.get("armed_at"),
+        "manifest_sha256": arm.get("manifest_sha256"),
+        "required_confirmation": ARM_CONFIRMATION,
+        "paper_only": True,
+        "live_money_authority": False,
     }
 
 

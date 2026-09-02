@@ -29,7 +29,7 @@ class LaunchFundingPolicy:
 
 
 class DexScreenerLaunchCollector:
-    """Derive launch structure only when program-wide stream coverage can be proved."""
+    """Derive launch structure and publish prospective coverage evidence."""
 
     def __init__(self, risk: TokenRiskIntelligence, *, client: Any | None = None, policy: LaunchFundingPolicy | None = None):
         self.risk, self.store = risk, risk.store
@@ -77,10 +77,22 @@ class DexScreenerLaunchCollector:
         )
         buys = [r for r in rows if r["side"] == "buy"]
         buyers = {str(r["wallet"]) for r in buys}
-        if len(buys) < self.policy.min_launch_buys or len(buyers) < self.policy.min_launch_buyers:
-            return False
-        earliest = min(datetime.fromisoformat(str(r["observed_at"])) for r in rows)
-        if abs((earliest - created_at).total_seconds()) > self.policy.max_pair_stream_lag_seconds:
+        earliest = min((datetime.fromisoformat(str(r["observed_at"])) for r in rows), default=None)
+        lag_seconds = abs((earliest - created_at).total_seconds()) if earliest is not None else None
+        near_creation = lag_seconds is not None and lag_seconds <= self.policy.max_pair_stream_lag_seconds
+        early_complete = len(buys) >= self.policy.min_launch_buys and len(buyers) >= self.policy.min_launch_buyers
+        if hasattr(self.store, "record_program_coverage"):
+            self.store.record_program_coverage(
+                token_mint=mint,
+                pair_created_at=created_at.isoformat(),
+                assessed_at=at.isoformat(),
+                launch_lag_ms=lag_seconds * 1000.0 if lag_seconds is not None else None,
+                launch_near_creation=near_creation,
+                early_buy_count=len(buys),
+                early_buyer_count=len(buyers),
+                early_buyers_complete=early_complete,
+            )
+        if not early_complete or not near_creation:
             return False
         slot_buyers: dict[int, set[str]] = {}
         buyer_sol: dict[str, float] = {}
@@ -240,6 +252,8 @@ class HeliusFundingCollector:
             received_at=at,
             source="helius-enhanced-history:complete-early-buyer-provenance-v1",
         )
+        if hasattr(self.store, "mark_program_coverage_funding_complete"):
+            self.store.mark_program_coverage_funding_complete(mint, assessed_at=at.isoformat())
         return True
 
 
@@ -274,7 +288,9 @@ class CompleteLiveRiskCollectors(LiveRiskCollectors):
         return {
             "automated_dimensions": automated,
             "still_fail_closed": blocked,
-            "program_wide_swap_coverage_asserted": self.coverage_asserted,
+            "program_wide_swap_collection_configured": self.coverage_asserted,
+            "program_wide_swap_coverage_verified": False,
+            "configuration_is_not_coverage_proof": True,
             "latency_certified_for_forward_cohort": False,
             "paper_signal_promotion_enabled": False,
         }
