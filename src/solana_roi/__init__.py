@@ -16,6 +16,14 @@ from .stream_resilience import install_stream_resilience
 
 install_stream_resilience()
 
+# Preserve the legacy marker contract used by production.py so that importing the
+# compatibility entrypoint later cannot wrap over the richer intrinsic status or
+# stream implementation and hide the active safety/telemetry envelope.
+from .direct_solana import DirectSolanaIngestionPlane
+
+setattr(DirectSolanaIngestionPlane._stream_endpoint, "_roi_stream_guarded", True)
+setattr(DirectSolanaIngestionPlane.status, "_roi_memory_bounded", True)
+
 from .config import BASELINE, StrategyConfig
 
 __all__ = ["BASELINE", "StrategyConfig"]
