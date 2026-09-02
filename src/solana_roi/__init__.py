@@ -155,6 +155,15 @@ from .launch_coverage_bridge import install_launch_coverage_bridge
 
 install_launch_coverage_bridge()
 
+# Successful paper entries use the exact assembled Jupiter taker-order price and
+# debit observed signature, priority and rent lamports separately. Because the net
+# order output already embeds route/price impact, do not layer the fixed 2.5% entry
+# haircut on top; retain that drag only as the conservative fallback for paths with
+# no amount-specific executable observation (including current exits/offline use).
+from .execution_realism import install_execution_realism
+
+install_execution_realism()
+
 # Preserve the legacy marker contract used by production.py so that importing the
 # compatibility entrypoint later cannot wrap over the richer intrinsic status or
 # stream implementation and hide the active safety/telemetry envelope.
