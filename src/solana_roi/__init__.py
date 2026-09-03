@@ -130,8 +130,8 @@ install_continuity_durability_repair()
 
 # The recoverability lease is a promise made after an actual real-WebSocket target
 # loss, not after an arbitrary earlier successful poll. Timestamp that exact gap
-# generation, wake its bounded recovery worker immediately, and keep the unchanged
-# 12-second lease and 3x1000 delta boundary fail-closed.
+# generation and rebase the canonical worker's existing lease clock to it while
+# keeping the unchanged 12-second lease and 3x1000 delta boundary fail-closed.
 from .continuity_gap_clock_repair import install_continuity_gap_clock_repair
 
 install_continuity_gap_clock_repair()
