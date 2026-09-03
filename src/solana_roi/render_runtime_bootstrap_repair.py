@@ -56,6 +56,8 @@ def _public_status() -> dict[str, Any]:
         "canonical_observation_evidence_retained": True,
         "target_frontier_continuity_repair_installed_before_api_capture": True,
         "real_gap_recovery_uses_confirmed_target_frontier": True,
+        "certification_failure_accounting_installed_before_api_capture": True,
+        "failed_candidate_attempts_remain_in_certification_denominators": True,
         "certification_thresholds_unchanged": True,
         "continuity_lease_unchanged": True,
         "recovery_bound_unchanged": True,
@@ -155,9 +157,6 @@ async def _bootstrap_and_run(stop: asyncio.Event) -> None:
 def _guarded_ingestion_runtime() -> Any:
     if _RUNTIME is not None:
         return _RUNTIME
-    # Preserve direct/unit-test construction before an ASGI lifespan is active.
-    # During a real Render lifespan, however, API callers must never race the
-    # single background bootstrap or synchronously reopen the persistent store.
     if not bool(_BOOTSTRAP_STATE["lifespan_active"]):
         if _ORIGINAL_INGESTION_RUNTIME is None:
             raise RuntimeError("Render runtime bootstrap repair is not installed")
@@ -190,10 +189,6 @@ async def _render_handoff_lifespan(_app: Any):
         }
     )
     stop = asyncio.Event()
-    # Crucially, yield ASGI startup before any persistent-disk open. Render's
-    # constant-time health route can become healthy, allowing the prior instance
-    # to release the SQLite writer. The canonical runtime then acquires the store
-    # in this background task; all deep/runtime endpoints remain 503 until ready.
     bootstrap_task = asyncio.create_task(_bootstrap_and_run(stop), name="runtime-bootstrap-handoff")
     try:
         yield
@@ -211,12 +206,7 @@ def install_render_runtime_bootstrap_handoff() -> None:
     if _API is not None and bool(getattr(_API.app.state, "roi_runtime_bootstrap_handoff", False)):
         return
 
-    # The certification/research architecture and final continuity anchor repair
-    # must be installed after every prior production wrapper but before api.py
-    # captures runtime.build_runtime. The target-frontier wrapper therefore sees
-    # each accepted target notification at the outer socket-read boundary, before
-    # durable dispatch can lag, while recovery still uses only confirmed read-only
-    # evidence and the unchanged 12-second / 3x1000 fail-closed bounds.
+    from .certification_failure_accounting_runtime_install import install_final_certification_failure_accounting
     from .certification_research_architecture import install_certification_research_architecture
     from .continuity_target_frontier_repair import install_continuity_target_frontier_repair
     from .ephemeral_candidate_retention import install_ephemeral_candidate_retention
@@ -224,10 +214,8 @@ def install_render_runtime_bootstrap_handoff() -> None:
     install_certification_research_architecture()
     install_ephemeral_candidate_retention()
     install_continuity_target_frontier_repair()
+    install_final_certification_failure_accounting()
 
-    # Import only after the production composition has installed all runtime class
-    # and build_runtime guards. api.py therefore captures the exact canonical
-    # production builder, but its ASGI lifespan is replaced before Uvicorn starts.
     from . import api as api_module
 
     _API = api_module
