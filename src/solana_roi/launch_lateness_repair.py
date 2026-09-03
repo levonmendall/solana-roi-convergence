@@ -161,6 +161,14 @@ def install_launch_lateness_repair() -> None:
     if not bool(getattr(current_status, "_roi_launch_lateness_repair", False)):
         DirectSolanaIngestionPlane.status = _status_with_launch_lateness(current_status)  # type: ignore[method-assign]
 
+    # Production proved that absolute host-wall-clock versus Solana blockTime still
+    # rejects most otherwise complete launch observations. Install the v4 proof only
+    # after v3 so direct/offline callers keep v3 compatibility while production
+    # launch-bridge contexts use a first-receipt confirmed-chain-head comparison.
+    from .launch_chain_timing_repair import install_launch_chain_timing_repair
+
+    install_launch_chain_timing_repair()
+
 
 __all__ = [
     "install_launch_lateness_repair",
