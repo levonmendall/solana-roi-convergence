@@ -57,16 +57,24 @@ async def _lease_aware_slot_fetch_delta(
     """Keep the hard delta bound while letting the fixed recovery lease do its job.
 
     The final pagination implementation still decides whether the bounded delta is
-    complete. An incomplete result is *not* evidence that a prospective interval
-    is already lost: while the prior watermark remains intact, another bounded
-    attempt can still recover it. Raising here routes that state through the
-    existing lease logic instead of the older immediate-latch branch.
+    complete. A genuine bounded overflow is *not* proof that the prospective
+    interval is already lost: while the prior watermark remains intact, another
+    bounded attempt can still recover it. Raising here routes that state through
+    the existing lease logic instead of the older immediate-latch branch.
+
+    The preceding exception-rearm repair intentionally represents a transient RPC
+    exception under uninterrupted real-WebSocket coverage as ``([], False, None,
+    None)``. Preserve that sentinel so its established same-target standby re-arm
+    remains available; only a real bounded overflow with provider evidence is
+    converted to the lease-routed exception.
     """
 
     rows, complete, provider, latency = await _ORIGINAL_SLOT_FETCH_DELTA(
         self, target, cursor_slot
     )
     if not complete:
+        if provider is None and latency is None:
+            return rows, False, provider, latency
         raise RecoverableLivePollDeltaIncomplete(
             "bounded confirmed-slot delta incomplete; retry from unchanged watermark"
         )
@@ -81,6 +89,7 @@ def _status_with_continuity_durability(
         poll = payload.get("live_poll_redundancy")
         if isinstance(poll, dict):
             poll["bounded_delta_incomplete_uses_recoverability_lease"] = True
+            poll["continuous_ws_exception_rearm_preserved"] = True
             poll["poll_reads_hedged"] = True
             poll["poll_watermark_abandoned_before_irrecoverable_gap"] = False
         policy = payload.setdefault("provider_runtime_policy", {})
@@ -89,6 +98,7 @@ def _status_with_continuity_durability(
                 {
                     "live_poll_incomplete_delta_immediately_latches_gap": False,
                     "live_poll_incomplete_delta_uses_fixed_recoverability_lease": True,
+                    "live_poll_continuous_ws_exception_rearm_preserved": True,
                     "live_poll_recovery_reads_hedged": True,
                     "live_poll_hard_delta_bound_unchanged": True,
                     "live_poll_irrecoverable_interval_fails_release_closed": True,
