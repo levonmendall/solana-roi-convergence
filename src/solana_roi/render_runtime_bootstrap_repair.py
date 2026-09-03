@@ -48,6 +48,9 @@ def _public_status() -> dict[str, Any]:
         "liveness_decoupled_from_sqlite_bootstrap": True,
         "deep_runtime_fail_closed_until_ready": True,
         "sqlite_lock_retries_are_background_only": True,
+        "certification_research_architecture_installed_before_api_capture": True,
+        "wallet_research_operationally_isolated": True,
+        "process_wide_rpc_workload_governor": True,
         "certification_thresholds_unchanged": True,
         "continuity_lease_unchanged": True,
         "recovery_bound_unchanged": True,
@@ -202,6 +205,15 @@ def install_render_runtime_bootstrap_handoff() -> None:
     global _API, _ORIGINAL_INGESTION_RUNTIME
     if _API is not None and bool(getattr(_API.app.state, "roi_runtime_bootstrap_handoff", False)):
         return
+
+    # The certification/research architecture must be installed after every prior
+    # production repair but before api.py captures runtime.build_runtime. This is
+    # the final composition boundary: the strategy keeps the full observer and its
+    # frozen scouts, while background wallet evaluation receives a separate RPC
+    # pool plus a process-wide bounded research workload class.
+    from .certification_research_architecture import install_certification_research_architecture
+
+    install_certification_research_architecture()
 
     # Import only after the production composition has installed all runtime class
     # and build_runtime guards. api.py therefore captures the exact canonical
