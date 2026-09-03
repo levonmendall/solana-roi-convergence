@@ -178,6 +178,16 @@ def install_launch_lateness_repair() -> None:
 
     install_launch_reference_timing_repair()
 
+    # Exact release b799b274 proved the preexisting reference itself is healthy, but
+    # v5 still rejected 5/5 complete launch observations because it discarded chain
+    # progress whenever the preexisting head was earlier than the launch. Resolve the
+    # fixed reference head's immutable blockTime for every launch and apply the signed
+    # chain-time delta inside the same conservative RTT+age upper bound. The fixed
+    # three-second requirement remains unchanged and missing proof still fails closed.
+    from .launch_reference_signed_delta_repair import install_launch_reference_signed_delta_repair
+
+    install_launch_reference_signed_delta_repair()
+
 
 __all__ = [
     "install_launch_lateness_repair",
