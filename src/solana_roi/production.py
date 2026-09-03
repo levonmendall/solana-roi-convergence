@@ -145,6 +145,14 @@ def install_direct_stream_memory_bounds() -> None:
 install_direct_stream_fairness()
 install_direct_stream_memory_bounds()
 
+# Continuous wallet discovery is research-only and has zero paper/live authority.
+# Its schema/bootstrap must therefore never be able to terminate the web service.
+# Defer that bootstrap into its background task, report any failure through status,
+# and retry without changing the active cohort or any certification threshold.
+from .wallet_discovery_startup_repair import install_wallet_discovery_startup_isolation
+
+install_wallet_discovery_startup_isolation()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
