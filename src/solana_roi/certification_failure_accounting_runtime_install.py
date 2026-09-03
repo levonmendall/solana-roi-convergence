@@ -16,15 +16,19 @@ def install_final_certification_failure_accounting() -> None:
     continuity/research/quote wrapper marker.
 
     This is also the final post-frontier composition point in Render bootstrap.
-    Install the exact-release early transport-loss repair here so no older quorum
-    installer can replace its target-stream liveness or gap-snapshot behavior.
+    Install the exact-release transport and hydration scheduling repairs here so no
+    older quorum/worker installer can replace them before runtime tasks are created.
     """
 
+    from .candidate_hydration_work_conserving_repair import (
+        install_candidate_hydration_work_conserving_repair,
+    )
     from .continuity_early_loss_detection_repair import (
         install_continuity_early_loss_detection_repair,
     )
 
     install_continuity_early_loss_detection_repair()
+    install_candidate_hydration_work_conserving_repair()
 
     current_discard = retention._discard_hydration_row
     if not bool(getattr(current_discard, "_roi_failure_accounting", False)):
