@@ -44,13 +44,9 @@ def test_immediate_recovery_retries_inside_same_fixed_lease(monkeypatch):
     assert live_poll.POLL_LIMIT == 1000
 
 
-def test_proxy_consumes_recovery_started_at_gap_instead_of_starting_late_read():
+def test_existing_durability_proxy_consumes_recovery_started_at_gap():
     target = _target()
     key = live_poll._poll_target_key(target)
-
-    class Base:
-        async def _slot_fetch_delta(self, *_args):
-            raise AssertionError("base fetch should not run when immediate recovery is ready")
 
     async def scenario():
         plane = SimpleNamespace(_roi_real_ws_gap_generations={key: 1})
@@ -66,8 +62,7 @@ def test_proxy_consumes_recovery_started_at_gap_instead_of_starting_late_read():
             "task": task,
             "started_monotonic": 1.0,
         }
-        proxy = immediate._ImmediateRecoveryProxy(Base())
-        result = await proxy._slot_fetch_delta(plane, target, 100)
+        result = await lease.watermark._slot_fetch_delta(plane, target, 100)
         return plane, result
 
     plane, result = asyncio.run(scenario())
