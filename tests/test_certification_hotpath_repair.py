@@ -246,8 +246,8 @@ def test_final_v7_hydration_hands_complete_window_to_launch_and_funding(monkeypa
     assert launch_context["launch_signature"] == "launch-sig"
     assert launch_context["launch_slot"] == 777
     assert coverage._funding_contexts(funding_collector)["mint-a"] is True
-    assert getattr(plane, "_roi_launch_coverage_bridge_coverage_context_attested") == 1
-    assert getattr(plane, "_roi_launch_coverage_bridge_coverage_context_complete") == 1
+    assert getattr(plane, "_roi_launch_bridge_coverage_context_attested") == 1
+    assert getattr(plane, "_roi_launch_bridge_coverage_context_complete") == 1
 
 
 def test_signature_window_truncation_stays_fail_closed(monkeypatch):
