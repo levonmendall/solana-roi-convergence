@@ -278,8 +278,22 @@ class ContinuousWalletIntelligence:
 
         incumbent_rows = [snapshot for snapshot in incumbent_snapshots.values() if snapshot is not None]
         weakest = min(incumbent_rows, key=self.risk_adjusted_copyable_score)
+        incumbent_entities = {snapshot.entity_id for snapshot in incumbent_rows}
         candidates = [snapshot for snapshot in self.latest_snapshots() if snapshot.wallet not in set(incumbents)]
-        decisions = [self.compare(candidate, weakest) for candidate in candidates]
+        decisions: list[WalletPromotionDecision] = []
+        for candidate in candidates:
+            decision = self.compare(candidate, weakest)
+            if candidate.entity_id in incumbent_entities and candidate.entity_id != weakest.entity_id:
+                decision = WalletPromotionDecision(
+                    candidate_wallet=decision.candidate_wallet,
+                    incumbent_wallet=decision.incumbent_wallet,
+                    eligible=False,
+                    blockers=decision.blockers + ("same_economic_entity_as_incumbent_cohort",),
+                    candidate_score=decision.candidate_score,
+                    incumbent_score=decision.incumbent_score,
+                    superiority_ratio=decision.superiority_ratio,
+                )
+            decisions.append(decision)
         eligible = [decision for decision in decisions if decision.eligible]
         if not eligible:
             return {
@@ -304,7 +318,7 @@ class ContinuousWalletIntelligence:
             "activation_boundary": "future immutable strategy cohort only",
         }
         raw = json.dumps(cohort, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(raw.encode()).hexdigest()
+        digest = hashlib.sha256(f"{strategy_version}|{raw}".encode()).hexdigest()
         created_at = utcnow().isoformat()
         with self.store._lock, self.store.db:
             self.store.db.execute(
