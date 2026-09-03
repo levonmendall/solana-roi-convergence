@@ -58,6 +58,9 @@ def _public_status() -> dict[str, Any]:
         "real_gap_recovery_uses_confirmed_target_frontier": True,
         "certification_failure_accounting_installed_before_api_capture": True,
         "failed_candidate_attempts_remain_in_certification_denominators": True,
+        "candidate_certification_hotpath_installed_before_api_capture": True,
+        "frozen_scout_source_wide_prefill_removed_from_hotpath": True,
+        "launch_near_creation_diagnostics_enabled": True,
         "certification_thresholds_unchanged": True,
         "continuity_lease_unchanged": True,
         "recovery_bound_unchanged": True,
@@ -206,6 +209,7 @@ def install_render_runtime_bootstrap_handoff() -> None:
     if _API is not None and bool(getattr(_API.app.state, "roi_runtime_bootstrap_handoff", False)):
         return
 
+    from .candidate_certification_hotpath_repair import install_candidate_certification_hotpath_repair
     from .certification_failure_accounting_runtime_install import install_final_certification_failure_accounting
     from .certification_research_architecture import install_certification_research_architecture
     from .continuity_target_frontier_repair import install_continuity_target_frontier_repair
@@ -215,6 +219,7 @@ def install_render_runtime_bootstrap_handoff() -> None:
     install_ephemeral_candidate_retention()
     install_continuity_target_frontier_repair()
     install_final_certification_failure_accounting()
+    install_candidate_certification_hotpath_repair()
 
     from . import api as api_module
 
