@@ -4,9 +4,12 @@ from collections.abc import Callable
 from typing import Any
 
 from . import funding_provenance_repair as funding
+from . import funding_rpc_freshness_repair as funding_rpc
 from . import launch_chain_timing_repair as chain_timing
+from . import launch_context_rpc_repair as context_rpc
 from . import launch_reference_timing_repair as reference
 from . import launch_ws_frontier_timing_repair as frontier
+from . import raw_receipt_dedup_repair as raw_dedup
 from . import raw_receipt_dispatch_repair as raw_receipt
 from .coverage_completeness_repair import _launch_contexts
 from .launch_funding import DexScreenerLaunchCollector
@@ -91,6 +94,21 @@ def install_production_boundary_compatibility() -> None:
         )
     except Exception:
         pass
+
+    # With two healthy public stream providers, production receives the same
+    # signature/source twice. The durable journal already rejects that second copy
+    # through UNIQUE(signature, source_key), so suppress only that redundant copy
+    # before the bounded SQLite dispatcher while still observing its chain frontier.
+    # Every unique full-scope receipt remains durable and fail-closed.
+    raw_dedup.install_raw_receipt_dedup_repair()
+
+    # v8 exposed two independent read-RPC reliability boundaries. Keep the immutable
+    # eight-second launch event window and 35-second retrieval deadline, but retry a
+    # candidate transaction across the configured read-only endpoints before calling
+    # its context incomplete. Likewise, make funding provenance require all bounded
+    # configured transaction reads to be unavailable before failing that evidence.
+    context_rpc.install_launch_context_rpc_repair()
+    funding_rpc.install_funding_rpc_freshness_repair()
 
 
 __all__ = [
