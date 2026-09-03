@@ -390,12 +390,20 @@ def install_ephemeral_candidate_retention() -> None:
     current_hydrate = DirectSolanaIngestionPlane._hydrate_one
     if not bool(getattr(current_hydrate, "_roi_ephemeral_candidate_retention", False)):
         _ORIGINAL_HYDRATE_ONE = current_hydrate
+        try:
+            _bounded_ephemeral_hydrate_one.__dict__.update(getattr(current_hydrate, "__dict__", {}))
+        except Exception:
+            pass
         setattr(_bounded_ephemeral_hydrate_one, "_roi_ephemeral_candidate_retention", True)
         DirectSolanaIngestionPlane._hydrate_one = _bounded_ephemeral_hydrate_one  # type: ignore[method-assign]
 
     current_run = DirectSolanaIngestionPlane.run
     if not bool(getattr(current_run, "_roi_ephemeral_candidate_retention", False)):
         _ORIGINAL_DIRECT_RUN = current_run
+        try:
+            _run_with_ephemeral_reaper.__dict__.update(getattr(current_run, "__dict__", {}))
+        except Exception:
+            pass
         setattr(_run_with_ephemeral_reaper, "_roi_ephemeral_candidate_retention", True)
         DirectSolanaIngestionPlane.run = _run_with_ephemeral_reaper  # type: ignore[method-assign]
 
