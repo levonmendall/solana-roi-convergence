@@ -162,12 +162,36 @@ runtime_module.BASELINE = BASELINE
 # suppression. Install the capacity repair before runtime construction: 429s gain a
 # bounded read-only cooldown, api.mainnet.solana.com becomes sequential emergency
 # HTTP fallback instead of a proactive hedge, ordinary no-hydration program receipts
-# are committed in durable SQLite micro-batches, and research wallet discovery yields
-# while critical ingestion capacity is degraded. Strategy/certification limits stay
-# unchanged and no metered provider is enabled.
+# are committed in durable SQLite micro-batches, and broad research yields while
+# critical ingestion capacity is degraded. Strategy/certification limits stay
+# unchanged and no provider is created by this repair.
 from .production_capacity_repair import install_production_capacity_repair
 
 install_production_capacity_repair()
+
+# Broad discovery and historical screening are allowed to yield to critical
+# capacity, but already-enrolled wallets require their own prospective clock. Move
+# those wallets to direct logsSubscribe receipt timing, an independent read-only RPC
+# pool, durable small-queue hydration, bounded reconnect recovery and asynchronous
+# risk enrichment. Also upgrade ordinary receipt microbatches to grouped/set-based
+# writes. No entry/promotion threshold or active cohort authority is changed.
+from .wallet_realtime_tracking_repair import install_wallet_realtime_tracking_repair
+
+install_wallet_realtime_tracking_repair()
+
+# The outer realtime telemetry wrapper must preserve every marker attached by the
+# intrinsic stream/poll/memory repairs below it. Those markers are part of the
+# repository's production-composition proof, not cosmetic test metadata.
+from .wallet_realtime_status_compat import install_wallet_realtime_status_compatibility
+
+install_wallet_realtime_status_compatibility()
+
+# Keep append-only wallet-intelligence history, but prevent a snapshot from an old
+# polling epoch from becoming promotion evidence after the new realtime epoch has
+# started. Reads become epoch-aware; historical rows remain intact for audit.
+from .wallet_realtime_intelligence_boundary import install_wallet_realtime_intelligence_boundary
+
+install_wallet_realtime_intelligence_boundary()
 
 # PR #59 also moved wallet intelligence itself into build_runtime(). Its schema
 # creation is research-only and must not become a synchronous Render startup
