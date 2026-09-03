@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from solana_roi import raw_receipt_dispatch_repair as raw_dispatch
 from solana_roi import web_liveness_isolation_repair as repair
@@ -21,7 +22,7 @@ def test_durable_background_batch_runs_through_asyncio_worker_thread(monkeypatch
     monkeypatch.setattr(repair.capacity, "_persist_background_batch", persist)
     monkeypatch.setattr(repair.asyncio, "to_thread", fake_to_thread)
 
-    plane = object()
+    plane = SimpleNamespace()
     items = [object(), object(), object()]
     inserted = asyncio.run(repair._persist_background_batch_off_loop(plane, items))
 
@@ -30,6 +31,7 @@ def test_durable_background_batch_runs_through_asyncio_worker_thread(monkeypatch
     assert calls[0][1] is persist
     assert calls[0][2] == [plane, items]
     assert calls[1] == (persist, plane, items)
+    assert plane._roi_web_liveness_sqlite_batch_offloads == 1
 
 
 def test_install_replaces_capacity_dispatch_worker_and_marks_status():
@@ -41,7 +43,7 @@ def test_install_replaces_capacity_dispatch_worker_and_marks_status():
 
 def test_status_reports_no_durability_or_scope_weakening():
     wrapped = repair._status_with_web_liveness_isolation(lambda _self: {"raw_receipt_dispatch": {}})
-    plane = object()
+    plane = SimpleNamespace()
 
     payload = wrapped(plane)
     status = payload["web_liveness_isolation"]
