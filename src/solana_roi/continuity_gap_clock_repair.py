@@ -56,7 +56,8 @@ def _active_gap_clock(
         return None
     if int(row.get("generation", -1)) != int(current_generation):
         return None
-    if int(row.get("resolved_generation", -1)) == int(current_generation):
+    resolved_generation = row.get("resolved_generation")
+    if resolved_generation is not None and int(resolved_generation) == int(current_generation):
         return None
     return row
 
@@ -610,10 +611,19 @@ def _status_with_gap_clock(
     return status
 
 
+# Preserve the long-standing module/function contracts used by regressions and by
+# later repair layers while replacing their implementations in place.
+_gap_clock_poll_target.__name__ = "_leased_poll_target"
+_gap_clock_set_target_state.__name__ = "_tracked_quorum_set_target_state"
+
+
 def install_continuity_gap_clock_repair() -> None:
-    target_quorum._quorum_set_target_state = _gap_clock_set_target_state  # type: ignore[assignment]
-    fanout._set_target_state = _gap_clock_set_target_state  # type: ignore[assignment]
-    live_poll._poll_target = _gap_clock_poll_target  # type: ignore[assignment]
+    lease._tracked_quorum_set_target_state = _gap_clock_set_target_state  # type: ignore[assignment]
+    target_quorum._quorum_set_target_state = lease._tracked_quorum_set_target_state  # type: ignore[assignment]
+    fanout._set_target_state = lease._tracked_quorum_set_target_state  # type: ignore[assignment]
+
+    lease._leased_poll_target = _gap_clock_poll_target  # type: ignore[assignment]
+    live_poll._poll_target = lease._leased_poll_target  # type: ignore[assignment]
 
     current_status = DirectSolanaIngestionPlane.status
     if not bool(getattr(current_status, "_roi_continuity_gap_clock_repair", False)):
