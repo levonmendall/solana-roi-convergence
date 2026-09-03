@@ -17,11 +17,17 @@ from .activation import ARM_CONFIRMATION
 from .config import BASELINE
 from .direct_deployment import deployment_preflight
 from .runtime import IngestionRuntime, build_runtime
+from .wallet_intelligence import ContinuousWalletIntelligence
 
 
 @lru_cache(maxsize=1)
 def ingestion_runtime() -> IngestionRuntime:
     return build_runtime()
+
+
+@lru_cache(maxsize=1)
+def wallet_intelligence() -> ContinuousWalletIntelligence:
+    return ContinuousWalletIntelligence(ingestion_runtime().store)
 
 
 @asynccontextmanager
@@ -53,7 +59,7 @@ async def lifespan(app: FastAPI):
             await webhook_task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.12.0", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.13.0", lifespan=lifespan)
 
 
 class ArmRequest(BaseModel):
@@ -172,6 +178,7 @@ def ingestion_status() -> dict[str, object]:
         "latency": runtime.latency_gate.status(),
         "execution_quotes": runtime.quote_gate.status(),
         "forward_cohort": runtime.cohort_controller.status(),
+        "wallet_intelligence": wallet_intelligence().status(),
         "deployment_preflight": deployment_preflight(),
         "certification_epoch": runtime.certification_epoch.isoformat(),
         "shadow_price_clock_enabled": os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"},
@@ -213,6 +220,17 @@ def program_coverage_status() -> dict[str, object]:
 @app.get("/v1/forward-cohort/status")
 def forward_cohort_status() -> dict[str, object]:
     return ingestion_runtime().cohort_controller.status()
+
+
+@app.get("/v1/wallet-intelligence/status")
+def wallet_intelligence_status() -> dict[str, object]:
+    status = wallet_intelligence().status()
+    return {
+        **status,
+        "ecosystem_wide_discovery_complete": False,
+        "promotion_authority": "future_immutable_cohort_only",
+        "active_v3_1_mutation_allowed": False,
+    }
 
 
 @app.post("/v1/forward-cohort/freeze")
