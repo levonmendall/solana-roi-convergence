@@ -22,12 +22,15 @@ def install_wallet_realtime_status_compatibility() -> None:
 
     # Keep the parent research implementation importable and its historical rows
     # intact, then install the final governed strategy as the only new sampler.
-    # Both remain strictly downstream of realtime/continuity authority.
+    # The final wallet/entity universe is a bounded research-priority and scoring
+    # layer downstream of the same realtime/continuity authority.
     from .profit_first_entity_research import install_profit_first_entity_research
     from .profit_first_entity_final_research import install_final_profit_first_entity_research
+    from .wallet_entity_universe_v4 import install_v4_wallet_entity_universe
 
     install_profit_first_entity_research()
     install_final_profit_first_entity_research()
+    install_v4_wallet_entity_universe()
 
 
 __all__ = ["install_wallet_realtime_status_compatibility"]
