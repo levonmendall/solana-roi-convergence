@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from . import direct_solana as direct_solana_module
@@ -12,6 +12,9 @@ from . import launch_coverage_bridge as bridge
 from . import live_poll_redundancy as live_poll
 from .coverage_completeness_repair import _launch_contexts
 from .direct_solana import DirectSolanaIngestionPlane
+from .launch_funding import DexScreenerLaunchCollector
+from .live_collectors import _fresh
+from .risk import LaunchEvidence, RiskDimension
 
 
 REFERENCE_SAMPLE_INTERVAL_SECONDS = 0.5
@@ -133,9 +136,9 @@ async def _sample_reference_once(self: Any) -> None:
         state = _reference_state(self)
         previous_slot = int(state.get("head_slot") or 0)
         _increment(self, "samples_complete")
-        # A repeated or regressed backend head cannot refresh the proof clock. Only
-        # an advancing confirmed head is allowed to reset reference age, preventing
-        # a stale load-balanced backend from manufacturing apparently fresh proof.
+        # Only a genuinely advancing confirmed head may refresh the reference age.
+        # A stale/repeated load-balanced backend therefore cannot manufacture fresh
+        # prospective timing evidence.
         if head_slot <= previous_slot:
             _increment(self, "samples_nonadvancing")
             return
@@ -252,8 +255,8 @@ async def _handle_notification_with_preexisting_reference(
         if is_launch:
             _capture_preexisting_reference(self, signature, slot)
     except Exception:
-        # The timing proof is additive. Canonical receipt/hydration must continue;
-        # missing proof is rejected later by the unchanged coverage gate.
+        # Timing proof is additive. Canonical receipt/hydration remains authoritative;
+        # a missing proof is rejected later by the unchanged coverage gate.
         pass
 
     # Deliberately bypass the v4 on-demand getSlot sampler. This is the exact
@@ -289,6 +292,8 @@ async def _hydrate_mint_launch_context_with_reference(
             head_slot = 0
         if head_slot > launch_slot > 0 and row.get("reference_head_block_time") is None:
             try:
+                # This lookup may be slow, but its slot was fixed *before* the launch
+                # arrived, so lookup latency cannot move the timing reference.
                 value, _provider, _latency = await live_poll._poll_rpc(self).call_with_meta(
                     "getBlockTime",
                     [head_slot],
@@ -313,8 +318,6 @@ async def _hydrate_mint_launch_context_with_reference(
                 )
                 _increment(self, "reference_block_times_failed")
         elif head_slot > 0:
-            # No blockTime fetch is needed when the preexisting confirmed head had
-            # not advanced beyond the launch slot.
             _set_reference_block_time(
                 self.store,
                 launch_signature,
@@ -365,12 +368,135 @@ def _reference_lag_seconds(
             return None, "non_monotonic_reference_block_time"
         chain_delta = head_block_time - launch_block_time
 
-    # Conservative upper bound: the selected chain head existed before the launch
-    # receipt. Add the sample RPC round-trip and the monotonic age from sample
-    # completion to receipt. This removes host/Solana wall-clock offset while never
-    # subtracting observed transport delay from the unchanged three-second gate.
-    upper_bound = chain_delta + rpc_seconds + age_seconds
-    return upper_bound, "preexisting-confirmed-head-upper-bound"
+    # Conservative upper bound: the selected chain head was sampled before the
+    # launch receipt. Add its RPC round-trip and monotonic age; never subtract either
+    # uncertainty from the unchanged three-second near-creation gate.
+    return chain_delta + rpc_seconds + age_seconds, "preexisting-confirmed-head-upper-bound"
+
+
+def _timing_lag_with_v4_compatibility(
+    store: Any,
+    *,
+    signature: str,
+    created_at: datetime,
+) -> tuple[float | None, str, str]:
+    reference_row = _reference_row(store, signature)
+    if reference_row is not None:
+        lag, proof = _reference_lag_seconds(
+            store,
+            signature=signature,
+            created_at=created_at,
+        )
+        return lag, proof, "program-wide-swaps+preexisting-confirmed-chain-reference:launch-window-v5"
+
+    # Preserve the previously published v4 helper/test contract. Production v5 no
+    # longer creates these on-demand rows, so a new production launch with no v5
+    # reference still fails closed. Only an already-existing explicit v4 row can use
+    # the compatibility path.
+    if chain_timing._timing_row(store, signature) is not None:
+        lag, proof = chain_timing._chain_lag_seconds(
+            store,
+            signature=signature,
+            created_at=created_at,
+        )
+        return lag, proof, "program-wide-swaps+confirmed-chain-timing:launch-window-v4"
+    return None, "missing_preexisting_chain_reference", "program-wide-swaps+preexisting-confirmed-chain-reference:launch-window-v5"
+
+
+async def _launch_collect_with_reference_timing(
+    self: DexScreenerLaunchCollector,
+    mint: str,
+    at: datetime,
+) -> bool:
+    if _fresh(self.risk, mint, RiskDimension.LAUNCH, at):
+        return True
+    created_at = await self._created_at(mint)
+    if created_at is None:
+        return False
+    if at < created_at + timedelta(seconds=self.policy.launch_window_seconds):
+        return False
+
+    rows = self._early_rows(
+        mint,
+        start=created_at - timedelta(seconds=1),
+        end=created_at + timedelta(seconds=self.policy.launch_window_seconds),
+        decision_at=at,
+    )
+    buys = [row for row in rows if row["side"] == "buy"]
+    buyers = {str(row["wallet"]) for row in buys}
+
+    context = _launch_contexts(self).get(mint)
+    if isinstance(context, dict):
+        signature = str(context.get("launch_signature") or "")
+        if signature:
+            lag_seconds, timing_proof, source = _timing_lag_with_v4_compatibility(
+                self.store,
+                signature=signature,
+                created_at=created_at,
+            )
+        else:
+            lag_seconds = chain_timing._legacy_live_receipt_lag(context, created_at)
+            timing_proof = "legacy_direct_seed_live_receipt"
+            source = "program-wide-swaps+confirmed-launch-context:launch-window-v3"
+        near_creation = (
+            lag_seconds is not None
+            and lag_seconds <= self.policy.max_pair_stream_lag_seconds
+        )
+        early_complete = bool(context.get("complete"))
+        setattr(self, "_roi_last_launch_timing_proof", timing_proof)
+    else:
+        earliest = min(
+            (datetime.fromisoformat(str(row["observed_at"])) for row in rows),
+            default=None,
+        )
+        lag_seconds = (
+            abs((earliest - created_at).total_seconds())
+            if earliest is not None
+            else None
+        )
+        near_creation = (
+            lag_seconds is not None
+            and lag_seconds <= self.policy.max_pair_stream_lag_seconds
+        )
+        early_complete = (
+            len(buys) >= self.policy.min_launch_buys
+            and len(buyers) >= self.policy.min_launch_buyers
+        )
+        source = "program-wide-swaps+dexscreener:launch-window-v1"
+
+    if hasattr(self.store, "record_program_coverage"):
+        self.store.record_program_coverage(
+            token_mint=mint,
+            pair_created_at=created_at.isoformat(),
+            assessed_at=at.isoformat(),
+            launch_lag_ms=lag_seconds * 1000.0 if lag_seconds is not None else None,
+            launch_near_creation=near_creation,
+            early_buy_count=len(buys),
+            early_buyer_count=len(buyers),
+            early_buyers_complete=early_complete,
+        )
+    if not early_complete or not near_creation:
+        return False
+
+    slot_buyers: dict[int, set[str]] = {}
+    buyer_sol: dict[str, float] = {}
+    total_sol = 0.0
+    for row in buys:
+        slot_buyers.setdefault(int(row["slot"]), set()).add(str(row["wallet"]))
+        amount = float(row["native_amount_sol"])
+        total_sol += amount
+        buyer_sol[str(row["wallet"])] = buyer_sol.get(str(row["wallet"]), 0.0) + amount
+    bundled = max((len(value) for value in slot_buyers.values()), default=0) >= self.policy.bundled_same_slot_buyers
+    top_two = sum(sorted(buyer_sol.values(), reverse=True)[:2])
+    sniper_heavy = total_sol > 0 and top_two / total_sol >= self.policy.sniper_top_two_buy_share
+    self.risk.record_launch(
+        mint,
+        LaunchEvidence(bundled_launch=bundled, sniper_heavy=sniper_heavy),
+        observed_at=at,
+        received_at=at,
+        source=source,
+    )
+    return True
 
 
 def _status_with_reference_timing(
@@ -428,11 +554,12 @@ def _status_with_reference_timing(
 
 
 def install_launch_reference_timing_repair() -> None:
-    # The v4 collector already owns the correct launch-window/risk semantics. Replace
-    # only its timing proof function and the two v4 on-demand RPC hooks.
-    chain_timing._chain_lag_seconds = _reference_lag_seconds  # type: ignore[assignment]
+    # Preserve v4's helper identity/tests; production v5 changes only the collector
+    # selection and the two launch-path hooks that previously started/waited for an
+    # on-demand timing probe.
     DirectSolanaIngestionPlane._handle_notification = _handle_notification_with_preexisting_reference  # type: ignore[method-assign]
     bridge._hydrate_mint_launch_context = _hydrate_mint_launch_context_with_reference  # type: ignore[assignment]
+    DexScreenerLaunchCollector.collect = _launch_collect_with_reference_timing  # type: ignore[method-assign]
 
     current_run = DirectSolanaIngestionPlane.run
     if not bool(getattr(current_run, "_roi_launch_reference_timing_run", False)):
@@ -448,6 +575,7 @@ __all__ = [
     "REFERENCE_SAMPLE_INTERVAL_SECONDS",
     "install_launch_reference_timing_repair",
     "_capture_preexisting_reference",
+    "_launch_collect_with_reference_timing",
     "_reference_lag_seconds",
     "_reference_row",
     "_sample_reference_once",
