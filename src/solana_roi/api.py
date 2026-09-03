@@ -17,17 +17,11 @@ from .activation import ARM_CONFIRMATION
 from .config import BASELINE
 from .direct_deployment import deployment_preflight
 from .runtime import IngestionRuntime, build_runtime
-from .wallet_intelligence import ContinuousWalletIntelligence
 
 
 @lru_cache(maxsize=1)
 def ingestion_runtime() -> IngestionRuntime:
     return build_runtime()
-
-
-@lru_cache(maxsize=1)
-def wallet_intelligence() -> ContinuousWalletIntelligence:
-    return ContinuousWalletIntelligence(ingestion_runtime().store)
 
 
 @asynccontextmanager
@@ -37,8 +31,10 @@ async def lifespan(app: FastAPI):
     clock_task: asyncio.Task[None] | None = None
     webhook_stop = asyncio.Event()
     direct_stop = asyncio.Event()
+    wallet_stop = asyncio.Event()
     webhook_task = asyncio.create_task(runtime.webhook_worker.run(webhook_stop), name="legacy-helius-webhook-worker")
     direct_task = asyncio.create_task(runtime.direct_ingestion.run(direct_stop), name="direct-solana-ingestion")
+    wallet_task = asyncio.create_task(runtime.wallet_discovery.run(wallet_stop), name="continuous-wallet-discovery")
     enabled = os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"}
     if enabled:
         clock_stop = asyncio.Event()
@@ -46,6 +42,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        wallet_stop.set()
         direct_stop.set()
         webhook_stop.set()
         if clock_stop is not None:
@@ -54,12 +51,14 @@ async def lifespan(app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await clock_task
         with suppress(asyncio.CancelledError):
+            await wallet_task
+        with suppress(asyncio.CancelledError):
             await direct_task
         with suppress(asyncio.CancelledError):
             await webhook_task
 
 
-app = FastAPI(title="Solana ROI Convergence", version="0.13.0", lifespan=lifespan)
+app = FastAPI(title="Solana ROI Convergence", version="0.14.0", lifespan=lifespan)
 
 
 class ArmRequest(BaseModel):
@@ -125,9 +124,6 @@ def _latest_helius_bootstrap(runtime: IngestionRuntime) -> dict[str, object]:
 
 @app.get("/health")
 def health() -> dict[str, object]:
-    # Render liveness must never contend on the SQLite evidence plane or execute
-    # certification/readiness scans. Deep health remains under the explicit
-    # status endpoints; this route proves only that the HTTP process can answer.
     return {
         "status": "ok",
         "liveness_only": True,
@@ -178,7 +174,8 @@ def ingestion_status() -> dict[str, object]:
         "latency": runtime.latency_gate.status(),
         "execution_quotes": runtime.quote_gate.status(),
         "forward_cohort": runtime.cohort_controller.status(),
-        "wallet_intelligence": wallet_intelligence().status(),
+        "wallet_intelligence": runtime.wallet_intelligence.status(),
+        "wallet_discovery": runtime.wallet_discovery.status(),
         "deployment_preflight": deployment_preflight(),
         "certification_epoch": runtime.certification_epoch.isoformat(),
         "shadow_price_clock_enabled": os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"},
@@ -224,13 +221,22 @@ def forward_cohort_status() -> dict[str, object]:
 
 @app.get("/v1/wallet-intelligence/status")
 def wallet_intelligence_status() -> dict[str, object]:
-    status = wallet_intelligence().status()
+    runtime = ingestion_runtime()
+    status = runtime.wallet_intelligence.status()
+    discovery = runtime.wallet_discovery.status()
     return {
         **status,
+        "continuous_discovery_enabled": discovery["enabled"],
+        "broad_discovery_operational": discovery["broad_program_receipt_sampling"],
         "ecosystem_wide_discovery_complete": False,
         "promotion_authority": "future_immutable_cohort_only",
         "active_v3_1_mutation_allowed": False,
     }
+
+
+@app.get("/v1/wallet-discovery/status")
+def wallet_discovery_status() -> dict[str, object]:
+    return ingestion_runtime().wallet_discovery.status()
 
 
 @app.post("/v1/forward-cohort/freeze")

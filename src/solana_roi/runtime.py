@@ -31,6 +31,8 @@ from .shadow_execution import (
 )
 from .solana_rpc import SolanaRpcPool, rpc_endpoints_from_env
 from .source_coverage import SourceAwareProgramCoverageCertificationGate
+from .wallet_discovery import ContinuousWalletDiscovery, WalletDiscoveryPolicy
+from .wallet_intelligence import ContinuousWalletIntelligence
 from .webhook_ingress import CompositeHeliusWebhookIngestion
 from .webhook_queue import DurableHeliusWebhookQueue, HeliusWebhookWorker
 
@@ -87,10 +89,7 @@ class RuntimeForwardCohortController(ForwardCohortController):
         status["webhook_queue"] = queue_status
         status["direct_solana"] = direct_status
         status["requirements"]["continuous_price_clock_enabled"] = clock_enabled
-        # Legacy webhook evidence may still exist on disk; it must be fully
-        # drained before freeze so no delayed old observation can alter chronology.
         status["requirements"]["durable_webhook_queue_drained"] = queue_drained
-        # Direct full-scope observation is now a hard operational invariant.
         status["requirements"]["direct_full_scope_stream_continuity"] = direct_ok
         status["passed"] = all(bool(value) for value in status["requirements"].values())
         return status
@@ -115,6 +114,8 @@ class IngestionRuntime:
     activation_gate: CandidateActivationGate
     service: CollectingLiveEvidenceIngestionService
     direct_ingestion: DirectSolanaIngestionPlane
+    wallet_intelligence: ContinuousWalletIntelligence
+    wallet_discovery: ContinuousWalletDiscovery
     webhook_queue: DurableHeliusWebhookQueue
     webhook_worker: HeliusWebhookWorker
     certification_epoch: datetime
@@ -179,6 +180,28 @@ def _shadow_simulator(client: JupiterQuoteOnlyClient | None) -> JupiterShadowTra
         )
     except ValueError:
         return None
+
+
+def _wallet_discovery_policy() -> WalletDiscoveryPolicy:
+    return WalletDiscoveryPolicy(
+        broad_sample_modulus=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_SAMPLE_MODULUS", "20")),
+        broad_scan_limit=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_SCAN_LIMIT", "600")),
+        historical_max_signatures=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_HISTORY_SIGNATURES", "120")),
+        historical_rpc_concurrency=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_HISTORY_CONCURRENCY", "6")),
+        historical_min_closed_episodes=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_MIN_HISTORY_EPISODES", "5")),
+        historical_min_distinct_tokens=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_MIN_HISTORY_TOKENS", "5")),
+        historical_min_return_on_capital=float(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_MIN_HISTORY_RETURN", "0.05")),
+        historical_min_profit_factor=float(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_MIN_HISTORY_PROFIT_FACTOR", "1.05")),
+        max_tracked_challengers=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_MAX_TRACKED", "12")),
+        forward_poll_limit=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_FORWARD_POLL_LIMIT", "100")),
+        forward_max_pages=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_FORWARD_MAX_PAGES", "3")),
+        forward_rpc_concurrency=int(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_FORWARD_CONCURRENCY", "6")),
+        poll_interval_seconds=float(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_POLL_SECONDS", "10")),
+        rescreen_hours=float(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_RESCREEN_HOURS", "6")),
+        max_observation_lag_seconds=float(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_MAX_LAG_SECONDS", "20")),
+        min_risk_coverage_rate=float(os.getenv("SOLANA_ROI_WALLET_DISCOVERY_MIN_RISK_COVERAGE", "0.80")),
+        max_chase_fraction=BASELINE.max_chase_fraction,
+    )
 
 
 def build_runtime() -> IngestionRuntime:
@@ -292,8 +315,18 @@ def build_runtime() -> IngestionRuntime:
     )
     cohort_controller.direct_ingestion = direct_ingestion
 
-    # Retain the legacy durable webhook queue as a compatibility/fail-closed
-    # intake only. Production no longer depends on Helius webhook management.
+    wallet_intelligence = ContinuousWalletIntelligence(store)
+    wallet_discovery = ContinuousWalletDiscovery(
+        store=store,
+        rpc=rpc_pool,
+        entity_resolver=entity_resolver,
+        risk=risk,
+        risk_collectors=raw_collectors,
+        intelligence=wallet_intelligence,
+        policy=_wallet_discovery_policy(),
+        enabled=_env_true("SOLANA_ROI_WALLET_DISCOVERY_ENABLED"),
+    )
+
     webhook_ingress = CompositeHeliusWebhookIngestion(service)
     webhook_worker = HeliusWebhookWorker(queue=webhook_queue, service=webhook_ingress)
     return IngestionRuntime(
@@ -314,6 +347,8 @@ def build_runtime() -> IngestionRuntime:
         activation_gate=activation_gate,
         service=service,
         direct_ingestion=direct_ingestion,
+        wallet_intelligence=wallet_intelligence,
+        wallet_discovery=wallet_discovery,
         webhook_queue=webhook_queue,
         webhook_worker=webhook_worker,
         certification_epoch=certification_epoch,
