@@ -250,6 +250,17 @@ from .web_liveness_isolation_repair import install_web_liveness_isolation
 
 install_web_liveness_isolation()
 
+# Public RPC telemetry on the first disk-expanded PR #76 runtime proved routine
+# ten-target polling could still synchronize both public endpoints into 429
+# cooldown. Split that unchanged four-second standby cadence evenly across providers
+# and phase target starts across the interval. Also bound only terminal operational
+# hydration rows and checkpoint WAL growth; canonical evidence and raw receipts are
+# untouched. Urgent real-gap recovery keeps the same dedicated hedged pool, fixed
+# 12-second lease and 3x1000 bound.
+from .continuity_storage_capacity_repair import install_continuity_storage_capacity_repair
+
+install_continuity_storage_capacity_repair()
+
 # Render blue/green handoff can keep the prior process on the persistent SQLite
 # file until the new HTTP service reports healthy. Do not make ASGI startup wait on
 # that writer: start the constant-time health surface first, then acquire the exact
