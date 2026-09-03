@@ -20,12 +20,14 @@ def install_wallet_realtime_status_compatibility() -> None:
         pass
     setattr(current, "_roi_wallet_realtime_tracking_repair", True)
 
-    # v4 is research-only and intentionally installs after the realtime wallet
-    # transport exists, so both polling and low-latency observation writers can be
-    # shadowed without touching critical continuity/hydration authority.
+    # Keep the parent research implementation importable and its historical rows
+    # intact, then install the final governed strategy as the only new sampler.
+    # Both remain strictly downstream of realtime/continuity authority.
     from .profit_first_entity_research import install_profit_first_entity_research
+    from .profit_first_entity_final_research import install_final_profit_first_entity_research
 
     install_profit_first_entity_research()
+    install_final_profit_first_entity_research()
 
 
 __all__ = ["install_wallet_realtime_status_compatibility"]
