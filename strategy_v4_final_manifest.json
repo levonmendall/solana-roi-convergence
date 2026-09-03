@@ -18,6 +18,37 @@
     "entity_flow_momentum",
     "unified_profit_maximizer"
   ],
+  "wallet_entity_universe": {
+    "model": "large_observation_universe_to_token_specific_economic_entities_to_role_specific_alpha_to_dynamic_high_priority_set",
+    "named_seeds_are_hypotheses_not_whitelist": true,
+    "seed_addresses": {
+      "Jijo": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+      "trunoest": "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT",
+      "decu": "4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9",
+      "Wugi": "862TYSvRYoiHAK3F3WwTRYAfuGiQaGdxedN9AGvRGWo2",
+      "The Doc": "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt",
+      "Theo": "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt",
+      "Schoen": "5hAgYC8TJCcEZV7LTXAzkTrm7YL29YXyQQJPCNrG84zM",
+      "Cented": "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o"
+    },
+    "role_scores": [
+      "scout_alpha",
+      "creator_alpha",
+      "momentum_alpha",
+      "confirmation_alpha",
+      "exit_alpha",
+      "distribution_warning_value",
+      "copyable_return_on_capital",
+      "signal_decay"
+    ],
+    "existing_tracking_capacity_is_hard_ceiling": true,
+    "minimum_challenger_observation_slots": 4,
+    "challengers_can_replace_seeds_for_future_influence": true,
+    "historical_metrics_may_prioritize_research_but_cannot_promote": true,
+    "signal_redundancy_penalized": true,
+    "regime_specific_wallet_value_measured": true,
+    "active_strategy_mutation_allowed": false
+  },
   "primary_target": "copyable_executable_residual_return",
   "entry": {
     "measurement_start": "first_system_observable_executable_entry",
@@ -45,6 +76,9 @@
   "entity_resolution": {
     "point_in_time": true,
     "append_only": true,
+    "token_specific_independence": true,
+    "stable_explicit_identity_anchors_allowed": true,
+    "legacy_links_require_current_token_context_before_final_v4_independence_use": true,
     "related_addresses_count_as_one_confirmation": true,
     "future_links_may_not_authorize_past_decisions": true
   },
