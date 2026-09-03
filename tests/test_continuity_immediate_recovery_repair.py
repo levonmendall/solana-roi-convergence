@@ -87,7 +87,7 @@ def test_failed_immediate_recovery_stays_fail_closed(monkeypatch):
 
     times = iter([0.0, 13.0, 13.0])
     monkeypatch.setattr(durability, "_hedged_gap_fetch_delta", fail_fetch)
-    monkeypatch.setattr(immediate.time, "monotonic", lambda: next(times, 13.0))
+    monkeypatch.setattr(immediate, "_monotonic", lambda: next(times, 13.0))
 
     try:
         asyncio.run(immediate._recover_until_lease_boundary(plane, target, 100, 1))
