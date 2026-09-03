@@ -9,33 +9,35 @@ from solana_roi import poll_recoverability_lease as lease
 from solana_roi.direct_solana import WatchTarget
 
 
-def test_real_gap_lease_age_starts_at_gap_not_previous_poll_success():
+def test_real_gap_clock_rebases_existing_lease_age_to_gap_onset(monkeypatch):
     target = WatchTarget("program", "program-a", "PUMP_FUN")
     plane = SimpleNamespace()
     key = live_poll._poll_target_key(target)
     lease._ws_gap_generations(plane)[key] = 2
+    lease._runtime(plane)[key] = {
+        "cursor_ws_generation": 1,
+        "last_success_monotonic": 80.0,
+    }
     repair._gap_clocks(plane)[key] = {
         "generation": 2,
         "started_monotonic": 100.0,
-        "resolved_generation": None,
     }
+    monkeypatch.setattr(repair, "_ORIGINAL_MONOTONIC", lambda: 105.0)
+    token = repair._POLL_CONTEXT.set((plane, target))
+    try:
+        virtual_now = repair._gap_aware_monotonic()
+    finally:
+        repair._POLL_CONTEXT.reset(token)
 
-    age, attempt_age, source = repair._lease_ages(
-        plane,
-        target,
-        cursor_generation=1,
-        last_success_monotonic=80.0,
-        attempt_started_monotonic=103.0,
-        now_monotonic=105.0,
-    )
-
-    assert age == 5.0
-    assert attempt_age == 3.0
-    assert source == "real_websocket_gap_onset"
+    # The unchanged worker subtracts its prior success (80). The repaired clock
+    # returns 85, so the lease age is the actual five seconds since the gap, not
+    # the twenty-five seconds since the older poll success.
+    assert virtual_now == 85.0
+    assert virtual_now - 80.0 == 5.0
     assert lease.POLL_RECOVERABILITY_LEASE_SECONDS == 12.0
 
 
-def test_gap_generation_records_monotonic_origin_and_wakes_recovery(monkeypatch):
+def test_gap_generation_records_actual_monotonic_origin(monkeypatch):
     target = WatchTarget("scout", "wallet-a", None)
     plane = SimpleNamespace()
     endpoint = SimpleNamespace(name="publicnode")
@@ -46,7 +48,7 @@ def test_gap_generation_records_monotonic_origin_and_wakes_recovery(monkeypatch)
         lease._ws_gap_generations(self)[key] = 1
 
     monkeypatch.setattr(repair, "_PREVIOUS_SET_TARGET_STATE", previous)
-    monkeypatch.setattr(repair.time, "monotonic", lambda: 123.5)
+    monkeypatch.setattr(repair, "_ORIGINAL_MONOTONIC", lambda: 123.5)
 
     asyncio.run(
         repair._gap_clock_set_target_state(
@@ -61,30 +63,24 @@ def test_gap_generation_records_monotonic_origin_and_wakes_recovery(monkeypatch)
     row = repair._gap_clocks(plane)[key]
     assert row["generation"] == 1
     assert row["started_monotonic"] == 123.5
-    assert row["resolved_generation"] is None
-    assert repair._wake_for(plane, target).is_set() is True
+    assert row["started_at"]
 
 
-def test_resolved_gap_clock_no_longer_rebases_lease_age():
+def test_no_active_gap_uses_original_clock_and_keeps_canonical_worker(monkeypatch):
     target = WatchTarget("program", "program-b", "RAYDIUM")
     plane = SimpleNamespace()
     key = live_poll._poll_target_key(target)
     lease._ws_gap_generations(plane)[key] = 3
-    repair._gap_clocks(plane)[key] = {
-        "generation": 3,
-        "started_monotonic": 100.0,
-        "resolved_generation": 3,
+    lease._runtime(plane)[key] = {
+        "cursor_ws_generation": 3,
+        "last_success_monotonic": 110.0,
     }
+    monkeypatch.setattr(repair, "_ORIGINAL_MONOTONIC", lambda: 114.0)
+    token = repair._POLL_CONTEXT.set((plane, target))
+    try:
+        assert repair._gap_aware_monotonic() == 114.0
+    finally:
+        repair._POLL_CONTEXT.reset(token)
 
-    age, attempt_age, source = repair._lease_ages(
-        plane,
-        target,
-        cursor_generation=2,
-        last_success_monotonic=110.0,
-        attempt_started_monotonic=112.0,
-        now_monotonic=114.0,
-    )
-
-    assert age == 4.0
-    assert attempt_age == 2.0
-    assert source == "last_successful_poll"
+    assert live_poll._poll_target is lease._leased_poll_target
+    assert target.__class__ is WatchTarget
