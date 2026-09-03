@@ -145,6 +145,14 @@ def install_direct_stream_memory_bounds() -> None:
 install_direct_stream_fairness()
 install_direct_stream_memory_bounds()
 
+# PR #59 also moved wallet intelligence itself into build_runtime(). Its schema
+# creation is research-only and must not become a synchronous Render startup
+# prerequisite. Install its lazy proxy before the discovery proxy and before api.py
+# captures runtime.build_runtime.
+from .wallet_intelligence_startup_repair import install_wallet_intelligence_startup_isolation
+
+install_wallet_intelligence_startup_isolation()
+
 # Continuous wallet discovery is research-only and has zero paper/live authority.
 # Its schema/bootstrap must therefore never be able to terminate the web service.
 # Defer that bootstrap into its background task, report any failure through status,
