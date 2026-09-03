@@ -7,6 +7,7 @@ from . import funding_provenance_repair as funding
 from . import launch_chain_timing_repair as chain_timing
 from . import launch_reference_timing_repair as reference
 from . import launch_ws_frontier_timing_repair as frontier
+from . import raw_receipt_dispatch_repair as raw_receipt
 from .coverage_completeness_repair import _launch_contexts
 from .launch_funding import DexScreenerLaunchCollector
 
@@ -72,6 +73,13 @@ def install_production_boundary_compatibility() -> None:
     # its status-wrapper factory so minimal intrinsic status callers stay supported;
     # production funding collection logic is untouched.
     funding._status_with_funding_provenance = _safe_funding_status_factory  # type: ignore[assignment]
+
+    # The v7 production cohort proved that timing evidence was still stamped only
+    # after each WebSocket reader waited for synchronous durable dispatch. Install
+    # the bounded raw-receipt dispatcher here, after v7 timing is active and before
+    # the runtime is constructed, so every supported entrypoint observes socket-read
+    # arrival time without changing launch, funding, continuity, or safety gates.
+    raw_receipt.install_raw_receipt_dispatch_repair()
 
 
 __all__ = [
