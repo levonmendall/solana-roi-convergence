@@ -81,6 +81,17 @@ def install_production_boundary_compatibility() -> None:
     # arrival time without changing launch, funding, continuity, or safety gates.
     raw_receipt.install_raw_receipt_dispatch_repair()
 
+    # `_launch_like` already carries the program-scoped detector marker contract
+    # installed by runtime_guards. The sentinel wrapper changes transport shape,
+    # not detection scope, so preserve every existing marker for production.py and
+    # the intrinsic regression suite.
+    try:
+        raw_receipt._launch_like_with_sentinel.__dict__.update(
+            getattr(raw_receipt._ORIGINAL_LAUNCH_LIKE, "__dict__", {})
+        )
+    except Exception:
+        pass
+
 
 __all__ = [
     "install_production_boundary_compatibility",
