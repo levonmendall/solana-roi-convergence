@@ -206,7 +206,7 @@ def install_render_runtime_bootstrap_handoff() -> None:
     if _API is not None and bool(getattr(_API.app.state, "roi_runtime_bootstrap_handoff", False)):
         return
 
-    from .certification_failure_accounting_repair import install_certification_failure_accounting_repair
+    from .certification_failure_accounting_runtime_install import install_final_certification_failure_accounting
     from .certification_research_architecture import install_certification_research_architecture
     from .continuity_target_frontier_repair import install_continuity_target_frontier_repair
     from .ephemeral_candidate_retention import install_ephemeral_candidate_retention
@@ -214,7 +214,7 @@ def install_render_runtime_bootstrap_handoff() -> None:
     install_certification_research_architecture()
     install_ephemeral_candidate_retention()
     install_continuity_target_frontier_repair()
-    install_certification_failure_accounting_repair()
+    install_final_certification_failure_accounting()
 
     from . import api as api_module
 
