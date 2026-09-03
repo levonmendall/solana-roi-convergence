@@ -145,6 +145,17 @@ def install_direct_stream_memory_bounds() -> None:
 install_direct_stream_fairness()
 install_direct_stream_memory_bounds()
 
+# PR #59 added _wallet_discovery_policy() with BASELINE.max_chase_fraction but did
+# not import BASELINE into runtime.py. Render therefore failed synchronously in
+# build_runtime() with NameError before any background isolation could take effect.
+# Bind the canonical frozen baseline into the runtime module before api.py invokes
+# build_runtime(). This changes no strategy value; it only restores the intended
+# reference to the already-canonical configuration object.
+from . import runtime as runtime_module
+from .config import BASELINE
+
+runtime_module.BASELINE = BASELINE
+
 # PR #59 also moved wallet intelligence itself into build_runtime(). Its schema
 # creation is research-only and must not become a synchronous Render startup
 # prerequisite. Install its lazy proxy before the discovery proxy and before api.py
