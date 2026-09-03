@@ -179,6 +179,13 @@ from .wallet_realtime_tracking_repair import install_wallet_realtime_tracking_re
 
 install_wallet_realtime_tracking_repair()
 
+# The outer realtime telemetry wrapper must preserve every marker attached by the
+# intrinsic stream/poll/memory repairs below it. Those markers are part of the
+# repository's production-composition proof, not cosmetic test metadata.
+from .wallet_realtime_status_compat import install_wallet_realtime_status_compatibility
+
+install_wallet_realtime_status_compatibility()
+
 # Keep append-only wallet-intelligence history, but prevent a snapshot from an old
 # polling epoch from becoming promotion evidence after the new realtime epoch has
 # started. Reads become epoch-aware; historical rows remain intact for audit.
