@@ -14,6 +14,7 @@ from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 
 
 _PREVIOUS_SET_TARGET_STATE = target_quorum._quorum_set_target_state
+_PREVIOUS_PROXY_FETCH = durability._LeaseWatermarkProxy._slot_fetch_delta
 _monotonic = time.monotonic
 
 
@@ -43,10 +44,10 @@ async def _recover_until_lease_boundary(
     """Spend the existing fixed lease on useful bounded recovery attempts.
 
     Each attempt preserves the established 3x1000 confirmed-slot delta and read-only
-    hedging. The only change is scheduling: recovery begins at the actual real-WS
-    zero-coverage transition instead of waiting for the next four-second poll tick.
-    An attempt that starts inside the unchanged 12-second lease may finish after it,
-    matching the canonical worker's existing attempt-start grace.
+    hedging. The only scheduling change is that the first recovery begins at the
+    actual real-WebSocket zero-coverage transition rather than waiting for the next
+    four-second poll tick. An attempt that starts inside the unchanged 12-second
+    lease may finish after it, matching the canonical worker's attempt-start grace.
     """
 
     deadline = _monotonic() + lease.POLL_RECOVERABILITY_LEASE_SECONDS
@@ -161,48 +162,44 @@ async def _set_target_state_with_immediate_recovery(
         _kick_immediate_recovery(self, target, after_generation)
 
 
-class _ImmediateRecoveryProxy:
-    def __init__(self, base: Any):
-        self._base = base
+async def _immediate_aware_proxy_fetch(
+    proxy: durability._LeaseWatermarkProxy,
+    plane: Any,
+    target: WatchTarget,
+    cursor_slot: int,
+) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
+    """Consume recovery already started at gap onset without changing proxy identity."""
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._base, name)
+    key = live_poll._poll_target_key(target)
+    runtime = lease._runtime(plane).get(key, {})
+    current_generation = _generation(plane, target)
+    cursor_generation = int(runtime.get("cursor_ws_generation", current_generation) or 0)
+    if current_generation != cursor_generation:
+        pending = _recovery_tasks(plane).get(key)
+        if isinstance(pending, dict):
+            task = pending.get("task")
+            if (
+                int(pending.get("generation", -1)) == current_generation
+                and int(pending.get("cursor_slot", -1)) == int(cursor_slot)
+                and isinstance(task, asyncio.Task)
+            ):
+                try:
+                    result = await asyncio.shield(task)
+                    _increment(plane, "consumed")
+                    _recovery_tasks(plane).pop(key, None)
+                    return result
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _recovery_tasks(plane).pop(key, None)
+                    raise durability.RecoverableLivePollDeltaIncomplete(
+                        f"immediate real-gap recovery failed closed: {type(exc).__name__}"
+                    ) from exc
+    return await _PREVIOUS_PROXY_FETCH(proxy, plane, target, cursor_slot)
 
-    async def _slot_fetch_delta(
-        self,
-        plane: Any,
-        target: WatchTarget,
-        cursor_slot: int,
-    ) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
-        key = live_poll._poll_target_key(target)
-        runtime = lease._runtime(plane).get(key, {})
-        current_generation = _generation(plane, target)
-        cursor_generation = int(runtime.get("cursor_ws_generation", current_generation) or 0)
-        if current_generation != cursor_generation:
-            pending = _recovery_tasks(plane).get(key)
-            if isinstance(pending, dict):
-                task = pending.get("task")
-                if (
-                    int(pending.get("generation", -1)) == current_generation
-                    and int(pending.get("cursor_slot", -1)) == int(cursor_slot)
-                    and isinstance(task, asyncio.Task)
-                ):
-                    try:
-                        result = await asyncio.shield(task)
-                        _increment(plane, "consumed")
-                        _recovery_tasks(plane).pop(key, None)
-                        return result
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        _recovery_tasks(plane).pop(key, None)
-                        # Route the failed immediate attempt through the canonical
-                        # lease exception branch. It will use the unchanged gap clock
-                        # and fail the exact release only when recovery truly expired.
-                        raise durability.RecoverableLivePollDeltaIncomplete(
-                            f"immediate real-gap recovery failed closed: {type(exc).__name__}"
-                        ) from exc
-        return await self._base._slot_fetch_delta(plane, target, cursor_slot)
+
+setattr(_immediate_aware_proxy_fetch, "_roi_immediate_recovery_fetch", True)
+_set_target_state_with_immediate_recovery.__name__ = "_tracked_quorum_set_target_state"
 
 
 def _status_with_immediate_recovery(
@@ -251,12 +248,18 @@ def _status_with_immediate_recovery(
 
 
 def install_continuity_immediate_recovery_repair() -> None:
-    target_quorum._quorum_set_target_state = _set_target_state_with_immediate_recovery  # type: ignore[assignment]
-    fanout._set_target_state = _set_target_state_with_immediate_recovery  # type: ignore[assignment]
+    # Preserve the established helper identity: callers and regressions expect the
+    # lease module's tracked setter to be the exact object installed into target
+    # quorum/fanout.
+    lease._tracked_quorum_set_target_state = _set_target_state_with_immediate_recovery  # type: ignore[assignment]
+    target_quorum._quorum_set_target_state = lease._tracked_quorum_set_target_state  # type: ignore[assignment]
+    fanout._set_target_state = lease._tracked_quorum_set_target_state  # type: ignore[assignment]
 
-    current = getattr(lease, "watermark", None)
-    if not isinstance(current, _ImmediateRecoveryProxy):
-        lease.watermark = _ImmediateRecoveryProxy(current)  # type: ignore[assignment]
+    # Preserve the durability proxy itself and its `_base is watermark` contract.
+    # Extend the class method in place rather than stacking another proxy object.
+    current_fetch = durability._LeaseWatermarkProxy._slot_fetch_delta
+    if not bool(getattr(current_fetch, "_roi_immediate_recovery_fetch", False)):
+        durability._LeaseWatermarkProxy._slot_fetch_delta = _immediate_aware_proxy_fetch  # type: ignore[method-assign]
 
     current_status = DirectSolanaIngestionPlane.status
     if not bool(getattr(current_status, "_roi_continuity_immediate_recovery", False)):
@@ -265,7 +268,7 @@ def install_continuity_immediate_recovery_repair() -> None:
 
 __all__ = [
     "install_continuity_immediate_recovery_repair",
-    "_ImmediateRecoveryProxy",
+    "_immediate_aware_proxy_fetch",
     "_kick_immediate_recovery",
     "_recover_until_lease_boundary",
 ]
