@@ -54,6 +54,35 @@ services:
         value: "5"
       - key: SOLANA_ROI_DIRECT_RAW_RETENTION_SECONDS
         value: "900"
+      # Research-only adaptive wallet lane. It samples raw full-program receipts,
+      # uses historical RPC only for screening, and starts promotion evidence at a
+      # new prospective forward boundary. It cannot sign, submit, or mutate v3.1.
+      - key: SOLANA_ROI_WALLET_DISCOVERY_ENABLED
+        value: "true"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_SAMPLE_MODULUS
+        value: "20"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_SCAN_LIMIT
+        value: "600"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_HISTORY_SIGNATURES
+        value: "120"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_HISTORY_CONCURRENCY
+        value: "6"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_MAX_TRACKED
+        value: "12"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_FORWARD_POLL_LIMIT
+        value: "100"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_FORWARD_MAX_PAGES
+        value: "3"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_FORWARD_CONCURRENCY
+        value: "6"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_POLL_SECONDS
+        value: "10"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_RESCREEN_HOURS
+        value: "6"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_MAX_LAG_SECONDS
+        value: "20"
+      - key: SOLANA_ROI_WALLET_DISCOVERY_MIN_RISK_COVERAGE
+        value: "0.80"
       - key: SOLANA_ROI_SHADOW_CLOCK_ENABLED
         value: "true"
       - key: SOLANA_ROI_SHADOW_CLOCK_SECONDS
