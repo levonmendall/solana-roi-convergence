@@ -43,7 +43,6 @@ def test_confirmed_frontier_advances_only_to_slot_minus_one(monkeypatch):
         ]
     )
     monkeypatch.setattr(frontier.isolation, "_recovery_rpc", lambda _plane: pool)
-    monkeypatch.setattr(frontier.time, "monotonic", lambda: 3.0)
 
     cursor, anchor = asyncio.run(
         frontier._confirmed_target_frontier_cursor(plane, target, 100, 2)
@@ -70,7 +69,6 @@ def test_processed_or_slot_mismatched_frontier_is_never_trusted(monkeypatch):
     frontier._observe_target_frontier(plane, "publicnode", target, "sig-new", 700, observed_monotonic=1.0)
     pool = ConfirmingPool([{"slot": 701, "confirmationStatus": "processed"}])
     monkeypatch.setattr(frontier.isolation, "_recovery_rpc", lambda _plane: pool)
-    monkeypatch.setattr(frontier.time, "monotonic", lambda: 1.0)
 
     cursor, anchor = asyncio.run(
         frontier._confirmed_target_frontier_cursor(plane, target, 100, 1)
