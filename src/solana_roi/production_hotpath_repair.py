@@ -11,7 +11,6 @@ from . import funding_provenance_repair as funding
 from . import launch_coverage_bridge as bridge
 from . import launch_ws_frontier_timing_repair as frontier
 from . import production_capacity_repair as capacity
-from . import raw_receipt_dispatch_repair as raw_dispatch
 from . import continuity_recovery_isolation_repair as recovery_isolation
 from .direct_solana import DirectSolanaIngestionPlane
 from .launch_funding import FundingSource
@@ -214,11 +213,7 @@ def _funding_source_from_transaction(
         tx_block_time = int(tx.get("blockTime") or row_block_time or 0)
     except (TypeError, ValueError):
         tx_block_time = row_block_time
-    transfer_at = (
-        datetime.fromtimestamp(tx_block_time, tz=timezone.utc)
-        if tx_block_time > 0
-        else before_at
-    )
+    transfer_at = datetime.fromtimestamp(tx_block_time, tz=timezone.utc) if tx_block_time > 0 else before_at
     candidates = [
         (source, lamports)
         for source, lamports in funding._native_inbound_transfers_extended(tx, wallet)
@@ -258,6 +253,8 @@ async def _funding_source_result_concurrent(
             return_exceptions=True,
         )
         for (_signature, block_time), result in zip(chunk, results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
             if isinstance(result, BaseException):
                 return None, f"transaction_rpc:{type(result).__name__}"
             if not isinstance(result, dict):
