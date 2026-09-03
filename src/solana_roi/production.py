@@ -250,6 +250,15 @@ from .web_liveness_isolation_repair import install_web_liveness_isolation
 
 install_web_liveness_isolation()
 
+# Render blue/green handoff can keep the prior process on the persistent SQLite
+# file until the new HTTP service reports healthy. Do not make ASGI startup wait on
+# that writer: start the constant-time health surface first, then acquire the exact
+# canonical runtime in a guarded background bootstrap. Deep endpoints remain 503
+# until it is ready, so data/certification authority stays fail-closed.
+from .render_runtime_bootstrap_repair import install_render_runtime_bootstrap_handoff
+
+install_render_runtime_bootstrap_handoff()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
