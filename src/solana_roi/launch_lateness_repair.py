@@ -169,6 +169,15 @@ def install_launch_lateness_repair() -> None:
 
     install_launch_chain_timing_repair()
 
+    # Production then proved that starting getSlot/getBlockTime only after the live
+    # launch receipt charges the timing probe's own public-RPC latency against the
+    # unchanged three-second gate. Maintain an advancing confirmed-head reference in
+    # the background and snapshot it before each launch; the launch path performs no
+    # timing RPC and missing/stale proof still fails closed.
+    from .launch_reference_timing_repair import install_launch_reference_timing_repair
+
+    install_launch_reference_timing_repair()
+
 
 __all__ = [
     "install_launch_lateness_repair",

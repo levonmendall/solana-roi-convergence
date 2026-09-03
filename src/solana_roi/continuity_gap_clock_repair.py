@@ -178,6 +178,15 @@ def install_continuity_gap_clock_repair() -> None:
     if not bool(getattr(current_status, "_roi_continuity_gap_clock_repair", False)):
         DirectSolanaIngestionPlane.status = _status_with_gap_clock(current_status)  # type: ignore[method-assign]
 
+    # Production proved that waiting for the next four-second poll tick can spend a
+    # large fraction of the fixed 12-second real-gap lease before the first useful
+    # bounded recovery read begins. Kick that same canonical bounded/hedged recovery
+    # immediately on the zero-WebSocket transition without changing the lease or
+    # 3x1000 delta limit.
+    from .continuity_immediate_recovery_repair import install_continuity_immediate_recovery_repair
+
+    install_continuity_immediate_recovery_repair()
+
 
 __all__ = [
     "install_continuity_gap_clock_repair",
