@@ -169,6 +169,18 @@ from .production_capacity_repair import install_production_capacity_repair
 
 install_production_capacity_repair()
 
+# Exact-release telemetry then isolated two remaining proof hot paths: funding
+# provenance could spend the entire launch cycle hydrating history serially, while
+# an actual WebSocket gap could spend its unchanged 12-second recovery lease on one
+# slow public RPC page. It also showed v7 launch reconstruction producing swaps but
+# no final completeness attestations. Overlap only bounded read-only funding calls,
+# restore hedging only for the dedicated urgent recovery pool, and carry the existing
+# immutable-window attestation through the final v7 timing wrapper. No threshold,
+# market scope, signing/submission authority, or paper-only boundary changes.
+from .certification_hotpath_repair import install_certification_hotpath_repair
+
+install_certification_hotpath_repair()
+
 # Broad discovery and historical screening are allowed to yield to critical
 # capacity, but already-enrolled wallets require their own prospective clock. Move
 # those wallets to direct logsSubscribe receipt timing, an independent read-only RPC
