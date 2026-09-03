@@ -191,6 +191,17 @@ from .wallet_realtime_tracking_repair import install_wallet_realtime_tracking_re
 
 install_wallet_realtime_tracking_repair()
 
+# Exact-release telemetry on PR #67 proved the ordinary set-based writer was active,
+# yet the bounded no-drop queue still stayed ~100% full with ~100-second dispatch
+# delay. The remaining per-receipt transactions were launch, scout and bootstrap/
+# sample receipts. Batch the complete raw dispatch scope in one durable transaction
+# while reproducing the canonical hydration enqueue decisions and priorities. The
+# 4096 queue bound, no-drop rule, full market scope, certification thresholds and
+# paper-only authority remain unchanged.
+from .full_scope_dispatch_capacity_repair import install_full_scope_dispatch_capacity_repair
+
+install_full_scope_dispatch_capacity_repair()
+
 # The outer realtime telemetry wrapper must preserve every marker attached by the
 # intrinsic stream/poll/memory repairs below it. Those markers are part of the
 # repository's production-composition proof, not cosmetic test metadata.
