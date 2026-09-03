@@ -34,3 +34,14 @@ class DirectRpcJupiterQuoteClient(JupiterQuoteOnlyClient):
         self.now_fn = now_fn
         self.perf_fn = perf_fn
         self._sol_usd_cache: tuple[datetime, float] | None = None
+
+
+# Package initialization installs exact-fill accounting first. The production
+# runtime imports this direct quote adapter before constructing its handoff and
+# activation gate, so install the all-in admission layer here without freezing or
+# arming any cohort state. This only changes candidate economics: the existing 15%
+# chase ceiling remains the authority, now applied to route price plus observed
+# signature/priority/rent cash costs.
+from .all_in_execution_cost_gate import install_all_in_execution_cost_gate
+
+install_all_in_execution_cost_gate()
