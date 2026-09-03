@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from solana_roi import launch_reference_timing_repair as reference
 from solana_roi.ingestion import WalletProfileRegistry
 from solana_roi.launch_funding import DexScreenerLaunchCollector
@@ -46,7 +48,7 @@ def test_preexisting_head_before_launch_uses_rtt_plus_reference_age_upper_bound(
         created_at=created,
     )
 
-    assert lag == 1.2
+    assert lag == pytest.approx(1.2)
     assert proof == "preexisting-confirmed-head-upper-bound"
     assert _collector(tmp_path).policy.max_pair_stream_lag_seconds == 3.0
 
@@ -76,7 +78,7 @@ def test_preexisting_later_head_adds_chain_duration_without_probe_latency(tmp_pa
         created_at=created,
     )
 
-    assert lag == 2.0
+    assert lag == pytest.approx(2.0)
     assert proof == "preexisting-confirmed-head-upper-bound"
 
 
@@ -105,7 +107,7 @@ def test_upper_bound_above_unchanged_three_seconds_remains_rejected_by_policy(tm
         created_at=created,
     )
 
-    assert lag == 3.5
+    assert lag == pytest.approx(3.5)
     assert lag > _collector(tmp_path).policy.max_pair_stream_lag_seconds
 
 
