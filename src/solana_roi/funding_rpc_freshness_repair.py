@@ -98,33 +98,39 @@ def _status_with_funding_rpc(original: Any) -> Any:
     def status(self: Any) -> dict[str, Any]:
         payload = original(self)
         bridge = payload.get("launch_coverage_bridge")
-        if isinstance(bridge, dict):
-            raw = funding.bridge._raw_collectors(self)
-            collector = getattr(raw, "funding", None)
+        if not isinstance(bridge, dict):
+            return payload
+        bridge.update(
+            {
+                "funding_transaction_rpc_rounds": FUNDING_TRANSACTION_RPC_ROUNDS,
+                "funding_transaction_null_result_secondary_fallback": True,
+                "funding_transaction_retry_delay_seconds": FUNDING_TRANSACTION_RETRY_DELAY_SECONDS,
+                "funding_history_page_cap_unchanged": True,
+            }
+        )
+        # Intrinsic/minimal status regressions construct the ingestion plane without
+        # the runtime collector graph. Additive telemetry must never make the core
+        # status endpoint depend on that graph.
+        if not hasattr(self, "service"):
+            return payload
+        raw = funding.bridge._raw_collectors(self)
+        collector = getattr(raw, "funding", None)
+        if collector is not None:
             bridge.update(
                 {
-                    "funding_transaction_rpc_rounds": FUNDING_TRANSACTION_RPC_ROUNDS,
-                    "funding_transaction_null_result_secondary_fallback": True,
-                    "funding_transaction_retry_delay_seconds": FUNDING_TRANSACTION_RETRY_DELAY_SECONDS,
-                    "funding_history_page_cap_unchanged": True,
+                    "funding_transaction_null_results": int(
+                        getattr(collector, "_roi_funding_provenance_transaction_null_results", 0) or 0
+                    ),
+                    "funding_transaction_secondary_non_null_recoveries": int(
+                        getattr(
+                            collector,
+                            "_roi_funding_provenance_transaction_secondary_non_null_recoveries",
+                            0,
+                        )
+                        or 0
+                    ),
                 }
             )
-            if collector is not None:
-                bridge.update(
-                    {
-                        "funding_transaction_null_results": int(
-                            getattr(collector, "_roi_funding_provenance_transaction_null_results", 0) or 0
-                        ),
-                        "funding_transaction_secondary_non_null_recoveries": int(
-                            getattr(
-                                collector,
-                                "_roi_funding_provenance_transaction_secondary_non_null_recoveries",
-                                0,
-                            )
-                            or 0
-                        ),
-                    }
-                )
         return payload
 
     try:
