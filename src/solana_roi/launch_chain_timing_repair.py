@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
+from . import direct_solana as direct_solana_module
 from . import launch_coverage_bridge as bridge
 from .coverage_completeness_repair import _launch_contexts
 from .direct_solana import DirectSolanaIngestionPlane
@@ -36,11 +37,6 @@ def _timing_tasks(self: Any) -> dict[str, asyncio.Task[Any]]:
 def _increment(self: Any, name: str, amount: int = 1) -> None:
     attr = f"_roi_launch_timing_{name}"
     setattr(self, attr, int(getattr(self, attr, 0) or 0) + int(amount))
-
-
-def _ensure_timing_table(self: Any) -> None:
-    with self.store._lock, self.store.db:
-        self.store.db.execute(_TIMING_TABLE_SQL)
 
 
 def _write_timing_row(
@@ -86,7 +82,7 @@ def _write_timing_row(
 
 def _timing_row(store: Any, signature: str) -> dict[str, Any] | None:
     try:
-        with store._lock:
+        with store._lock, store.db:
             store.db.execute(_TIMING_TABLE_SQL)
             row = store.db.execute(
                 "SELECT signature, launch_slot, head_slot, head_block_time, rpc_provider, "
@@ -100,15 +96,15 @@ def _timing_row(store: Any, signature: str) -> dict[str, Any] | None:
 
 
 async def _sample_confirmed_chain_head(self: Any, signature: str, launch_slot: int) -> None:
-    """Capture a chain-native upper-bound timing proof at first live receipt.
+    """Capture a chain-native timing proof at first live receipt.
 
-    The WebSocket notification carries the launch slot. Immediately after receipt we
-    ask the existing read-only RPC pool for the current *confirmed* chain head. If
-    that head has not advanced beyond the launch slot, the launch was observed before
-    confirmation could outrun it and its certified lag is zero. If the head is later,
-    its blockTime and the launch transaction blockTime are compared later in the
-    collector. Both timestamps are then in the Solana clock domain, so host-wall-clock
-    offset cannot create or erase certification evidence.
+    The WebSocket notification carries the launch slot. Immediately after that first
+    receipt, the existing read-only RPC pool samples the current *confirmed* chain
+    head. If confirmation has not advanced beyond the launch slot, the event was
+    necessarily observed while it was still at or ahead of confirmed head. If the
+    head is later, its blockTime and the launch transaction blockTime are compared
+    later in the collector. Both values then live in the Solana clock domain, so
+    Render-host clock offset cannot create or erase certification evidence.
     """
 
     _increment(self, "started")
@@ -147,9 +143,7 @@ async def _sample_confirmed_chain_head(self: Any, signature: str, launch_slot: i
             provider=provider,
             slot_latency_ms=slot_latency,
             block_time_latency_ms=block_time_latency,
-            sampled_at=self.utcnow().isoformat() if callable(getattr(self, "utcnow", None)) else __import__(
-                "solana_roi.direct_solana", fromlist=["utcnow"]
-            ).utcnow().isoformat(),
+            sampled_at=direct_solana_module.utcnow().isoformat(),
             status="complete",
         )
         _increment(self, "complete")
@@ -166,7 +160,7 @@ async def _sample_confirmed_chain_head(self: Any, signature: str, launch_slot: i
                 provider=None,
                 slot_latency_ms=None,
                 block_time_latency_ms=None,
-                sampled_at=__import__("solana_roi.direct_solana", fromlist=["utcnow"]).utcnow().isoformat(),
+                sampled_at=direct_solana_module.utcnow().isoformat(),
                 status="failed",
                 error_type=type(exc).__name__,
             )
@@ -188,19 +182,25 @@ async def _handle_notification_with_chain_timing(
         signature = str(value.get("signature") or "") if isinstance(value, dict) else ""
         slot = int(result.get("context", {}).get("slot") or 0) if isinstance(result, dict) else 0
         logs = value.get("logs") if isinstance(value, dict) else None
-        is_launch = bool(signature and slot > 0 and value.get("err") is None and self._launch_like(logs))
+        is_launch = bool(
+            signature
+            and slot > 0
+            and isinstance(value, dict)
+            and value.get("err") is None
+            and self._launch_like(logs)
+        )
         if is_launch:
             tasks = _timing_tasks(self)
-            current = tasks.get(signature)
-            if current is None or current.done():
-                task = asyncio.create_task(
+            # Keep the first live receipt authoritative. A later duplicate from the
+            # second WebSocket provider must never overwrite it with a worse sample.
+            if signature not in tasks:
+                tasks[signature] = asyncio.create_task(
                     _sample_confirmed_chain_head(self, signature, slot),
                     name=f"launch-chain-timing:{signature[:12]}",
                 )
-                tasks[signature] = task
     except Exception:
         # Timing proof is additive and fail-closed. Never interrupt the canonical
-        # notification path because the optional proof sampler could not start.
+        # notification path because the proof sampler could not start.
         pass
 
     await _PREVIOUS_HANDLE_NOTIFICATION(self, provider, subscription_targets, message)
@@ -212,7 +212,7 @@ async def _await_timing_sample(self: Any, signature: str, *, timeout_seconds: fl
         return
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=max(0.05, float(timeout_seconds)))
-    except (asyncio.TimeoutError, Exception):
+    except Exception:
         return
 
 
@@ -275,6 +275,13 @@ def _chain_lag_seconds(
     return head_block_time - launch_block_time, "confirmed_chain_duration"
 
 
+def _legacy_live_receipt_lag(context: dict[str, Any], created_at: datetime) -> float | None:
+    observed_at = context.get("observed_at")
+    if not isinstance(observed_at, datetime):
+        return None
+    return max(0.0, (observed_at - created_at).total_seconds())
+
+
 async def _launch_collect_with_chain_timing(
     self: DexScreenerLaunchCollector,
     mint: str,
@@ -306,19 +313,22 @@ async def _launch_collect_with_chain_timing(
                 signature=signature,
                 created_at=created_at,
             )
+            source = "program-wide-swaps+confirmed-chain-timing:launch-window-v4"
         else:
-            lag_seconds, timing_proof = None, "missing_launch_signature"
+            # Directly seeded/offline tests and compatibility callers do not pass
+            # through the production launch bridge, so they have no launch signature
+            # to bind to a first-receipt chain-head sample. Preserve their established
+            # v3 semantics; production bridge contexts always carry a signature.
+            lag_seconds = _legacy_live_receipt_lag(context, created_at)
+            timing_proof = "legacy_direct_seed_live_receipt"
+            source = "program-wide-swaps+confirmed-launch-context:launch-window-v3"
         near_creation = (
             lag_seconds is not None
             and lag_seconds <= self.policy.max_pair_stream_lag_seconds
         )
         early_complete = bool(context.get("complete"))
-        source = "program-wide-swaps+confirmed-chain-timing:launch-window-v4"
         setattr(self, "_roi_last_launch_timing_proof", timing_proof)
     else:
-        # No live bridge attestation means no chain-head sample is tied to this
-        # observation. Preserve the established legacy/offline semantics rather
-        # than manufacturing prospective timing proof.
         earliest = min(
             (datetime.fromisoformat(str(row["observed_at"])) for row in rows),
             default=None,
