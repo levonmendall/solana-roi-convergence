@@ -51,6 +51,9 @@ def _public_status() -> dict[str, Any]:
         "certification_research_architecture_installed_before_api_capture": True,
         "wallet_research_operationally_isolated": True,
         "process_wide_rpc_workload_governor": True,
+        "ephemeral_candidate_retention_installed_before_api_capture": True,
+        "active_strategy_candidate_state_ephemeral": True,
+        "canonical_observation_evidence_retained": True,
         "certification_thresholds_unchanged": True,
         "continuity_lease_unchanged": True,
         "recovery_bound_unchanged": True,
@@ -212,8 +215,10 @@ def install_render_runtime_bootstrap_handoff() -> None:
     # frozen scouts, while background wallet evaluation receives a separate RPC
     # pool plus a process-wide bounded research workload class.
     from .certification_research_architecture import install_certification_research_architecture
+    from .ephemeral_candidate_retention import install_ephemeral_candidate_retention
 
     install_certification_research_architecture()
+    install_ephemeral_candidate_retention()
 
     # Import only after the production composition has installed all runtime class
     # and build_runtime guards. api.py therefore captures the exact canonical
