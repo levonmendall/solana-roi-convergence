@@ -14,7 +14,17 @@ def install_final_certification_failure_accounting() -> None:
     delegates here, at production install time, prevents test import order from
     causing it to wrap stale pre-production methods and preserves every existing
     continuity/research/quote wrapper marker.
+
+    This is also the final post-frontier composition point in Render bootstrap.
+    Install the exact-release early transport-loss repair here so no older quorum
+    installer can replace its target-stream liveness or gap-snapshot behavior.
     """
+
+    from .continuity_early_loss_detection_repair import (
+        install_continuity_early_loss_detection_repair,
+    )
+
+    install_continuity_early_loss_detection_repair()
 
     current_discard = retention._discard_hydration_row
     if not bool(getattr(current_discard, "_roi_failure_accounting", False)):
