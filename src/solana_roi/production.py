@@ -191,6 +191,16 @@ from .wallet_realtime_tracking_repair import install_wallet_realtime_tracking_re
 
 install_wallet_realtime_tracking_repair()
 
+# Production wallet telemetry then proved that the live socket clock was healthy
+# while FIFO catch-up hydration still delayed observation-time marks by minutes.
+# Reserve workers for receipts still inside the unchanged 20-second SLA, move stale
+# and recovery work onto a separate backlog lane, bound recovery concurrency, and
+# make risk enrichment a claimed multi-worker queue with explicit pending-age
+# telemetry. No strategy or promotion threshold changes.
+from .wallet_live_priority_repair import install_wallet_live_priority_repair
+
+install_wallet_live_priority_repair()
+
 # Exact-release telemetry on PR #67 proved the ordinary set-based writer was active,
 # yet the bounded no-drop queue still stayed ~100% full with ~100-second dispatch
 # delay. The remaining per-receipt transactions were launch, scout and bootstrap/
