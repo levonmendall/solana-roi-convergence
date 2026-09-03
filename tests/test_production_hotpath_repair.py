@@ -5,11 +5,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from solana_roi import production_capacity_repair as capacity
 from solana_roi.direct_solana import DirectSolanaJournal, WatchTarget
 from solana_roi.launch_funding import LaunchFundingPolicy
 from solana_roi.observation_store import ObservationEventStore
 from solana_roi.production_hotpath_repair import (
     FUNDING_TRANSACTION_GLOBAL_CONCURRENCY,
+    _capacity_call_with_urgent_recovery,
     _funding_source_result_concurrent,
     _persist_background_batch_aggregated,
 )
@@ -206,3 +208,42 @@ def test_speculative_older_rpc_failure_cannot_override_newer_valid_funding_sourc
     assert reason == "latest_qualifying_source_found"
     assert source is not None
     assert source.funder == "newest-funder"
+
+
+def test_only_marked_urgent_gap_recovery_bypasses_routine_sequential_fallback(monkeypatch):
+    calls: list[tuple[str, bool]] = []
+
+    async def original(_self, _method, _params, *, hedge=False):
+        calls.append(("urgent", bool(hedge)))
+        return 123, "secondary", 1.0
+
+    async def routine(_self, _method, _params, *, hedge=False):
+        calls.append(("routine", bool(hedge)))
+        return 456, "primary", 2.0
+
+    monkeypatch.setattr(capacity, "_ORIGINAL_RPC_CALL_WITH_META", original)
+    monkeypatch.setattr(capacity, "_capacity_call_with_meta", routine)
+
+    urgent_pool = SimpleNamespace(_roi_urgent_gap_recovery_pool=True)
+    ordinary_pool = SimpleNamespace()
+
+    urgent = asyncio.run(
+        _capacity_call_with_urgent_recovery(
+            urgent_pool,
+            "getSignaturesForAddress",
+            ["target", {}],
+            hedge=True,
+        )
+    )
+    ordinary = asyncio.run(
+        _capacity_call_with_urgent_recovery(
+            ordinary_pool,
+            "getSignaturesForAddress",
+            ["target", {}],
+            hedge=True,
+        )
+    )
+
+    assert urgent[1] == "secondary"
+    assert ordinary[1] == "primary"
+    assert calls == [("urgent", True), ("routine", True)]
