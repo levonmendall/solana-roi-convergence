@@ -179,6 +179,15 @@ from .wallet_realtime_tracking_repair import install_wallet_realtime_tracking_re
 
 install_wallet_realtime_tracking_repair()
 
+# Production telemetry after the realtime cutover proved that FIFO durability was
+# still allowing recovery/catch-up receipts to delay genuinely live observations by
+# minutes. Reserve workers for receipts still inside the unchanged 20-second SLA,
+# move stale/recovery work to a separate backlog lane, bound recovery concurrency,
+# and parallelize fail-closed risk enrichment with explicit backlog telemetry.
+from .wallet_live_priority_repair import install_wallet_live_priority_repair
+
+install_wallet_live_priority_repair()
+
 # The outer realtime telemetry wrapper must preserve every marker attached by the
 # intrinsic stream/poll/memory repairs below it. Those markers are part of the
 # repository's production-composition proof, not cosmetic test metadata.
