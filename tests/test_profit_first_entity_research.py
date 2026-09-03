@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-
-import pytest
 
 from solana_roi.observation_store import ObservationEventStore
 from solana_roi.profit_first_entity_research import ProfitFirstResearchAdapter
@@ -94,8 +93,7 @@ def _insert_forward(
         )
 
 
-@pytest.mark.asyncio
-async def test_adapter_persists_release_bound_shadow_trials_and_exact_exit_outcomes(monkeypatch, tmp_path):
+def test_adapter_persists_release_bound_shadow_trials_and_exact_exit_outcomes(monkeypatch, tmp_path):
     monkeypatch.setenv("RENDER_GIT_COMMIT", "release-abc")
     store = ObservationEventStore(tmp_path / "research.sqlite3")
     _create_forward_table(store)
@@ -119,7 +117,7 @@ async def test_adapter_persists_release_bound_shadow_trials_and_exact_exit_outco
         }
 
     adapter._entry = entry_execution  # type: ignore[method-assign]
-    await adapter.observe("buy-sig")
+    asyncio.run(adapter.observe("buy-sig"))
 
     status = adapter.status()
     assert status["strategy_version"] == STRATEGY_VERSION
@@ -143,7 +141,7 @@ async def test_adapter_persists_release_bound_shadow_trials_and_exact_exit_outco
         }
 
     adapter._route = sell_route  # type: ignore[method-assign]
-    await adapter.observe("sell-sig")
+    asyncio.run(adapter.observe("sell-sig"))
 
     status = adapter.status()
     assert status["forward_outcomes"] == 2
