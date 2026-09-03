@@ -13,7 +13,7 @@ from solana_roi import poll_watermark_repair as watermark
 from solana_roi.direct_solana import WatchTarget
 
 
-def test_time_critical_recoverability_poll_page_uses_read_only_rpc_hedging(monkeypatch):
+def test_real_gap_recovery_page_uses_read_only_rpc_hedging(monkeypatch):
     calls: list[tuple[str, bool]] = []
 
     class Rpc:
@@ -24,7 +24,7 @@ def test_time_critical_recoverability_poll_page_uses_read_only_rpc_hedging(monke
     monkeypatch.setattr(live_poll, "_poll_rpc", lambda _self: Rpc())
     target = WatchTarget("program", "program-a", "PUMP_FUN")
     rows, provider, latency = asyncio.run(
-        repair._lease_slot_poll_page(SimpleNamespace(), target, limit=1)
+        repair._hedged_gap_poll_page(SimpleNamespace(), target, limit=1)
     )
 
     assert rows == []
@@ -33,28 +33,26 @@ def test_time_critical_recoverability_poll_page_uses_read_only_rpc_hedging(monke
     assert calls == [("getSignaturesForAddress", True)]
 
 
-def test_incomplete_bounded_delta_after_real_ws_gap_routes_into_lease(monkeypatch):
-    async def full_page(_self, _target, **_kwargs):
-        return [
-            {"signature": "s105", "slot": 105},
-            {"signature": "s104", "slot": 104},
-        ], "publicnode", 2500.0
-
-    monkeypatch.setattr(repair, "_lease_slot_poll_page", full_page)
-    monkeypatch.setattr(live_poll, "POLL_LIMIT", 2)
-    monkeypatch.setattr(live_poll, "POLL_CURSOR_MAX_PAGES", 1)
-    monkeypatch.setattr(live_poll, "_ws_target_covered", lambda _self, _target: False)
+def test_incomplete_bounded_delta_after_tracked_ws_gap_routes_into_existing_lease(monkeypatch):
     target = WatchTarget("program", "program-a", "PUMP_AMM")
+    key = live_poll._poll_target_key(target)
+    plane = SimpleNamespace()
+    lease._runtime(plane)[key] = {"cursor_ws_generation": 0}
+    lease._ws_gap_generations(plane)[key] = 1
+
+    async def incomplete(_self, _target, _cursor_slot):
+        return [], False, "publicnode", 2500.0
+
+    monkeypatch.setattr(watermark, "_slot_fetch_delta", incomplete)
 
     with pytest.raises(repair.RecoverableLivePollDeltaIncomplete):
-        asyncio.run(repair._lease_slot_fetch_delta(SimpleNamespace(), target, 100))
+        asyncio.run(lease.watermark._slot_fetch_delta(plane, target, 100))
 
 
 def test_continuity_repair_preserves_existing_module_contracts_and_fixed_lease():
     assert lease.POLL_RECOVERABILITY_LEASE_SECONDS == 12.0
-    # Established offline/helper contracts remain untouched.
+    # Established helpers remain canonical and continue to be monkeypatchable.
     assert watermark._slot_fetch_delta is exception_rearm._exception_rearm_fetch_delta
     assert live_poll._fetch_delta is exception_rearm._exception_rearm_fetch_delta
-    # Only the production recoverability worker sees the repaired hedged view.
-    assert lease.watermark._slot_fetch_delta is repair._lease_slot_fetch_delta
-    assert lease.watermark._slot_poll_page is repair._lease_slot_poll_page
+    assert lease.watermark._base is watermark
+    assert lease.watermark._slot_poll_page is watermark._slot_poll_page
