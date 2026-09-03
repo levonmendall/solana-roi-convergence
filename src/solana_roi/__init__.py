@@ -136,6 +136,14 @@ from .continuity_gap_clock_repair import install_continuity_gap_clock_repair
 
 install_continuity_gap_clock_repair()
 
+# The public RPC pool is shared by continuous polling and hydration, and production
+# proved that one real gap can still lose its fixed lease under that contention.
+# Give only urgent real-gap recovery a dedicated read-only pool and publish exact
+# target/page/lease failure attribution; do not change the 12-second or 3x1000 caps.
+from .continuity_recovery_isolation_repair import install_continuity_recovery_isolation_repair
+
+install_continuity_recovery_isolation_repair()
+
 # Production telemetry proved the managed Alchemy endpoint is connection-rate
 # limited when all ten frozen targets open separate sockets. Keep PublicNode and
 # Solana mainnet target-isolated, but carry all ten Alchemy logsSubscribe requests
@@ -187,6 +195,23 @@ install_coverage_completeness_repair()
 from .launch_lateness_repair import install_launch_lateness_repair
 
 install_launch_lateness_repair()
+
+# v5/v6 proved that continuously probing getSlot through slow public RPC both
+# consumed timing uncertainty and added load to continuity. Derive the prospective
+# timing frontier from already-required live logsSubscribe traffic instead: the
+# reference must preexist the launch receipt and be no older than the same 3-second
+# gate. Missing/stale proof remains fail-closed; no new stream or authority is added.
+from .launch_ws_frontier_timing_repair import install_launch_ws_frontier_timing_repair
+
+install_launch_ws_frontier_timing_repair()
+
+# Funding provenance is independent evidence. Use chain slot order to admit a real
+# same-second funding transfer only when it is strictly before the buyer's purchase,
+# recognize System Program account-creation funding, and retry transient read-only
+# RPC failures inside the unchanged bounded history policy.
+from .funding_provenance_repair import install_funding_provenance_repair
+
+install_funding_provenance_repair()
 
 # Successful paper entries use the exact assembled Jupiter taker-order price and
 # debit observed signature, priority and rent lamports separately. Because the net
