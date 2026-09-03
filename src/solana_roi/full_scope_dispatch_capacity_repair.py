@@ -120,14 +120,10 @@ def _persist_full_scope_batch(self: Any, items: list[Any]) -> int:
             provider_last[provider] = received_at
 
     # Raw receipt persistence does not change normalized-swap coverage, so the
-    # canonical modulus decision is stable for the duration of one dispatch batch.
-    modulus_by_source: dict[str, int] = {}
+    # source-bootstrap hydration decision is stable for the duration of one batch.
+    coverage_needs_more_by_source: dict[str, bool] = {}
     for source in sources:
-        modulus_by_source[source] = (
-            int(self.market_sample_modulus)
-            if self._coverage_needs_more(source)
-            else int(self.audit_sample_modulus)
-        )
+        coverage_needs_more_by_source[source] = bool(self._coverage_needs_more(source))
 
     journal = self.journal
     inserted_keys: set[tuple[str, str]] = set()
@@ -248,8 +244,10 @@ def _persist_full_scope_batch(self: Any, items: list[Any]) -> int:
                 continue
 
             source = str(row["source"] or "")
-            modulus = modulus_by_source.get(source, int(self.market_sample_modulus))
-            if bool(row["launch_like"]) or self._sample(signature, modulus):
+            coverage_needs_more = coverage_needs_more_by_source.get(source, True)
+            if bool(row["launch_like"]) or (
+                coverage_needs_more and self._sample(signature, self.market_sample_modulus)
+            ):
                 launch_like = bool(row["launch_like"])
                 _enqueue_hydration_locked(
                     self,
