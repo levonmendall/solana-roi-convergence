@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from typing import Any
 
 from . import live_poll_redundancy as live_poll
+from . import poll_exception_rearm as exception_rearm
 from . import poll_recoverability_lease as lease
 from . import poll_watermark_repair as watermark
 from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 
 
 class RecoverableLivePollDeltaIncomplete(RuntimeError):
-    """A bounded poll delta was not proven complete after a real WS gap."""
+    """A bounded poll delta is retryable inside the existing fixed lease."""
 
 
-async def _lease_slot_poll_page(
+async def _hedged_gap_poll_page(
     self: Any,
     target: WatchTarget,
     *,
@@ -22,7 +22,7 @@ async def _lease_slot_poll_page(
     min_context_slot: int | None = None,
     limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], str, float]:
-    """Hedge only the time-critical poll reads used by the recoverability worker."""
+    """Hedge only recovery reads after a tracked real-WebSocket gap."""
 
     page_limit = live_poll.POLL_LIMIT if limit is None else int(limit)
     config: dict[str, Any] = {
@@ -42,31 +42,12 @@ async def _lease_slot_poll_page(
     return rows, provider, latency
 
 
-def _websocket_continuous(self: Any, target: WatchTarget) -> bool:
-    key = live_poll._poll_target_key(target)
-    runtime = lease._runtime(self).get(key, {})
-    current_generation = lease._current_ws_generation(self, target)
-    cursor_generation = int(runtime.get("cursor_ws_generation", current_generation) or 0)
-    return bool(
-        live_poll._ws_target_covered(self, target)
-        and current_generation == cursor_generation
-    )
-
-
-async def _lease_slot_fetch_delta(
+async def _hedged_gap_fetch_delta(
     self: Any,
     target: WatchTarget,
     cursor_slot: int,
 ) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
-    """Fetch the final bounded delta with hedging and correct lease classification.
-
-    The hard page/row bound and confirmed-slot watermark are unchanged. A bounded
-    overflow while the same target has uninterrupted real-WebSocket coverage keeps
-    the established standby re-arm path. If a real WebSocket zero-coverage
-    generation occurred, however, an incomplete bounded read is still recoverable
-    until the existing fixed lease expires, so raise into the lease exception path
-    instead of immediately latching the release failed.
-    """
+    """Repeat the unchanged bounded watermark delta with read-only hedging."""
 
     pages: list[list[dict[str, Any]]] = []
     before: str | None = None
@@ -75,51 +56,37 @@ async def _lease_slot_fetch_delta(
     complete = False
     context_floor = max(0, int(cursor_slot))
 
-    try:
-        for _page_index in range(live_poll.POLL_CURSOR_MAX_PAGES):
-            page, provider, latency = await _lease_slot_poll_page(
-                self,
-                target,
-                before=before,
-                min_context_slot=context_floor if context_floor > 0 else None,
-                limit=live_poll.POLL_LIMIT,
-            )
-            pages.append(page)
-            if not page:
-                complete = True
-                break
+    for _page_index in range(live_poll.POLL_CURSOR_MAX_PAGES):
+        page, provider, latency = await _hedged_gap_poll_page(
+            self,
+            target,
+            before=before,
+            min_context_slot=context_floor if context_floor > 0 else None,
+            limit=live_poll.POLL_LIMIT,
+        )
+        pages.append(page)
+        if not page:
+            complete = True
+            break
 
-            page_slots = [watermark._row_slot(row) for row in page]
-            newest_page_slot = max(page_slots, default=0)
-            context_floor = max(context_floor, newest_page_slot)
+        page_slots = [watermark._row_slot(row) for row in page]
+        newest_page_slot = max(page_slots, default=0)
+        context_floor = max(context_floor, newest_page_slot)
 
-            if cursor_slot > 0 and any(slot <= cursor_slot for slot in page_slots):
-                complete = True
-                break
-            if len(page) < live_poll.POLL_LIMIT:
-                complete = True
-                break
+        if cursor_slot > 0 and any(slot <= cursor_slot for slot in page_slots):
+            complete = True
+            break
+        if len(page) < live_poll.POLL_LIMIT:
+            complete = True
+            break
 
-            before = str(page[-1].get("signature") or "")
-            if not before:
-                complete = True
-                break
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        # Preserve the existing exception-rearm contract when the real WebSocket
-        # union never lost this target. A real WS gap instead reaches the normal
-        # lease exception path, which already honors attempt-start grace.
-        if _websocket_continuous(self, target):
-            return [], False, None, None
-        raise
+        before = str(page[-1].get("signature") or "")
+        if not before:
+            complete = True
+            break
 
     if not complete:
-        if _websocket_continuous(self, target):
-            return [], False, provider, latency
-        raise RecoverableLivePollDeltaIncomplete(
-            "bounded confirmed-slot delta incomplete after real WebSocket gap; retry from unchanged watermark"
-        )
+        return [], False, provider, latency
 
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -135,10 +102,12 @@ async def _lease_slot_fetch_delta(
 
 
 class _LeaseWatermarkProxy:
-    """Give only the recoverability worker repaired poll semantics.
+    """Change only the recoverability worker's delta classification.
 
-    Other modules keep the established watermark/exception-rearm function objects,
-    so their contracts and offline regression helpers remain unchanged.
+    The underlying watermark module remains the canonical object. Baseline reads,
+    monkeypatched regression helpers, and all other callers therefore continue to
+    see exactly the established functions. Only a production real-gap recovery
+    attempt uses the hedged bounded reader.
     """
 
     def __init__(self, base: Any):
@@ -147,8 +116,42 @@ class _LeaseWatermarkProxy:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
 
-    _slot_poll_page = staticmethod(_lease_slot_poll_page)
-    _slot_fetch_delta = staticmethod(_lease_slot_fetch_delta)
+    async def _slot_fetch_delta(
+        self,
+        plane: Any,
+        target: WatchTarget,
+        cursor_slot: int,
+    ) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
+        key = live_poll._poll_target_key(target)
+        runtime = lease._runtime(plane).get(key, {})
+        current_generation = lease._current_ws_generation(plane, target)
+        cursor_generation = int(runtime.get("cursor_ws_generation", current_generation) or 0)
+        gap_before_attempt = current_generation != cursor_generation
+
+        base_fetch = self._base._slot_fetch_delta
+        # In production, once a real zero-coverage generation is known, hedge the
+        # recovery read immediately. Tests and compatibility callers that replace
+        # the underlying function still exercise their injected function exactly.
+        if gap_before_attempt and base_fetch is exception_rearm._exception_rearm_fetch_delta:
+            rows, complete, provider, latency = await _hedged_gap_fetch_delta(
+                plane, target, cursor_slot
+            )
+        else:
+            rows, complete, provider, latency = await base_fetch(
+                plane, target, cursor_slot
+            )
+
+        current_generation = lease._current_ws_generation(plane, target)
+        gap_after_attempt = current_generation != cursor_generation
+        if not complete and gap_after_attempt:
+            # The interval is not yet proven lost. Raising routes this bounded
+            # incomplete result through the existing exception branch, which
+            # honors the unchanged 12-second lease and attempt-start grace. Only
+            # expiry after the tracked real gap latches the exact release failed.
+            raise RecoverableLivePollDeltaIncomplete(
+                "bounded confirmed-slot recovery incomplete after real WebSocket gap"
+            )
+        return rows, complete, provider, latency
 
 
 def _status_with_continuity_durability(
@@ -160,7 +163,7 @@ def _status_with_continuity_durability(
         if isinstance(poll, dict):
             poll["bounded_delta_after_real_ws_gap_uses_recoverability_lease"] = True
             poll["continuous_ws_standby_rearm_preserved"] = True
-            poll["recoverability_worker_poll_reads_hedged"] = True
+            poll["real_gap_recovery_reads_hedged"] = True
             poll["poll_watermark_abandoned_before_irrecoverable_gap"] = False
         policy = payload.setdefault("provider_runtime_policy", {})
         if isinstance(policy, dict):
@@ -169,7 +172,7 @@ def _status_with_continuity_durability(
                     "live_poll_gap_overflow_immediately_latches_gap": False,
                     "live_poll_gap_overflow_uses_fixed_recoverability_lease": True,
                     "live_poll_continuous_ws_standby_rearm_preserved": True,
-                    "live_poll_recovery_reads_hedged": True,
+                    "live_poll_real_gap_recovery_reads_hedged": True,
                     "live_poll_hard_delta_bound_unchanged": True,
                     "live_poll_irrecoverable_interval_fails_release_closed": True,
                 }
@@ -197,6 +200,6 @@ def install_continuity_durability_repair() -> None:
 __all__ = [
     "RecoverableLivePollDeltaIncomplete",
     "install_continuity_durability_repair",
-    "_lease_slot_fetch_delta",
-    "_lease_slot_poll_page",
+    "_hedged_gap_fetch_delta",
+    "_hedged_gap_poll_page",
 ]
