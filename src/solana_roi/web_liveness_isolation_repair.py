@@ -155,6 +155,14 @@ def install_web_liveness_isolation() -> None:
     if not bool(getattr(current_status, "_roi_web_liveness_isolation", False)):
         DirectSolanaIngestionPlane.status = _status_with_web_liveness_isolation(current_status)  # type: ignore[method-assign]
 
+    # This is the final production-composition hook before api.py constructs the
+    # runtime. Install the wallet evidence repair here so it sees every earlier
+    # realtime/priority/status wrapper and remains independent of web liveness
+    # behavior itself.
+    from .wallet_evidence_rpc_repair import install_wallet_evidence_rpc_repair
+
+    install_wallet_evidence_rpc_repair()
+
 
 __all__ = [
     "install_web_liveness_isolation",
