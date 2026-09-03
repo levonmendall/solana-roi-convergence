@@ -236,6 +236,16 @@ def install_web_liveness_isolation() -> None:
     # helper. Publish the exact adapter before installing the evidence worker.
     wallet_priority._risk_swap = _risk_swap_from_row  # type: ignore[attr-defined]
 
+    # PR #77 moves storage retention into a background thread, but the original
+    # implementation still takes the canonical store RLock from that thread. Since
+    # event-loop ingestion also enters that lock synchronously, a large prune can
+    # park Uvicorn long enough to miss Render's five-second health probe. Install
+    # the zero-busy independent-WAL maintenance implementation before PR #77 later
+    # composes its run wrapper; the wrapper resolves the worker dynamically.
+    from .storage_maintenance_liveness_repair import install_storage_maintenance_liveness_repair
+
+    install_storage_maintenance_liveness_repair()
+
     # This is the final production-composition hook before api.py constructs the
     # runtime. Install the wallet evidence repair here so it sees every earlier
     # realtime/priority/status wrapper and remains independent of web liveness
