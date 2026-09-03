@@ -18,6 +18,8 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: python -m pip install -e '.[dev]'
+      - name: Final v4 wallet entity universe regressions
+        run: python -m pytest tests/test_wallet_entity_universe_v4.py
       - name: Existing regressions
         run: python -m pytest --ignore=tests/test_forward_activation.py
       - name: Forward cohort certification regressions
