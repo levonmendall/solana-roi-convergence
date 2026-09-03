@@ -205,6 +205,14 @@ from .launch_ws_frontier_timing_repair import install_launch_ws_frontier_timing_
 
 install_launch_ws_frontier_timing_repair()
 
+# Preserve published direct/offline timing fixtures and intrinsic status calls
+# without changing production v7 evidence. Production always writes a v7 frontier
+# row; only hand-seeded legacy fixtures lacking one can use the established v4 path.
+# Also make additive funding telemetry optional for minimal status-only plane tests.
+from .production_boundary_compatibility import install_production_boundary_compatibility
+
+install_production_boundary_compatibility()
+
 # Funding provenance is independent evidence. Use chain slot order to admit a real
 # same-second funding transfer only when it is strictly before the buyer's purchase,
 # recognize System Program account-creation funding, and retry transient read-only
