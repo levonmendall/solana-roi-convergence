@@ -77,8 +77,6 @@ def _bounded_context_prefill(original: ContextPrefill) -> ContextPrefill:
             profile = self.service.registry.get(candidate.wallet)
             critical = bool(profile is not None and str(candidate.side).lower() == "buy")
         except Exception:
-            # Classification uncertainty is background-only; it must never gain
-            # candidate-reserved capacity by accident.
             critical = False
 
         attribute = "_roi_candidate_context_gate" if critical else "_roi_background_context_gate"
@@ -139,95 +137,51 @@ def install_direct_stream_memory_bounds() -> None:
         DirectSolanaIngestionPlane.status = _bounded_status(current_status)  # type: ignore[method-assign]
 
 
-# Install before importing the FastAPI runtime so every production instance uses
-# fair scheduling and bounded memory without changing strategy, sampling, scope,
-# certification thresholds, signing, submission, or paper-only authority.
 install_direct_stream_fairness()
 install_direct_stream_memory_bounds()
 
-# PR #59 added _wallet_discovery_policy() with BASELINE.max_chase_fraction but did
-# not import BASELINE into runtime.py. Render therefore failed synchronously in
-# build_runtime() with NameError before any background isolation could take effect.
-# Bind the canonical frozen baseline into the runtime module before api.py invokes
-# build_runtime(). This changes no strategy value; it only restores the intended
-# reference to the already-canonical configuration object.
 from . import runtime as runtime_module
 from .config import BASELINE
 
 runtime_module.BASELINE = BASELINE
 
-# Production telemetry on the first successful PR #60 deployment proved that the
-# official public Solana endpoint was being rate-limited under routine hedging and
-# that the no-drop durable receipt queue remained saturated despite provider-copy
-# suppression. Install the capacity repair before runtime construction: 429s gain a
-# bounded read-only cooldown, api.mainnet.solana.com becomes sequential emergency
-# HTTP fallback instead of a proactive hedge, ordinary no-hydration program receipts
-# are committed in durable SQLite micro-batches, and broad research yields while
-# critical ingestion capacity is degraded. Strategy/certification limits stay
-# unchanged and no provider is created by this repair.
 from .production_capacity_repair import install_production_capacity_repair
 
 install_production_capacity_repair()
 
-# Exact-release telemetry then isolated two remaining proof hot paths: funding
-# provenance could spend the entire launch cycle hydrating history serially, while
-# an actual WebSocket gap could spend its unchanged 12-second recovery lease on one
-# slow public RPC page. It also showed v7 launch reconstruction producing swaps but
-# no final completeness attestations. Overlap only bounded read-only funding calls,
-# restore hedging only for the dedicated urgent recovery pool, and carry the existing
-# immutable-window attestation through the final v7 timing wrapper. No threshold,
-# market scope, signing/submission authority, or paper-only boundary changes.
 from .certification_hotpath_repair import install_certification_hotpath_repair
 
 install_certification_hotpath_repair()
 
-# Broad discovery and historical screening are allowed to yield to critical
-# capacity, but already-enrolled wallets require their own prospective clock. Move
-# those wallets to direct logsSubscribe receipt timing, an independent read-only RPC
-# pool, durable small-queue hydration, bounded reconnect recovery and asynchronous
-# risk enrichment. Also upgrade ordinary receipt microbatches to grouped/set-based
-# writes. No entry/promotion threshold or active cohort authority is changed.
 from .wallet_realtime_tracking_repair import install_wallet_realtime_tracking_repair
 
 install_wallet_realtime_tracking_repair()
 
-# Exact-release telemetry on PR #67 proved the ordinary set-based writer was active,
-# yet the bounded no-drop queue still stayed ~100% full with ~100-second dispatch
-# delay. The remaining per-receipt transactions were launch, scout and bootstrap/
-# sample receipts. Batch the complete raw dispatch scope in one durable transaction
-# while reproducing the canonical hydration enqueue decisions and priorities. The
-# 4096 queue bound, no-drop rule, full market scope, certification thresholds and
-# paper-only authority remain unchanged.
+# Fresh prospective wallet receipts must never sit behind historical catch-up.
+# Reserve hydration workers for receipts still inside the unchanged 20-second
+# copyability SLA, move stale/recovery work onto a separate backlog lane, bound
+# recovery concurrency, and make risk enrichment a claimed multi-worker queue with
+# explicit pending-age telemetry. No promotion or strategy threshold is changed.
+from .wallet_live_priority_repair import install_wallet_live_priority_repair
+
+install_wallet_live_priority_repair()
+
 from .full_scope_dispatch_capacity_repair import install_full_scope_dispatch_capacity_repair
 
 install_full_scope_dispatch_capacity_repair()
 
-# The outer realtime telemetry wrapper must preserve every marker attached by the
-# intrinsic stream/poll/memory repairs below it. Those markers are part of the
-# repository's production-composition proof, not cosmetic test metadata.
 from .wallet_realtime_status_compat import install_wallet_realtime_status_compatibility
 
 install_wallet_realtime_status_compatibility()
 
-# Keep append-only wallet-intelligence history, but prevent a snapshot from an old
-# polling epoch from becoming promotion evidence after the new realtime epoch has
-# started. Reads become epoch-aware; historical rows remain intact for audit.
 from .wallet_realtime_intelligence_boundary import install_wallet_realtime_intelligence_boundary
 
 install_wallet_realtime_intelligence_boundary()
 
-# PR #59 also moved wallet intelligence itself into build_runtime(). Its schema
-# creation is research-only and must not become a synchronous Render startup
-# prerequisite. Install its lazy proxy before the discovery proxy and before api.py
-# captures runtime.build_runtime.
 from .wallet_intelligence_startup_repair import install_wallet_intelligence_startup_isolation
 
 install_wallet_intelligence_startup_isolation()
 
-# Continuous wallet discovery is research-only and has zero paper/live authority.
-# Its schema/bootstrap must therefore never be able to terminate the web service.
-# Defer that bootstrap into its background task, report any failure through status,
-# and retry without changing the active cohort or any certification threshold.
 from .wallet_discovery_startup_repair import install_wallet_discovery_startup_isolation
 
 install_wallet_discovery_startup_isolation()
