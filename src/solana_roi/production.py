@@ -232,6 +232,17 @@ from .wallet_discovery_startup_repair import install_wallet_discovery_startup_is
 
 install_wallet_discovery_startup_isolation()
 
+# PR #68 removes the remaining per-critical-receipt commits by writing the complete
+# raw dispatch batch in one set-based transaction. Keep that exact full-scope batch,
+# but do not execute its FULL-sync persistent-disk commit on the single Uvicorn event
+# loop that must satisfy Render's five-second HTTP liveness deadline. The store's
+# check_same_thread=False connection and process RLock make the bounded transaction
+# safe to run in an asyncio worker thread without changing receipt order, evidence,
+# queue bounds, hydration priorities, strategy, certification, or paper-only authority.
+from .web_liveness_isolation_repair import install_web_liveness_isolation
+
+install_web_liveness_isolation()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
