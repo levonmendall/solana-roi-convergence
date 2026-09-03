@@ -12,6 +12,9 @@ from .coverage_completeness_repair import _launch_contexts
 from .direct_solana import DirectSolanaIngestionPlane
 
 
+_PREVIOUS_TIMING_LAG = reference._timing_lag_with_v4_compatibility
+
+
 async def _hydrate_mint_launch_context_with_signed_reference(
     self: Any,
     *,
@@ -122,6 +125,41 @@ def _reference_lag_seconds_signed(
     return upper_bound, "preexisting-confirmed-head-signed-chain-upper-bound"
 
 
+def _timing_lag_with_signed_reference(
+    store: Any,
+    *,
+    signature: str,
+    created_at: datetime,
+) -> tuple[float | None, str, str]:
+    """Use v6 only for completed production reference rows.
+
+    Keep the published v5 helper contract intact for direct/offline callers and
+    regressions. Production v6 hydration resolves the fixed reference head's actual
+    blockTime and marks that row complete before the launch collector evaluates it.
+    """
+
+    row = reference._reference_row(store, signature)
+    if isinstance(row, dict) and str(row.get("status") or "") == "complete":
+        lag, proof = _reference_lag_seconds_signed(
+            store,
+            signature=signature,
+            created_at=created_at,
+        )
+        return (
+            lag,
+            proof,
+            "program-wide-swaps+preexisting-confirmed-chain-reference-signed-delta:launch-window-v6",
+        )
+    return _PREVIOUS_TIMING_LAG(
+        store,
+        signature=signature,
+        created_at=created_at,
+    )
+
+
+setattr(_timing_lag_with_signed_reference, "_roi_signed_chain_delta", True)
+
+
 def _status_with_signed_reference(
     original: Callable[[Any], dict[str, Any]],
 ) -> Callable[[Any], dict[str, Any]]:
@@ -168,7 +206,10 @@ def _status_with_signed_reference(
 
 def install_launch_reference_signed_delta_repair() -> None:
     bridge._hydrate_mint_launch_context = _hydrate_mint_launch_context_with_signed_reference  # type: ignore[assignment]
-    reference._reference_lag_seconds = _reference_lag_seconds_signed  # type: ignore[assignment]
+
+    current_timing = reference._timing_lag_with_v4_compatibility
+    if not bool(getattr(current_timing, "_roi_signed_chain_delta", False)):
+        reference._timing_lag_with_v4_compatibility = _timing_lag_with_signed_reference  # type: ignore[assignment]
 
     current_status = DirectSolanaIngestionPlane.status
     if not bool(getattr(current_status, "_roi_launch_reference_signed_delta_repair", False)):
@@ -179,4 +220,5 @@ __all__ = [
     "install_launch_reference_signed_delta_repair",
     "_hydrate_mint_launch_context_with_signed_reference",
     "_reference_lag_seconds_signed",
+    "_timing_lag_with_signed_reference",
 ]
