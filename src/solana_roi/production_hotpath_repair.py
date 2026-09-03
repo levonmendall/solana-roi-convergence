@@ -183,6 +183,8 @@ async def _funding_transaction_cached(self: Any, signature: str) -> dict[str, An
         return cached
 
     async with _funding_transaction_gate(self):
+        # Re-check after waiting so concurrent traces of the same transaction do
+        # not create a second read-only RPC request.
         cached = cache.get(signature)
         if isinstance(cached, dict):
             cache.move_to_end(signature)
@@ -213,7 +215,11 @@ def _funding_source_from_transaction(
         tx_block_time = int(tx.get("blockTime") or row_block_time or 0)
     except (TypeError, ValueError):
         tx_block_time = row_block_time
-    transfer_at = datetime.fromtimestamp(tx_block_time, tz=timezone.utc) if tx_block_time > 0 else before_at
+    transfer_at = (
+        datetime.fromtimestamp(tx_block_time, tz=timezone.utc)
+        if tx_block_time > 0
+        else before_at
+    )
     candidates = [
         (source, lamports)
         for source, lamports in funding._native_inbound_transfers_extended(tx, wallet)
@@ -222,7 +228,12 @@ def _funding_source_from_transaction(
     if not candidates:
         return None
     source, lamports = max(candidates, key=lambda item: item[1])
-    return FundingSource(wallet, source, lamports / 1_000_000_000, transfer_at)
+    return FundingSource(
+        wallet,
+        source,
+        lamports / 1_000_000_000,
+        transfer_at,
+    )
 
 
 async def _funding_source_result_concurrent(
@@ -244,7 +255,9 @@ async def _funding_source_result_concurrent(
     before_signature: str | None = None
     threshold_lamports = int(self.policy.min_funding_transfer_sol * 1_000_000_000)
 
-    async def resolve_chunk(chunk: list[tuple[str, int]]) -> tuple[FundingSource | None, str | None]:
+    async def resolve_chunk(
+        chunk: list[tuple[str, int]],
+    ) -> tuple[FundingSource | None, str | None]:
         if not chunk:
             return None, None
         _increment(self, "funding_tx_chunks")
@@ -273,7 +286,11 @@ async def _funding_source_result_concurrent(
 
     for _page_index in range(self.policy.max_history_pages):
         try:
-            rows = await funding._signature_page_with_retry(self, wallet, before=before_signature)
+            rows = await funding._signature_page_with_retry(
+                self,
+                wallet,
+                before=before_signature,
+            )
         except Exception as exc:
             return None, False, f"signature_history_rpc:{type(exc).__name__}"
         if not rows:
@@ -297,7 +314,11 @@ async def _funding_source_result_concurrent(
                 block_time = int(row.get("blockTime") or 0)
             except (TypeError, ValueError):
                 block_time = 0
-            observed = datetime.fromtimestamp(block_time, tz=timezone.utc) if block_time > 0 else None
+            observed = (
+                datetime.fromtimestamp(block_time, tz=timezone.utc)
+                if block_time > 0
+                else None
+            )
 
             if before_slot > 0 and row_slot > 0:
                 if row_slot >= before_slot:
@@ -368,8 +389,23 @@ async def _capacity_call_with_urgent_recovery(
     hedge: bool = False,
 ) -> tuple[Any, str, float]:
     if hedge and bool(getattr(self, "_roi_urgent_gap_recovery_pool", False)):
-        return await capacity._ORIGINAL_RPC_CALL_WITH_META(self, method, params, hedge=True)
-    return await capacity._capacity_call_with_meta(self, method, params, hedge=hedge)
+        # Urgent real-gap recovery is the one place where waiting for a slow primary
+        # before touching the official fallback can consume the fixed 12-second
+        # lease. Use the pool's original bounded hedge implementation here only.
+        # Capacity-aware endpoint ordering/cooldowns still apply through the
+        # already-patched _ordered/_call_endpoint methods.
+        return await capacity._ORIGINAL_RPC_CALL_WITH_META(
+            self,
+            method,
+            params,
+            hedge=True,
+        )
+    return await capacity._capacity_call_with_meta(
+        self,
+        method,
+        params,
+        hedge=hedge,
+    )
 
 
 async def _hydrate_mint_launch_context_final_attestation(
@@ -396,7 +432,11 @@ async def _hydrate_mint_launch_context_final_attestation(
     launch = getattr(raw, "launch", None)
     funding_collector = getattr(raw, "funding", None)
     launch_context = coverage._launch_contexts(launch).get(mint) if launch is not None else None
-    funding_context = coverage._funding_contexts(funding_collector).get(mint) if funding_collector is not None else None
+    funding_context = (
+        coverage._funding_contexts(funding_collector).get(mint)
+        if funding_collector is not None
+        else None
+    )
     has_final_signature = bool(
         isinstance(launch_context, dict)
         and str(launch_context.get("launch_signature") or "") == launch_signature
@@ -416,7 +456,11 @@ async def _hydrate_mint_launch_context_final_attestation(
             observed_at=observed_at,
             complete=attested_complete,
         ):
-            launch_context = coverage._launch_contexts(launch).get(mint) if launch is not None else None
+            launch_context = (
+                coverage._launch_contexts(launch).get(mint)
+                if launch is not None
+                else None
+            )
             if isinstance(launch_context, dict):
                 row = frontier._frontier_row(self.store, launch_signature) or {}
                 launch_context["launch_signature"] = launch_signature
@@ -462,8 +506,13 @@ def _status_with_production_hotpath(original: Any) -> Any:
                     "coverage_thresholds_unchanged": True,
                 }
             )
-            raw = bridge._raw_collectors(self)
-            funding_collector = getattr(raw, "funding", None)
+            funding_collector = None
+            if hasattr(self, "service"):
+                try:
+                    raw = bridge._raw_collectors(self)
+                    funding_collector = getattr(raw, "funding", None)
+                except Exception:
+                    funding_collector = None
             if funding_collector is not None:
                 launch_bridge.update(
                     {
