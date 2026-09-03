@@ -20,7 +20,7 @@ from .rpc_workload_governor import (
     install_rpc_workload_governor,
     rpc_workload,
 )
-from .solana_rpc import SolanaRpcPool
+from .solana_rpc import RpcEndpoint, SolanaRpcPool
 from .wallet_discovery import ContinuousWalletDiscovery
 
 
@@ -52,16 +52,33 @@ def _background_hydration_max_age_seconds() -> float:
     return max(30.0, value)
 
 
+def _is_metered_alchemy_endpoint(endpoint: RpcEndpoint) -> bool:
+    try:
+        host = endpoint.http_url.split("/", 3)[2].lower()
+    except Exception:
+        host = ""
+    return endpoint.name.strip().lower() == "alchemy" or host.endswith(".alchemy.com")
+
+
 def _new_research_rpc(core_rpc: SolanaRpcPool) -> SolanaRpcPool:
     timeout = float(os.getenv("SOLANA_ROI_WALLET_RESEARCH_RPC_TIMEOUT_SECONDS", "2.5"))
     hedge_delay = float(os.getenv("SOLANA_ROI_WALLET_RESEARCH_HEDGE_DELAY_SECONDS", "0.10"))
+    metered_enabled = _env_true("SOLANA_ROI_ENABLE_METERED_ALCHEMY")
+    endpoints = tuple(
+        endpoint
+        for endpoint in tuple(core_rpc.endpoints)
+        if metered_enabled or not _is_metered_alchemy_endpoint(endpoint)
+    )
+    if not endpoints:
+        raise RuntimeError("wallet research requires at least one configured non-metered Solana RPC endpoint")
     pool = SolanaRpcPool(
-        tuple(core_rpc.endpoints),
+        endpoints,
         timeout_seconds=timeout,
         hedge_delay_seconds=hedge_delay,
     )
     setattr(pool, "_roi_wallet_research_pool", True)
     setattr(pool, "_roi_shared_with_certification_pool", False)
+    setattr(pool, "_roi_metered_alchemy_enabled", any(_is_metered_alchemy_endpoint(row) for row in endpoints))
     return pool
 
 
@@ -164,6 +181,10 @@ def _research_discovery_status(self: ContinuousWalletDiscovery) -> dict[str, Any
         "challenger_forward_proof_required_before_promotion": True,
         "active_v3_1_cohort_mutation_allowed": False,
         "background_discovery_continues_during_core_queue_pressure": isolated,
+        "metered_alchemy_required": False,
+        "metered_alchemy_default_enabled": False,
+        "metered_alchemy_explicit_opt_in_only": True,
+        "metered_alchemy_enabled": bool(getattr(self.rpc, "_roi_metered_alchemy_enabled", False)) if isolated else False,
         "paper_only": True,
         "live_money_authority": False,
         "research_rpc": self.rpc.status() if isolated else None,
@@ -265,6 +286,9 @@ def _direct_status_with_architecture(self: DirectSolanaIngestionPlane) -> dict[s
                 "stale_non_authoritative_market_samples_expire_without_rpc": True,
                 "full_raw_market_scope_preserved": True,
                 "active_strategy_wallets_preserved": True,
+                "metered_alchemy_required": False,
+                "metered_alchemy_default_enabled": False,
+                "metered_alchemy_explicit_opt_in_only": True,
                 "certification_thresholds_unchanged": True,
                 "paper_only_authority_unchanged": True,
             }
@@ -357,6 +381,8 @@ __all__ = [
     "_background_hydration_max_age_seconds",
     "_build_runtime_with_research_isolation",
     "_deadline_aware_hydrate_one",
+    "_is_metered_alchemy_endpoint",
     "_isolated_research_pressure_reason",
+    "_new_research_rpc",
     "install_certification_research_architecture",
 ]
