@@ -156,6 +156,19 @@ from .config import BASELINE
 
 runtime_module.BASELINE = BASELINE
 
+# Production telemetry on the first successful PR #60 deployment proved that the
+# official public Solana endpoint was being rate-limited under routine hedging and
+# that the no-drop durable receipt queue remained saturated despite provider-copy
+# suppression. Install the capacity repair before runtime construction: 429s gain a
+# bounded read-only cooldown, api.mainnet.solana.com becomes sequential emergency
+# HTTP fallback instead of a proactive hedge, ordinary no-hydration program receipts
+# are committed in durable SQLite micro-batches, and research wallet discovery yields
+# while critical ingestion capacity is degraded. Strategy/certification limits stay
+# unchanged and no metered provider is enabled.
+from .production_capacity_repair import install_production_capacity_repair
+
+install_production_capacity_repair()
+
 # PR #59 also moved wallet intelligence itself into build_runtime(). Its schema
 # creation is research-only and must not become a synchronous Render startup
 # prerequisite. Install its lazy proxy before the discovery proxy and before api.py
