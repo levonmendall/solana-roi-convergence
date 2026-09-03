@@ -169,6 +169,18 @@ from .production_capacity_repair import install_production_capacity_repair
 
 install_production_capacity_repair()
 
+# Exact-release telemetry then proved the remaining bottlenecks were inside those
+# already-safe paths: minute receipt counters still performed redundant SQLite work,
+# funding provenance hydrated transaction history serially, and urgent real-gap
+# recovery inherited the routine no-proactive-hedge policy despite its fixed lease.
+# Repair only those execution shapes. Full raw durability, newest-first provenance,
+# the 12-second/3x1000 continuity bounds, all certification thresholds, and paper-only
+# authority remain unchanged. The final v7 launch timing layer also re-publishes the
+# established immutable-window attestation if an earlier wrapper handoff omitted it.
+from .production_hotpath_repair import install_production_hotpath_repair
+
+install_production_hotpath_repair()
+
 # PR #59 also moved wallet intelligence itself into build_runtime(). Its schema
 # creation is research-only and must not become a synchronous Render startup
 # prerequisite. Install its lazy proxy before the discovery proxy and before api.py
