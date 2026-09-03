@@ -242,6 +242,14 @@ from .wallet_discovery_startup_repair import install_wallet_discovery_startup_is
 
 install_wallet_discovery_startup_isolation()
 
+# Keep the full-scope set-based dispatcher from synchronously occupying the single
+# Uvicorn event-loop thread during persistent-disk SQLite work. The exact batch,
+# WAL/FULL durability, queue bound, receipt ordering, hydration semantics, strategy,
+# certification gates, and paper-only authority are unchanged.
+from .web_liveness_isolation_repair import install_web_liveness_isolation
+
+install_web_liveness_isolation()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
