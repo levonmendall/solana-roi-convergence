@@ -120,6 +120,14 @@ from .continuity_startup_barrier import install_continuity_startup_barrier
 
 install_continuity_startup_barrier()
 
+# Production proved that a bounded-delta overflow can occur while public RPC calls
+# are simply slow. Route incomplete bounded deltas through the unchanged 12-second
+# recoverability lease and hedge those read-only poll requests. A real interval that
+# still cannot be recovered before lease expiry continues to fail the release closed.
+from .continuity_durability_repair import install_continuity_durability_repair
+
+install_continuity_durability_repair()
+
 # Production telemetry proved the managed Alchemy endpoint is connection-rate
 # limited when all ten frozen targets open separate sockets. Keep PublicNode and
 # Solana mainnet target-isolated, but carry all ten Alchemy logsSubscribe requests
@@ -154,6 +162,15 @@ install_public_data_economics()
 from .launch_coverage_bridge import install_launch_coverage_bridge
 
 install_launch_coverage_bridge()
+
+# Coverage certification must measure what the observer actually proved, not
+# whether a launch happened to attract three buyers immediately. Bind the 3-second
+# metric to the live launch receipt, bind early-buyer completeness to the immutable
+# launch-window acquisition, and scan standard-RPC funding newest-first until the
+# latest source or the unchanged policy boundary is proved.
+from .coverage_completeness_repair import install_coverage_completeness_repair
+
+install_coverage_completeness_repair()
 
 # Successful paper entries use the exact assembled Jupiter taker-order price and
 # debit observed signature, priority and rent lamports separately. Because the net
