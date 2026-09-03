@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from . import full_scope_dispatch_capacity_repair as full_scope
 from . import production_capacity_repair as capacity
 from . import raw_receipt_dispatch_repair as raw_dispatch
+from . import runtime as runtime_module
+from . import wallet_live_priority_repair as wallet_priority
 from .direct_solana import DirectSolanaIngestionPlane
+from .ingestion import NormalizedSwap
+
+
+# A same-release Render restart can briefly overlap the prior process's final
+# persistent-disk SQLite teardown. Retry only the narrow SQLite lock/busy class;
+# every other startup exception remains fail-fast and visible to Uvicorn/Render.
+STARTUP_SQLITE_RETRY_DELAYS_SECONDS = (0.25, 0.75, 1.50)
 
 
 async def _persist_full_scope_batch_off_loop(self: Any, items: list[Any]) -> int:
@@ -101,6 +112,56 @@ async def _web_safe_full_scope_dispatch_worker(
                 queue.task_done()
 
 
+def _risk_swap_from_row(row: dict[str, Any]) -> NormalizedSwap:
+    """Rebuild the exact realtime risk-work swap without a hidden helper dependency.
+
+    PR #73's no-lookahead worker calls ``wallet_live_priority_repair._risk_swap``.
+    The priority module never defined that private helper because its original
+    worker built the same NormalizedSwap inline. Install this adapter before the
+    PR #73 worker is activated so claimed risk rows can actually be evaluated.
+    """
+
+    token_amount = float(row["token_amount"])
+    wallet_price_sol = float(row["wallet_price_sol"])
+    return NormalizedSwap(
+        signature=str(row["signature"]),
+        slot=0,
+        observed_at=datetime.fromisoformat(str(row["observed_at"])),
+        received_at=datetime.fromisoformat(str(row["received_at"])),
+        wallet=str(row["wallet"]),
+        token_mint=str(row["token_mint"]),
+        side="buy",
+        token_amount=token_amount,
+        native_amount_sol=token_amount * wallet_price_sol,
+        reference_price_sol=wallet_price_sol,
+        source=str(row["source"]),
+    )
+
+
+def _restart_safe_build_runtime(original: Callable[[], Any]) -> Callable[[], Any]:
+    """Retry only transient SQLite lock/busy errors during same-release restarts."""
+
+    def build_runtime() -> Any:
+        for attempt, delay in enumerate((*STARTUP_SQLITE_RETRY_DELAYS_SECONDS, 0.0), start=1):
+            try:
+                return original()
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                retryable = "locked" in message or "busy" in message
+                final_attempt = attempt > len(STARTUP_SQLITE_RETRY_DELAYS_SECONDS)
+                if not retryable or final_attempt:
+                    raise
+                # Startup has not yielded the ASGI lifespan yet, so this bounded
+                # synchronous wait cannot starve live HTTP traffic. It only lets a
+                # previous same-service process release the persistent SQLite file.
+                time.sleep(delay)
+        raise RuntimeError("unreachable Render startup retry state")
+
+    setattr(build_runtime, "_roi_render_restart_sqlite_retry", True)
+    setattr(build_runtime, "_roi_original_build_runtime", original)
+    return build_runtime
+
+
 def _status_with_web_liveness_isolation(
     original: Callable[[Any], dict[str, Any]],
 ) -> Callable[[Any], dict[str, Any]]:
@@ -122,6 +183,16 @@ def _status_with_web_liveness_isolation(
             "drops_allowed": False,
             "strategy_scope_reduced": False,
             "certification_thresholds_unchanged": True,
+            "wallet_risk_row_adapter_installed": callable(
+                getattr(wallet_priority, "_risk_swap", None)
+            ),
+            "same_release_sqlite_restart_retry_installed": bool(
+                getattr(runtime_module.build_runtime, "_roi_render_restart_sqlite_retry", False)
+            ),
+            "same_release_sqlite_restart_retry_delays_seconds": list(
+                STARTUP_SQLITE_RETRY_DELAYS_SECONDS
+            ),
+            "startup_non_lock_errors_fail_fast": True,
             "batch_offloads": offloads,
             "last_batch_ms": last_ms if offloads else None,
             "max_batch_ms": max_ms if offloads else None,
@@ -147,13 +218,23 @@ def _status_with_web_liveness_isolation(
 
 
 def install_web_liveness_isolation() -> None:
-    """Keep the full-scope persistent-disk batch from blocking Render liveness."""
+    """Keep persistent-disk work and restart races from terminating web liveness."""
 
     raw_dispatch._dispatch_worker = _web_safe_full_scope_dispatch_worker  # type: ignore[assignment]
 
     current_status = DirectSolanaIngestionPlane.status
     if not bool(getattr(current_status, "_roi_web_liveness_isolation", False)):
         DirectSolanaIngestionPlane.status = _status_with_web_liveness_isolation(current_status)  # type: ignore[method-assign]
+
+    current_build_runtime = runtime_module.build_runtime
+    if not bool(getattr(current_build_runtime, "_roi_render_restart_sqlite_retry", False)):
+        runtime_module.build_runtime = _restart_safe_build_runtime(current_build_runtime)  # type: ignore[assignment]
+
+    # PR #73's point-in-time risk worker intentionally lives in the priority module
+    # global so the already-installed run loop picks it up dynamically. Its row
+    # reconstruction had previously been inline and therefore had no `_risk_swap`
+    # helper. Publish the exact adapter before installing the evidence worker.
+    wallet_priority._risk_swap = _risk_swap_from_row  # type: ignore[attr-defined]
 
     # This is the final production-composition hook before api.py constructs the
     # runtime. Install the wallet evidence repair here so it sees every earlier
@@ -165,7 +246,10 @@ def install_web_liveness_isolation() -> None:
 
 
 __all__ = [
-    "install_web_liveness_isolation",
+    "STARTUP_SQLITE_RETRY_DELAYS_SECONDS",
     "_persist_full_scope_batch_off_loop",
+    "_restart_safe_build_runtime",
+    "_risk_swap_from_row",
     "_web_safe_full_scope_dispatch_worker",
+    "install_web_liveness_isolation",
 ]
