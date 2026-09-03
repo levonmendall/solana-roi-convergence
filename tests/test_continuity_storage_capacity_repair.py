@@ -170,7 +170,7 @@ def test_production_composition_preserves_continuity_and_paper_boundaries():
     from solana_roi.config import BASELINE
     from solana_roi.continuity_storage_capacity_repair import _sharded_slot_poll_page
 
-    assert getattr(live_poll._poll_target, "_roi_routine_provider_sharding", False) is True
+    assert live_poll._poll_target is lease._leased_poll_target
     assert watermark._slot_poll_page is _sharded_slot_poll_page
     assert getattr(DirectSolanaIngestionPlane.run, "_roi_storage_capacity_maintenance", False) is True
     assert getattr(DirectSolanaIngestionPlane.status, "_roi_continuity_storage_capacity", False) is True
