@@ -128,6 +128,14 @@ from .continuity_durability_repair import install_continuity_durability_repair
 
 install_continuity_durability_repair()
 
+# The recoverability lease is a promise made after an actual real-WebSocket target
+# loss, not after an arbitrary earlier successful poll. Timestamp that exact gap
+# generation and rebase the canonical worker's existing lease clock to it while
+# keeping the unchanged 12-second lease and 3x1000 delta boundary fail-closed.
+from .continuity_gap_clock_repair import install_continuity_gap_clock_repair
+
+install_continuity_gap_clock_repair()
+
 # Production telemetry proved the managed Alchemy endpoint is connection-rate
 # limited when all ten frozen targets open separate sockets. Keep PublicNode and
 # Solana mainnet target-isolated, but carry all ten Alchemy logsSubscribe requests
@@ -171,6 +179,14 @@ install_launch_coverage_bridge()
 from .coverage_completeness_repair import install_coverage_completeness_repair
 
 install_coverage_completeness_repair()
+
+# Solana blockTime and the Render host clock are different clock domains. For the
+# live-attested path, near-creation is a lateness bound: a negative signed delta is
+# clock skew, not a late observation. Keep the same three-second positive-lateness
+# threshold and retain fail-closed legacy behavior without a live receipt.
+from .launch_lateness_repair import install_launch_lateness_repair
+
+install_launch_lateness_repair()
 
 # Successful paper entries use the exact assembled Jupiter taker-order price and
 # debit observed signature, priority and rent lamports separately. Because the net
