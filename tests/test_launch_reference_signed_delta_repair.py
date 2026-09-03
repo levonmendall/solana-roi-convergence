@@ -15,6 +15,11 @@ from solana_roi.observation_store import ObservationEventStore
 from solana_roi.risk import EntityResolver, TokenRiskIntelligence
 
 
+class NoLaunchHttp:
+    async def get(self, _url, **_kwargs):
+        raise AssertionError("not used")
+
+
 def _store(tmp_path):
     return ObservationEventStore(tmp_path / "signed-reference-timing.sqlite3")
 
@@ -24,7 +29,7 @@ def _collector(tmp_path):
     registry = WalletProfileRegistry(store)
     resolver = EntityResolver(store, registry)
     risk = TokenRiskIntelligence(store, entity_resolver=resolver, registry=registry)
-    return DexScreenerLaunchCollector(risk)
+    return DexScreenerLaunchCollector(risk, client=NoLaunchHttp())
 
 
 def _row(store, *, signature, launch_slot, head_slot, created, rpc_ms, age_ms, head_offset_seconds):
