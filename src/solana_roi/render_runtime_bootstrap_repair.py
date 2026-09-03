@@ -54,6 +54,8 @@ def _public_status() -> dict[str, Any]:
         "ephemeral_candidate_retention_installed_before_api_capture": True,
         "active_strategy_candidate_state_ephemeral": True,
         "canonical_observation_evidence_retained": True,
+        "target_frontier_continuity_repair_installed_before_api_capture": True,
+        "real_gap_recovery_uses_confirmed_target_frontier": True,
         "certification_thresholds_unchanged": True,
         "continuity_lease_unchanged": True,
         "recovery_bound_unchanged": True,
@@ -209,16 +211,19 @@ def install_render_runtime_bootstrap_handoff() -> None:
     if _API is not None and bool(getattr(_API.app.state, "roi_runtime_bootstrap_handoff", False)):
         return
 
-    # The certification/research architecture must be installed after every prior
-    # production repair but before api.py captures runtime.build_runtime. This is
-    # the final composition boundary: the strategy keeps the full observer and its
-    # frozen scouts, while background wallet evaluation receives a separate RPC
-    # pool plus a process-wide bounded research workload class.
+    # The certification/research architecture and final continuity anchor repair
+    # must be installed after every prior production wrapper but before api.py
+    # captures runtime.build_runtime. The target-frontier wrapper therefore sees
+    # each accepted target notification at the outer socket-read boundary, before
+    # durable dispatch can lag, while recovery still uses only confirmed read-only
+    # evidence and the unchanged 12-second / 3x1000 fail-closed bounds.
     from .certification_research_architecture import install_certification_research_architecture
+    from .continuity_target_frontier_repair import install_continuity_target_frontier_repair
     from .ephemeral_candidate_retention import install_ephemeral_candidate_retention
 
     install_certification_research_architecture()
     install_ephemeral_candidate_retention()
+    install_continuity_target_frontier_repair()
 
     # Import only after the production composition has installed all runtime class
     # and build_runtime guards. api.py therefore captures the exact canonical
