@@ -14,6 +14,7 @@ from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 
 
 _PREVIOUS_SET_TARGET_STATE = target_quorum._quorum_set_target_state
+_monotonic = time.monotonic
 
 
 def _generation(self: Any, target: WatchTarget) -> int:
@@ -48,11 +49,11 @@ async def _recover_until_lease_boundary(
     matching the canonical worker's existing attempt-start grace.
     """
 
-    deadline = time.monotonic() + lease.POLL_RECOVERABILITY_LEASE_SECONDS
+    deadline = _monotonic() + lease.POLL_RECOVERABILITY_LEASE_SECONDS
     attempts = 0
     last_error: Exception | None = None
     while True:
-        if attempts > 0 and time.monotonic() > deadline:
+        if attempts > 0 and _monotonic() > deadline:
             break
         if _generation(self, target) != int(generation):
             raise RuntimeError("real websocket gap generation superseded")
@@ -77,7 +78,7 @@ async def _recover_until_lease_boundary(
         except Exception as exc:
             last_error = exc
 
-        if time.monotonic() <= deadline:
+        if _monotonic() <= deadline:
             _increment(self, "retries")
             await asyncio.sleep(0)
             continue
@@ -127,7 +128,7 @@ def _kick_immediate_recovery(self: Any, target: WatchTarget, generation: int) ->
         "generation": int(generation),
         "cursor_slot": cursor_slot,
         "task": task,
-        "started_monotonic": time.monotonic(),
+        "started_monotonic": _monotonic(),
     }
     _increment(self, "kicked")
 
