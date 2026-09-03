@@ -221,6 +221,15 @@ from .wallet_discovery_startup_repair import install_wallet_discovery_startup_is
 
 install_wallet_discovery_startup_isolation()
 
+# Render's five-second HTTP liveness deadline must not be coupled to a FULL-sync
+# SQLite micro-batch on the persistent disk. Keep the exact no-drop durable batch,
+# receipt order, WAL/FULL settings, full market scope, and certification gates, but
+# execute that bounded synchronous transaction in an asyncio worker thread so the
+# single Uvicorn event loop can continue serving liveness requests.
+from .web_liveness_isolation_repair import install_web_liveness_isolation
+
+install_web_liveness_isolation()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
