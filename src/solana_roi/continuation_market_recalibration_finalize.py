@@ -5,6 +5,7 @@ from dataclasses import replace
 from functools import wraps
 from typing import Any, Callable
 
+from . import continuation_market_context as market_context
 from . import continuation_market_recalibration as continuation
 from . import fomo_runtime_install
 from . import risk_conditioned_alpha_v5 as v5
@@ -84,7 +85,7 @@ def _compatible_latency_band(value: float | None) -> str:
 
 
 async def _final_continuation_admission(self: Any, row: dict[str, Any]) -> None:
-    """Admit a later valid buy ephemerally without mutating durable copyability evidence."""
+    """Admit later valid buys and record scale/sensitivity without mutating durable evidence."""
     if _ORIGINAL_FINAL_BUY is None:
         raise RuntimeError("continuation final admission is not installed")
     candidate = row
@@ -97,6 +98,10 @@ async def _final_continuation_admission(self: Any, row: dict[str, Any]) -> None:
             int(getattr(self, "_roi_continuation_late_admission_bypasses", 0) or 0) + 1,
         )
     await _ORIGINAL_FINAL_BUY(self, candidate)
+    # Market cap is descriptive context, never a direct entry/size gate. One cached
+    # token-supply read plus already-cached SOL/USD lets forward outcomes later be
+    # segmented by asset scale and observed price sensitivity to market flow.
+    await market_context.record_candidate_market_context(self, candidate)
 
 
 def _fomo_continuation_classifier(features: Any, *, max_chase_fraction: float = 0.15, max_latency_seconds: float = 20.0) -> FomoState:
@@ -160,6 +165,18 @@ def _status_with_final_authority(self: Any) -> dict[str, Any]:
                 "extended_continuation_bands_recorded_separately": True,
             }
         )
+    try:
+        payload["continuation_market_context"] = market_context.status(self)
+    except Exception as exc:
+        payload["continuation_market_context"] = {
+            "version": market_context.CONTEXT_VERSION,
+            "failed_closed": True,
+            "error": f"{type(exc).__name__}: market context unavailable",
+            "market_cap_is_direct_entry_veto": False,
+            "market_cap_is_direct_size_authority": False,
+            "paper_only": True,
+            "live_money_authority": False,
+        }
     return payload
 
 
