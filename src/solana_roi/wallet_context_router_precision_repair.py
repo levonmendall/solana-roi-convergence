@@ -191,24 +191,24 @@ def _manifest_with_percent_and_fail_closed(
 
 
 def install_wallet_context_router_precision_repair() -> None:
-    """Install the narrow v1.1 reporting/accessibility repair exactly once."""
+    """Install precision, governance, bandwidth and FOMO composition exactly once."""
 
     global _ORIGINAL_CLASSIFY, _ORIGINAL_CONTEXT_METRICS, _ORIGINAL_STATUS, _ORIGINAL_MANIFEST
 
     current_classify = router_module.classify_observation_accessibility
-    if not bool(getattr(current_classify, "_roi_wallet_context_precision_repair", False)):
+    if _ORIGINAL_CLASSIFY is None:
         _ORIGINAL_CLASSIFY = current_classify
         setattr(_fail_closed_accessibility, "_roi_wallet_context_precision_repair", True)
         router_module.classify_observation_accessibility = _fail_closed_accessibility
 
     current_metrics = router_module._context_metrics
-    if not bool(getattr(current_metrics, "_roi_wallet_context_precision_repair", False)):
+    if _ORIGINAL_CONTEXT_METRICS is None:
         _ORIGINAL_CONTEXT_METRICS = current_metrics
         setattr(_percent_context_metrics, "_roi_wallet_context_precision_repair", True)
         router_module._context_metrics = _percent_context_metrics
 
     current_status = WalletContextRouter.status
-    if not bool(getattr(current_status, "_roi_wallet_context_precision_repair", False)):
+    if _ORIGINAL_STATUS is None:
         _ORIGINAL_STATUS = current_status
         try:
             _status_with_percent_and_fail_closed.__dict__.update(
@@ -220,7 +220,7 @@ def install_wallet_context_router_precision_repair() -> None:
         WalletContextRouter.status = _status_with_percent_and_fail_closed  # type: ignore[method-assign]
 
     current_manifest = FinalProfitFirstResearchAdapter._manifest
-    if not bool(getattr(current_manifest, "_roi_wallet_context_precision_repair", False)):
+    if _ORIGINAL_MANIFEST is None:
         _ORIGINAL_MANIFEST = current_manifest
         try:
             _manifest_with_percent_and_fail_closed.__dict__.update(
@@ -231,19 +231,18 @@ def install_wallet_context_router_precision_repair() -> None:
         setattr(_manifest_with_percent_and_fail_closed, "_roi_wallet_context_precision_repair", True)
         FinalProfitFirstResearchAdapter._manifest = _manifest_with_percent_and_fail_closed  # type: ignore[method-assign]
 
-    from .wallet_context_governance import install_wallet_context_governance
+    from . import wallet_context_governance as governance_module
 
-    install_wallet_context_governance()
+    if governance_module._ORIGINAL_FINAL_MANIFEST is None:
+        governance_module.install_wallet_context_governance()
 
-    from .context_research_bandwidth_governor import (
-        install_context_research_bandwidth_governor,
-    )
+    from . import context_research_bandwidth_governor as bandwidth_module
 
-    install_context_research_bandwidth_governor()
+    if bandwidth_module._ORIGINAL_MANIFEST is None:
+        bandwidth_module.install_context_research_bandwidth_governor()
 
     # FOMO is a subordinate production-shadow consumer of the already-governed
-    # prospective evidence. Install it last so it cannot bypass context governance
-    # or bandwidth control and cannot gain tracking/strategy/live-money authority.
+    # prospective evidence. Its installer also captures each wrapped method once.
     from .fomo_runtime_install import install_fomo_runtime
 
     install_fomo_runtime()
