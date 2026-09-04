@@ -5,6 +5,7 @@ from typing import Any
 
 from . import continuity_storage_capacity_repair as storage
 from . import live_poll_redundancy as live_poll
+from . import poll_exception_rearm as exception_rearm
 from . import poll_watermark_repair as watermark
 from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 
@@ -69,13 +70,7 @@ async def _poll_page_with_exact_baseline(
     min_context_slot: int | None = None,
     limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], str, float]:
-    """Keep the exact signature that established a high-volume slot baseline.
-
-    The existing confirmed-slot watermark remains the audit/fallback cursor. For
-    Pump.fun and Pump AMM only, the exact confirmed signature is retained beside it
-    so subsequent four-second deltas can ask the assigned RPC backend to stop at the
-    prior boundary instead of walking arbitrary older address history.
-    """
+    """Retain the exact signature that established a high-volume slot baseline."""
 
     if _ORIGINAL_SLOT_POLL_PAGE is None:
         raise RuntimeError("high-volume exact signature cursor repair is not installed")
@@ -111,12 +106,7 @@ async def _exact_page(
     min_context_slot: int,
     before: str | None = None,
 ) -> tuple[list[dict[str, Any]], str, float]:
-    """Read one routine page from the target's already-assigned public RPC.
-
-    This does not add providers, hedging or fanout. It preserves the provider shard
-    and existing process-wide governor while adding only the server-side `until`
-    boundary for the two burst-heavy Pump targets.
-    """
+    """Read one routine page from the target's already-assigned public RPC."""
 
     config: dict[str, Any] = {
         "commitment": "confirmed",
@@ -143,10 +133,10 @@ async def _fetch_delta_with_high_volume_exact_cursor(
 ) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
     """Use an exact confirmed lower boundary only for Pump.fun/Pump AMM.
 
-    The previous slot-only routine poll could consume 3x1000 signatures without
-    ever reaching a slot boundary on burst-heavy program addresses. That left the
-    routine standby cursor stale, so a later WebSocket gap inherited thousands of
-    unrelated signatures even when its actual interval was small.
+    This function is deliberately installed *under* the existing exception-rearm
+    wrapper rather than replacing its public identity. The established pagination,
+    exception re-arm, recoverability lease and checkpoint composition therefore stay
+    canonical. Only the two burst-heavy Pump sources take the exact-signature path.
 
     The hard 3x1000 bound is unchanged. If the exact signature is unavailable on the
     assigned backend, three full pages still fail closed; no cursor advances and no
@@ -240,6 +230,9 @@ async def _fetch_delta_with_high_volume_exact_cursor(
     return ordered, True, provider, latency
 
 
+# Preserve all intrinsic markers from the sharded page transport before adding the
+# outer exact-baseline observer. Existing composition tests use these markers as a
+# contract that provider sharding was not replaced.
 setattr(_poll_page_with_exact_baseline, "_roi_high_volume_signature_cursor", True)
 setattr(_fetch_delta_with_high_volume_exact_cursor, "_roi_high_volume_signature_cursor", True)
 
@@ -264,6 +257,7 @@ def _status_with_high_volume_exact_cursor(self: Any) -> dict[str, Any]:
         "server_side_until_cursor": True,
         "same_slot_rows_preserved": True,
         "assigned_provider_shard_preserved": True,
+        "canonical_exception_rearm_identity_preserved": True,
         "poll_interval_seconds_unchanged": live_poll.POLL_INTERVAL_SECONDS,
         "hard_page_count_unchanged": live_poll.POLL_CURSOR_MAX_PAGES,
         "hard_page_size_unchanged": live_poll.POLL_LIMIT,
@@ -282,6 +276,7 @@ def _status_with_high_volume_exact_cursor(self: Any) -> dict[str, Any]:
                 "high_volume_live_poll_exact_signature_cursor": True,
                 "high_volume_live_poll_server_side_until_cursor": True,
                 "high_volume_live_poll_same_slot_rows_preserved": True,
+                "canonical_poll_exception_rearm_identity_preserved": True,
                 "routine_poll_interval_unchanged": True,
                 "recovery_bound_unchanged": True,
                 "continuity_lease_unchanged": True,
@@ -298,15 +293,23 @@ setattr(_status_with_high_volume_exact_cursor, "_roi_high_volume_signature_curso
 def install_high_volume_signature_cursor_repair() -> None:
     global _ORIGINAL_SLOT_POLL_PAGE, _ORIGINAL_SLOT_FETCH_DELTA, _ORIGINAL_STATUS
 
-    if bool(getattr(watermark._slot_fetch_delta, "_roi_high_volume_signature_cursor", False)):
+    if _ORIGINAL_STATUS is not None:
         return
+
     _ORIGINAL_SLOT_POLL_PAGE = watermark._slot_poll_page
-    _ORIGINAL_SLOT_FETCH_DELTA = watermark._slot_fetch_delta
+    try:
+        _poll_page_with_exact_baseline.__dict__.update(getattr(_ORIGINAL_SLOT_POLL_PAGE, "__dict__", {}))
+    except Exception:
+        pass
+    setattr(_poll_page_with_exact_baseline, "_roi_high_volume_signature_cursor", True)
     watermark._slot_poll_page = _poll_page_with_exact_baseline  # type: ignore[assignment]
-    watermark._slot_fetch_delta = _fetch_delta_with_high_volume_exact_cursor  # type: ignore[assignment]
-    # Some compatibility paths resolve the live-poll globals directly.
     live_poll._poll_page = _poll_page_with_exact_baseline  # type: ignore[assignment]
-    live_poll._fetch_delta = _fetch_delta_with_high_volume_exact_cursor  # type: ignore[assignment]
+
+    # Preserve the canonical public fetch identity. The exception-rearm wrapper is
+    # required by established continuity contracts and dynamically calls this
+    # underlying delegate, so replace only its private lower delegate.
+    _ORIGINAL_SLOT_FETCH_DELTA = exception_rearm._ORIGINAL_FETCH_DELTA
+    exception_rearm._ORIGINAL_FETCH_DELTA = _fetch_delta_with_high_volume_exact_cursor
 
     _ORIGINAL_STATUS = DirectSolanaIngestionPlane.status
     try:
