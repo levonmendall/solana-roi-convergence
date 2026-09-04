@@ -14,6 +14,7 @@ from .risk_conditioned_alpha_v5 import install_risk_conditioned_alpha_v5
 install_risk_conditioned_alpha_v5()
 
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
+from .robinhood_chain_profit_maximizer import ROBINHOOD_V5_VERSION
 
 
 _ORIGINAL_RUNTIME_WORKERS: Callable[[Any, asyncio.Event], Any] | None = None
@@ -73,11 +74,62 @@ async def _runtime_workers_with_robinhood(runtime: Any, stop: asyncio.Event) -> 
 
 def _status() -> dict[str, Any]:
     if _PLANE is not None:
-        return {**_PLANE.status(), "runtime_ready": True, "production_install": dict(_STATE)}
+        payload = _PLANE.status()
+        try:
+            with _PLANE.store._lock:
+                contexts = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_trial_context WHERE release_commit=?",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+                challengers = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_trial_context WHERE release_commit=? AND threshold_challenger=1",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+                marks = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_marks WHERE release_commit=?",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+        except Exception:
+            contexts = challengers = marks = 0
+        payload.update(
+            {
+                "strategy_version": ROBINHOOD_V5_VERSION,
+                "wallet_authority_key": "chain_x_entity_x_role_x_venue_x_lifecycle_x_regime_x_risk_signature_x_flow_state",
+                "risk_conditioned_v5": {
+                    "active_paper_authority": True,
+                    "lanes": [
+                        "elite_entity_continuation",
+                        "creator_deployer_continuation",
+                        "entity_flow_accumulation",
+                        "fomo_continuation",
+                        "lifecycle_transition_continuation",
+                        "hazard_continuation",
+                    ],
+                    "deployer_is_automatic_veto": False,
+                    "deployer_counts_as_independent_confirmation": False,
+                    "pons_v2_85pct_progress_is_automatic_veto": False,
+                    "snipe_tax_above_500bps_is_automatic_veto": False,
+                    "promotion_requires_50pct_hit_rate": False,
+                    "promotion_objective": "robust_forward_expected_log_growth_with_tail_and_drawdown_constraints",
+                    "learned_exit_policy": "forward_MFE_MAE_after_30_closed_context_outcomes",
+                    "context_rows": contexts,
+                    "threshold_challenger_rows": challengers,
+                    "mark_to_market_rows": marks,
+                },
+                "paper_only": True,
+                "live_money_authority": False,
+                "signing_available": False,
+                "transaction_submission_available": False,
+                "runtime_ready": True,
+                "production_install": dict(_STATE),
+            }
+        )
+        return payload
     return {
         "enabled": True,
         "chain": "ROBINHOOD_CHAIN",
         "chain_id": 4663,
+        "strategy_version": ROBINHOOD_V5_VERSION,
         "paper_only": True,
         "paper_trading_authority": False,
         "shadow_only": False,
