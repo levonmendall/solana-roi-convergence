@@ -40,9 +40,9 @@ async def _refresh_until_entry_ceiling(
     current_swap: Any = None,
 ) -> None:
     """Keep the 5s latency target while allowing evidence collection through 20s."""
-    if _ORIGINAL_REFRESH is None:
-        raise RuntimeError("candidate risk-window repair is not installed")
     if not _eligible(self, current_swap):
+        if _ORIGINAL_REFRESH is None:
+            raise RuntimeError("candidate risk-window repair is not installed")
         await _ORIGINAL_REFRESH(self, mint, at, current_swap=current_swap)
         return
 
