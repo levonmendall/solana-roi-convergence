@@ -290,6 +290,20 @@ from .wallet_venue_lifecycle_research import install_wallet_venue_lifecycle_rese
 
 install_wallet_venue_lifecycle_research()
 
+# Post-PR104 production telemetry proved two composition gaps: the final set-based
+# writer bypassed PR102's per-receipt exact-durable frontier hook, and a frozen scout
+# arriving before launch attestation had no bounded mint-only way to acquire the
+# early context required by the six-dimension risk bundle. Repair those final
+# composition boundaries only after PR102-PR105 are installed. The fixed 12-second
+# / 3x1000 continuity bound, 5-second latency target, 20-second entry ceiling, risk
+# thresholds, full scope, paper-only authority, and no-signing/no-submission boundary
+# all remain unchanged.
+from .post104_production_architecture_repair import (
+    install_post104_production_architecture_repair,
+)
+
+install_post104_production_architecture_repair()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
