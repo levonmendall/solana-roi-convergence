@@ -5,7 +5,7 @@ from typing import Any
 
 from . import continuity_storage_capacity_repair as storage
 from . import live_poll_redundancy as live_poll
-from . import poll_exception_rearm as exception_rearm
+from . import poll_pagination_context as pagination
 from . import poll_watermark_repair as watermark
 from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 
@@ -14,7 +14,6 @@ REPAIR_VERSION = "high-volume-exact-signature-poll-v1"
 HIGH_VOLUME_SOURCES = frozenset({"PUMP_AMM", "PUMP_FUN"})
 
 _ORIGINAL_SLOT_POLL_PAGE: Callable[..., Any] | None = None
-_ORIGINAL_SLOT_FETCH_DELTA: Callable[..., Any] | None = None
 _ORIGINAL_STATUS: Callable[..., dict[str, Any]] | None = None
 
 
@@ -70,7 +69,7 @@ async def _poll_page_with_exact_baseline(
     min_context_slot: int | None = None,
     limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], str, float]:
-    """Retain the exact signature that established a high-volume slot baseline."""
+    """Retain the exact confirmed signature that established a Pump baseline."""
 
     if _ORIGINAL_SLOT_POLL_PAGE is None:
         raise RuntimeError("high-volume exact signature cursor repair is not installed")
@@ -106,7 +105,7 @@ async def _exact_page(
     min_context_slot: int,
     before: str | None = None,
 ) -> tuple[list[dict[str, Any]], str, float]:
-    """Read one routine page from the target's already-assigned public RPC."""
+    """Read one bounded routine page from the target's assigned provider shard."""
 
     config: dict[str, Any] = {
         "commitment": "confirmed",
@@ -126,28 +125,27 @@ async def _exact_page(
     return rows, provider, latency
 
 
-async def _fetch_delta_with_high_volume_exact_cursor(
+async def _maybe_fetch_high_volume_exact_cursor(
     self: Any,
     target: WatchTarget,
     cursor_slot: int,
-) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
-    """Use an exact confirmed lower boundary only for Pump.fun/Pump AMM.
+) -> pagination.DeltaResult | None:
+    """Specialize only Pump.fun/Pump AMM without replacing canonical poll wrappers.
 
-    This function is deliberately installed *under* the existing exception-rearm
-    wrapper rather than replacing its public identity. The established pagination,
-    exception re-arm, recoverability lease and checkpoint composition therefore stay
-    canonical. Only the two burst-heavy Pump sources take the exact-signature path.
+    The canonical pagination function calls this hook before its ordinary slot-only
+    path. Non-Pump targets return None and therefore follow the exact pre-existing
+    implementation. For Pump.fun/Pump AMM, the prior confirmed target signature is
+    sent as the server-side ``until`` boundary on the already-assigned routine RPC.
 
-    The hard 3x1000 bound is unchanged. If the exact signature is unavailable on the
-    assigned backend, three full pages still fail closed; no cursor advances and no
-    evidence is silently skipped. Same-slot signatures are retained because the
-    exact signature, not `slot <= cursor_slot`, proves completion.
+    The hard 3x1000 bound remains exact. If the assigned backend cannot reach the
+    signature inside that bound, this returns an incomplete delta and leaves both
+    slot and exact cursors unchanged. Same-slot signatures newer than the boundary
+    are retained because completion is proved by signature identity rather than by
+    discarding every row whose slot equals the previous slot watermark.
     """
 
-    if _ORIGINAL_SLOT_FETCH_DELTA is None:
-        raise RuntimeError("high-volume exact signature cursor repair is not installed")
     if not _is_high_volume(target):
-        return await _ORIGINAL_SLOT_FETCH_DELTA(self, target, cursor_slot)
+        return None
 
     key = _target_key(target)
     cursor = _cursor_state(self).get(key)
@@ -155,40 +153,29 @@ async def _fetch_delta_with_high_volume_exact_cursor(
     exact_slot = int(cursor.get("slot") or 0) if isinstance(cursor, dict) else 0
     if not exact_signature or exact_slot < int(cursor_slot):
         _inc(self, "fallback_slot_fetches")
-        rows, complete, provider, latency = await _ORIGINAL_SLOT_FETCH_DELTA(
-            self, target, cursor_slot
-        )
-        if complete and rows:
-            newest = rows[-1]
-            newest_signature = _signature(newest)
-            newest_slot = watermark._row_slot(newest)
-            if newest_signature and newest_slot > 0:
-                _save_cursor(
-                    self,
-                    target,
-                    signature=newest_signature,
-                    slot=newest_slot,
-                    provider=provider,
-                    source="slot-fallback-complete",
-                )
-                _inc(self, "fallback_cursor_updates")
-        return rows, complete, provider, latency
+        return None
 
     pages: list[list[dict[str, Any]]] = []
     before: str | None = None
     provider: str | None = None
     latency: float | None = None
     complete = False
+    context_floor = max(int(cursor_slot), exact_slot)
 
     for _page_index in range(live_poll.POLL_CURSOR_MAX_PAGES):
         page, provider, latency = await _exact_page(
             self,
             target,
             until=exact_signature,
-            min_context_slot=max(int(cursor_slot), exact_slot),
+            min_context_slot=context_floor,
             before=before,
         )
         pages.append(page)
+        if page:
+            context_floor = max(
+                context_floor,
+                max((watermark._row_slot(row) for row in page), default=context_floor),
+            )
         if not page or len(page) < live_poll.POLL_LIMIT:
             complete = True
             break
@@ -230,11 +217,8 @@ async def _fetch_delta_with_high_volume_exact_cursor(
     return ordered, True, provider, latency
 
 
-# Preserve all intrinsic markers from the sharded page transport before adding the
-# outer exact-baseline observer. Existing composition tests use these markers as a
-# contract that provider sharding was not replaced.
 setattr(_poll_page_with_exact_baseline, "_roi_high_volume_signature_cursor", True)
-setattr(_fetch_delta_with_high_volume_exact_cursor, "_roi_high_volume_signature_cursor", True)
+setattr(_maybe_fetch_high_volume_exact_cursor, "_roi_high_volume_signature_cursor", True)
 
 
 def _status_with_high_volume_exact_cursor(self: Any) -> dict[str, Any]:
@@ -257,6 +241,7 @@ def _status_with_high_volume_exact_cursor(self: Any) -> dict[str, Any]:
         "server_side_until_cursor": True,
         "same_slot_rows_preserved": True,
         "assigned_provider_shard_preserved": True,
+        "canonical_pagination_identity_preserved": True,
         "canonical_exception_rearm_identity_preserved": True,
         "poll_interval_seconds_unchanged": live_poll.POLL_INTERVAL_SECONDS,
         "hard_page_count_unchanged": live_poll.POLL_CURSOR_MAX_PAGES,
@@ -276,6 +261,7 @@ def _status_with_high_volume_exact_cursor(self: Any) -> dict[str, Any]:
                 "high_volume_live_poll_exact_signature_cursor": True,
                 "high_volume_live_poll_server_side_until_cursor": True,
                 "high_volume_live_poll_same_slot_rows_preserved": True,
+                "canonical_poll_pagination_identity_preserved": True,
                 "canonical_poll_exception_rearm_identity_preserved": True,
                 "routine_poll_interval_unchanged": True,
                 "recovery_bound_unchanged": True,
@@ -291,7 +277,7 @@ setattr(_status_with_high_volume_exact_cursor, "_roi_high_volume_signature_curso
 
 
 def install_high_volume_signature_cursor_repair() -> None:
-    global _ORIGINAL_SLOT_POLL_PAGE, _ORIGINAL_SLOT_FETCH_DELTA, _ORIGINAL_STATUS
+    global _ORIGINAL_SLOT_POLL_PAGE, _ORIGINAL_STATUS
 
     if _ORIGINAL_STATUS is not None:
         return
@@ -305,11 +291,10 @@ def install_high_volume_signature_cursor_repair() -> None:
     watermark._slot_poll_page = _poll_page_with_exact_baseline  # type: ignore[assignment]
     live_poll._poll_page = _poll_page_with_exact_baseline  # type: ignore[assignment]
 
-    # Preserve the canonical public fetch identity. The exception-rearm wrapper is
-    # required by established continuity contracts and dynamically calls this
-    # underlying delegate, so replace only its private lower delegate.
-    _ORIGINAL_SLOT_FETCH_DELTA = exception_rearm._ORIGINAL_FETCH_DELTA
-    exception_rearm._ORIGINAL_FETCH_DELTA = _fetch_delta_with_high_volume_exact_cursor
+    # Do not replace pagination or exception-rearm function identities. The canonical
+    # pagination function exposes this one lower specialization hook explicitly so
+    # the existing wrapper chain remains byte-for-byte addressable by regressions.
+    pagination._HIGH_VOLUME_DELTA_HOOK = _maybe_fetch_high_volume_exact_cursor
 
     _ORIGINAL_STATUS = DirectSolanaIngestionPlane.status
     try:
@@ -322,6 +307,6 @@ def install_high_volume_signature_cursor_repair() -> None:
 __all__ = [
     "HIGH_VOLUME_SOURCES",
     "REPAIR_VERSION",
-    "_fetch_delta_with_high_volume_exact_cursor",
+    "_maybe_fetch_high_volume_exact_cursor",
     "install_high_volume_signature_cursor_repair",
 ]
