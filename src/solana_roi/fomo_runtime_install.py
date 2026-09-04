@@ -30,6 +30,13 @@ _ORIGINAL_STATUS: Callable[..., dict[str, Any]] | None = None
 _ORIGINAL_MANIFEST: Callable[..., dict[str, Any]] | None = None
 
 
+def _inherit_markers(wrapper: Callable[..., Any], wrapped: Callable[..., Any]) -> None:
+    try:
+        wrapper.__dict__.update(getattr(wrapped, "__dict__", {}))
+    except Exception:
+        pass
+
+
 def _safe_json(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return dict(raw)
@@ -117,7 +124,6 @@ def _qualified_momentum_wallets(adapter: FinalProfitFirstResearchAdapter) -> set
                     qualified.add(str(wallet))
                     break
     except Exception:
-        # Dynamic scoring is supplementary; known point-in-time seeds remain usable.
         pass
     setattr(adapter, "_roi_fomo_wallet_role_cache", (now, frozenset(qualified)))
     return qualified
@@ -300,7 +306,6 @@ async def _observe_with_fomo(self: FinalProfitFirstResearchAdapter, signature: s
         _record_fomo_observation(self, signature)
         _set_error(self, None)
     except Exception as exc:
-        # FOMO is shadow research and is never allowed to break canonical v4 observation.
         _set_error(self, f"{type(exc).__name__}: {exc}")
 
 
@@ -390,24 +395,28 @@ def install_fomo_runtime() -> None:
     current_observe = FinalProfitFirstResearchAdapter.observe
     if not bool(getattr(current_observe, "_roi_fomo_runtime", False)):
         _ORIGINAL_OBSERVE = current_observe
+        _inherit_markers(_observe_with_fomo, current_observe)
         setattr(_observe_with_fomo, "_roi_fomo_runtime", True)
         FinalProfitFirstResearchAdapter.observe = _observe_with_fomo  # type: ignore[method-assign]
 
     current_sell = FinalProfitFirstResearchAdapter._sell
     if not bool(getattr(current_sell, "_roi_fomo_runtime", False)):
         _ORIGINAL_SELL = current_sell
+        _inherit_markers(_sell_with_fomo, current_sell)
         setattr(_sell_with_fomo, "_roi_fomo_runtime", True)
         FinalProfitFirstResearchAdapter._sell = _sell_with_fomo  # type: ignore[method-assign]
 
     current_status = FinalProfitFirstResearchAdapter.status
     if not bool(getattr(current_status, "_roi_fomo_runtime", False)):
         _ORIGINAL_STATUS = current_status
+        _inherit_markers(_status_with_fomo, current_status)
         setattr(_status_with_fomo, "_roi_fomo_runtime", True)
         FinalProfitFirstResearchAdapter.status = _status_with_fomo  # type: ignore[method-assign]
 
     current_manifest = FinalProfitFirstResearchAdapter._manifest
     if not bool(getattr(current_manifest, "_roi_fomo_runtime", False)):
         _ORIGINAL_MANIFEST = current_manifest
+        _inherit_markers(_manifest_with_fomo, current_manifest)
         setattr(_manifest_with_fomo, "_roi_fomo_runtime", True)
         FinalProfitFirstResearchAdapter._manifest = _manifest_with_fomo  # type: ignore[method-assign]
 
