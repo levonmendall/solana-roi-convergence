@@ -9,8 +9,7 @@ from .direct_solana import DirectSolanaIngestionPlane
 
 
 NotificationHandler = Callable[[Any, str, dict[int, Any], dict[str, Any]], Awaitable[None]]
-ContextPrefill = Callable[[Any, Any], Awaitable[bool]
-]
+ContextPrefill = Callable[[Any, Any], Awaitable[bool]]
 
 # These are hard production memory ceilings, not strategy/sample ceilings.
 # The raw Solana feed remains full-scope; when a provider outruns the process,
