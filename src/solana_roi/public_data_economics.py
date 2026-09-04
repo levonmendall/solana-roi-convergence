@@ -10,6 +10,7 @@ from . import direct_solana as direct_solana_module
 from . import solana_rpc as solana_rpc_module
 from .direct_solana import DirectSolanaIngestionPlane, DirectSolanaJournal
 from .solana_rpc import RpcEndpoint
+from .source_coverage import SOURCE_COVERAGE_HOTPATH_VERSION
 
 
 METERED_ALCHEMY_OPT_IN_ENV = "SOLANA_ROI_ENABLE_METERED_ALCHEMY"
@@ -64,10 +65,9 @@ def _public_first_endpoint_factory(
     return endpoints
 
 
-def _source_needs_bootstrap(self: Any, source: str) -> bool:
-    status_fn = getattr(self, "coverage_status_fn", None)
-    if status_fn is None:
-        return True
+def _legacy_status_source_needs_bootstrap(status_fn: Callable[..., Any], source: str) -> bool:
+    """Compatibility-only fallback for tests/legacy adapters without a source probe."""
+
     try:
         status = status_fn()
     except Exception:
@@ -86,7 +86,68 @@ def _source_needs_bootstrap(self: Any, source: str) -> bool:
     return observed < required
 
 
+def _source_needs_bootstrap(self: Any, source: str) -> bool:
+    """Use the bounded source probe, never full certification status in production.
+
+    Production passes the bound SourceAwareProgramCoverageCertificationGate.status
+    method. Resolve its owner and call source_needs_bootstrap(), which stops after the
+    unchanged per-source empirical minimum. A short per-source monotonic cache keeps
+    even that bounded SQLite read off dense raw receipt bursts. The legacy status
+    fallback exists only for older/test adapters that do not expose the new probe.
+    """
+
+    source_key = str(source or "").upper()
+    now = time.monotonic()
+    cache = getattr(self, "_roi_coverage_bootstrap_decision_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(self, "_roi_coverage_bootstrap_decision_cache", cache)
+    cached = cache.get(source_key)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        try:
+            checked_at = float(cached[0])
+            if (
+                COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS > 0
+                and now - checked_at < COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS
+            ):
+                return bool(cached[1])
+        except (TypeError, ValueError):
+            pass
+
+    status_fn = getattr(self, "coverage_status_fn", None)
+    if not callable(status_fn):
+        decision = True
+    else:
+        owner = getattr(status_fn, "__self__", None)
+        source_probe = getattr(owner, "source_needs_bootstrap", None)
+        if callable(source_probe):
+            try:
+                decision = bool(source_probe(source_key))
+            except Exception:
+                decision = True
+        else:
+            decision = _legacy_status_source_needs_bootstrap(status_fn, source_key)
+
+    cache[source_key] = (now, decision)
+    return decision
+
+
 def _bootstrap_capacity_available(self: Any, source: str) -> bool:
+    # The cadence check is intentionally first. Before this repair every ordinary
+    # raw receipt hit SQLite even when the same source had just been checked.
+    now = time.monotonic()
+    last_by_source = getattr(self, "_roi_coverage_bootstrap_last_enqueue", None)
+    if not isinstance(last_by_source, dict):
+        last_by_source = {}
+        setattr(self, "_roi_coverage_bootstrap_last_enqueue", last_by_source)
+    previous = float(last_by_source.get(source, 0.0) or 0.0)
+    if (
+        previous
+        and COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS > 0
+        and now - previous < COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS
+    ):
+        return False
+
     with self.store._lock:
         row = self.store.db.execute(
             "SELECT COUNT(*) AS n FROM direct_solana_hydration_queue "
@@ -98,14 +159,6 @@ def _bootstrap_capacity_available(self: Any, source: str) -> bool:
     if outstanding >= COVERAGE_BOOTSTRAP_MAX_OUTSTANDING_PER_SOURCE:
         return False
 
-    now = time.monotonic()
-    last_by_source = getattr(self, "_roi_coverage_bootstrap_last_enqueue", None)
-    if not isinstance(last_by_source, dict):
-        last_by_source = {}
-        setattr(self, "_roi_coverage_bootstrap_last_enqueue", last_by_source)
-    previous = float(last_by_source.get(source, 0.0) or 0.0)
-    if previous and now - previous < COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS:
-        return False
     last_by_source[source] = now
     return True
 
@@ -210,6 +263,10 @@ def _journal_init_with_legacy_sample_retirement(
         original(self, *args, **kwargs)
         now = direct_solana_module.utcnow().isoformat()
         with self.store._lock, self.store.db:
+            self.store.db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_direct_hydration_source_reason_status "
+                "ON direct_solana_hydration_queue(source_hint, reason, status)"
+            )
             cur = self.store.db.execute(
                 "UPDATE direct_solana_hydration_queue SET status='failed', last_error=?, updated_at=? "
                 "WHERE status IN ('pending','processing') AND reason='deterministic_market_sample'",
@@ -248,6 +305,11 @@ def _status_with_public_data_economics(
             "coverage_bootstrap_interval_seconds": COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS,
             "coverage_bootstrap_max_outstanding_per_source": COVERAGE_BOOTSTRAP_MAX_OUTSTANDING_PER_SOURCE,
             "legacy_random_samples_retired_at_startup": retired,
+            "source_coverage_hotpath_version": SOURCE_COVERAGE_HOTPATH_VERSION,
+            "coverage_bootstrap_decision": "bounded_source_specific_release_probe",
+            "coverage_full_status_in_notification_hotpath": False,
+            "coverage_probe_cache_seconds": COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS,
+            "capacity_interval_checked_before_sqlite": True,
             "strategy_scope_reduced": False,
         }
         policy = payload.setdefault("provider_runtime_policy", {})
@@ -271,6 +333,7 @@ def _status_with_public_data_economics(
                     "coverage_bootstrap_interval_seconds": COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS,
                     "random_market_sampling_after_source_minimum": False,
                     "launches_and_scouts_preserve_deep_analysis": True,
+                    "coverage_full_status_in_notification_hotpath": False,
                     "strategy_scope_reduced": False,
                 }
             )
