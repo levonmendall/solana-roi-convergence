@@ -74,9 +74,9 @@ def install_final_certification_failure_accounting() -> None:
     install_candidate_completion_continuity_repair()
     # PR99 telemetry then proved the candidate lane was healthy but PUMP_FUN could
     # generate more than 3,000 signatures between the routine standby cursor and a
-    # real WebSocket loss. Keep a confirmed same-generation pre-gap lower cursor at
-    # sub-poll cadence and deepen frame buffering without increasing its byte
-    # ceiling. The PR99 generation guard remains the delegated authority.
+    # real WebSocket loss. Maintain a confirmed same-generation pre-gap lower cursor
+    # at sub-poll cadence while leaving transport memory, the four-second poll, the
+    # fixed recovery bound, and PR99's generation guard unchanged.
     install_high_volume_pre_gap_frontier_repair()
 
     current_discard = retention._discard_hydration_row
