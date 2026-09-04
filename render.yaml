@@ -4,19 +4,22 @@ services:
     runtime: python
     plan: 1c-2g
     buildCommand: pip install -e .
-    # Production composition installs a cooperative scheduler handoff on the
-    # full-scope direct Solana notification path before FastAPI is imported.
+    # Preserve the exact canonical production entrypoint. Robinhood Chain is
+    # installed additively inside solana_roi.production after all existing Solana
+    # continuity/certification composition has been established.
     startCommand: uvicorn solana_roi.production:app --host 0.0.0.0 --port $PORT
     # Render liveness must remain constant-time and independent of SQLite,
     # certification scans, provider state, or the append-only event-chain audit.
-    # Deep readiness remains available under /v1/ingestion/status.
+    # Deep readiness remains available under /v1/ingestion/status and
+    # /v1/robinhood-chain/status.
     healthCheckPath: /v1/strategy/baseline
     autoDeployTrigger: checksPass
     numInstances: 1
     disk:
       name: roi-convergence-data
       mountPath: /var/data
-      sizeGB: 1
+      # Match the already-upgraded production disk; do not regress the live size.
+      sizeGB: 10
     envVars:
       - key: PAPER_ONLY
         value: "true"
@@ -54,9 +57,8 @@ services:
         value: "5"
       - key: SOLANA_ROI_DIRECT_RAW_RETENTION_SECONDS
         value: "900"
-      # Research-only adaptive wallet lane. It samples raw full-program receipts,
-      # uses historical RPC only for screening, and starts promotion evidence at a
-      # new prospective forward boundary. It cannot sign, submit, or mutate v3.1.
+      # Research-only adaptive Solana wallet lane. It samples raw full-program
+      # receipts and cannot sign, submit, or mutate the historical v3.1 cohort.
       - key: SOLANA_ROI_WALLET_DISCOVERY_ENABLED
         value: "true"
       - key: SOLANA_ROI_WALLET_DISCOVERY_SAMPLE_MODULUS
@@ -101,4 +103,22 @@ services:
         generateValue: true
       # Public address only. No private key, signer, seed phrase, or mnemonic.
       - key: SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY
+        sync: false
+
+      # Robinhood Chain is an active PAPER strategy, not shadow-only. It has an
+      # isolated $500 paper sleeve and never signs or submits transactions.
+      - key: ROBINHOOD_CHAIN_ENABLED
+        value: "true"
+      - key: ROBINHOOD_PAPER_STARTING_NAV_USD
+        value: "500"
+      - key: ROBINHOOD_POLL_SECONDS
+        value: "5"
+      - key: ROBINHOOD_RWA_FILTER_REQUIRED
+        value: "true"
+      - key: ROBINHOOD_ENTITY_RESOLUTION_REQUIRED
+        value: "true"
+      # Optional production RPC override. When absent, the implementation falls
+      # back to Robinhood's official rate-limited public read-only RPC and reports
+      # that condition in telemetry. No private key is ever configured.
+      - key: ROBINHOOD_RPC_URL
         sync: false
