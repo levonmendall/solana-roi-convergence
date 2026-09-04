@@ -106,8 +106,17 @@ async def _isolated_runtime_workers(runtime: Any, stop: asyncio.Event) -> None:
     fail-closed after a bounded backoff while the web process remains observable.
     """
 
-    while not stop.is_set():
+    first_attempt = True
+    while first_attempt or not stop.is_set():
+        first_attempt = False
         thread, thread_stop = _start_worker_thread(runtime)
+        if stop.is_set():
+            # Preserve the original worker composition contract used by shutdown and
+            # regression harnesses: workers are entered once even when the outer stop
+            # signal is already set, then receive their loop-local stop immediately.
+            await _join_worker(thread, thread_stop)
+            return
+
         while not stop.is_set() and thread.is_alive():
             try:
                 await asyncio.wait_for(stop.wait(), timeout=SUPERVISOR_POLL_SECONDS)
