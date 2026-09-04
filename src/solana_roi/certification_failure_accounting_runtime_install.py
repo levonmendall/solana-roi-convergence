@@ -19,9 +19,9 @@ def install_final_certification_failure_accounting() -> None:
     Install the exact-release transport, generation-safe recovery, standby
     affinity/priority, confirmed-WebSocket checkpoint architecture, hydration
     scheduling, candidate RPC-priority/hedging, universal continuity scheduling,
-    the candidate-completion/standby-fairness repair, and the final realtime
-    wallet-to-v4 handoff here so no older installer can replace them before runtime
-    tasks are created.
+    the candidate-completion/standby-fairness repair, high-volume pre-gap frontier
+    maintenance, and the final realtime wallet-to-v4 handoff here so no older
+    installer can replace them before runtime tasks are created.
     """
 
     from .candidate_completion_continuity_repair import (
@@ -47,6 +47,9 @@ def install_final_certification_failure_accounting() -> None:
     from .continuity_high_volume_poll_affinity_repair import (
         install_continuity_high_volume_poll_affinity_repair,
     )
+    from .continuity_high_volume_pre_gap_repair import (
+        install_high_volume_pre_gap_frontier_repair,
+    )
     from .continuity_standby_rpc_priority_repair import (
         install_continuity_standby_rpc_priority_repair,
     )
@@ -69,6 +72,12 @@ def install_final_certification_failure_accounting() -> None:
     # entire scout entry window, and continuous candidate traffic can starve the
     # high-volume standby lane that keeps the fixed 3x1000 recovery bound useful.
     install_candidate_completion_continuity_repair()
+    # PR99 telemetry then proved the candidate lane was healthy but PUMP_FUN could
+    # generate more than 3,000 signatures between the routine standby cursor and a
+    # real WebSocket loss. Keep a confirmed same-generation pre-gap lower cursor at
+    # sub-poll cadence and deepen frame buffering without increasing its byte
+    # ceiling. The PR99 generation guard remains the delegated authority.
+    install_high_volume_pre_gap_frontier_repair()
 
     current_discard = retention._discard_hydration_row
     if not bool(getattr(current_discard, "_roi_failure_accounting", False)):
