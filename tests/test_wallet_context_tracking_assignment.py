@@ -33,7 +33,7 @@ def _profile(
     }
 
 
-def test_tracking_capacity_is_partitioned_by_venue_lifecycle_before_global_strength() -> None:
+def test_tracking_capacity_is_earned_by_forward_roi_without_fixed_venue_reservation() -> None:
     profiles = [
         _profile("ray-a", "RAYDIUM", "raydium_native_or_migration_unproven", "momentum_alpha", 9.0, 0.60),
         _profile("ray-b", "RAYDIUM", "raydium_native_or_migration_unproven", "confirmation_alpha", 8.0, 0.50),
@@ -43,10 +43,11 @@ def test_tracking_capacity_is_partitioned_by_venue_lifecycle_before_global_stren
     states = {wallet: "tracking" for wallet in ("ray-a", "ray-b", "pump-a", "amm-a")}
     plan = build_context_tracking_plan(profiles, capacity=3, candidate_states=states)
 
-    assert set(plan["context_assigned_wallets"]) == {"ray-a", "pump-a", "amm-a"}
-    assert "ray-b" not in plan["context_assigned_wallets"]
+    assert plan["context_assigned_wallets"] == ["ray-a", "ray-b", "pump-a"]
+    assert "amm-a" not in plan["context_assigned_wallets"]
+    assert plan["fixed_venue_high_priority_reservations"] is False
+    assert plan["high_priority_capacity_earned_by_forward_roi"] is True
     assert plan["cross_context_success_transfer_allowed"] is False
-    assert len(plan["venue_lifecycle_coverage"]) == 3
 
 
 def test_bootstrap_wallet_can_be_observed_but_never_gets_strategy_eligibility() -> None:
