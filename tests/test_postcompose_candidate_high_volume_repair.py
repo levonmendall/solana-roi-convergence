@@ -5,13 +5,16 @@ from types import SimpleNamespace
 
 
 def test_production_composition_installs_scout_and_high_volume_repairs():
+    from solana_roi import high_volume_signature_cursor_repair as repair
+    from solana_roi import poll_exception_rearm as exception_rearm
     from solana_roi import poll_watermark_repair as watermark
     from solana_roi.direct_solana import DirectSolanaIngestionPlane
     from solana_roi.production import app  # noqa: F401
 
     assert getattr(DirectSolanaIngestionPlane.status, "_roi_scout_candidate_continuity", False) is True
     assert getattr(watermark._slot_poll_page, "_roi_high_volume_signature_cursor", False) is True
-    assert getattr(watermark._slot_fetch_delta, "_roi_high_volume_signature_cursor", False) is True
+    assert watermark._slot_fetch_delta is exception_rearm._exception_rearm_fetch_delta
+    assert exception_rearm._ORIGINAL_FETCH_DELTA is repair._fetch_delta_with_high_volume_exact_cursor
 
 
 def test_high_volume_exact_cursor_preserves_same_slot_rows(monkeypatch):
