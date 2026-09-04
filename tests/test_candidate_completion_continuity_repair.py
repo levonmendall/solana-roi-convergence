@@ -52,7 +52,7 @@ def _insert(
     )
 
 
-def test_candidate_claim_waits_for_confirmation_grace_and_retry_backoff():
+def test_candidate_first_claim_is_immediate_but_retry_obeys_backoff():
     journal = _journal()
     now = datetime.now(timezone.utc)
     _insert(journal, signature="fresh-first", trigger=now, attempts=0, updated=now)
@@ -64,16 +64,22 @@ def test_candidate_claim_waits_for_confirmation_grace_and_retry_backoff():
         updated=now,
     )
 
-    assert repair._deadline_aware_claim_candidate(journal) is None
-
-    old = now - timedelta(seconds=1)
-    journal.store.db.execute(
-        "UPDATE direct_solana_hydration_queue SET trigger_received_at=?, updated_at=? WHERE signature='fresh-first'",
-        (old.isoformat(), old.isoformat()),
-    )
     row = repair._deadline_aware_claim_candidate(journal)
     assert row is not None
     assert row["signature"] == "fresh-first"
+
+    # The untouched retry remains pending until its short re-admission backoff has
+    # elapsed, preventing a null-result row from immediately consuming another RPC
+    # slot ahead of new scout triggers.
+    assert repair._deadline_aware_claim_candidate(journal) is None
+    old = now - timedelta(seconds=1)
+    journal.store.db.execute(
+        "UPDATE direct_solana_hydration_queue SET updated_at=? WHERE signature='fresh-retry'",
+        (old.isoformat(),),
+    )
+    row = repair._deadline_aware_claim_candidate(journal)
+    assert row is not None
+    assert row["signature"] == "fresh-retry"
 
 
 def test_candidate_claim_prioritizes_trigger_near_entry_deadline():
@@ -247,7 +253,24 @@ def test_checkpoint_resumes_after_cursor_generation_is_recovered(monkeypatch):
     assert calls == [101]
 
 
+def test_checkpoint_compatibility_without_cursor_generation_is_exact_delegate(monkeypatch):
+    target = WatchTarget(kind="program", address="pump", source_hint="PUMP_FUN")
+    plane = SimpleNamespace()
+    calls: list[int] = []
+
+    async def original(_self, _target, cursor):
+        calls.append(cursor)
+        return [], True, "publicnode", 1.0
+
+    monkeypatch.setattr(lease, "_runtime", lambda _self: {})
+    monkeypatch.setattr(repair, "_ORIGINAL_CHECKPOINT_FETCH", original)
+    result = asyncio.run(repair._generation_safe_checkpoint_fetch(plane, target, 55))
+    assert result == ([], True, "publicnode", 1.0)
+    assert calls == [55]
+
+
 def test_frozen_safety_and_certification_boundaries_are_unchanged():
+    assert repair.CANDIDATE_FIRST_FETCH_GRACE_SECONDS == 0.0
     assert forward.LATENCY_BUDGET_SECONDS == 5.0
     assert forward.ENTRY_WINDOW_SECONDS == 20.0
     assert lease.POLL_RECOVERABILITY_LEASE_SECONDS == 12.0
