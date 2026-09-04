@@ -4,6 +4,8 @@ import sqlite3
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from solana_roi.unified_strategy_status import (
     REGIMES,
     _probe_status,
@@ -98,7 +100,7 @@ def test_one_real_executable_round_trip_probe_can_complete_in_every_solana_regim
     status = _probe_status(store, "test-release")
     assert set(status) == set(REGIMES)
     assert all(status[regime]["completed"] is True for regime in REGIMES)
-    assert all(status[regime]["net_return_pct"] == -1.0 for regime in REGIMES)
+    assert all(status[regime]["net_return_pct"] == pytest.approx(-1.0) for regime in REGIMES)
 
     with store._lock:
         rows = store.db.execute(
