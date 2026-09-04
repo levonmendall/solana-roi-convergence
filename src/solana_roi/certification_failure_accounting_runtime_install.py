@@ -152,5 +152,15 @@ def install_final_certification_failure_accounting() -> None:
     # retries, preserving fail-closed certification truth.
     install_release_bound_scout_reaper_atomicity()
 
+    # PR #136 moved the final selective WebSocket receipt write into a worker thread.
+    # Bind explicit real-WebSocket provenance before that thread hop so the existing
+    # exact/scout durable-frontier wrappers can publish their confirmed lower
+    # recovery boundary after SQLite commit. Live-poll/history rows remain excluded.
+    from .websocket_frontier_provenance_repair import (
+        install_websocket_frontier_provenance_repair,
+    )
+
+    install_websocket_frontier_provenance_repair()
+
 
 __all__ = ["install_final_certification_failure_accounting"]
