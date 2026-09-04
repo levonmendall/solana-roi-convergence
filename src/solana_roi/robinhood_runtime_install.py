@@ -73,6 +73,17 @@ from . import fomo_runtime_install as _fomo_runtime_install
 
 _fomo_runtime_install.classify_fomo_state = _fomo_classify_v5
 
+# PR120 makes risk signature a first-class strategy dimension. Apply the matching
+# wallet allocator only after v5/FOMO composition is complete: specialist coverage
+# is reserved by strategy + regime, then unused challenger capacity is still earned
+# globally by forward ROI. High-risk and hazard-FOMO wallets retain observation
+# coverage without gaining paper authority or weakening mechanical hard stops.
+from .strategy_specialist_wallet_allocator import (
+    install_strategy_specialist_wallet_allocator,
+)
+
+install_strategy_specialist_wallet_allocator()
+
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 from .robinhood_chain_profit_maximizer import ROBINHOOD_V5_VERSION
 
