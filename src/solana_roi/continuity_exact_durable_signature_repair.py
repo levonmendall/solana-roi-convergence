@@ -17,12 +17,9 @@ from . import raw_receipt_dispatch_repair as raw_dispatch
 from .direct_solana import DirectSolanaIngestionPlane, DirectSolanaJournal, WatchTarget
 
 
-# This repair does not increase either immutable recovery bound. It changes only
-# the *lower proof boundary* for high-volume PUMP targets: when an exact WebSocket
-# signature is already durably committed, recovery may stop at that exact signature
-# instead of replaying the entire confirmed slot via slot-1.
 EXACT_BOUNDARY_CONFIRMATION_ATTEMPTS = 2
 EXACT_BOUNDARY_CONFIRMATION_RETRY_SECONDS = 0.10
+_DURABLE_QUERY_CHUNK = 400
 
 _ORIGINAL_RECORD_RECEIPT: Callable[..., bool] | None = None
 _ORIGINAL_KICK: Callable[..., Any] | None = None
@@ -60,16 +57,7 @@ def _record_receipt_with_durable_frontier(
     received_at: datetime,
     launch_like: bool,
 ) -> bool:
-    """Remember an exact high-volume WebSocket signature only after SQLite commit.
-
-    The raw-dispatch ContextVar is non-null only while the canonical queued
-    WebSocket handler is executing. Live-poll/backfill calls to record_receipt do
-    not inherit that context and therefore cannot become this recovery authority.
-    The delegate returns only after its transaction context exits, so publishing the
-    in-memory frontier after it returns proves the referenced raw receipt is already
-    durable. The frontier is continuity metadata only; it creates no market sample.
-    """
-
+    """Publish a high-volume WebSocket frontier only after its SQLite commit."""
     if _ORIGINAL_RECORD_RECEIPT is None:
         raise RuntimeError("exact durable signature repair is not installed")
     inserted = bool(
@@ -84,12 +72,9 @@ def _record_receipt_with_durable_frontier(
     )
     if not inserted:
         return False
-
     if str(source_key) not in affinity.HIGH_VOLUME_ROUTINE_SOURCES:
         return True
     if raw_dispatch._RECEIPT_WALL_TIME.get() is None:
-        # Poll/recovery/history can persist the same schema, but only a real
-        # WebSocket dispatch may establish this exact prospective lower boundary.
         return True
 
     try:
@@ -100,7 +85,6 @@ def _record_receipt_with_durable_frontier(
     if not signature or parsed_slot <= 0:
         return True
 
-    frontiers = _journal_frontiers(self)
     row = {
         "signature": signature,
         "slot": parsed_slot,
@@ -110,6 +94,7 @@ def _record_receipt_with_durable_frontier(
         "durable": True,
         "transport": "websocket",
     }
+    frontiers = _journal_frontiers(self)
     current = frontiers.get(str(source_key))
     if not isinstance(current, dict) or (
         parsed_slot,
@@ -151,10 +136,8 @@ def _snapshot_exact_durable_boundary(
     generation: int,
 ) -> dict[str, Any] | None:
     source = _source_key(target)
-    if source is None:
-        return None
     journal = getattr(self, "journal", None)
-    if journal is None:
+    if source is None or journal is None:
         return None
     frontier = _journal_frontiers(journal).get(source)
     if not isinstance(frontier, dict) or not bool(frontier.get("durable")):
@@ -164,16 +147,18 @@ def _snapshot_exact_durable_boundary(
     key = live_poll._poll_target_key(target)
     previous_generation = int(generation) - 1
     runtime = lease._runtime(self).get(key, {})
-    if not isinstance(runtime, dict):
+    if (
+        not isinstance(runtime, dict)
+        or "cursor_ws_generation" not in runtime
+        or previous_generation < 0
+    ):
         _increment(self, "snapshot_generation_rejected")
         return None
     try:
-        cursor_generation = int(runtime.get("cursor_ws_generation", previous_generation) or 0)
+        cursor_generation = int(runtime.get("cursor_ws_generation") or 0)
     except (TypeError, ValueError):
         cursor_generation = -1
-    if previous_generation < 0 or cursor_generation != previous_generation:
-        # A stale/unrecovered generation can never be skipped by a newer durable
-        # receipt. Canonical generation recovery remains authoritative first.
+    if cursor_generation != previous_generation:
         _increment(self, "snapshot_generation_rejected")
         return None
 
@@ -190,9 +175,6 @@ def _snapshot_exact_durable_boundary(
 
     gap_started = _gap_started_monotonic(self, target)
     if gap_started is not None and committed > gap_started:
-        # Conservatively reject a commit that happened after the real zero-coverage
-        # transition. It may still describe a queued pre-gap receipt, but proving
-        # that ordering is unnecessary because the slot-based fallback remains.
         _increment(self, "snapshot_after_gap_rejected")
         return None
 
@@ -207,6 +189,7 @@ def _snapshot_exact_durable_boundary(
         "snapshot_monotonic": time.monotonic(),
         "confirmed": False,
         "confirmation_failed": False,
+        "same_slot_durability_failed": False,
         "lower_boundary_model": "last-durably-committed-websocket-signature",
         "exclusive_after_signature": True,
         "recorded_gap_can_be_repaired": False,
@@ -233,11 +216,7 @@ def _confirmation_rows(result: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else []
 
 
-async def _confirm_boundary(
-    self: Any,
-    target: WatchTarget,
-    boundary: dict[str, Any],
-) -> bool:
+async def _confirm_boundary(self: Any, target: WatchTarget, boundary: dict[str, Any]) -> bool:
     if bool(boundary.get("confirmed")):
         return True
     if bool(boundary.get("confirmation_failed")):
@@ -300,19 +279,58 @@ async def _confirm_boundary(
     return False
 
 
+def _durable_signatures_present(self: Any, source_key: str, signatures: list[str]) -> bool:
+    wanted = list(dict.fromkeys(str(value) for value in signatures if str(value)))
+    if not wanted:
+        return True
+    journal = getattr(self, "journal", None)
+    store = getattr(journal, "store", None)
+    lock = getattr(store, "_lock", None)
+    db = getattr(store, "db", None)
+    if lock is None or db is None:
+        return False
+
+    found: set[str] = set()
+    try:
+        for start in range(0, len(wanted), _DURABLE_QUERY_CHUNK):
+            chunk = wanted[start : start + _DURABLE_QUERY_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = (
+                "SELECT signature FROM direct_solana_recent_receipts "
+                f"WHERE source_key=? AND signature IN ({placeholders})"
+            )
+            with lock:
+                rows = db.execute(sql, (str(source_key), *chunk)).fetchall()
+            found.update(str(row[0]) for row in rows if row and row[0])
+    except Exception:
+        return False
+    return all(signature in found for signature in wanted)
+
+
+def _same_slot_tail(
+    page: list[dict[str, Any]],
+    lower_index: int,
+    lower_slot: int,
+) -> tuple[list[str], bool]:
+    signatures: list[str] = []
+    for row in page[lower_index + 1 :]:
+        slot = isolation.watermark._row_slot(row)
+        if slot < lower_slot:
+            return signatures, True
+        if slot == lower_slot:
+            signature = str(row.get("signature") or "")
+            if signature:
+                signatures.append(signature)
+    if len(page) < live_poll.POLL_LIMIT:
+        return signatures, True
+    return signatures, False
+
+
 async def _exact_signature_interval_fetch(
     self: Any,
     target: WatchTarget,
     cursor_slot: int,
 ) -> tuple[list[dict[str, Any]], bool, str | None, float | None, dict[str, Any]]:
-    """Recover exact missing signatures without replaying already-durable same-slot rows.
-
-    The first successfully recorded post-gap WebSocket receipt remains the optional
-    exclusive upper boundary from the existing generation-interval architecture.
-    The lower boundary is the confirmed exact signature that was durably committed
-    before zero WebSocket coverage. Pagination remains exactly 3 x 1000.
-    """
-
     if _ORIGINAL_INTERVAL_FETCH is None:
         raise RuntimeError("exact durable signature interval repair is not installed")
     source = _source_key(target)
@@ -324,6 +342,9 @@ async def _exact_signature_interval_fetch(
     boundary = _boundaries(self).get(key)
     if not isinstance(boundary, dict) or int(boundary.get("generation", -1)) != generation:
         _increment(self, "fallback_no_boundary")
+        return await _ORIGINAL_INTERVAL_FETCH(self, target, cursor_slot)
+    if bool(boundary.get("same_slot_durability_failed")):
+        _increment(self, "fallback_same_slot_unproved")
         return await _ORIGINAL_INTERVAL_FETCH(self, target, cursor_slot)
     if not await _confirm_boundary(self, target, boundary):
         _increment(self, "fallback_unconfirmed")
@@ -341,12 +362,15 @@ async def _exact_signature_interval_fetch(
         except (TypeError, ValueError):
             upper_slot = 0
 
-    pages: list[list[dict[str, Any]]] = []
+    interval_pages: list[list[dict[str, Any]]] = []
+    all_pages: list[list[dict[str, Any]]] = []
     page_providers: list[str | None] = []
     page_latencies: list[float | None] = []
     provider: str | None = None
     latency: float | None = None
     lower_reached = False
+    same_slot_tail_proven = False
+    omitted_same_slot_signatures: list[str] = []
     context_floor = max(0, int(cursor_slot), lower_slot)
 
     _increment(self, "exact_recovery_attempts")
@@ -365,63 +389,95 @@ async def _exact_signature_interval_fetch(
             hedge=True,
         )
         page = [row for row in result if isinstance(row, dict)] if isinstance(result, list) else []
+        all_pages.append(page)
         page_providers.append(provider)
         page_latencies.append(float(latency) if latency is not None else None)
 
-        lower_index: int | None = None
-        for index, row in enumerate(page):
-            if str(row.get("signature") or "") == lower_signature:
-                lower_index = index
-                break
-        if lower_index is not None:
-            # Keep the exact lower row only as a terminator. Any rows after it are
-            # older address history, including older same-slot signatures that were
-            # already outside the missing interval.
-            page = page[: lower_index + 1]
-            pages.append(page)
-            lower_reached = True
-            break
+        if not lower_reached:
+            lower_index: int | None = None
+            for index, row in enumerate(page):
+                if str(row.get("signature") or "") == lower_signature:
+                    lower_index = index
+                    break
+            if lower_index is not None:
+                lower_reached = True
+                interval_pages.append(page[: lower_index + 1])
+                tail, same_slot_tail_proven = _same_slot_tail(page, lower_index, lower_slot)
+                omitted_same_slot_signatures.extend(tail)
+                if same_slot_tail_proven:
+                    break
+                before = str(page[-1].get("signature") or "") or None
+                if not before:
+                    break
+                continue
 
-        pages.append(page)
-        if not page or len(page) < live_poll.POLL_LIMIT:
-            # A confirmed exact anchor must itself be observed before this path can
-            # claim completeness. A short/inconsistent RPC page is not proof.
+            interval_pages.append(page)
+            if not page or len(page) < live_poll.POLL_LIMIT:
+                break
+            before = str(page[-1].get("signature") or "") or None
+            if not before:
+                break
+            continue
+
+        for row in page:
+            slot = isolation.watermark._row_slot(row)
+            if slot < lower_slot:
+                same_slot_tail_proven = True
+                break
+            if slot == lower_slot:
+                signature = str(row.get("signature") or "")
+                if signature:
+                    omitted_same_slot_signatures.append(signature)
+        if same_slot_tail_proven or len(page) < live_poll.POLL_LIMIT:
+            same_slot_tail_proven = True
             break
         before = str(page[-1].get("signature") or "") or None
         if not before:
             break
 
-    if not lower_reached:
+    all_slots = [isolation.watermark._row_slot(row) for page in all_pages for row in page]
+    base_meta = {
+        "page_count": len(all_pages),
+        "page_sizes": [len(page) for page in all_pages],
+        "page_providers": page_providers,
+        "page_latencies_ms": page_latencies,
+        "newest_slot_seen": max(all_slots, default=0),
+        "oldest_slot_seen": min((slot for slot in all_slots if slot > 0), default=0),
+        "cursor_slot": int(cursor_slot),
+        "hard_page_limit": live_poll.POLL_CURSOR_MAX_PAGES,
+        "hard_page_size": live_poll.POLL_LIMIT,
+        "exact_durable_lower_boundary_applied": True,
+        "exact_durable_lower_signature": lower_signature,
+        "exact_durable_lower_slot": lower_slot,
+        "exact_durable_lower_reached": bool(lower_reached),
+        "same_slot_tail_proven": bool(same_slot_tail_proven),
+        "same_slot_omitted_signature_count": len(set(omitted_same_slot_signatures)),
+        "generation_upper_boundary_applied": bool(upper and upper_slot > 0),
+        "generation_upper_boundary_slot": upper_slot or None,
+        "generation_upper_boundary_source": (
+            str(upper.get("source")) if isinstance(upper, dict) and upper_slot > 0 else None
+        ),
+    }
+
+    if not lower_reached or not same_slot_tail_proven:
         _increment(self, "exact_recovery_incomplete")
-        all_slots = [isolation.watermark._row_slot(row) for page in pages for row in page]
-        meta = {
-            "page_count": len(pages),
-            "page_sizes": [len(page) for page in pages],
-            "page_providers": page_providers,
-            "page_latencies_ms": page_latencies,
-            "newest_slot_seen": max(all_slots, default=0),
-            "oldest_slot_seen": min((slot for slot in all_slots if slot > 0), default=0),
-            "cursor_slot": int(cursor_slot),
+        return [], False, provider, latency, {
+            **base_meta,
             "cursor_reached": False,
             "complete": False,
             "recovered_row_count": 0,
-            "hard_page_limit": live_poll.POLL_CURSOR_MAX_PAGES,
-            "hard_page_size": live_poll.POLL_LIMIT,
-            "exact_durable_lower_boundary_applied": True,
-            "exact_durable_lower_signature": lower_signature,
-            "exact_durable_lower_slot": lower_slot,
-            "exact_durable_lower_reached": False,
-            "generation_upper_boundary_applied": bool(upper and upper_slot > 0),
-            "generation_upper_boundary_slot": upper_slot or None,
-            "generation_upper_boundary_source": (
-                str(upper.get("source")) if isinstance(upper, dict) and upper_slot > 0 else None
-            ),
         }
-        return [], False, provider, latency, meta
+
+    durability_set = [lower_signature, *omitted_same_slot_signatures]
+    if not _durable_signatures_present(self, source, durability_set):
+        boundary["same_slot_durability_failed"] = True
+        _increment(self, "same_slot_durability_failures")
+        _increment(self, "fallback_same_slot_unproved")
+        return await _ORIGINAL_INTERVAL_FETCH(self, target, cursor_slot)
 
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for page in reversed(pages):
+    for page in reversed(interval_pages):
         for row in reversed(page):
             signature = str(row.get("signature") or "")
             if not signature or signature == lower_signature or signature in seen:
@@ -429,30 +485,13 @@ async def _exact_signature_interval_fetch(
             seen.add(signature)
             rows.append(row)
 
-    all_slots = [isolation.watermark._row_slot(row) for page in pages for row in page]
     meta = {
-        "page_count": len(pages),
-        "page_sizes": [len(page) for page in pages],
-        "page_providers": page_providers,
-        "page_latencies_ms": page_latencies,
-        "newest_slot_seen": max(all_slots, default=0),
-        "oldest_slot_seen": min((slot for slot in all_slots if slot > 0), default=0),
-        "cursor_slot": int(cursor_slot),
+        **base_meta,
         "cursor_reached": True,
         "complete": True,
         "recovered_row_count": len(rows),
-        "hard_page_limit": live_poll.POLL_CURSOR_MAX_PAGES,
-        "hard_page_size": live_poll.POLL_LIMIT,
-        "exact_durable_lower_boundary_applied": True,
-        "exact_durable_lower_signature": lower_signature,
-        "exact_durable_lower_slot": lower_slot,
-        "exact_durable_lower_reached": True,
+        "same_slot_older_rows_durable": True,
         "same_slot_already_durable_rows_can_be_excluded": True,
-        "generation_upper_boundary_applied": bool(upper and upper_slot > 0),
-        "generation_upper_boundary_slot": upper_slot or None,
-        "generation_upper_boundary_source": (
-            str(upper.get("source")) if isinstance(upper, dict) and upper_slot > 0 else None
-        ),
     }
     _increment(self, "exact_recovery_completed")
     setattr(
@@ -464,7 +503,8 @@ async def _exact_signature_interval_fetch(
             "lower_signature": lower_signature,
             "lower_slot": lower_slot,
             "recovered_row_count": len(rows),
-            "page_count": len(pages),
+            "page_count": len(all_pages),
+            "same_slot_omitted_signature_count": len(set(omitted_same_slot_signatures)),
             "upper_boundary_applied": bool(upper and upper_slot > 0),
         },
     )
@@ -482,16 +522,16 @@ def _status_with_exact_durable_signature(self: Any) -> dict[str, Any]:
     journal_frontiers = _journal_frontiers(journal) if journal is not None else {}
     boundary_rows: dict[str, Any] = {}
     for key, row in _boundaries(self).items():
-        if not isinstance(row, dict):
-            continue
-        boundary_rows[key] = {
-            "generation": int(row.get("generation", 0) or 0),
-            "signature": row.get("signature"),
-            "slot": int(row.get("slot", 0) or 0),
-            "confirmed": bool(row.get("confirmed")),
-            "confirmation_failed": bool(row.get("confirmation_failed")),
-            "lower_boundary_model": row.get("lower_boundary_model"),
-        }
+        if isinstance(row, dict):
+            boundary_rows[key] = {
+                "generation": int(row.get("generation", 0) or 0),
+                "signature": row.get("signature"),
+                "slot": int(row.get("slot", 0) or 0),
+                "confirmed": bool(row.get("confirmed")),
+                "confirmation_failed": bool(row.get("confirmation_failed")),
+                "same_slot_durability_failed": bool(row.get("same_slot_durability_failed")),
+                "lower_boundary_model": row.get("lower_boundary_model"),
+            }
 
     payload["exact_durable_signature_continuity"] = {
         "installed": True,
@@ -510,12 +550,15 @@ def _status_with_exact_durable_signature(self: Any) -> dict[str, Any]:
         "exact_recovery_attempts": int(getattr(self, "_roi_exact_durable_signature_exact_recovery_attempts", 0) or 0),
         "exact_recovery_completed": int(getattr(self, "_roi_exact_durable_signature_exact_recovery_completed", 0) or 0),
         "exact_recovery_incomplete": int(getattr(self, "_roi_exact_durable_signature_exact_recovery_incomplete", 0) or 0),
+        "same_slot_durability_failures": int(getattr(self, "_roi_exact_durable_signature_same_slot_durability_failures", 0) or 0),
         "fallback_no_boundary": int(getattr(self, "_roi_exact_durable_signature_fallback_no_boundary", 0) or 0),
         "fallback_unconfirmed": int(getattr(self, "_roi_exact_durable_signature_fallback_unconfirmed", 0) or 0),
+        "fallback_same_slot_unproved": int(getattr(self, "_roi_exact_durable_signature_fallback_same_slot_unproved", 0) or 0),
         "boundaries": boundary_rows,
         "last_success": getattr(self, "_roi_exact_durable_signature_last_success", None),
+        "same_slot_order_is_not_assumed_from_websocket_arrival": True,
+        "same_slot_omissions_require_durable_sqlite_proof": True,
         "slot_minus_one_fallback_preserved": True,
-        "same_slot_replay_preserved_on_fallback": True,
         "recorded_gap_can_be_repaired": False,
         "historical_promotion_authority": False,
         "recoverability_lease_seconds_unchanged": lease.POLL_RECOVERABILITY_LEASE_SECONDS,
@@ -531,6 +574,7 @@ def _status_with_exact_durable_signature(self: Any) -> dict[str, Any]:
                 "real_gap_exact_durable_signature_lower_boundary": True,
                 "exact_boundary_requires_durable_websocket_receipt": True,
                 "exact_boundary_requires_confirmed_or_finalized_rpc_proof": True,
+                "exact_boundary_same_slot_omissions_require_durable_proof": True,
                 "exact_boundary_never_uses_live_poll_or_history_receipt": True,
                 "exact_boundary_cannot_restore_recorded_gap": True,
                 "exact_boundary_slot_minus_one_fallback_preserved": True,
@@ -547,8 +591,6 @@ setattr(_status_with_exact_durable_signature, "_roi_exact_durable_signature", Tr
 
 
 def install_exact_durable_signature_continuity_repair() -> None:
-    """Install exact durable lower-boundary recovery after PR100 final composition."""
-
     global _ORIGINAL_RECORD_RECEIPT, _ORIGINAL_KICK, _ORIGINAL_INTERVAL_FETCH, _ORIGINAL_STATUS
 
     current_record = DirectSolanaJournal.record_receipt
@@ -591,7 +633,9 @@ __all__ = [
     "EXACT_BOUNDARY_CONFIRMATION_ATTEMPTS",
     "EXACT_BOUNDARY_CONFIRMATION_RETRY_SECONDS",
     "install_exact_durable_signature_continuity_repair",
+    "_durable_signatures_present",
     "_exact_signature_interval_fetch",
     "_record_receipt_with_durable_frontier",
+    "_same_slot_tail",
     "_snapshot_exact_durable_boundary",
 ]
