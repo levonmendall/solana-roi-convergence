@@ -101,6 +101,22 @@ async def _hedged_gap_fetch_delta(
     return rows, True, provider, latency
 
 
+def _requires_hedged_real_gap_fetch(base_fetch: Callable[..., Any]) -> bool:
+    """Recognize wrappers that intentionally change only healthy standby upkeep.
+
+    The durability proxy historically identified the canonical exception-rearm
+    function by object identity. The high-volume checkpoint architecture wraps the
+    same base function so healthy WebSocket periods can advance the standby cursor
+    from confirmed live receipts. A real zero-WebSocket generation must still bypass
+    that healthy-path wrapper and retain the existing dedicated hedged 3x1000 read.
+    """
+
+    return bool(
+        base_fetch is exception_rearm._exception_rearm_fetch_delta
+        or getattr(base_fetch, "_roi_high_volume_standby_checkpoint", False)
+    )
+
+
 class _LeaseWatermarkProxy:
     """Change only the recoverability worker's delta classification.
 
@@ -129,10 +145,10 @@ class _LeaseWatermarkProxy:
         gap_before_attempt = current_generation != cursor_generation
 
         base_fetch = self._base._slot_fetch_delta
-        # In production, once a real zero-coverage generation is known, hedge the
-        # recovery read immediately. Tests and compatibility callers that replace
-        # the underlying function still exercise their injected function exactly.
-        if gap_before_attempt and base_fetch is exception_rearm._exception_rearm_fetch_delta:
+        # Once a real zero-coverage generation is known, always retain the dedicated
+        # hedged bounded recovery path. Healthy-path wrappers may change standby
+        # maintenance, but they cannot intercept or weaken real-gap recovery.
+        if gap_before_attempt and _requires_hedged_real_gap_fetch(base_fetch):
             rows, complete, provider, latency = await _hedged_gap_fetch_delta(
                 plane, target, cursor_slot
             )
@@ -202,4 +218,5 @@ __all__ = [
     "install_continuity_durability_repair",
     "_hedged_gap_fetch_delta",
     "_hedged_gap_poll_page",
+    "_requires_hedged_real_gap_fetch",
 ]
