@@ -1,12 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import copy
-import os
-import sqlite3
-import threading
 from contextlib import suppress
-from pathlib import Path
 from typing import Any, Callable
 
 from . import render_runtime_bootstrap_repair as render_bootstrap
@@ -147,89 +142,129 @@ from .strategy_relevant_continuity import install_strategy_relevant_continuity
 
 install_strategy_relevant_continuity()
 
-from .observation_store import ObservationEventStore
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 from .robinhood_chain_profit_maximizer import ROBINHOOD_V5_VERSION
 
 
-ROBINHOOD_WORKER_ISOLATION_VERSION = "robinhood-dedicated-worker-v2"
-ROBINHOOD_STATUS_REFRESH_SECONDS = 1.0
-ROBINHOOD_WORKER_RESTART_SECONDS = 1.0
-
 _ORIGINAL_RUNTIME_WORKERS: Callable[[Any, asyncio.Event], Any] | None = None
 _PLANE: RobinhoodChainPaperPlane | None = None
 _STARTUP_ERROR: str | None = None
-_STATUS_LOCK = threading.Lock()
-_STATUS_SNAPSHOT: dict[str, Any] | None = None
 _STATE: dict[str, Any] = {
     "installed": False,
     "state": "not_started",
     "attempts": 0,
-    "worker_restarts": 0,
-    "dedicated_thread_alive": False,
-    "dedicated_store_path": None,
-    "canonical_cursor_seeded": False,
-    "canonical_cursor_seed_error": None,
 }
 
 
-def _dedicated_store_path(canonical_store_path: str | Path) -> Path:
-    explicit = os.getenv("ROBINHOOD_ISOLATED_STORE_PATH", "").strip()
-    if explicit:
-        return Path(explicit)
-    canonical = Path(canonical_store_path)
-    if canonical.suffix:
-        return canonical.with_name(f"{canonical.stem}-robinhood{canonical.suffix}")
-    return canonical.with_name(f"{canonical.name}-robinhood.sqlite3")
+async def _runtime_workers_with_robinhood(runtime: Any, stop: asyncio.Event) -> None:
+    """Run Robinhood beside canonical workers after durable runtime bootstrap.
 
+    The canonical `_render_handoff_lifespan` and its exact object identity are left
+    untouched. This function is reached only after that bootstrap has acquired the
+    persistent SQLite runtime, so Robinhood cannot delay Render liveness or compete
+    with the blue/green handoff for initial database ownership.
+    """
+    global _PLANE, _STARTUP_ERROR
+    if _ORIGINAL_RUNTIME_WORKERS is None:
+        raise RuntimeError("Robinhood production worker composition is not installed")
 
-def _seed_cursor_from_canonical(
-    plane: RobinhoodChainPaperPlane,
-    canonical_store_path: str | Path,
-) -> tuple[bool, str | None]:
-    if plane._cursor is not None:
-        return False, None
-    source = Path(canonical_store_path)
+    _STATE["attempts"] = int(_STATE["attempts"]) + 1
+    robinhood_task: asyncio.Task[None] | None = None
     try:
-        uri = f"file:{source.resolve().as_posix()}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True, timeout=0.25)
         try:
-            row = connection.execute(
-                "SELECT value FROM robinhood_chain_state WHERE key='cursor_block'"
-            ).fetchone()
-        finally:
-            connection.close()
-    except sqlite3.Error as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-    if row is None:
-        return False, None
-    try:
-        plane._set_cursor(int(row[0]))
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-    return True, None
+            _PLANE = RobinhoodChainPaperPlane(runtime.store)
+            _STARTUP_ERROR = None
+            _STATE["state"] = "running" if _PLANE.enabled else "disabled"
+            if _PLANE.enabled:
+                robinhood_task = asyncio.create_task(
+                    _PLANE.run(stop),
+                    name="robinhood-chain-paper",
+                )
+        except Exception as exc:
+            # Robinhood is additive. Initialization failure must never terminate
+            # the existing Solana/FOMO workers; only Robinhood fails closed.
+            _PLANE = None
+            _STARTUP_ERROR = f"{type(exc).__name__}: {exc}"
+            _STATE["state"] = "failed_closed"
+
+        await _ORIGINAL_RUNTIME_WORKERS(runtime, stop)
+    finally:
+        if robinhood_task is not None:
+            if not stop.is_set():
+                robinhood_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await robinhood_task
+        if _PLANE is not None:
+            with suppress(Exception):
+                await _PLANE.close()
+        if stop.is_set():
+            _STATE["state"] = "stopped"
 
 
-def _worker_isolation_status() -> dict[str, Any]:
-    return {
-        "version": ROBINHOOD_WORKER_ISOLATION_VERSION,
-        "dedicated_thread": True,
-        "dedicated_asyncio_event_loop": True,
-        "dedicated_sqlite_file": True,
-        "canonical_sqlite_shared": False,
-        "uvicorn_event_loop_runs_robinhood_polling": False,
-        "uvicorn_event_loop_runs_robinhood_sqlite": False,
-        "status_served_from_cached_snapshot": True,
-        "canonical_cursor_seed_is_read_only": True,
-        "strategy_thresholds_changed": False,
-        "paper_only": True,
-        "live_money_authority": False,
-        "signing_available": False,
-        "transaction_submission_available": False,
-    }
-
-
-def _fallback_status(error: str | None = None) -> dict[str, Any]:
+def _status() -> dict[str, Any]:
+    if _PLANE is not None:
+        payload = _PLANE.status()
+        try:
+            with _PLANE.store._lock:
+                contexts = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_trial_context WHERE release_commit=?",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+                challengers = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_trial_context WHERE release_commit=? AND threshold_challenger=1",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+                marks = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_marks WHERE release_commit=?",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+        except Exception:
+            contexts = challengers = marks = 0
+        try:
+            regime_authority = robinhood_regime_entity_authority_status(_PLANE)
+        except Exception as exc:
+            regime_authority = {
+                "authority_version": "regime-roi-wallet-authority-v2",
+                "failed_closed": True,
+                "error": f"{type(exc).__name__}: Robinhood regime entity authority unavailable",
+                "paper_only": True,
+                "live_money_authority": False,
+            }
+        payload.update(
+            {
+                "strategy_version": ROBINHOOD_V5_VERSION,
+                "wallet_authority_key": "chain_x_entity_x_role_x_venue_x_lifecycle_x_regime_x_risk_signature_x_flow_state",
+                "risk_conditioned_v5": {
+                    "active_paper_authority": True,
+                    "lanes": [
+                        "elite_entity_continuation",
+                        "creator_deployer_continuation",
+                        "entity_flow_accumulation",
+                        "fomo_continuation",
+                        "lifecycle_transition_continuation",
+                        "hazard_continuation",
+                    ],
+                    "deployer_is_automatic_veto": False,
+                    "deployer_counts_as_independent_confirmation": False,
+                    "pons_v2_85pct_progress_is_automatic_veto": False,
+                    "snipe_tax_above_500bps_is_automatic_veto": False,
+                    "promotion_requires_50pct_hit_rate": False,
+                    "promotion_objective": "robust_forward_expected_log_growth_with_tail_and_drawdown_constraints",
+                    "learned_exit_policy": "forward_MFE_MAE_after_30_closed_context_outcomes",
+                    "context_rows": contexts,
+                    "threshold_challenger_rows": challengers,
+                    "mark_to_market_rows": marks,
+                },
+                "regime_roi_entity_authority": regime_authority,
+                "paper_only": True,
+                "live_money_authority": False,
+                "signing_available": False,
+                "transaction_submission_available": False,
+                "runtime_ready": True,
+                "production_install": dict(_STATE),
+            }
+        )
+        return payload
     return {
         "enabled": True,
         "chain": "ROBINHOOD_CHAIN",
@@ -243,212 +278,9 @@ def _fallback_status(error: str | None = None) -> dict[str, Any]:
         "transaction_submission_available": False,
         "runtime_ready": False,
         "failed_closed": True,
-        "error": error or _STARTUP_ERROR or "canonical_runtime_not_ready",
-        "worker_isolation": _worker_isolation_status(),
+        "error": _STARTUP_ERROR or "canonical_runtime_not_ready",
         "production_install": dict(_STATE),
     }
-
-
-def _build_plane_status(plane: RobinhoodChainPaperPlane) -> dict[str, Any]:
-    payload = plane.status()
-    try:
-        with plane.store._lock:
-            contexts = int(plane.store.db.execute(
-                "SELECT COUNT(*) FROM robinhood_v5_trial_context WHERE release_commit=?",
-                (plane.release_commit,),
-            ).fetchone()[0])
-            challengers = int(plane.store.db.execute(
-                "SELECT COUNT(*) FROM robinhood_v5_trial_context WHERE release_commit=? AND threshold_challenger=1",
-                (plane.release_commit,),
-            ).fetchone()[0])
-            marks = int(plane.store.db.execute(
-                "SELECT COUNT(*) FROM robinhood_v5_marks WHERE release_commit=?",
-                (plane.release_commit,),
-            ).fetchone()[0])
-    except Exception:
-        contexts = challengers = marks = 0
-    try:
-        regime_authority = robinhood_regime_entity_authority_status(plane)
-    except Exception as exc:
-        regime_authority = {
-            "authority_version": "regime-roi-wallet-authority-v2",
-            "failed_closed": True,
-            "error": f"{type(exc).__name__}: Robinhood regime entity authority unavailable",
-            "paper_only": True,
-            "live_money_authority": False,
-        }
-    payload.update(
-        {
-            "strategy_version": ROBINHOOD_V5_VERSION,
-            "wallet_authority_key": "chain_x_entity_x_role_x_venue_x_lifecycle_x_regime_x_risk_signature_x_flow_state",
-            "risk_conditioned_v5": {
-                "active_paper_authority": True,
-                "lanes": [
-                    "elite_entity_continuation",
-                    "creator_deployer_continuation",
-                    "entity_flow_accumulation",
-                    "fomo_continuation",
-                    "lifecycle_transition_continuation",
-                    "hazard_continuation",
-                ],
-                "deployer_is_automatic_veto": False,
-                "deployer_counts_as_independent_confirmation": False,
-                "pons_v2_85pct_progress_is_automatic_veto": False,
-                "snipe_tax_above_500bps_is_automatic_veto": False,
-                "promotion_requires_50pct_hit_rate": False,
-                "promotion_objective": "robust_forward_expected_log_growth_with_tail_and_drawdown_constraints",
-                "learned_exit_policy": "forward_MFE_MAE_after_30_closed_context_outcomes",
-                "context_rows": contexts,
-                "threshold_challenger_rows": challengers,
-                "mark_to_market_rows": marks,
-            },
-            "regime_roi_entity_authority": regime_authority,
-            "paper_only": True,
-            "live_money_authority": False,
-            "signing_available": False,
-            "transaction_submission_available": False,
-            "runtime_ready": True,
-            "worker_isolation": _worker_isolation_status(),
-            "production_install": dict(_STATE),
-        }
-    )
-    return payload
-
-
-def _publish_status(payload: dict[str, Any]) -> None:
-    global _STATUS_SNAPSHOT
-    with _STATUS_LOCK:
-        _STATUS_SNAPSHOT = copy.deepcopy(payload)
-
-
-async def _snapshot_loop(plane: RobinhoodChainPaperPlane, stop: asyncio.Event) -> None:
-    while not stop.is_set():
-        try:
-            _publish_status(_build_plane_status(plane))
-        except Exception as exc:
-            _publish_status(_fallback_status(f"{type(exc).__name__}: Robinhood status snapshot failed"))
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=ROBINHOOD_STATUS_REFRESH_SECONDS)
-        except asyncio.TimeoutError:
-            pass
-
-
-async def _thread_cycle(canonical_store_path: str, thread_stop: threading.Event) -> None:
-    global _PLANE, _STARTUP_ERROR
-    dedicated_path = _dedicated_store_path(canonical_store_path)
-    dedicated_path.parent.mkdir(parents=True, exist_ok=True)
-    _STATE["dedicated_store_path"] = str(dedicated_path)
-
-    store = ObservationEventStore(dedicated_path)
-    plane: RobinhoodChainPaperPlane | None = None
-    async_stop = asyncio.Event()
-
-    async def bridge_stop() -> None:
-        while not thread_stop.is_set():
-            await asyncio.sleep(0.10)
-        async_stop.set()
-
-    bridge_task: asyncio.Task[None] | None = None
-    snapshot_task: asyncio.Task[None] | None = None
-    try:
-        plane = RobinhoodChainPaperPlane(store)
-        _PLANE = plane
-        seeded, seed_error = _seed_cursor_from_canonical(plane, canonical_store_path)
-        _STATE["canonical_cursor_seeded"] = seeded
-        _STATE["canonical_cursor_seed_error"] = seed_error
-        _STARTUP_ERROR = None
-        _STATE["state"] = "running" if plane.enabled else "disabled"
-        _STATE["dedicated_thread_alive"] = True
-        _publish_status(_build_plane_status(plane))
-
-        bridge_task = asyncio.create_task(bridge_stop(), name="robinhood-worker-stop-bridge")
-        snapshot_task = asyncio.create_task(
-            _snapshot_loop(plane, async_stop),
-            name="robinhood-worker-status-snapshot",
-        )
-        if plane.enabled:
-            await plane.run(async_stop)
-        else:
-            await bridge_task
-    finally:
-        async_stop.set()
-        if snapshot_task is not None:
-            snapshot_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await snapshot_task
-        if bridge_task is not None and not bridge_task.done():
-            bridge_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await bridge_task
-        if plane is not None:
-            with suppress(Exception):
-                await plane.close()
-        store.close()
-        _PLANE = None
-        _STATE["dedicated_thread_alive"] = False
-
-
-def _thread_entry(canonical_store_path: str, thread_stop: threading.Event) -> None:
-    global _STARTUP_ERROR
-    while not thread_stop.is_set():
-        try:
-            asyncio.run(_thread_cycle(canonical_store_path, thread_stop))
-        except Exception as exc:
-            _STARTUP_ERROR = f"{type(exc).__name__}: {exc}"
-            _STATE["state"] = "failed_closed"
-            _STATE["dedicated_thread_alive"] = False
-            _publish_status(_fallback_status(_STARTUP_ERROR))
-        if thread_stop.is_set():
-            break
-        _STATE["worker_restarts"] = int(_STATE["worker_restarts"]) + 1
-        _STATE["state"] = "restarting_worker"
-        if thread_stop.wait(ROBINHOOD_WORKER_RESTART_SECONDS):
-            break
-    _STATE["dedicated_thread_alive"] = False
-
-
-async def _runtime_workers_with_robinhood(runtime: Any, stop: asyncio.Event) -> None:
-    """Run Robinhood outside Uvicorn's event loop and canonical SQLite file.
-
-    Production proved cooperative yields were insufficient because one synchronous
-    SQLite/CPU section could still occupy the web process beyond Render's five-second
-    health deadline. Robinhood now owns a dedicated thread, asyncio loop and SQLite
-    file. The only canonical-store contact is a one-time read-only cursor seed when
-    the isolated store has no cursor yet. Solana/FOMO worker composition is unchanged.
-    """
-    if _ORIGINAL_RUNTIME_WORKERS is None:
-        raise RuntimeError("Robinhood production worker composition is not installed")
-
-    _STATE["attempts"] = int(_STATE["attempts"]) + 1
-    canonical_store_path = str(runtime.store.path)
-    thread_stop = threading.Event()
-    worker_thread = threading.Thread(
-        target=_thread_entry,
-        args=(canonical_store_path, thread_stop),
-        name="robinhood-chain-paper-worker",
-        daemon=True,
-    )
-    worker_thread.start()
-    try:
-        await _ORIGINAL_RUNTIME_WORKERS(runtime, stop)
-    finally:
-        thread_stop.set()
-        await asyncio.to_thread(worker_thread.join, 5.0)
-        if worker_thread.is_alive():
-            _STATE["state"] = "worker_thread_still_stopping"
-        elif stop.is_set():
-            _STATE["state"] = "stopped"
-        _STATE["dedicated_thread_alive"] = worker_thread.is_alive()
-
-
-def _status() -> dict[str, Any]:
-    with _STATUS_LOCK:
-        snapshot = copy.deepcopy(_STATUS_SNAPSHOT)
-    if snapshot is not None:
-        snapshot["production_install"] = dict(_STATE)
-        snapshot["worker_isolation"] = _worker_isolation_status()
-        return snapshot
-    return _fallback_status()
 
 
 def install_robinhood_chain_paper_runtime(app: Any, runtime_provider: Callable[[], Any]) -> None:
@@ -483,10 +315,14 @@ def install_robinhood_chain_paper_runtime(app: Any, runtime_provider: Callable[[
     _STATE["state"] = "installed_waiting_for_canonical_runtime"
 
 
-__all__ = [
-    "ROBINHOOD_WORKER_ISOLATION_VERSION",
-    "_dedicated_store_path",
-    "_seed_cursor_from_canonical",
-    "_status",
-    "install_robinhood_chain_paper_runtime",
-]
+# Production proved per-log cooperative yields were not enough: Robinhood catch-up
+# could still park the single Uvicorn loop on a synchronous SQLite/CPU section longer
+# than Render's five-second health deadline. Patch the just-defined worker/status
+# hooks before production invokes the installer so Robinhood owns a private thread,
+# event loop, SQLite store and nonblocking status cache.
+from .robinhood_worker_isolation_repair import install_robinhood_worker_isolation_repair
+
+install_robinhood_worker_isolation_repair()
+
+
+__all__ = ["install_robinhood_chain_paper_runtime"]
