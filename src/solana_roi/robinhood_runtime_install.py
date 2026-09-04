@@ -73,10 +73,18 @@ from . import fomo_runtime_install as _fomo_runtime_install
 
 _fomo_runtime_install.classify_fomo_state = _fomo_classify_v5
 
+# V5.1 must be installed before the regime proof wraps the active buy path. This
+# ensures the proof records the final entity-exact, amount-specific converged paper
+# fraction rather than the preliminary v5 quote fraction. The installer remains
+# paper-only and adds no signer, submission path or live-money authority.
+from .risk_conditioned_alpha_v51 import install_risk_conditioned_alpha_v51
+
+install_risk_conditioned_alpha_v51()
+
 # PR120 makes risk signature a first-class strategy dimension. Apply the matching
-# wallet allocator only after v5/FOMO composition is complete: specialist coverage
-# is reserved by strategy + regime, then unused challenger capacity is still earned
-# globally by forward ROI. High-risk and hazard-FOMO wallets retain observation
+# wallet allocator only after v5/FOMO/v5.1 composition is complete: specialist
+# coverage is reserved by strategy + regime, then unused challenger capacity is still
+# earned globally by forward ROI. High-risk and hazard-FOMO wallets retain observation
 # coverage without gaining paper authority or weakening mechanical hard stops.
 from .strategy_specialist_wallet_allocator import (
     install_strategy_specialist_wallet_allocator,
@@ -84,9 +92,9 @@ from .strategy_specialist_wallet_allocator import (
 
 install_strategy_specialist_wallet_allocator()
 
-# Make PR122's fairness repair part of actual production composition and tighten the
+# Make the fairness repair part of actual production composition and tighten the
 # selection rule to regime-specific robust ROI percentage. Assigned leaders can use
-# normal v5 paper sizing; lower-ranked/nonleader wallets remain bounded challengers
+# normal v5.1 paper sizing; lower-ranked/nonleader wallets remain bounded challengers
 # so a new wallet can still dethrone an incumbent. No dollar-P/L ranking is used.
 from .regime_roi_wallet_authority import (
     install_regime_roi_wallet_authority,
@@ -97,9 +105,9 @@ install_regime_roi_wallet_authority()
 
 # The unified status contract is installed at the same final production-composition
 # boundary so it can observe Solana, FOMO and Robinhood without replacing any data
-# plane. The regime probe wraps the already-installed v5 buy path and reuses its
-# exact entry/immediate-exit snapshot; it never issues an extra quote or RPC request
-# and has no promotion, portfolio-allocation, signing, submission or live authority.
+# plane. The regime probe now wraps the already-installed v5.1 buy path and reuses its
+# final exact entry/immediate-exit snapshot; it never issues an extra quote or RPC
+# request and has no promotion, portfolio-allocation, signing, submission or live authority.
 from .unified_strategy_status import (
     install_regime_paper_e2e_probe,
     install_unified_ingestion_status,
