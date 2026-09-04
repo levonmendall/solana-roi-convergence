@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict
 from typing import Any
@@ -7,15 +8,26 @@ from typing import Any
 from .risk_conditioned_alpha_v5 import robust_return_profile
 
 
-ALLOCATOR_VERSION = "cross-regime-paper-allocator-v1"
+ALLOCATOR_VERSION = "cross-regime-paper-allocator-v2-context-isolated"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
 MIN_SEGMENT_SAMPLES = 30
-MAX_SEGMENT_WEIGHT = 0.50
-UNKNOWN_CORRELATION_WEIGHT_CAP = 0.25
+MAX_FAMILY_WEIGHT = 0.50
+UNKNOWN_CORRELATION_FAMILY_CAP = 0.25
 ALLOCATOR_EVIDENCE_POSITION_GRID = (0.005, 0.01, 0.02, 0.05)
+
+_FOMO_NON_HAZARD_VARIANTS = frozenset(
+    {
+        "wallet_signal_only",
+        "wallet_plus_entity_confirmation",
+        "wallet_plus_fomo_acceleration",
+        "pure_entity_flow_fomo",
+        "hazard_fomo",
+        "clean_fomo",
+    }
+)
 
 
 def _table_exists(store: Any, table: str) -> bool:
@@ -27,33 +39,173 @@ def _table_exists(store: Any, table: str) -> bool:
     return row is not None
 
 
-def _segment_returns(store: Any, release_commit: str) -> dict[str, list[float]]:
+def _safe_json(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _fomo_risk_signature(raw_state_json: Any) -> str:
+    payload = _safe_json(raw_state_json)
+    variants = {
+        str(value)
+        for value in (payload.get("experiment_variants") or ())
+        if str(value)
+    }
+    hazards = sorted(value for value in variants if value not in _FOMO_NON_HAZARD_VARIANTS)
+    return "clean" if not hazards else "+".join(hazards)
+
+
+def _segment_key(
+    *,
+    surface: str,
+    lane: str,
+    venue: str,
+    lifecycle: str,
+    regime: str,
+    risk_signature: str,
+) -> str:
+    return "|".join(
+        (
+            surface,
+            lane,
+            venue,
+            lifecycle,
+            regime,
+            risk_signature,
+        )
+    )
+
+
+def _family_key(*, surface: str, venue: str) -> str:
+    # Solana active-alpha and FOMO overlays can express the same underlying venue
+    # exposure. Keep them in the same correlation family until aligned forward
+    # evidence proves the overlap is diversifying rather than duplicative.
+    if surface in {"SOLANA_ALPHA", "FOMO"}:
+        return f"SOLANA_UNDERLYING:{venue}"
+    return "ROBINHOOD_CHAIN"
+
+
+def _append(
+    grouped: dict[str, list[float]],
+    metadata: dict[str, dict[str, str]],
+    *,
+    surface: str,
+    lane: str,
+    venue: str,
+    lifecycle: str,
+    regime: str,
+    risk_signature: str,
+    net_return: float,
+) -> None:
+    key = _segment_key(
+        surface=surface,
+        lane=lane,
+        venue=venue,
+        lifecycle=lifecycle,
+        regime=regime,
+        risk_signature=risk_signature,
+    )
+    grouped.setdefault(key, []).append(float(net_return))
+    metadata[key] = {
+        "surface": surface,
+        "lane": lane,
+        "venue": venue,
+        "lifecycle": lifecycle,
+        "regime": regime,
+        "risk_signature": risk_signature,
+        "correlation_family": _family_key(surface=surface, venue=venue),
+    }
+
+
+def _segment_returns(
+    store: Any,
+    release_commit: str,
+) -> tuple[dict[str, list[float]], dict[str, dict[str, str]]]:
     grouped: dict[str, list[float]] = {}
+    metadata: dict[str, dict[str, str]] = {}
+
     if _table_exists(store, "risk_conditioned_alpha_v5_outcomes"):
         with store._lock:
             rows = store.db.execute(
-                "SELECT venue,net_return FROM risk_conditioned_alpha_v5_outcomes "
-                "WHERE release_commit=? ORDER BY id",
+                "SELECT lane,venue,lifecycle,regime,risk_signature,net_return "
+                "FROM risk_conditioned_alpha_v5_outcomes WHERE release_commit=? ORDER BY id",
                 (release_commit,),
             ).fetchall()
         for row in rows:
-            venue = str(row["venue"] or "UNKNOWN")
-            grouped.setdefault(venue, []).append(float(row["net_return"]))
+            _append(
+                grouped,
+                metadata,
+                surface="SOLANA_ALPHA",
+                lane=str(row["lane"] or "unknown"),
+                venue=str(row["venue"] or "UNKNOWN"),
+                lifecycle=str(row["lifecycle"] or "unknown"),
+                regime=str(row["regime"] or "unknown"),
+                risk_signature=str(row["risk_signature"] or "clean"),
+                net_return=float(row["net_return"]),
+            )
+
     if _table_exists(store, "fomo_paper_outcomes"):
+        shadow_exists = _table_exists(store, "fomo_shadow_observations")
+        with store._lock:
+            if shadow_exists:
+                rows = store.db.execute(
+                    "SELECT o.venue,o.lifecycle,o.regime,o.net_return,s.state_json "
+                    "FROM fomo_paper_outcomes o "
+                    "LEFT JOIN fomo_shadow_observations s "
+                    "ON s.release_commit=o.release_commit AND s.source_signature=o.source_signature "
+                    "WHERE o.release_commit=? ORDER BY o.id",
+                    (release_commit,),
+                ).fetchall()
+            else:
+                rows = store.db.execute(
+                    "SELECT venue,lifecycle,regime,net_return,NULL AS state_json "
+                    "FROM fomo_paper_outcomes WHERE release_commit=? ORDER BY id",
+                    (release_commit,),
+                ).fetchall()
+        for row in rows:
+            _append(
+                grouped,
+                metadata,
+                surface="FOMO",
+                lane="fomo_continuation",
+                venue=str(row["venue"] or "UNKNOWN"),
+                lifecycle=str(row["lifecycle"] or "unknown"),
+                regime=str(row["regime"] or "unknown"),
+                risk_signature=_fomo_risk_signature(row["state_json"]),
+                net_return=float(row["net_return"]),
+            )
+
+    if _table_exists(store, "robinhood_paper_outcomes") and _table_exists(store, "robinhood_v5_trial_context"):
         with store._lock:
             rows = store.db.execute(
-                "SELECT net_return FROM fomo_paper_outcomes WHERE release_commit=? ORDER BY id",
+                "SELECT c.lane,t.venue,t.lifecycle,c.regime,c.risk_signature,o.net_return "
+                "FROM robinhood_paper_outcomes o "
+                "JOIN robinhood_v5_trial_context c ON c.trial_id=o.trial_id "
+                "JOIN robinhood_paper_trials t ON t.id=o.trial_id "
+                "WHERE o.release_commit=? ORDER BY o.id",
                 (release_commit,),
             ).fetchall()
-        grouped["FOMO"] = [float(row["net_return"]) for row in rows]
-    if _table_exists(store, "robinhood_paper_outcomes"):
-        with store._lock:
-            rows = store.db.execute(
-                "SELECT net_return FROM robinhood_paper_outcomes WHERE release_commit=? ORDER BY id",
-                (release_commit,),
-            ).fetchall()
-        grouped["ROBINHOOD_CHAIN"] = [float(row["net_return"]) for row in rows]
-    return grouped
+        for row in rows:
+            _append(
+                grouped,
+                metadata,
+                surface="ROBINHOOD_CHAIN",
+                lane=str(row["lane"] or "unknown"),
+                venue=str(row["venue"] or "UNKNOWN"),
+                lifecycle=str(row["lifecycle"] or "unknown"),
+                regime=str(row["regime"] or "unknown"),
+                risk_signature=str(row["risk_signature"] or "clean"),
+                net_return=float(row["net_return"]),
+            )
+
+    return grouped, metadata
 
 
 def _score(profile: Any) -> float:
@@ -99,22 +251,18 @@ def _capped_normalize(scores: dict[str, float], caps: dict[str, float]) -> dict[
 
 
 def build_cross_regime_allocation(store: Any, release_commit: str) -> dict[str, Any]:
-    """Allocate only mature, robust-positive paper regimes; unallocated weight is cash.
+    """Allocate paper capital by exact lifecycle/regime/risk segments.
 
-    Cross-regime correlation is deliberately fail-closed. Until sufficiently aligned
-    forward observations exist to estimate it reliably, any one regime is capped at
-    25% rather than assuming independence. Once correlation evidence is added, that
-    cap can be relaxed up to the hard 50% per-regime ceiling.
-
-    The evidence profile uses at most a 5% per-observation trial fraction. Meta-level
-    regime weights are decided separately below, so the allocator does not reject a
-    profitable regime merely because a hypothetical 20% single-trade fraction would
-    have breached the strategy-level drawdown constraint.
+    A weak lifecycle or hazard cohort cannot dilute or subsidize a different
+    lifecycle/regime/risk signature. Correlation remains fail-closed: Solana alpha
+    and FOMO exposures on the same underlying venue share one family cap until
+    aligned forward evidence can support a correlation estimate.
     """
-    grouped = _segment_returns(store, release_commit)
+    grouped, metadata = _segment_returns(store, release_commit)
     profiles: dict[str, dict[str, Any]] = {}
-    scores: dict[str, float] = {}
-    caps: dict[str, float] = {}
+    segment_scores: dict[str, float] = {}
+    family_scores: dict[str, float] = {}
+
     for segment, values in grouped.items():
         profile = robust_return_profile(
             values,
@@ -124,23 +272,52 @@ def build_cross_regime_allocation(store: Any, release_commit: str) -> dict[str, 
         profiles[segment] = asdict(profile)
         mature = profile.sample_count >= MIN_SEGMENT_SAMPLES
         promoted = profile.state == "promoted_positive_log_growth"
-        scores[segment] = _score(profile) if mature and promoted else 0.0
-        caps[segment] = min(MAX_SEGMENT_WEIGHT, UNKNOWN_CORRELATION_WEIGHT_CAP)
-    weights = _capped_normalize(scores, caps)
-    allocated = min(1.0, sum(weights.values()))
+        score = _score(profile) if mature and promoted else 0.0
+        segment_scores[segment] = score
+        if score > 0.0:
+            family = metadata[segment]["correlation_family"]
+            family_scores[family] = family_scores.get(family, 0.0) + score
+
+    family_caps = {
+        family: min(MAX_FAMILY_WEIGHT, UNKNOWN_CORRELATION_FAMILY_CAP)
+        for family in family_scores
+    }
+    family_weights = _capped_normalize(family_scores, family_caps)
+
+    segment_weights: dict[str, float] = {}
+    for family, family_weight in family_weights.items():
+        members = {
+            segment: score
+            for segment, score in segment_scores.items()
+            if score > 0.0 and metadata[segment]["correlation_family"] == family
+        }
+        denom = sum(members.values())
+        if denom <= 0.0:
+            continue
+        for segment, score in members.items():
+            segment_weights[segment] = family_weight * score / denom
+
+    allocated = min(1.0, sum(segment_weights.values()))
     return {
         "allocator_version": ALLOCATOR_VERSION,
         "release_commit": release_commit,
-        "authority": "paper_only_if_forward_mature_and_robust_positive",
+        "authority": "paper_only_if_exact_forward_segment_is_mature_and_robust_positive",
+        "segmentation": "surface_x_lane_x_venue_x_lifecycle_x_regime_x_full_risk_signature",
         "minimum_segment_samples": MIN_SEGMENT_SAMPLES,
-        "correlation_policy": "unknown_correlation_is_not_zero; cap_each_segment_until_aligned_forward_evidence",
-        "max_segment_weight": MAX_SEGMENT_WEIGHT,
-        "unknown_correlation_weight_cap": UNKNOWN_CORRELATION_WEIGHT_CAP,
+        "correlation_policy": (
+            "unknown_correlation_is_not_zero; Solana alpha and FOMO on the same "
+            "underlying venue share one capped family until aligned forward evidence"
+        ),
+        "max_family_weight": MAX_FAMILY_WEIGHT,
+        "unknown_correlation_family_cap": UNKNOWN_CORRELATION_FAMILY_CAP,
+        "segment_metadata": metadata,
         "segment_profiles": profiles,
-        "segment_scores": scores,
-        "paper_allocation_weights": weights,
+        "segment_scores": segment_scores,
+        "family_scores": family_scores,
+        "family_weights": family_weights,
+        "paper_allocation_weights": segment_weights,
         "paper_cash_weight": max(0.0, 1.0 - allocated),
-        "mature_promoted_segments": sum(1 for score in scores.values() if score > 0.0),
+        "mature_promoted_segments": sum(1 for score in segment_scores.values() if score > 0.0),
         "paper_only": True,
         "live_money_authority": False,
         "signing_available": False,

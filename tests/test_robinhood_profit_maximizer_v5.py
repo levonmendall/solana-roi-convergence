@@ -5,20 +5,29 @@ from solana_roi.robinhood_chain_profit_maximizer import (
     ROBINHOOD_V5_VERSION,
     RobinhoodProfitMaximizerMixin,
 )
+from solana_roi.risk_conditioned_alpha_v51 import ROBINHOOD_V51_VERSION
 
 
 def test_v5_policy_overrides_legacy_entry_and_dispatches_settlement_by_evidence_version() -> None:
     assert issubclass(RobinhoodChainPaperPlane, RobinhoodProfitMaximizerMixin)
     assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("robinhood_chain_profit_maximizer")
-    assert RobinhoodChainPaperPlane._maybe_open_v2.__module__.endswith("robinhood_chain_profit_maximizer")
-    # Settlement has a class-level compatibility dispatcher: v5 trials use learned
-    # exits while pre-v5 trials retain their exact historical reason semantics.
+    # V5.1 intentionally supersedes only the Pons V2 entry path when the fully
+    # composed production installer has already run in this process. Direct module
+    # imports still expose the immutable base-v5 implementation.
+    v2_module = RobinhoodChainPaperPlane._maybe_open_v2.__module__
+    assert v2_module.endswith(("robinhood_chain_profit_maximizer", "risk_conditioned_alpha_v51"))
+    # Settlement has a class-level compatibility dispatcher: v5/v5.1 trials use
+    # learned exits while pre-v5 trials retain their exact historical reason semantics.
     assert RobinhoodChainPaperPlane._settle_one.__module__.endswith("robinhood_chain_paper")
     assert RobinhoodProfitMaximizerMixin._settle_one.__module__.endswith("robinhood_chain_profit_maximizer")
 
 
-def test_v5_version_is_distinct_from_original_bootstrap_policy() -> None:
-    assert ROBINHOOD_V5_VERSION == "robinhood-chain-risk-conditioned-v2"
+def test_active_robinhood_version_is_base_v5_or_explicit_v51_override() -> None:
+    v2_module = RobinhoodChainPaperPlane._maybe_open_v2.__module__
+    if v2_module.endswith("risk_conditioned_alpha_v51"):
+        assert ROBINHOOD_V5_VERSION == ROBINHOOD_V51_VERSION
+    else:
+        assert ROBINHOOD_V5_VERSION == "robinhood-chain-risk-conditioned-v2"
 
 
 def test_robinhood_regime_sizing_tightens_weak_and_mania_correlation_risk() -> None:

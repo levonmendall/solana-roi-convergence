@@ -51,6 +51,20 @@ class RobinhoodChainPaperPlane(
         await RobinhoodProfitMaximizerMixin._settle_one(self, trial)
 
 
+# Production imports this module from robinhood_runtime_install only after base v5,
+# the governed FOMO maturity override, specialist wallet allocation and the unified
+# regime paper probe are composed. Install v5.1 at this final policy boundary so the
+# newer production repairs remain authoritative while entity-exact promotion and
+# amount-specific sizing become the active paper policy. Direct/research imports
+# retain their historical module semantics and cannot wrap a pre-v5 adapter.
+from . import risk_conditioned_alpha_v5 as _risk_v5
+
+if bool(getattr(_risk_v5, "_INSTALLED", False)):
+    from .risk_conditioned_alpha_v51 import install_risk_conditioned_alpha_v51
+
+    install_risk_conditioned_alpha_v51()
+
+
 __all__ = [
     "RobinhoodChainPaperPlane",
     "ROBINHOOD_CHAIN_ID",
