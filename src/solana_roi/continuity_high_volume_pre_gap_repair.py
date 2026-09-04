@@ -5,7 +5,6 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from . import candidate_completion_continuity_repair as candidate_continuity
 from . import continuity_high_volume_checkpoint_architecture as checkpoint
 from . import continuity_high_volume_poll_affinity_repair as affinity
 from . import continuity_immediate_recovery_repair as immediate
@@ -14,20 +13,12 @@ from . import continuity_target_frontier_repair as frontier
 from . import live_poll_redundancy as live_poll
 from . import poll_recoverability_lease as lease
 from . import rpc_workload_governor as governor
-from . import target_stream_fanout as fanout
 from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 
 
-# The final fanout transport currently allows 8 x 1 MiB receive frames per target.
-# High-volume Pump streams can fill eight frames during a short event-loop stall.
-# Increase frame depth without increasing the established per-target byte ceiling.
-TARGET_WS_BURST_MAX_QUEUE = 32
-TARGET_WS_BURST_MAX_SIZE_BYTES = 256 * 1024
-TARGET_WS_BURST_BYTE_CEILING = TARGET_WS_BURST_MAX_QUEUE * TARGET_WS_BURST_MAX_SIZE_BYTES
-
-# Confirmed pre-gap checkpoints are research/continuity metadata only. They never
-# create market observations and never repair a recorded gap. A short cadence keeps
-# the safe lower recovery cursor close enough to the live Pump frontier that the
+# Confirmed pre-gap checkpoints are continuity metadata only. They never create
+# market observations and never repair a recorded gap. A short cadence keeps the
+# safe lower recovery cursor close enough to the live Pump frontier that the
 # unchanged 3x1000 recovery window remains useful during bursts.
 PROACTIVE_CHECKPOINT_MIN_INTERVAL_SECONDS = 0.50
 PROACTIVE_CHECKPOINT_MAX_AGE_SECONDS = 2.50
@@ -98,13 +89,7 @@ def _cache_row_is_fresh(row: Any, *, now: float | None = None) -> bool:
 
 
 async def _confirm_pre_gap_frontier(self: Any, target: WatchTarget) -> None:
-    """Publish one same-generation confirmed cursor without changing evidence.
-
-    The current poll cursor and its generation must already be healthy. A processed
-    WebSocket receipt is only a candidate anchor; the existing standard RPC
-    getSignatureStatuses proof must confirm it. The result keeps the whole confirmed
-    slot replayable by storing slot-1 exactly like the canonical checkpoint path.
-    """
+    """Publish one same-generation confirmed cursor without changing evidence."""
 
     key = live_poll._poll_target_key(target)
     generation = int(lease._current_ws_generation(self, target))
@@ -135,8 +120,6 @@ async def _confirm_pre_gap_frontier(self: Any, target: WatchTarget) -> None:
         _increment(self, "confirmation_errors")
         return
 
-    # A confirmation that overlaps a coverage-generation transition cannot be used
-    # as a pre-gap lower boundary. Leave the canonical recovery path untouched.
     if (
         not live_poll._ws_target_covered(self, target)
         or int(lease._current_ws_generation(self, target)) != generation
@@ -213,8 +196,6 @@ async def _notification_with_pre_gap_checkpoint(
     if parsed is not None:
         target, signature, slot = parsed
         if affinity._is_high_volume_target(target):
-            # Ensure the proactive task can see the exact socket-read receipt even
-            # when durable dispatch is intentionally queued off the event loop.
             frontier._observe_target_frontier(
                 self,
                 provider,
@@ -237,13 +218,7 @@ async def _checkpoint_fetch_with_pre_gap_cache(
     target: WatchTarget,
     cursor_slot: int,
 ) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
-    """Let the normal four-second poll consume a recent confirmed checkpoint.
-
-    This does not replace the poll worker or change its cadence. It only avoids a
-    redundant confirmation call when an exact same-generation proof was already
-    acquired prospectively. PR #99's generation-safe checkpoint delegate remains
-    authoritative whenever the cache is absent, stale, or crosses a gap.
-    """
+    """Let the unchanged four-second poll consume a recent confirmed checkpoint."""
 
     if _ORIGINAL_CHECKPOINT_FETCH is None:
         raise RuntimeError("high-volume pre-gap frontier repair is not installed")
@@ -251,14 +226,19 @@ async def _checkpoint_fetch_with_pre_gap_cache(
         return await _ORIGINAL_CHECKPOINT_FETCH(self, target, cursor_slot)
 
     key = live_poll._poll_target_key(target)
-    generation = int(lease._current_ws_generation(self, target))
     row = _cache(self).get(key)
+    # Preserve legacy/test call shape: when no usable proactive proof exists, do
+    # not read generation state before delegating to PR #99's canonical guard.
+    if not _cache_row_is_fresh(row):
+        return await _ORIGINAL_CHECKPOINT_FETCH(self, target, cursor_slot)
+    if int(row.get("checkpoint_cursor_slot") or 0) <= int(cursor_slot):
+        return await _ORIGINAL_CHECKPOINT_FETCH(self, target, cursor_slot)
+
+    generation = int(lease._current_ws_generation(self, target))
     if (
         live_poll._ws_target_covered(self, target)
         and _runtime_generation(self, target, generation) == generation
-        and _cache_row_is_fresh(row)
         and int(row.get("generation", -1)) == generation
-        and int(row.get("checkpoint_cursor_slot") or 0) > int(cursor_slot)
     ):
         effective_cursor = int(row["checkpoint_cursor_slot"])
         _increment(self, "cache_hits")
@@ -300,8 +280,6 @@ def _kick_with_pre_gap_checkpoint(self: Any, target: WatchTarget, generation: in
         key = live_poll._poll_target_key(target)
         row = _cache(self).get(key)
         state = live_poll._poll_state(self).get(key)
-        # Generation increments exactly when all real WebSocket coverage is lost.
-        # Therefore only the immediately preceding healthy generation is eligible.
         if (
             isinstance(state, dict)
             and bool(state.get("baseline_established"))
@@ -367,25 +345,12 @@ def _status_with_pre_gap_frontier(self: Any) -> dict[str, Any]:
         "cache": cache_rows,
         "same_slot_replay_preserved": True,
         "recorded_gap_can_be_repaired_by_checkpoint": False,
+        "websocket_transport_memory_boundary_unchanged": True,
         "poll_interval_seconds_unchanged": live_poll.POLL_INTERVAL_SECONDS,
         "recoverability_lease_seconds_unchanged": lease.POLL_RECOVERABILITY_LEASE_SECONDS,
         "hard_page_limit_unchanged": live_poll.POLL_CURSOR_MAX_PAGES,
         "hard_page_size_unchanged": live_poll.POLL_LIMIT,
     }
-
-    memory = payload.get("production_memory_boundary")
-    if isinstance(memory, dict):
-        memory.update(
-            {
-                "websocket_max_queue": TARGET_WS_BURST_MAX_QUEUE,
-                "websocket_max_size_bytes": TARGET_WS_BURST_MAX_SIZE_BYTES,
-                "websocket_max_queue_per_target": TARGET_WS_BURST_MAX_QUEUE,
-                "websocket_receive_byte_ceiling_per_target": TARGET_WS_BURST_BYTE_CEILING,
-                "websocket_receive_byte_ceiling_per_target_unchanged": True,
-            }
-        )
-        target_count = int(memory.get("target_streams_per_provider", 10) or 10)
-        memory["receive_payload_ceiling_bytes_per_provider"] = TARGET_WS_BURST_BYTE_CEILING * target_count
 
     policy = payload.setdefault("provider_runtime_policy", {})
     if isinstance(policy, dict):
@@ -396,8 +361,7 @@ def _status_with_pre_gap_frontier(self: Any) -> dict[str, Any]:
                 "pre_gap_checkpoint_cannot_restore_recorded_gap": True,
                 "pre_gap_checkpoint_same_slot_replay_preserved": True,
                 "pre_gap_checkpoint_requires_same_generation": True,
-                "high_volume_websocket_burst_depth_increased": True,
-                "high_volume_websocket_receive_byte_ceiling_unchanged": True,
+                "websocket_transport_memory_boundary_unchanged": True,
                 "routine_poll_interval_unchanged": True,
                 "continuity_lease_unchanged": True,
                 "recovery_bound_unchanged": True,
@@ -416,14 +380,6 @@ def install_high_volume_pre_gap_frontier_repair() -> None:
 
     global _ORIGINAL_NOTIFICATION, _ORIGINAL_CHECKPOINT_FETCH, _ORIGINAL_KICK, _ORIGINAL_STATUS
 
-    # Preserve the exact existing 8 MiB per-target receive envelope while allowing
-    # more small notification frames to queue during short event-loop stalls.
-    previous_byte_ceiling = int(fanout.TARGET_WS_MAX_QUEUE) * int(fanout.TARGET_WS_MAX_SIZE_BYTES)
-    if previous_byte_ceiling != TARGET_WS_BURST_BYTE_CEILING:
-        raise RuntimeError("target WebSocket byte ceiling changed unexpectedly; refusing burst-buffer install")
-    fanout.TARGET_WS_MAX_QUEUE = TARGET_WS_BURST_MAX_QUEUE
-    fanout.TARGET_WS_MAX_SIZE_BYTES = TARGET_WS_BURST_MAX_SIZE_BYTES
-
     current_notification = DirectSolanaIngestionPlane._handle_notification
     if not bool(getattr(current_notification, "_roi_high_volume_pre_gap_frontier", False)):
         _ORIGINAL_NOTIFICATION = current_notification
@@ -434,8 +390,6 @@ def install_high_volume_pre_gap_frontier_repair() -> None:
         setattr(_notification_with_pre_gap_checkpoint, "_roi_high_volume_pre_gap_frontier", True)
         DirectSolanaIngestionPlane._handle_notification = _notification_with_pre_gap_checkpoint  # type: ignore[method-assign]
 
-    # This is deliberately installed after PR #99. The current delegate contains
-    # the generation-safe guard and remains the fallback for every unsafe cache case.
     current_checkpoint = checkpoint._checkpointed_slot_fetch_delta
     if not bool(getattr(current_checkpoint, "_roi_high_volume_pre_gap_frontier", False)):
         _ORIGINAL_CHECKPOINT_FETCH = current_checkpoint
@@ -463,9 +417,6 @@ def install_high_volume_pre_gap_frontier_repair() -> None:
 
 
 __all__ = [
-    "TARGET_WS_BURST_MAX_QUEUE",
-    "TARGET_WS_BURST_MAX_SIZE_BYTES",
-    "TARGET_WS_BURST_BYTE_CEILING",
     "PROACTIVE_CHECKPOINT_MIN_INTERVAL_SECONDS",
     "PROACTIVE_CHECKPOINT_MAX_AGE_SECONDS",
     "install_high_volume_pre_gap_frontier_repair",
