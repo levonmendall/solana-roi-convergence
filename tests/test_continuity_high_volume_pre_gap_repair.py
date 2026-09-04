@@ -5,7 +5,6 @@ import time
 from types import SimpleNamespace
 
 from solana_roi import continuity_high_volume_pre_gap_repair as repair
-from solana_roi import continuity_immediate_recovery_repair as immediate
 from solana_roi import live_poll_redundancy as live_poll
 from solana_roi import poll_recoverability_lease as lease
 from solana_roi.direct_solana import WatchTarget
@@ -31,13 +30,6 @@ def _plane(*, cursor: int = 100, generation: int = 7) -> SimpleNamespace:
         },
         _roi_real_ws_gap_generations={key: generation},
     )
-
-
-def test_burst_buffer_preserves_exact_per_target_byte_ceiling():
-    assert repair.TARGET_WS_BURST_MAX_QUEUE == 32
-    assert repair.TARGET_WS_BURST_MAX_SIZE_BYTES == 256 * 1024
-    assert repair.TARGET_WS_BURST_BYTE_CEILING == 8 * 1024 * 1024
-    assert repair.TARGET_WS_BURST_BYTE_CEILING == 8 * (1024 * 1024)
 
 
 def test_proactive_confirmation_publishes_same_generation_slot_minus_one(monkeypatch):
@@ -117,9 +109,26 @@ def test_cached_checkpoint_advances_healthy_poll_without_bypassing_generation_gu
     assert result[1] is True
     assert delegated == []
 
-    # If the runtime cursor still belongs to the previous generation, the cache is
-    # forbidden and the PR99 generation-safe delegate must remain authoritative.
     plane._roi_poll_recoverability_runtime[key]["cursor_ws_generation"] = 6
+    result = asyncio.run(repair._checkpoint_fetch_with_pre_gap_cache(plane, target, 100))
+    assert result == ([], True, "fallback", 1.0)
+    assert delegated == [100]
+
+
+def test_empty_cache_delegates_without_consuming_generation_test_seam(monkeypatch):
+    target = _target()
+    plane = SimpleNamespace()
+    generations = iter([7, 8])
+    delegated: list[int] = []
+
+    async def fallback(_self, _target, cursor):
+        delegated.append(cursor)
+        # The wrapper must not have consumed either generation value.
+        assert next(generations) == 7
+        assert next(generations) == 8
+        return [], True, "fallback", 1.0
+
+    monkeypatch.setattr(repair, "_ORIGINAL_CHECKPOINT_FETCH", fallback)
     result = asyncio.run(repair._checkpoint_fetch_with_pre_gap_cache(plane, target, 100))
     assert result == ([], True, "fallback", 1.0)
     assert delegated == [100]
@@ -129,8 +138,6 @@ def test_real_gap_kick_uses_only_fresh_immediately_previous_generation_checkpoin
     target = _target()
     plane = _plane(cursor=100, generation=8)
     key = live_poll._poll_target_key(target)
-    # State/runtime cursor belongs to healthy generation 7 at the instant generation
-    # 8 is opened by a true zero-WebSocket-coverage transition.
     plane._roi_poll_recoverability_runtime[key]["cursor_ws_generation"] = 7
     repair._cache(plane)[key] = {
         "generation": 7,
@@ -151,7 +158,6 @@ def test_real_gap_kick_uses_only_fresh_immediately_previous_generation_checkpoin
     assert plane._roi_live_poll_state[key]["pre_gap_checkpoint_applied"] is True
     assert plane._roi_pre_gap_frontier_recovery_cursor_upgrades == 1
 
-    # A checkpoint from anything other than generation N-1 cannot move the cursor.
     plane._roi_live_poll_state[key]["cursor_slot"] = 100
     repair._cache(plane)[key]["generation"] = 6
     seen.clear()
@@ -159,9 +165,12 @@ def test_real_gap_kick_uses_only_fresh_immediately_previous_generation_checkpoin
     assert seen == [100]
 
 
-def test_fixed_continuity_and_candidate_boundaries_remain_unchanged():
+def test_fixed_transport_continuity_and_candidate_boundaries_remain_unchanged():
     from solana_roi import forward_evidence_runtime_repair as forward
+    from solana_roi import target_stream_fanout as fanout
 
+    assert fanout.TARGET_WS_MAX_QUEUE == 8
+    assert fanout.TARGET_WS_MAX_SIZE_BYTES == 1024 * 1024
     assert lease.POLL_RECOVERABILITY_LEASE_SECONDS == 12.0
     assert live_poll.POLL_CURSOR_MAX_PAGES == 3
     assert live_poll.POLL_LIMIT == 1000
