@@ -8,7 +8,6 @@ from . import continuity_standby_rpc_priority_repair as standby_priority
 from . import continuity_target_frontier_repair as frontier
 from . import live_poll_redundancy as live_poll
 from . import poll_recoverability_lease as lease
-from . import poll_watermark_repair as watermark
 from . import rpc_workload_governor as governor
 from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 
@@ -45,15 +44,11 @@ async def _checkpointed_slot_fetch_delta(
 ) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
     """Keep high-volume standby cursors current from confirmed live receipts.
 
-    While a real WebSocket copy is continuously authoritative, there is no value in
-    asking public RPC to replay thousands of already-observed Pump.fun/Pump AMM
-    signatures merely to move the standby watermark. Instead, confirm the newest
-    bounded real-WebSocket target frontier and advance only the *standby cursor* to
-    one slot before that confirmed receipt. The one-slot replay preserves same-slot
-    safety. No synthetic receipt is ever persisted or granted evidence authority.
-
-    Once real WebSocket coverage is absent, this function delegates unchanged to
-    the existing bounded 3x1000 getSignaturesForAddress recovery path.
+    This helper sits *outside* the canonical poll-watermark module. Existing poll,
+    pagination, exception-rearm, recoverability-lease, generation-floor and hedged
+    real-gap helpers therefore retain their exact identities and monkeypatch
+    contracts. Only the leased worker's outer standby view changes while a real
+    high-volume target WebSocket remains continuously authoritative.
     """
 
     if _ORIGINAL_SLOT_FETCH is None:
@@ -62,9 +57,6 @@ async def _checkpointed_slot_fetch_delta(
     if not affinity._is_high_volume_target(target) or not live_poll._ws_target_covered(self, target):
         return await _ORIGINAL_SLOT_FETCH(self, target, cursor_slot)
 
-    # If the local confirmed-slot cursor is already at the newest observed live
-    # target slot, the real WebSocket remains the authority and no redundant RPC
-    # history traversal is needed on this tick.
     latest_observed_slot = _latest_observed_target_slot(self, target)
     if latest_observed_slot <= int(cursor_slot) + 1:
         return [], True, None, None
@@ -79,13 +71,8 @@ async def _checkpointed_slot_fetch_delta(
                 generation,
             )
     except Exception:
-        # Confirmation uncertainty never advances the cursor. Fall back to the
-        # existing bounded standby delta rather than weakening continuity proof.
         return await _ORIGINAL_SLOT_FETCH(self, target, cursor_slot)
 
-    # The target must have remained continuously covered while confirmation was in
-    # flight. A zero-WebSocket transition increments the generation and sends this
-    # tick through the canonical bounded recovery path instead.
     if (
         not live_poll._ws_target_covered(self, target)
         or int(lease._current_ws_generation(self, target)) != generation
@@ -110,12 +97,9 @@ async def _checkpointed_slot_fetch_delta(
         "same_slot_replay_required": True,
     }
 
-    # The leased poll worker derives its local cursor from returned row slots. This
-    # internal marker intentionally has no signature, so if WebSocket coverage
-    # changes between this return and worker accounting, _record_poll_rows() skips
-    # it and it can never become a receipt, hydration row, candidate, or strategy
-    # observation. External telemetry subtracts these internal markers from the
-    # ordinary suppressed-receipt counter.
+    # The leased worker derives its cursor from returned row slots. This marker has
+    # no signature, so _record_poll_rows() can never persist it as a raw receipt,
+    # hydration item, candidate, strategy signal or paper observation.
     marker = {
         "signature": "",
         "slot": int(effective_cursor),
@@ -133,6 +117,26 @@ async def _checkpointed_slot_fetch_delta(
 
 
 setattr(_checkpointed_slot_fetch_delta, "_roi_high_volume_standby_checkpoint", True)
+
+
+class _HighVolumeCheckpointProxy:
+    """Outer leased-watermark view that preserves every canonical inner contract."""
+
+    def __init__(self, delegate: Any):
+        # Deliberately do not use the name `_base`: existing continuity contracts
+        # expose lease.watermark._base as the canonical poll_watermark module.
+        self._checkpoint_delegate = delegate
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._checkpoint_delegate, name)
+
+    async def _slot_fetch_delta(
+        self,
+        plane: Any,
+        target: WatchTarget,
+        cursor_slot: int,
+    ) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
+        return await _checkpointed_slot_fetch_delta(plane, target, cursor_slot)
 
 
 def _status_with_checkpoint_architecture(self: DirectSolanaIngestionPlane) -> dict[str, Any]:
@@ -156,10 +160,13 @@ def _status_with_checkpoint_architecture(self: DirectSolanaIngestionPlane) -> di
     payload["high_volume_standby_checkpoint_architecture"] = {
         "installed": True,
         "sources": sorted(affinity.HIGH_VOLUME_ROUTINE_SOURCES),
-        "mode": "confirmed-real-websocket-frontier-to-standby-watermark",
+        "mode": "outer-lease-proxy-confirmed-real-websocket-frontier-to-standby-watermark",
         "checkpoint_count": sum(int(value) for value in counts.values()),
         "checkpoint_counts_by_target": dict(sorted(counts.items())),
         "last_checkpoints": dict(sorted(_last_checkpoints(self).items())),
+        "canonical_poll_module_function_identity_preserved": True,
+        "canonical_recoverability_proxy_preserved": True,
+        "real_gap_hedged_recovery_path_unchanged": True,
         "healthy_websocket_avoids_replaying_suppressed_high_volume_history": True,
         "checkpoint_requires_confirmed_target_receipt": True,
         "checkpoint_requires_continuous_real_websocket_generation": True,
@@ -184,6 +191,8 @@ def _status_with_checkpoint_architecture(self: DirectSolanaIngestionPlane) -> di
                 "high_volume_healthy_ws_history_replay_removed": True,
                 "high_volume_checkpoint_same_slot_replay_preserved": True,
                 "high_volume_checkpoint_never_persists_synthetic_receipt": True,
+                "canonical_poll_helper_identity_preserved": True,
+                "urgent_real_gap_recovery_behavior_unchanged": True,
                 "continuity_lease_unchanged": True,
                 "recovery_bound_unchanged": True,
                 "provider_scope_unchanged": True,
@@ -197,19 +206,16 @@ setattr(_status_with_checkpoint_architecture, "_roi_high_volume_standby_checkpoi
 
 
 def install_high_volume_standby_checkpoint_architecture() -> None:
-    """Install the final high-volume continuity composition.
-
-    This is deliberately installed after provider sharding and standby RPC priority
-    so it replaces repeated healthy-history replay rather than stacking another
-    recovery policy on top of it.
-    """
+    """Install healthy high-volume checkpointing outside canonical poll helpers."""
 
     global _ORIGINAL_SLOT_FETCH, _ORIGINAL_DIRECT_STATUS
 
-    current_fetch = watermark._slot_fetch_delta
-    if not bool(getattr(current_fetch, "_roi_high_volume_standby_checkpoint", False)):
-        _ORIGINAL_SLOT_FETCH = current_fetch
-        watermark._slot_fetch_delta = _checkpointed_slot_fetch_delta  # type: ignore[assignment]
+    current_watermark = getattr(lease, "watermark", None)
+    if not isinstance(current_watermark, _HighVolumeCheckpointProxy):
+        if current_watermark is None or not callable(getattr(current_watermark, "_slot_fetch_delta", None)):
+            raise RuntimeError("canonical leased watermark is unavailable")
+        _ORIGINAL_SLOT_FETCH = current_watermark._slot_fetch_delta
+        lease.watermark = _HighVolumeCheckpointProxy(current_watermark)  # type: ignore[assignment]
 
     current_status = DirectSolanaIngestionPlane.status
     if not bool(getattr(current_status, "_roi_high_volume_standby_checkpoint", False)):
@@ -223,6 +229,7 @@ def install_high_volume_standby_checkpoint_architecture() -> None:
 
 
 __all__ = [
+    "_HighVolumeCheckpointProxy",
     "_checkpointed_slot_fetch_delta",
     "_latest_observed_target_slot",
     "install_high_volume_standby_checkpoint_architecture",
