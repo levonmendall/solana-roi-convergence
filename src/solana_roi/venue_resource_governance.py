@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -540,11 +539,11 @@ def install_venue_resource_governance() -> None:
         tracking_module.build_context_tracking_plan = build_roi_earned_tracking_plan
 
     if _ORIGINAL_SCHEDULE is None:
-        current_schedule = FinalProfitFirstResearchAdapter._schedule_observation
+        current_schedule = FinalProfitFirstResearchAdapter.schedule
         _ORIGINAL_SCHEDULE = current_schedule
         _inherit_markers(_schedule_with_venue_priority, current_schedule)
         setattr(_schedule_with_venue_priority, "_roi_venue_resource_governance", True)
-        FinalProfitFirstResearchAdapter._schedule_observation = _schedule_with_venue_priority  # type: ignore[method-assign]
+        FinalProfitFirstResearchAdapter.schedule = _schedule_with_venue_priority  # type: ignore[method-assign]
 
     if _ORIGINAL_ROUTER_STATUS is None:
         current_router_status = WalletContextRouter.status
