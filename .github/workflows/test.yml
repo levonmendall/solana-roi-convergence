@@ -18,6 +18,8 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: python -m pip install -e '.[dev]'
+      - name: Canonical architecture and transfer-certification invariants
+        run: python -m pytest tests/test_five_phase_certification_consolidation.py
       - name: Final v4 wallet entity universe regressions
         run: python -m pytest tests/test_wallet_entity_universe_v4.py
       - name: Existing regressions
