@@ -111,6 +111,17 @@ from .later_activity_execution_repair import install_later_activity_execution_re
 
 install_later_activity_execution_repair()
 
+# The legacy wallet `copyable` bit predates v5.1 and encodes the old <=15% mark
+# policy. Do not let it veto the final amount-specific strategy before v5.1 can apply
+# its own <=20s entry window, 15-40% challenger bands, exact entry/exit execution,
+# regime routing and mechanical hard stops. Install this after the durable handoff
+# and before the regime proof so every production path observes the repaired buy.
+from .strategy_candidate_admission_repair import (
+    install_strategy_candidate_admission_repair,
+)
+
+install_strategy_candidate_admission_repair()
+
 # The unified status contract is installed at the same final production-composition
 # boundary so it can observe Solana, FOMO and Robinhood without replacing any data
 # plane. The regime probe now wraps the already-installed v5.1 buy path and reuses its
@@ -181,8 +192,6 @@ async def _runtime_workers_with_robinhood(runtime: Any, stop: asyncio.Event) -> 
                     name="robinhood-chain-paper",
                 )
         except Exception as exc:
-            # Robinhood is additive. Initialization failure must never terminate
-            # the existing Solana/FOMO workers; only Robinhood fails closed.
             _PLANE = None
             _STARTUP_ERROR = f"{type(exc).__name__}: {exc}"
             _STATE["state"] = "failed_closed"
