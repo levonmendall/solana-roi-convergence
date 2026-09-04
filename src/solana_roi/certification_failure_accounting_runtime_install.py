@@ -142,8 +142,15 @@ def install_final_certification_failure_accounting() -> None:
     from .release_bound_scout_classification_repair import (
         install_release_bound_scout_classification_repair,
     )
+    from .release_bound_scout_reaper_atomicity import (
+        install_release_bound_scout_reaper_atomicity,
+    )
 
     install_release_bound_scout_classification_repair()
+    # Never delete a timed-out scout hydration row unless its exact trigger-epoch
+    # failure evidence has committed first. On SQLite contention cleanup yields and
+    # retries, preserving fail-closed certification truth.
+    install_release_bound_scout_reaper_atomicity()
 
 
 __all__ = ["install_final_certification_failure_accounting"]
