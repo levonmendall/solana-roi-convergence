@@ -4,9 +4,10 @@ services:
     runtime: python
     plan: 1c-2g
     buildCommand: pip install -e .
-    # Production composition installs a cooperative scheduler handoff on the
-    # full-scope direct Solana notification path before FastAPI is imported.
-    startCommand: uvicorn solana_roi.production:app --host 0.0.0.0 --port $PORT
+    # Production composition installs the complete canonical runtime first, then
+    # applies the candidate risk-window semantic correction as the final wrapper:
+    # 5s remains the latency target while 20s remains the strategy entry ceiling.
+    startCommand: uvicorn solana_roi.production_candidate_window:app --host 0.0.0.0 --port $PORT
     # Render liveness must remain constant-time and independent of SQLite,
     # certification scans, provider state, or the append-only event-chain audit.
     # Deep readiness remains available under /v1/ingestion/status.
