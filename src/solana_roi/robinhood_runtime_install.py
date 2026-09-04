@@ -5,6 +5,7 @@ from contextlib import suppress
 from typing import Any, Callable
 
 from . import render_runtime_bootstrap_repair as render_bootstrap
+from . import risk_conditioned_alpha_v5 as _risk_v5
 from .risk_conditioned_alpha_v5 import (
     _fomo_classify_v5,
     install_risk_conditioned_alpha_v5,
@@ -15,6 +16,56 @@ from .risk_conditioned_alpha_v5 import (
 # Install v5 here so existing adapter instances pick up class-method wrappers without
 # altering Render startup, RPC continuity, signing/submission, or live-money authority.
 install_risk_conditioned_alpha_v5()
+
+# Preserve the pre-v5 forward-maturity boundary. The strategy redesign intentionally
+# removes the 50% hit-rate / positive-median veto; it does not silently raise the
+# already-governed number of forward samples required before a FOMO wallet can be
+# promoted. Robust expected log growth and tail constraints apply at the same mature
+# forward boundary used by the existing wallet/entity system.
+from . import fomo_paper_strategy as _fomo_paper_strategy
+from .wallet_entity_universe_v4 import MIN_MATURE_FORWARD_SAMPLES
+
+
+def _fomo_profile_with_existing_forward_maturity(values: list[float]) -> dict[str, Any]:
+    profile = _risk_v5.robust_return_profile(
+        values,
+        grid=_risk_v5.FOMO_ACTIVE_GRID,
+        max_fraction=0.05,
+        min_samples=MIN_MATURE_FORWARD_SAMPLES,
+    )
+    challenger = {
+        fraction: _risk_v5._expected_log_growth(values, fraction)
+        for fraction in _risk_v5.FOMO_CHALLENGER_GRID
+    }
+    if profile.sample_count < MIN_MATURE_FORWARD_SAMPLES:
+        state = "bootstrap_forward_evidence"
+    elif profile.state == "promoted_positive_log_growth":
+        state = "promoted_fomo_wallet"
+    elif profile.state == "demoted_nonpositive_log_growth":
+        state = "demoted_fomo_wallet"
+    else:
+        state = "observe_mixed_fomo_wallet"
+    return {
+        "sample_count": profile.sample_count,
+        "mean_residual_roi_pct": profile.mean_return * 100.0 if profile.mean_return is not None else None,
+        "median_residual_roi_pct": profile.median_return * 100.0 if profile.median_return is not None else None,
+        "trimmed_mean_residual_roi_ex_best_1_pct": profile.trimmed_mean_ex_best * 100.0 if profile.trimmed_mean_ex_best is not None else None,
+        "positive_rate_pct": profile.hit_rate * 100.0 if profile.hit_rate is not None else None,
+        "mature": profile.sample_count >= MIN_MATURE_FORWARD_SAMPLES,
+        "state": state,
+        "best_paper_position_fraction": min(0.05, profile.best_fraction),
+        "best_expected_log_growth": profile.best_expected_log_growth,
+        "expected_shortfall_20_pct": profile.expected_shortfall_20 * 100.0 if profile.expected_shortfall_20 is not None else None,
+        "winner_concentration_pct": profile.winner_concentration * 100.0 if profile.winner_concentration is not None else None,
+        "max_drawdown_at_best_fraction_pct": profile.max_drawdown_at_best_fraction * 100.0 if profile.max_drawdown_at_best_fraction is not None else None,
+        "challenger_expected_log_growth": challenger,
+        "hit_rate_is_promotion_veto": False,
+        "historical_evidence_used_for_promotion": False,
+    }
+
+
+_risk_v5._fomo_profile_v5 = _fomo_profile_with_existing_forward_maturity
+_fomo_paper_strategy.classify_fomo_wallet_returns = _fomo_profile_with_existing_forward_maturity
 
 # fomo_runtime_install imports classify_fomo_state by value, so rebind that local
 # production reference as well as the source module patched by the installer.
