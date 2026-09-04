@@ -311,15 +311,29 @@ def _start_worker_thread(
 
 
 async def _isolated_runtime_workers(runtime: Any, stop: asyncio.Event) -> None:
-    """Keep Robinhood completely off the Uvicorn loop and canonical SQLite file."""
+    """Keep Robinhood completely off the Uvicorn loop and canonical SQLite file.
+
+    Production's post-bootstrap runtime always owns a canonical durable store. Some
+    focused regression harnesses intentionally exercise only the canonical worker
+    composition with minimal runtime doubles that omit storage entirely. Those
+    doubles cannot host Robinhood and therefore delegate unchanged to the original
+    workers rather than forcing tests to fabricate production-only state.
+    """
 
     module = _runtime_install_module()
     original_workers = getattr(module, "_ORIGINAL_RUNTIME_WORKERS", None)
     if original_workers is None:
         raise RuntimeError("Robinhood production worker composition is not installed")
 
+    canonical_store = getattr(runtime, "store", None)
+    if canonical_store is None or not hasattr(canonical_store, "path"):
+        module._STATE["worker_isolation_skipped_no_store"] = True
+        await original_workers(runtime, stop)
+        return
+
+    module._STATE["worker_isolation_skipped_no_store"] = False
     module._STATE["attempts"] = int(module._STATE.get("attempts", 0)) + 1
-    thread, thread_stop = _start_worker_thread(runtime.store)
+    thread, thread_stop = _start_worker_thread(canonical_store)
     try:
         await original_workers(runtime, stop)
     finally:
