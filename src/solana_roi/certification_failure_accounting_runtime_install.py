@@ -31,8 +31,10 @@ def install_final_certification_failure_accounting() -> None:
     from .candidate_hydration_work_conserving_repair import (
         install_candidate_hydration_work_conserving_repair,
     )
+    from .candidate_risk_quote_v4_handoff import install_candidate_risk_quote_v4_handoff
     from .candidate_rpc_hedge_repair import install_candidate_rpc_hedge_repair
     from .candidate_rpc_priority_repair import install_candidate_rpc_priority_repair
+    from .candidate_v4_runtime_wiring import install_candidate_v4_runtime_wiring
     from .certification_runtime_architecture_repair import (
         install_certification_runtime_architecture_repair,
     )
@@ -115,6 +117,14 @@ def install_final_certification_failure_accounting() -> None:
         accounting._ORIGINAL_QUOTE_OBSERVE = current_handoff
 
     accounting.install_certification_failure_accounting_repair()
+
+    # Production telemetry proved the high-priority direct frozen-scout candidate
+    # lane could hydrate confirmed transactions while the wallet/V4 lane remained
+    # empty. Wire those planes by shared store, then install one post-hydration,
+    # evidence-only bridge. It may collect risk/quote/simulation/V4 research rows,
+    # but it cannot arm the cohort or authorize paper/live execution.
+    install_candidate_v4_runtime_wiring()
+    install_candidate_risk_quote_v4_handoff()
 
 
 __all__ = ["install_final_certification_failure_accounting"]
