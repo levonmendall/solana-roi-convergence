@@ -56,9 +56,11 @@ def _robust_positive(row: dict[str, Any]) -> bool:
 
 
 def _rank(row: dict[str, Any]) -> tuple[float, float, int]:
+    score = _safe_float(row.get("context_score"))
+    copyable = _safe_float(row.get("copyable_return_on_deployed_fraction"))
     return (
-        _safe_float(row.get("context_score")) or float("-inf"),
-        _safe_float(row.get("copyable_return_on_deployed_fraction")) or float("-inf"),
+        score if score is not None else float("-inf"),
+        copyable if copyable is not None else float("-inf"),
         int(row.get("sample_count") or 0),
     )
 
@@ -74,17 +76,18 @@ def build_context_tracking_plan(
 
     Mature positive contexts win scarce capacity first. Unassigned fallback wallets are
     allowed only as bootstrap observation slots and receive no strategy authority.
+    When candidate states are supplied, only explicit `tracking` candidates are eligible.
     """
 
     capacity = max(0, int(capacity))
+    states_provided = candidate_states is not None
     states = candidate_states or {}
     eligible: list[dict[str, Any]] = []
     for row in profiles:
         wallet = str(row.get("wallet") or "")
         if not wallet or not _robust_positive(row):
             continue
-        state = states.get(wallet)
-        if states and state != "tracking":
+        if states_provided and states.get(wallet) != "tracking":
             continue
         eligible.append(row)
     eligible.sort(key=_rank, reverse=True)
@@ -138,7 +141,7 @@ def build_context_tracking_plan(
             wallet = str(wallet)
             if not wallet or wallet in selected_wallets:
                 continue
-            if states and states.get(wallet) != "tracking":
+            if states_provided and states.get(wallet) != "tracking":
                 continue
             bootstrap.append(wallet)
             selected_wallets.add(wallet)
@@ -178,7 +181,7 @@ def build_context_tracking_plan(
         "capacity": capacity,
         "context_assigned_wallets": [row["wallet"] for row in assignments],
         "bootstrap_observation_wallets": bootstrap,
-        "selected_challenger_wallets": [*([row["wallet"] for row in assignments]), *bootstrap],
+        "selected_challenger_wallets": [row["wallet"] for row in assignments] + bootstrap,
         "context_assignments": assignments,
         "bootstrap_assignments": bootstrap_rows,
         "venue_lifecycle_coverage": [
@@ -247,6 +250,9 @@ def _partitioned_select(self: WalletEntityUniverseV4) -> list[str]:
         raise RuntimeError("context tracking assignment is not installed")
     fallback = list(_ORIGINAL_SELECT(self))
     states = _candidate_states(self)
+    if not states:
+        setattr(self, "_roi_context_tracking_last_error", "candidate_state_unavailable_fail_closed_to_existing_tracking")
+        return fallback
     incumbents = [wallet for wallet in fallback if states.get(wallet) == "incumbent_tracking"]
     fallback_challengers = [wallet for wallet in fallback if states.get(wallet) == "tracking"]
     try:
@@ -283,9 +289,12 @@ def _status_with_assignments(self: WalletContextRouter) -> dict[str, Any]:
     payload["venue_lifecycle_tracking_assignment"] = {
         "assignment_version": ASSIGNMENT_VERSION,
         **plan,
+        "candidate_state_available": bool(states),
         "incumbent_wallets_preserved": incumbents,
-        "effective_tracked_wallets": list(
-            dict.fromkeys((*incumbents, *plan["selected_challenger_wallets"]))
+        "effective_tracked_wallets": (
+            list(dict.fromkeys((*incumbents, *plan["selected_challenger_wallets"])))
+            if states
+            else fallback
         ),
         "tracking_capacity_partitioned_by_venue_lifecycle_before_global_fill": True,
         "observation_bootstrap_preserved": True,
@@ -305,7 +314,7 @@ def _status_with_assignments(self: WalletContextRouter) -> dict[str, Any]:
         "paper_only": True,
         "live_money_authority": False,
     }
-    payload["context_recommendations_have_tracking_mutation_authority"] = True
+    payload["context_recommendations_have_tracking_mutation_authority"] = bool(states)
     payload["tracking_mutation_scope"] = "research_wallet_tracking_only_exact_context_partitioned"
     payload["context_scores_have_trade_authority"] = False
     return payload
