@@ -11,7 +11,7 @@ services:
     # certification scans, provider state, or the append-only event-chain audit.
     # Deep readiness remains available under /v1/ingestion/status.
     healthCheckPath: /v1/strategy/baseline
-    autoDeployTrigger: off
+    autoDeployTrigger: checksPass
     numInstances: 1
     disk:
       name: roi-convergence-data
