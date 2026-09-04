@@ -5,13 +5,22 @@ from contextlib import suppress
 from typing import Any, Callable
 
 from . import render_runtime_bootstrap_repair as render_bootstrap
-from .risk_conditioned_alpha_v5 import install_risk_conditioned_alpha_v5
+from .risk_conditioned_alpha_v5 import (
+    _fomo_classify_v5,
+    install_risk_conditioned_alpha_v5,
+)
 
 # The Robinhood installer is imported by production only after canonical Solana/FOMO
 # modules have been composed and before the ASGI lifespan starts background workers.
 # Install v5 here so existing adapter instances pick up class-method wrappers without
 # altering Render startup, RPC continuity, signing/submission, or live-money authority.
 install_risk_conditioned_alpha_v5()
+
+# fomo_runtime_install imports classify_fomo_state by value, so rebind that local
+# production reference as well as the source module patched by the installer.
+from . import fomo_runtime_install as _fomo_runtime_install
+
+_fomo_runtime_install.classify_fomo_state = _fomo_classify_v5
 
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 from .robinhood_chain_profit_maximizer import ROBINHOOD_V5_VERSION
