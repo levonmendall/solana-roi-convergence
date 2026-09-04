@@ -280,6 +280,16 @@ from .candidate_risk_window_repair import install_candidate_risk_window_repair
 
 install_candidate_risk_window_repair()
 
+# Segment the already-prospective wallet/entity evidence by venue and lifecycle so
+# Pump.fun bonding-curve, Pump AMM, and Raydium behavior can be evaluated separately.
+# Raydium is called post-Pump only when current-release point-in-time Pump evidence
+# for the same token predates it. This is read-only research: it does not change the
+# active strategy, tracking authority, entry/exit rules, certification thresholds,
+# continuity bounds, signing/submission capability, or paper-only boundary.
+from .wallet_venue_lifecycle_research import install_wallet_venue_lifecycle_research
+
+install_wallet_venue_lifecycle_research()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
