@@ -339,6 +339,15 @@ from .candidate_execution_evidence_plane import (
 install_candidate_execution_evidence_plane()
 
 from .api import app as app  # noqa: E402  (installation must happen first)
+from .api import ingestion_runtime  # noqa: E402
+from .robinhood_runtime_install import install_robinhood_chain_paper_runtime  # noqa: E402
+
+# Robinhood Chain is an additive active-paper plane. Install it only after the
+# canonical Solana app and guarded background runtime bootstrap exist. Its worker
+# waits for that runtime asynchronously, so Render liveness and Solana continuity
+# remain authoritative and unchanged. Robinhood can create paper positions only;
+# signing, submission, private-key handling and live-money authority remain absent.
+install_robinhood_chain_paper_runtime(app, ingestion_runtime)
 
 __all__ = [
     "app",
