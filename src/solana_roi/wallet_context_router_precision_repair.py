@@ -191,7 +191,7 @@ def _manifest_with_percent_and_fail_closed(
 
 
 def install_wallet_context_router_precision_repair() -> None:
-    """Install precision, governance, bandwidth, FOMO and context assignment exactly once."""
+    """Install precision, governance, bandwidth and FOMO composition exactly once."""
 
     global _ORIGINAL_CLASSIFY, _ORIGINAL_CONTEXT_METRICS, _ORIGINAL_STATUS, _ORIGINAL_MANIFEST
 
@@ -241,8 +241,7 @@ def install_wallet_context_router_precision_repair() -> None:
     if bandwidth_module._ORIGINAL_MANIFEST is None:
         bandwidth_module.install_context_research_bandwidth_governor()
 
-    # FOMO is a subordinate production-shadow consumer of the already-governed
-    # prospective evidence. Its installer also captures each wrapped method once.
+    # FOMO's point-in-time collector remains an auditable research/evidence plane.
     from .fomo_runtime_install import install_fomo_runtime
 
     install_fomo_runtime()
@@ -253,10 +252,17 @@ def install_wallet_context_router_precision_repair() -> None:
     install_fomo_venue_lifecycle_reporting()
 
     # Scarce challenger tracking is partitioned by proven exact context. Bootstrap
-    # observation remains possible, but bootstrap wallets receive no strategy authority.
+    # observation remains possible and is consumed prospectively by the paper lane.
     from .wallet_context_tracking_assignment import install_wallet_context_tracking_assignment
 
     install_wallet_context_tracking_assignment()
+
+    # Above the immutable evidence/tracking layers, activate an independent FOMO
+    # paper strategy. It may simulate entries and settle outcomes but cannot sign,
+    # submit, authorize live money, or mutate the existing scout strategy.
+    from .fomo_paper_strategy import install_fomo_paper_strategy
+
+    install_fomo_paper_strategy()
 
 
 __all__ = [
