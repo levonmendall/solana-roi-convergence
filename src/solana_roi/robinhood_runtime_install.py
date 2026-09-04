@@ -315,4 +315,14 @@ def install_robinhood_chain_paper_runtime(app: Any, runtime_provider: Callable[[
     _STATE["state"] = "installed_waiting_for_canonical_runtime"
 
 
+# Production proved per-log cooperative yields were not enough: Robinhood catch-up
+# could still park the single Uvicorn loop on a synchronous SQLite/CPU section longer
+# than Render's five-second health deadline. Patch the just-defined worker/status
+# hooks before production invokes the installer so Robinhood owns a private thread,
+# event loop, SQLite store and nonblocking status cache.
+from .robinhood_worker_isolation_repair import install_robinhood_worker_isolation_repair
+
+install_robinhood_worker_isolation_repair()
+
+
 __all__ = ["install_robinhood_chain_paper_runtime"]
