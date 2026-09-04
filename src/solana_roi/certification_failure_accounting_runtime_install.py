@@ -28,6 +28,7 @@ def install_final_certification_failure_accounting() -> None:
     from .candidate_completion_continuity_repair import (
         install_candidate_completion_continuity_repair,
     )
+    from .candidate_compute_admission import install_candidate_compute_admission
     from .candidate_hydration_work_conserving_repair import (
         install_candidate_hydration_work_conserving_repair,
     )
@@ -125,6 +126,13 @@ def install_final_certification_failure_accounting() -> None:
     # but it cannot arm the cohort or authorize paper/live execution.
     install_candidate_v4_runtime_wiring()
     install_candidate_risk_quote_v4_handoff()
+
+    # Keep minimal confirmed transaction hydration and all canonical observation/
+    # continuity evidence, but prevent structurally inaccessible or mature-negative
+    # scout buys from spending launch-context, six-dimension collector RPC, Jupiter
+    # shadow simulation, or final-V4 compute. This is installed last so no earlier
+    # certification/runtime wrapper can bypass the admission decision.
+    install_candidate_compute_admission()
 
 
 __all__ = ["install_final_certification_failure_accounting"]
