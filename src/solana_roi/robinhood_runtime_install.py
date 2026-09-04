@@ -5,7 +5,76 @@ from contextlib import suppress
 from typing import Any, Callable
 
 from . import render_runtime_bootstrap_repair as render_bootstrap
+from . import risk_conditioned_alpha_v5 as _risk_v5
+from .risk_conditioned_alpha_v5 import (
+    _fomo_classify_v5,
+    install_risk_conditioned_alpha_v5,
+)
+
+# The Robinhood installer is imported by production only after canonical Solana/FOMO
+# modules have been composed and before the ASGI lifespan starts background workers.
+# Install v5 here so existing adapter instances pick up class-method wrappers without
+# altering Render startup, RPC continuity, signing/submission, or live-money authority.
+install_risk_conditioned_alpha_v5()
+
+# Preserve the pre-v5 forward-maturity boundary. The strategy redesign intentionally
+# removes the 50% hit-rate / positive-median veto; it does not silently raise the
+# already-governed number of forward samples required before a FOMO wallet can be
+# promoted. Robust expected log growth and tail constraints apply at the same mature
+# forward boundary used by the existing wallet/entity system.
+from . import fomo_paper_strategy as _fomo_paper_strategy
+from .wallet_entity_universe_v4 import MIN_MATURE_FORWARD_SAMPLES
+
+
+def _fomo_profile_with_existing_forward_maturity(values: list[float]) -> dict[str, Any]:
+    profile = _risk_v5.robust_return_profile(
+        values,
+        grid=_risk_v5.FOMO_ACTIVE_GRID,
+        max_fraction=0.05,
+        min_samples=MIN_MATURE_FORWARD_SAMPLES,
+    )
+    challenger = {
+        fraction: _risk_v5._expected_log_growth(values, fraction)
+        for fraction in _risk_v5.FOMO_CHALLENGER_GRID
+    }
+    if profile.sample_count < MIN_MATURE_FORWARD_SAMPLES:
+        state = "bootstrap_forward_evidence"
+    elif profile.state == "promoted_positive_log_growth":
+        state = "promoted_fomo_wallet"
+    elif profile.state == "demoted_nonpositive_log_growth":
+        state = "demoted_fomo_wallet"
+    else:
+        state = "observe_mixed_fomo_wallet"
+    return {
+        "sample_count": profile.sample_count,
+        "mean_residual_roi_pct": profile.mean_return * 100.0 if profile.mean_return is not None else None,
+        "median_residual_roi_pct": profile.median_return * 100.0 if profile.median_return is not None else None,
+        "trimmed_mean_residual_roi_ex_best_1_pct": profile.trimmed_mean_ex_best * 100.0 if profile.trimmed_mean_ex_best is not None else None,
+        "positive_rate_pct": profile.hit_rate * 100.0 if profile.hit_rate is not None else None,
+        "mature": profile.sample_count >= MIN_MATURE_FORWARD_SAMPLES,
+        "state": state,
+        "best_paper_position_fraction": min(0.05, profile.best_fraction),
+        "best_expected_log_growth": profile.best_expected_log_growth,
+        "expected_shortfall_20_pct": profile.expected_shortfall_20 * 100.0 if profile.expected_shortfall_20 is not None else None,
+        "winner_concentration_pct": profile.winner_concentration * 100.0 if profile.winner_concentration is not None else None,
+        "max_drawdown_at_best_fraction_pct": profile.max_drawdown_at_best_fraction * 100.0 if profile.max_drawdown_at_best_fraction is not None else None,
+        "challenger_expected_log_growth": challenger,
+        "hit_rate_is_promotion_veto": False,
+        "historical_evidence_used_for_promotion": False,
+    }
+
+
+_risk_v5._fomo_profile_v5 = _fomo_profile_with_existing_forward_maturity
+_fomo_paper_strategy.classify_fomo_wallet_returns = _fomo_profile_with_existing_forward_maturity
+
+# fomo_runtime_install imports classify_fomo_state by value, so rebind that local
+# production reference as well as the source module patched by the installer.
+from . import fomo_runtime_install as _fomo_runtime_install
+
+_fomo_runtime_install.classify_fomo_state = _fomo_classify_v5
+
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
+from .robinhood_chain_profit_maximizer import ROBINHOOD_V5_VERSION
 
 
 _ORIGINAL_RUNTIME_WORKERS: Callable[[Any, asyncio.Event], Any] | None = None
@@ -65,11 +134,62 @@ async def _runtime_workers_with_robinhood(runtime: Any, stop: asyncio.Event) -> 
 
 def _status() -> dict[str, Any]:
     if _PLANE is not None:
-        return {**_PLANE.status(), "runtime_ready": True, "production_install": dict(_STATE)}
+        payload = _PLANE.status()
+        try:
+            with _PLANE.store._lock:
+                contexts = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_trial_context WHERE release_commit=?",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+                challengers = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_trial_context WHERE release_commit=? AND threshold_challenger=1",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+                marks = int(_PLANE.store.db.execute(
+                    "SELECT COUNT(*) FROM robinhood_v5_marks WHERE release_commit=?",
+                    (_PLANE.release_commit,),
+                ).fetchone()[0])
+        except Exception:
+            contexts = challengers = marks = 0
+        payload.update(
+            {
+                "strategy_version": ROBINHOOD_V5_VERSION,
+                "wallet_authority_key": "chain_x_entity_x_role_x_venue_x_lifecycle_x_regime_x_risk_signature_x_flow_state",
+                "risk_conditioned_v5": {
+                    "active_paper_authority": True,
+                    "lanes": [
+                        "elite_entity_continuation",
+                        "creator_deployer_continuation",
+                        "entity_flow_accumulation",
+                        "fomo_continuation",
+                        "lifecycle_transition_continuation",
+                        "hazard_continuation",
+                    ],
+                    "deployer_is_automatic_veto": False,
+                    "deployer_counts_as_independent_confirmation": False,
+                    "pons_v2_85pct_progress_is_automatic_veto": False,
+                    "snipe_tax_above_500bps_is_automatic_veto": False,
+                    "promotion_requires_50pct_hit_rate": False,
+                    "promotion_objective": "robust_forward_expected_log_growth_with_tail_and_drawdown_constraints",
+                    "learned_exit_policy": "forward_MFE_MAE_after_30_closed_context_outcomes",
+                    "context_rows": contexts,
+                    "threshold_challenger_rows": challengers,
+                    "mark_to_market_rows": marks,
+                },
+                "paper_only": True,
+                "live_money_authority": False,
+                "signing_available": False,
+                "transaction_submission_available": False,
+                "runtime_ready": True,
+                "production_install": dict(_STATE),
+            }
+        )
+        return payload
     return {
         "enabled": True,
         "chain": "ROBINHOOD_CHAIN",
         "chain_id": 4663,
+        "strategy_version": ROBINHOOD_V5_VERSION,
         "paper_only": True,
         "paper_trading_authority": False,
         "shadow_only": False,
