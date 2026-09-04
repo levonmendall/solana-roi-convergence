@@ -7,6 +7,13 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from .canonical_production_architecture import (
+    architecture_status,
+    install_canonical_production_architecture,
+    legacy_helius_compat_enabled,
+)
+from .execution_transfer_certification import V4ExecutionTransferCertification
+
 
 BOOTSTRAP_RETRY_SECONDS = 0.50
 _BOOTSTRAP_STATE: dict[str, Any] = {
@@ -66,6 +73,14 @@ def _public_status() -> dict[str, Any]:
         "candidate_certification_hotpath_installed_before_api_capture": True,
         "frozen_scout_source_wide_prefill_removed_from_hotpath": True,
         "launch_near_creation_diagnostics_enabled": True,
+        "canonical_data_plane": "direct-standard-solana",
+        "canonical_quote_plane": "jupiter-order-plus-redundant-standard-solana-rpc",
+        "helius_required": False,
+        "legacy_helius_compat_enabled": legacy_helius_compat_enabled(),
+        "legacy_helius_worker_started_by_default": False,
+        "legacy_helius_has_readiness_authority": False,
+        "profitability_certification_endpoint_installed": True,
+        "architecture_status_endpoint_installed": True,
         "certification_thresholds_unchanged": True,
         "continuity_lease_unchanged": True,
         "recovery_bound_unchanged": True,
@@ -117,14 +132,17 @@ async def _build_runtime_until_ready(stop: asyncio.Event) -> Any | None:
 
 
 async def _run_runtime_workers(runtime: Any, stop: asyncio.Event) -> None:
-    webhook_stop = asyncio.Event()
+    webhook_stop: asyncio.Event | None = None
     direct_stop = asyncio.Event()
     wallet_stop = asyncio.Event()
     clock_stop: asyncio.Event | None = None
 
-    webhook_task = asyncio.create_task(
-        runtime.webhook_worker.run(webhook_stop), name="legacy-helius-webhook-worker"
-    )
+    webhook_task: asyncio.Task[None] | None = None
+    if legacy_helius_compat_enabled():
+        webhook_stop = asyncio.Event()
+        webhook_task = asyncio.create_task(
+            runtime.webhook_worker.run(webhook_stop), name="legacy-helius-webhook-worker"
+        )
     direct_task = asyncio.create_task(
         runtime.direct_ingestion.run(direct_stop), name="direct-solana-ingestion"
     )
@@ -141,7 +159,8 @@ async def _run_runtime_workers(runtime: Any, stop: asyncio.Event) -> None:
     finally:
         wallet_stop.set()
         direct_stop.set()
-        webhook_stop.set()
+        if webhook_stop is not None:
+            webhook_stop.set()
         if clock_stop is not None:
             clock_stop.set()
         if clock_task is not None:
@@ -151,8 +170,9 @@ async def _run_runtime_workers(runtime: Any, stop: asyncio.Event) -> None:
             await wallet_task
         with suppress(asyncio.CancelledError):
             await direct_task
-        with suppress(asyncio.CancelledError):
-            await webhook_task
+        if webhook_task is not None:
+            with suppress(asyncio.CancelledError):
+                await webhook_task
 
 
 async def _bootstrap_and_run(stop: asyncio.Event) -> None:
@@ -178,6 +198,15 @@ def _guarded_ingestion_runtime() -> Any:
             "runtime_bootstrap": _public_status(),
         },
     )
+
+
+def _architecture_route() -> dict[str, Any]:
+    return architecture_status(_guarded_ingestion_runtime())
+
+
+def _profitability_route() -> dict[str, Any]:
+    runtime = _guarded_ingestion_runtime()
+    return V4ExecutionTransferCertification(runtime.store).status()
 
 
 @asynccontextmanager
@@ -223,8 +252,15 @@ def install_render_runtime_bootstrap_handoff() -> None:
     install_certification_research_architecture()
     install_ephemeral_candidate_retention()
     install_continuity_target_frontier_repair()
+    # This installer is the current exact-release composition point for PR96-PR99:
+    # it installs universal continuity, candidate scheduling/RPC fairness, the final
+    # realtime v4 handoff and then failure accounting in authority order.
     install_final_certification_failure_accounting()
     install_candidate_certification_hotpath_repair()
+    # Canonicalize authority only after the final direct-Solana composition exists.
+    # This removes the legacy webhook queue from readiness without changing any
+    # direct continuity, coverage, quote, strategy or certification threshold.
+    install_canonical_production_architecture()
 
     from . import api as api_module
 
@@ -234,21 +270,39 @@ def install_render_runtime_bootstrap_handoff() -> None:
     api_module.app.router.lifespan_context = _render_handoff_lifespan
     api_module.app.state.roi_runtime_bootstrap_handoff = True
 
-    if not any(getattr(route, "path", None) == "/v1/runtime-bootstrap/status" for route in api_module.app.routes):
+    routes = {getattr(route, "path", None) for route in api_module.app.routes}
+    if "/v1/runtime-bootstrap/status" not in routes:
         api_module.app.add_api_route(
             "/v1/runtime-bootstrap/status",
             _public_status,
             methods=["GET"],
             name="runtime_bootstrap_status",
         )
+    if "/v1/architecture/status" not in routes:
+        api_module.app.add_api_route(
+            "/v1/architecture/status",
+            _architecture_route,
+            methods=["GET"],
+            name="canonical_architecture_status",
+        )
+    if "/v1/certification/profitability" not in routes:
+        api_module.app.add_api_route(
+            "/v1/certification/profitability",
+            _profitability_route,
+            methods=["GET"],
+            name="v4_profitability_certification",
+        )
 
 
 __all__ = [
     "BOOTSTRAP_RETRY_SECONDS",
+    "_architecture_route",
     "_build_runtime_until_ready",
     "_guarded_ingestion_runtime",
     "_is_sqlite_lock_error",
+    "_profitability_route",
     "_public_status",
     "_render_handoff_lifespan",
+    "_run_runtime_workers",
     "install_render_runtime_bootstrap_handoff",
 ]
