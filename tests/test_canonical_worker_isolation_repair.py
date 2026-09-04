@@ -4,12 +4,43 @@ import asyncio
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from solana_roi import canonical_worker_isolation_repair as repair
+
+
+@pytest.fixture(autouse=True)
+def _restore_isolation_module_state():
+    """Keep focused isolation tests from mutating later production-composition tests."""
+    original_workers = repair._ORIGINAL_RUNTIME_WORKERS
+    original_thread = repair._WORKER_THREAD
+    original_stop = repair._WORKER_STOP
+    original_ready = repair._WORKER_READY
+    original_installed = repair._INSTALLED
+    original_state = dict(repair._STATE)
+    try:
+        yield
+    finally:
+        current_stop = repair._WORKER_STOP
+        current_thread = repair._WORKER_THREAD
+        if current_stop is not None:
+            current_stop.set()
+        if current_thread is not None and current_thread.is_alive():
+            current_thread.join(timeout=1.0)
+        repair._ORIGINAL_RUNTIME_WORKERS = original_workers
+        repair._WORKER_THREAD = original_thread
+        repair._WORKER_STOP = original_stop
+        repair._WORKER_READY = original_ready
+        repair._INSTALLED = original_installed
+        repair._STATE.clear()
+        repair._STATE.update(original_state)
 
 
 def _reset_state() -> None:
     repair._WORKER_THREAD = None
     repair._WORKER_STOP = None
+    repair._WORKER_READY = None
+    repair._STATE.clear()
     repair._STATE.update(
         {
             "installed": True,
@@ -17,6 +48,7 @@ def _reset_state() -> None:
             "attempts": 0,
             "unexpected_exits": 0,
             "last_error": None,
+            "worker_graph_started": False,
         }
     )
 
