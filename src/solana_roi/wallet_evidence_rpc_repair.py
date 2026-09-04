@@ -19,6 +19,7 @@ RISK_PREWARM_SECONDS = 20.0
 RISK_OLD_OBSERVATION_STATUS = "pre_repair_unverifiable"
 RISK_POINT_IN_TIME_MISS_STATUS = "point_in_time_miss"
 RECOVERY_PROVIDER = "bounded-realtime-recovery"
+RISK_QUEUE_OFFLOOP_VERSION = "wallet-risk-queue-offloop-v1"
 
 _ORIGINAL_TRACKER_INIT = RealtimeWalletTracker.__init__
 _ORIGINAL_TRACKER_STATUS = RealtimeWalletTracker.status
@@ -79,12 +80,23 @@ def _tracker_init(self: RealtimeWalletTracker, discovery: ContinuousWalletDiscov
     self._roi_anchor_pending_count = 0
     self._roi_live_anchor_established_count = 0
     self._roi_recovery_waiting_for_anchor_count = 0
+    self._roi_risk_queue_offloop_calls = 0
     discovery._roi_risk_prewarm_locks = {}
     discovery._roi_risk_prewarm_next_at = {}
     discovery._roi_risk_prewarm_attempts = 0
     discovery._roi_risk_prewarm_errors = 0
     discovery._roi_risk_point_in_time_hits = 0
     discovery._roi_risk_point_in_time_misses = 0
+    # The risk synchronizer filters the forward-observation table by these exact
+    # columns before joining on signature. Runtime construction already happens in
+    # the background bootstrap thread, so create the supporting index here rather
+    # than letting every risk claim repeatedly scan the accumulated forward table.
+    with self.store._lock, self.store.db:
+        self.store.db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_wallet_forward_risk_pending "
+            "ON wallet_discovery_forward_observations("
+            "tracking_transport, side, risk_complete, received_at, signature)"
+        )
 
 
 async def _safe_begin_epoch(
@@ -305,10 +317,53 @@ async def _point_in_time_risk_flags(
     return False, True, True
 
 
+def _write_forward_risk_result(
+    self: RealtimeWalletTracker,
+    signature: str,
+    manipulation: bool,
+    side_wallet: bool,
+) -> None:
+    with self.store._lock, self.store.db:
+        self.store.db.execute(
+            "UPDATE wallet_discovery_forward_observations SET risk_complete=1, "
+            "manipulation_flag=?, side_wallet_flag=? WHERE signature=?",
+            (1 if manipulation else 0, 1 if side_wallet else 0, signature),
+        )
+
+
+def _refresh_wallet_post_risk(self: RealtimeWalletTracker, wallet: str) -> None:
+    self.discovery.refresh_wallet_snapshot(wallet)
+    try:
+        self.discovery.maybe_propose_adaptive_cohort()
+    except Exception:
+        pass
+
+
+async def _finish_risk_work_offloop(
+    self: RealtimeWalletTracker,
+    signature: str,
+    *,
+    status: str,
+    error: str | None = None,
+) -> None:
+    self._roi_risk_queue_offloop_calls = int(getattr(self, "_roi_risk_queue_offloop_calls", 0)) + 1
+    await asyncio.to_thread(
+        priority._finish_risk_work,
+        self,
+        signature,
+        status=status,
+        error=error,
+    )
+
+
 async def _risk_worker_no_lookahead(self: RealtimeWalletTracker, stop: asyncio.Event) -> None:
     while not stop.is_set():
-        priority._sync_risk_work(self)
-        row = priority._claim_risk_work(self)
+        # _claim_risk_work already performs the required queue synchronization. The
+        # old worker called _sync_risk_work immediately before calling claim, so the
+        # accumulated forward-observation table was scanned twice on every loop. Run
+        # the single authoritative claim transaction off the Uvicorn loop instead.
+        self._roi_risk_queue_offloop_calls = int(getattr(self, "_roi_risk_queue_offloop_calls", 0)) + 1
+        row = await asyncio.to_thread(priority._claim_risk_work, self)
         if row is None:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=0.10)
@@ -320,7 +375,7 @@ async def _risk_worker_no_lookahead(self: RealtimeWalletTracker, stop: asyncio.E
             swap = priority._risk_swap(row)
             boundary = self._roi_wallet_evidence_repair_started_at
             if swap.received_at < boundary:
-                priority._finish_risk_work(
+                await _finish_risk_work_offloop(
                     self,
                     signature,
                     status=RISK_OLD_OBSERVATION_STATUS,
@@ -329,32 +384,31 @@ async def _risk_worker_no_lookahead(self: RealtimeWalletTracker, stop: asyncio.E
                 continue
             complete, manipulation, side_wallet = await self.discovery._risk_flags(swap)
             if not complete:
-                priority._finish_risk_work(
+                await _finish_risk_work_offloop(
                     self,
                     signature,
                     status=RISK_POINT_IN_TIME_MISS_STATUS,
                     error="complete risk bundle unavailable at observation time; future evidence prewarmed",
                 )
                 continue
-            with self.store._lock, self.store.db:
-                self.store.db.execute(
-                    "UPDATE wallet_discovery_forward_observations SET risk_complete=1, "
-                    "manipulation_flag=?, side_wallet_flag=? WHERE signature=?",
-                    (1 if manipulation else 0, 1 if side_wallet else 0, signature),
-                )
-            priority._finish_risk_work(self, signature, status="complete")
+            self._roi_risk_queue_offloop_calls += 1
+            await asyncio.to_thread(
+                _write_forward_risk_result,
+                self,
+                signature,
+                manipulation,
+                side_wallet,
+            )
+            await _finish_risk_work_offloop(self, signature, status="complete")
             self._roi_risk_completed += 1
-            self.discovery.refresh_wallet_snapshot(swap.wallet)
-            try:
-                self.discovery.maybe_propose_adaptive_cohort()
-            except Exception:
-                pass
+            self._roi_risk_queue_offloop_calls += 1
+            await asyncio.to_thread(_refresh_wallet_post_risk, self, swap.wallet)
         except asyncio.CancelledError:
-            priority._finish_risk_work(self, signature, status="pending", error="cancelled")
+            await _finish_risk_work_offloop(self, signature, status="pending", error="cancelled")
             raise
         except Exception as exc:
             self._roi_risk_failures += 1
-            priority._finish_risk_work(
+            await _finish_risk_work_offloop(
                 self,
                 signature,
                 status=RISK_POINT_IN_TIME_MISS_STATUS,
@@ -408,6 +462,11 @@ def _status_with_evidence_repair(self: RealtimeWalletTracker) -> dict[str, Any]:
         "point_in_time_misses": int(discovery._roi_risk_point_in_time_misses),
         "full_six_dimension_refresh_per_signature_removed": True,
         "missing_bundle_prepares_future_observations_only": True,
+        "risk_queue_offloop_version": RISK_QUEUE_OFFLOOP_VERSION,
+        "risk_queue_sqlite_on_uvicorn_loop": False,
+        "duplicate_sync_before_claim_removed": True,
+        "risk_queue_offloop_calls": int(getattr(self, "_roi_risk_queue_offloop_calls", 0)),
+        "forward_risk_pending_index_installed": True,
     }
     payload["epoch_anchor_safety"] = {
         "null_anchor_observations_allowed": False,
@@ -435,6 +494,7 @@ def install_wallet_evidence_rpc_repair() -> None:
 
 
 __all__ = [
+    "RISK_QUEUE_OFFLOOP_VERSION",
     "_copyability_reasons",
     "_point_in_time_risk_flags",
     "install_wallet_evidence_rpc_repair",

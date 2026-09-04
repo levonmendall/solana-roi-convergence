@@ -49,6 +49,18 @@ from .render_main_thread_stall_diagnostic import install_render_main_thread_stal
 
 install_render_main_thread_stall_diagnostic()
 
+# PR #134-#136 then proved the health failures are a class of problem, not one single
+# call site: after each synchronous SQLite hot path was removed, other canonical
+# Solana/FOMO tasks (wallet risk queue, live-poll receipt journaling, forward-evidence
+# claims, TLS certificate setup) could still occupy the same Uvicorn event loop past
+# Render's health deadline. Move the existing canonical worker graph intact onto one
+# dedicated OS thread/private asyncio loop. Robinhood remains separately isolated.
+# This changes scheduling topology only; market scope, continuity, strategy and paper
+# authority are unchanged.
+from .canonical_worker_isolation_repair import install_canonical_worker_isolation
+
+install_canonical_worker_isolation()
+
 
 class RobinhoodChainPaperPlane(
     RobinhoodProfitMaximizerMixin,
