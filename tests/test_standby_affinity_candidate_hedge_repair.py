@@ -70,6 +70,12 @@ def _public_pair() -> tuple[RpcEndpoint, RpcEndpoint]:
     )
 
 
+def _base_assignment():
+    import solana_roi.continuity_high_volume_poll_affinity_repair as repair
+
+    return repair._ORIGINAL_ASSIGNED_ENDPOINT or storage._assigned_endpoint
+
+
 def test_high_volume_pump_targets_do_not_use_official_public_routine_primary(monkeypatch):
     endpoints = _public_pair()
     targets = (
@@ -85,16 +91,16 @@ def test_high_volume_pump_targets_do_not_use_official_public_routine_primary(mon
     )
 
     # Freeze the underlying PR #77 assignment for this regression so import order
-    # cannot make the helper recursively call an already-installed production wrapper.
-    original = storage._assigned_endpoint
+    # cannot make the helper compare the repair against its already-installed self.
+    original = _base_assignment()
     module = __import__(
         "solana_roi.continuity_high_volume_poll_affinity_repair",
         fromlist=["_ORIGINAL_ASSIGNED_ENDPOINT"],
     )
     monkeypatch.setattr(module, "_ORIGINAL_ASSIGNED_ENDPOINT", original)
 
-    # Under the original 5/5 index shard these odd-indexed targets would both land
-    # on api.mainnet.solana.com. The repair keeps them on the non-official primary.
+    # Under the original index shard these odd-indexed targets land on
+    # api.mainnet.solana.com. The repair keeps them on the non-official primary.
     assert original(plane, targets[1]).name == "solana-mainnet"
     assert original(plane, targets[3]).name == "solana-mainnet"
     assert _assigned_endpoint_with_high_volume_affinity(plane, targets[1]).name == "publicnode"
@@ -113,7 +119,7 @@ def test_high_volume_affinity_never_invents_a_provider(monkeypatch):
         endpoints=(official,),
         watch_targets=(target,),
     )
-    original = storage._assigned_endpoint
+    original = _base_assignment()
     module = __import__(
         "solana_roi.continuity_high_volume_poll_affinity_repair",
         fromlist=["_ORIGINAL_ASSIGNED_ENDPOINT"],
