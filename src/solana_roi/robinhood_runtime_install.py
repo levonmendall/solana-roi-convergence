@@ -84,6 +84,18 @@ from .strategy_specialist_wallet_allocator import (
 
 install_strategy_specialist_wallet_allocator()
 
+# The unified status contract is installed at the same final production-composition
+# boundary so it can observe Solana, FOMO and Robinhood without replacing any data
+# plane. The regime probe wraps the already-installed v5 buy path and reuses its
+# exact entry/immediate-exit snapshot; it never issues an extra quote or RPC request
+# and has no promotion, portfolio-allocation, signing, submission or live authority.
+from .unified_strategy_status import (
+    install_regime_paper_e2e_probe,
+    install_unified_ingestion_status,
+)
+
+install_regime_paper_e2e_probe()
+
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 from .robinhood_chain_profit_maximizer import ROBINHOOD_V5_VERSION
 
@@ -216,7 +228,6 @@ def _status() -> dict[str, Any]:
 
 def install_robinhood_chain_paper_runtime(app: Any, runtime_provider: Callable[[], Any]) -> None:
     """Add Robinhood worker/telemetry without replacing canonical ASGI lifespan."""
-    del runtime_provider  # canonical bootstrap passes the ready runtime to workers
     global _ORIGINAL_RUNTIME_WORKERS
     if bool(getattr(app.state, "roi_robinhood_chain_paper_runtime", False)):
         return
@@ -235,6 +246,13 @@ def install_robinhood_chain_paper_runtime(app: Any, runtime_provider: Callable[[
             methods=["GET"],
             name="robinhood_chain_status",
         )
+
+    install_unified_ingestion_status(
+        app,
+        runtime_provider=runtime_provider,
+        robinhood_status_provider=_status,
+    )
+
     app.state.roi_robinhood_chain_paper_runtime = True
     _STATE["installed"] = True
     _STATE["state"] = "installed_waiting_for_canonical_runtime"
