@@ -92,8 +92,10 @@ def install_wallet_forward_pipeline_architecture() -> None:
     # wallet status becomes the final outer composition without touching record
     # adapters or promotion authority.
     from .forward_evidence_runtime_repair import install_forward_evidence_runtime_repair
+    from .forward_evidence_compatibility import install_forward_evidence_compatibility
 
     install_forward_evidence_runtime_repair()
+    install_forward_evidence_compatibility()
 
 
 __all__ = ["install_wallet_forward_pipeline_architecture"]
