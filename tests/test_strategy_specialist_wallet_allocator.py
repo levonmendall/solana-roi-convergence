@@ -1,6 +1,12 @@
-from solana_roi.strategy_specialist_wallet_allocator import (
-    build_strategy_specialist_tracking_plan,
+from solana_roi import strategy_specialist_wallet_allocator as allocator
+from solana_roi.strategy_specialist_wallet_allocator_repair import (
+    install_strategy_specialist_wallet_allocator_repair,
 )
+
+
+# Exercise the final production composition, not the pre-repair helper captured by
+# the first CI attempt.
+install_strategy_specialist_wallet_allocator_repair()
 
 
 def _row(
@@ -57,7 +63,7 @@ def test_specialist_floors_precede_global_roi_fill():
     ]
     states = {row["wallet"]: "tracking" for row in rows}
 
-    plan = build_strategy_specialist_tracking_plan(
+    plan = allocator.build_strategy_specialist_tracking_plan(
         rows,
         capacity=4,
         candidate_states=states,
@@ -67,6 +73,7 @@ def test_specialist_floors_precede_global_roi_fill():
     assert "fomo-clean" in selected
     assert "hazard" in selected
     assert "creator" in selected
+    assert plan["strategy_family_first_pass_enabled"] is True
     assert plan["strategy_regime_specialist_floor_enabled"] is True
     assert plan["remaining_capacity_filled_by_global_forward_roi"] is True
     assert plan["coverage_debt"]
@@ -88,7 +95,7 @@ def test_high_risk_wallet_keeps_observation_floor_before_maturity():
     ]
     states = {row["wallet"]: "tracking" for row in rows}
 
-    plan = build_strategy_specialist_tracking_plan(
+    plan = allocator.build_strategy_specialist_tracking_plan(
         rows,
         capacity=2,
         candidate_states=states,
@@ -125,7 +132,7 @@ def test_clean_and_hazard_fomo_are_separate_specialist_surfaces():
     ]
     states = {row["wallet"]: "tracking" for row in rows}
 
-    plan = build_strategy_specialist_tracking_plan(
+    plan = allocator.build_strategy_specialist_tracking_plan(
         rows,
         capacity=2,
         candidate_states=states,
@@ -143,7 +150,7 @@ def test_clean_and_hazard_fomo_are_separate_specialist_surfaces():
 
 
 def test_bootstrap_wallets_never_gain_strategy_authority():
-    plan = build_strategy_specialist_tracking_plan(
+    plan = allocator.build_strategy_specialist_tracking_plan(
         [],
         capacity=2,
         candidate_states={"a": "tracking", "b": "tracking"},
