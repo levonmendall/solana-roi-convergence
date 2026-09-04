@@ -275,20 +275,74 @@ def _status_with_assignments(self: WalletContextRouter) -> dict[str, Any]:
     if _ORIGINAL_ROUTER_STATUS is None:
         raise RuntimeError("context tracking assignment status is not installed")
     payload = _ORIGINAL_ROUTER_STATUS(self)
-    profiles = list(payload.get("context_profiles") or self.context_profiles())
-    states = _candidate_states(self.universe)
-    fallback = list(_ORIGINAL_SELECT(self.universe)) if _ORIGINAL_SELECT is not None else []
+
+    raw_profiles = payload.get("context_profiles")
+    if isinstance(raw_profiles, list):
+        profiles = list(raw_profiles)
+    else:
+        context_profiles_fn = getattr(self, "context_profiles", None)
+        if callable(context_profiles_fn):
+            try:
+                profiles = list(context_profiles_fn())
+            except Exception:
+                profiles = []
+        else:
+            profiles = []
+
+    payload["future_strategy_assignments"] = {
+        "assignment_version": ASSIGNMENT_VERSION,
+        "assignment_key": "wallet_x_venue_x_lifecycle_x_regime_x_role",
+        "contexts": build_future_strategy_assignments(profiles),
+        "current_paper_strategy_authority": False,
+        "exact_context_match_required_for_future_paper_authority": True,
+        "cross_context_success_transfer_allowed": False,
+        "historical_promotion_authority": False,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+
+    universe = getattr(self, "universe", None)
+    production_tracking_capable = bool(
+        isinstance(universe, WalletEntityUniverseV4)
+        and _ORIGINAL_SELECT is not None
+        and callable(getattr(universe, "ensure_seed_candidates", None))
+        and hasattr(universe, "discovery")
+        and hasattr(universe, "store")
+    )
+    if not production_tracking_capable:
+        payload["venue_lifecycle_tracking_assignment"] = {
+            "assignment_version": ASSIGNMENT_VERSION,
+            "available": False,
+            "reason": "production_wallet_universe_unavailable",
+            "context_assignments": [],
+            "bootstrap_assignments": [],
+            "effective_tracked_wallets": [],
+            "tracking_capacity_partitioned_by_venue_lifecycle_before_global_fill": True,
+            "tracking_mutation_active": False,
+            "cross_context_success_transfer_allowed": False,
+            "active_strategy_mutation_allowed": False,
+            "paper_only": True,
+            "live_money_authority": False,
+        }
+        payload.setdefault("context_recommendations_have_tracking_mutation_authority", False)
+        payload["tracking_mutation_scope"] = "research_wallet_tracking_only_exact_context_partitioned"
+        payload["context_scores_have_trade_authority"] = False
+        return payload
+
+    states = _candidate_states(universe)
+    fallback = list(_ORIGINAL_SELECT(universe))
     incumbents = [wallet for wallet in fallback if states.get(wallet) == "incumbent_tracking"]
     fallback_challengers = [wallet for wallet in fallback if states.get(wallet) == "tracking"]
     plan = build_context_tracking_plan(
         profiles,
-        capacity=max(1, int(self.universe.discovery.policy.max_tracked_challengers)),
+        capacity=max(1, int(universe.discovery.policy.max_tracked_challengers)),
         candidate_states=states,
         fallback_wallets=fallback_challengers,
     )
     payload["venue_lifecycle_tracking_assignment"] = {
         "assignment_version": ASSIGNMENT_VERSION,
         **plan,
+        "available": True,
         "candidate_state_available": bool(states),
         "incumbent_wallets_preserved": incumbents,
         "effective_tracked_wallets": (
@@ -301,18 +355,7 @@ def _status_with_assignments(self: WalletContextRouter) -> dict[str, Any]:
         "active_strategy_mutation_allowed": False,
         "paper_only": True,
         "live_money_authority": False,
-        "last_error": getattr(self.universe, "_roi_context_tracking_last_error", None),
-    }
-    payload["future_strategy_assignments"] = {
-        "assignment_version": ASSIGNMENT_VERSION,
-        "assignment_key": "wallet_x_venue_x_lifecycle_x_regime_x_role",
-        "contexts": build_future_strategy_assignments(profiles),
-        "current_paper_strategy_authority": False,
-        "exact_context_match_required_for_future_paper_authority": True,
-        "cross_context_success_transfer_allowed": False,
-        "historical_promotion_authority": False,
-        "paper_only": True,
-        "live_money_authority": False,
+        "last_error": getattr(universe, "_roi_context_tracking_last_error", None),
     }
     payload["context_recommendations_have_tracking_mutation_authority"] = bool(states)
     payload["tracking_mutation_scope"] = "research_wallet_tracking_only_exact_context_partitioned"
