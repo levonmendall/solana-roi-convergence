@@ -164,6 +164,9 @@ def test_300_independent_policy_selected_stressed_profitable_episodes_can_certif
     assert status["robustness"]["pnl_ex_top_5_percent_winners_usd"] > 0
     assert status["blockers"] == []
     assert status["certified"] is True
+    assert status["profit_factor"] == "infinity"
+    assert status["execution_transfer"]["execution_stressed_profit_factor"] == "infinity"
+    json.dumps(status, allow_nan=False)
     assert status["live_money_authority"] is False
     assert status["signing_available"] is False
     assert status["transaction_submission_available"] is False
