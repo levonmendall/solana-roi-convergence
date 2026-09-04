@@ -15,7 +15,33 @@ from .shadow_execution import validate_solana_public_key
 from .solana_rpc import rpc_endpoints_from_env
 
 
+def _install_scout_candidate_repair_if_ready() -> None:
+    """Install the final scout repair only after production composition exists.
+
+    ``production.py`` imports this module through ``api.py`` after the candidate
+    execution-evidence plane has been installed. Some unit tests import deployment
+    helpers directly before production composition, so the readiness check keeps
+    those imports inert while the production import deterministically installs the
+    repair before the FastAPI runtime can be built.
+    """
+
+    try:
+        from . import candidate_execution_evidence_plane as candidate_plane
+        if candidate_plane._ORIGINAL_SERVICE_INGEST is None:
+            return
+        from .scout_candidate_continuity_repair import (
+            install_scout_candidate_continuity_repair,
+        )
+        install_scout_candidate_continuity_repair()
+    except (ImportError, RuntimeError):
+        # Direct deployment/preflight imports must remain safe outside the fully
+        # composed production entrypoint. Production will call this helper again
+        # below and on every preflight evaluation.
+        return
+
+
 def deployment_preflight(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    _install_scout_candidate_repair_if_ready()
     values: Mapping[str, str] = env or os.environ
     checks: list[PreflightCheck] = []
     checks.append(PreflightCheck("paper_only", _truthy(values.get("PAPER_ONLY")), "PAPER_ONLY must be true"))
@@ -105,3 +131,8 @@ def deployment_preflight(env: Mapping[str, str] | None = None) -> dict[str, Any]
         ],
         "rpc_endpoint_config_error_type": endpoint_error,
     }
+
+
+# In the production entrypoint this import occurs after the candidate execution
+# plane is composed and before ``api.ingestion_runtime`` can build an instance.
+_install_scout_candidate_repair_if_ready()
