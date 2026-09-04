@@ -468,9 +468,12 @@ def _status_with_strategy_continuity(self: Any) -> dict[str, Any]:
     payload = _ORIGINAL_STATUS(self)
 
     # Several intrinsic tests and non-runtime callers intentionally construct a
-    # partial plane. The production authority below only applies to a canonical plane
-    # with the frozen watch-target set; leave partial status surfaces untouched.
-    if not getattr(self, "watch_targets", None):
+    # partial plane. Production continuity authority belongs only to the canonical
+    # direct-Solana journal; leave mock/partial status surfaces untouched.
+    if (
+        not getattr(self, "watch_targets", None)
+        or not isinstance(getattr(self, "journal", None), DirectSolanaJournal)
+    ):
         return payload
 
     snapshot = _coverage_snapshot(self)
