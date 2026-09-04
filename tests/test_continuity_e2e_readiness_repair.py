@@ -149,8 +149,115 @@ def test_direct_transport_diagnostics_distinguish_provider_and_gap_blockers() ->
         )
         diagnostics = payload["solana"]["transport_diagnostics"]
         assert diagnostics["connected_provider_count"] == 0
+        assert diagnostics["legacy_full_program_provider_degraded"] is True
+        assert diagnostics["strategy_continuity_authoritative"] is False
         assert diagnostics["unresolved_gap"] is True
         assert "direct_solana_no_connected_provider" in payload["solana"]["blockers"]
         assert "direct_solana_unresolved_gap" in payload["solana"]["blockers"]
+    finally:
+        repair._ORIGINAL_UNIFIED_STATUS = original
+
+
+def test_strategy_continuity_authority_does_not_block_on_zero_legacy_provider_count() -> None:
+    original = repair._ORIGINAL_UNIFIED_STATUS
+    try:
+        repair._ORIGINAL_UNIFIED_STATUS = lambda base, runtime, robinhood: {
+            "solana": {
+                "all_regimes_e2e_achievable": True,
+                "blockers": ["direct_solana_no_connected_provider"],
+            },
+            "fomo": {
+                "all_regimes_e2e_achievable": True,
+                "blockers": ["direct_solana_no_connected_provider"],
+            },
+            "robinhood": {
+                "all_regimes_e2e_achievable": True,
+                "blockers": [],
+                "regimes": {},
+            },
+            "overall": {
+                "all_paper_planes_e2e_achievable": True,
+                "blocking_components": ["direct_solana_no_connected_provider"],
+            },
+        }
+        base = {
+            "direct_solana": {
+                "enabled": True,
+                "continuity_ok": True,
+                "connected_provider_count": 0,
+                "unresolved_gap": False,
+                "strategy_relevant_continuity": {
+                    "epoch_started": True,
+                    "lossless_authority": True,
+                    "transport_coverage_ok": True,
+                    "continuity_ok": True,
+                    "unresolved_gap": False,
+                    "program_firehose_gap_can_invalidate": False,
+                    "paper_only": True,
+                    "live_money_authority": False,
+                    "signing_available": False,
+                    "transaction_submission_available": False,
+                },
+            }
+        }
+        robinhood = {
+            "runtime_ready": True,
+            "paper_trading_authority": True,
+            "caught_up_for_paper_decisions": True,
+            "failed_closed": False,
+        }
+
+        payload = repair._unified_status_with_strict_transport(base, SimpleNamespace(), robinhood)
+
+        diagnostics = payload["solana"]["transport_diagnostics"]
+        assert diagnostics["connected_provider_count"] == 0
+        assert diagnostics["legacy_full_program_provider_degraded"] is True
+        assert diagnostics["strategy_continuity_authoritative"] is True
+        assert "direct_solana_no_connected_provider" not in payload["solana"]["blockers"]
+        assert "direct_solana_no_connected_provider" not in payload["fomo"]["blockers"]
+        assert "direct_solana_no_connected_provider" not in payload["overall"]["blocking_components"]
+        assert payload["overall"]["all_paper_planes_e2e_achievable"] is True
+        assert payload["overall"]["direct_solana_strategy_continuity_authoritative"] is True
+        assert payload["overall"]["direct_solana_legacy_provider_degraded"] is True
+    finally:
+        repair._ORIGINAL_UNIFIED_STATUS = original
+
+
+def test_zero_provider_count_still_fails_closed_without_strategy_epoch() -> None:
+    original = repair._ORIGINAL_UNIFIED_STATUS
+    try:
+        repair._ORIGINAL_UNIFIED_STATUS = lambda base, runtime, robinhood: {
+            "solana": {"all_regimes_e2e_achievable": True, "blockers": []},
+            "fomo": {"all_regimes_e2e_achievable": True, "blockers": []},
+            "robinhood": {"all_regimes_e2e_achievable": True, "blockers": [], "regimes": {}},
+            "overall": {"all_paper_planes_e2e_achievable": True, "blocking_components": []},
+        }
+        base = {
+            "direct_solana": {
+                "enabled": True,
+                "continuity_ok": True,
+                "connected_provider_count": 0,
+                "unresolved_gap": False,
+                "strategy_relevant_continuity": {
+                    "epoch_started": False,
+                    "transport_coverage_ok": True,
+                    "continuity_ok": True,
+                    "unresolved_gap": False,
+                },
+            }
+        }
+        payload = repair._unified_status_with_strict_transport(
+            base,
+            SimpleNamespace(),
+            {
+                "runtime_ready": True,
+                "paper_trading_authority": True,
+                "caught_up_for_paper_decisions": True,
+                "failed_closed": False,
+            },
+        )
+        assert payload["solana"]["transport_diagnostics"]["strategy_continuity_authoritative"] is False
+        assert "direct_solana_no_connected_provider" in payload["solana"]["blockers"]
+        assert "direct_solana_no_connected_provider" in payload["fomo"]["blockers"]
     finally:
         repair._ORIGINAL_UNIFIED_STATUS = original

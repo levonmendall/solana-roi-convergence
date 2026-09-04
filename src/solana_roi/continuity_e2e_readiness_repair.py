@@ -8,11 +8,12 @@ from . import direct_solana as direct_module
 from . import unified_strategy_status as unified_status
 
 
-REPAIR_VERSION = "continuity-e2e-readiness-v1"
+REPAIR_VERSION = "continuity-e2e-readiness-v2"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
+LEGACY_PROVIDER_BLOCKER = "direct_solana_no_connected_provider"
 
 _ORIGINAL_CLOSE_OUTAGE: Callable[..., Any] | None = None
 _ORIGINAL_CONNECTION_STATE: Callable[..., Any] | None = None
@@ -149,6 +150,32 @@ def _direct_status_with_release_epoch(self: Any) -> dict[str, Any]:
     return payload
 
 
+def _strategy_continuity_authoritative(direct: dict[str, Any]) -> bool:
+    """Use the post-PR #129 lossless strategy transport as E2E authority when present.
+
+    The legacy connected-provider count describes whether one raw WebSocket provider
+    currently owns every frozen program target. It remains useful degradation
+    telemetry, but after a strategy continuity epoch has armed it is not execution
+    authority: the strategy transport union (real WebSocket plus the bounded live
+    poll bridge) is. Older releases without this status continue to fail closed on
+    the legacy provider requirement.
+    """
+    strategy = direct.get("strategy_relevant_continuity")
+    if not isinstance(strategy, dict):
+        return False
+    return bool(
+        strategy.get("epoch_started")
+        and strategy.get("lossless_authority", True)
+        and strategy.get("transport_coverage_ok")
+        and strategy.get("continuity_ok")
+        and not strategy.get("unresolved_gap", False)
+    )
+
+
+def _without_legacy_provider_blocker(blockers: list[Any]) -> list[Any]:
+    return [blocker for blocker in blockers if blocker != LEGACY_PROVIDER_BLOCKER]
+
+
 def _unified_status_with_strict_transport(
     base_status: dict[str, Any],
     runtime: Any,
@@ -159,11 +186,18 @@ def _unified_status_with_strict_transport(
     payload = _ORIGINAL_UNIFIED_STATUS(base_status, runtime, robinhood_status)
 
     direct = base_status.get("direct_solana") if isinstance(base_status.get("direct_solana"), dict) else {}
+    strategy_authoritative = _strategy_continuity_authoritative(direct)
+    legacy_provider_count = int(direct.get("connected_provider_count") or 0)
+    legacy_provider_degraded = bool(direct.get("enabled")) and legacy_provider_count < 1
+
     solana = payload.get("solana") if isinstance(payload.get("solana"), dict) else {}
     solana["transport_diagnostics"] = {
         "enabled": bool(direct.get("enabled")),
         "continuity_ok": bool(direct.get("continuity_ok")),
-        "connected_provider_count": int(direct.get("connected_provider_count") or 0),
+        "connected_provider_count": legacy_provider_count,
+        "legacy_full_program_provider_degraded": legacy_provider_degraded,
+        "strategy_continuity_authoritative": strategy_authoritative,
+        "strategy_relevant_continuity": direct.get("strategy_relevant_continuity"),
         "unresolved_gap": bool(direct.get("unresolved_gap")),
         "outage_started_at": direct.get("outage_started_at"),
         "last_backfill_complete_at": direct.get("last_backfill_complete_at"),
@@ -171,8 +205,10 @@ def _unified_status_with_strict_transport(
         "release_continuity_epoch": direct.get("release_continuity_epoch"),
     }
     blockers = list(solana.get("blockers") or [])
-    if bool(direct.get("enabled")) and int(direct.get("connected_provider_count") or 0) < 1:
-        blockers.append("direct_solana_no_connected_provider")
+    if strategy_authoritative:
+        blockers = _without_legacy_provider_blocker(blockers)
+    elif legacy_provider_degraded:
+        blockers.append(LEGACY_PROVIDER_BLOCKER)
     if bool(direct.get("unresolved_gap")):
         blockers.append("direct_solana_unresolved_gap")
     solana["blockers"] = list(dict.fromkeys(blockers))
@@ -180,6 +216,8 @@ def _unified_status_with_strict_transport(
 
     fomo = payload.get("fomo") if isinstance(payload.get("fomo"), dict) else {}
     fomo_blockers = list(fomo.get("blockers") or [])
+    if strategy_authoritative:
+        fomo_blockers = _without_legacy_provider_blocker(fomo_blockers)
     for blocker in solana["blockers"]:
         if blocker.startswith("direct_solana_"):
             fomo_blockers.append(blocker)
@@ -216,11 +254,15 @@ def _unified_status_with_strict_transport(
         and payload.get("robinhood", {}).get("all_regimes_e2e_achievable")
     )
     all_blockers = list(overall.get("blocking_components") or [])
+    if strategy_authoritative:
+        all_blockers = _without_legacy_provider_blocker(all_blockers)
     all_blockers.extend(payload.get("solana", {}).get("blockers") or [])
     all_blockers.extend(payload.get("fomo", {}).get("blockers") or [])
     all_blockers.extend(payload.get("robinhood", {}).get("blockers") or [])
     overall["blocking_components"] = list(dict.fromkeys(all_blockers))
     overall["continuity_e2e_readiness_repair"] = REPAIR_VERSION
+    overall["direct_solana_strategy_continuity_authoritative"] = strategy_authoritative
+    overall["direct_solana_legacy_provider_degraded"] = legacy_provider_degraded
     payload["overall"] = overall
     return payload
 
