@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 from .profit_first_entity_final_research import FinalProfitFirstResearchAdapter
 from .wallet_entity_universe_v4 import WalletRole
@@ -123,9 +123,9 @@ def _status_with_percent_and_fail_closed(self: WalletContextRouter) -> dict[str,
         raise RuntimeError("wallet context precision repair is not installed")
     payload = _ORIGINAL_STATUS(self)
     payload["router_version"] = REPAIR_VERSION
-    payload["roi_ranking_basis"] = (
-        "explicit_percentage_copyable_executable_residual_roi_not_dollar_pnl"
-    )
+    # Preserve the v1 status string exactly for callers/tests that treat it as a
+    # stable contract. The unit clarification is additive rather than a rename.
+    payload["roi_output_unit"] = "percentage"
     payload["roi_percentage_fields_explicit"] = True
     payload["raw_fraction_fields_retained_for_backward_compatibility"] = True
     payload["accessibility_missing_evidence_fails_closed"] = True
