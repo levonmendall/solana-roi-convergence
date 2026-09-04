@@ -44,6 +44,8 @@ def test_program_poll_receipt_persistence_runs_off_event_loop() -> None:
 def test_offloop_repair_does_not_change_recovery_or_authority_constants() -> None:
     from solana_roi import live_poll_redundancy as live_poll
 
+    # These are the existing frozen polling/recovery boundaries; the repair changes
+    # only the execution thread used for durable poll-receipt persistence.
     assert live_poll.POLL_INTERVAL_SECONDS == 4.0
     assert live_poll.POLL_LIMIT == 1000
     assert live_poll.POLL_CURSOR_MAX_PAGES == 3
