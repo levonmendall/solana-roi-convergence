@@ -134,5 +134,23 @@ def install_final_certification_failure_accounting() -> None:
     # certification/runtime wrapper can bypass the admission decision.
     install_candidate_compute_admission()
 
+    # Bind anonymous scout expiry evidence to the original trigger epoch rather than
+    # the later cleanup time. This preserves old durable rows for audit while making
+    # inherited pre-release queue work unable to poison a new prospective release.
+    # If the exact-scout normalizer has not composed yet, direct_deployment invokes
+    # this idempotent installer again after that wrapper lands.
+    from .release_bound_scout_classification_repair import (
+        install_release_bound_scout_classification_repair,
+    )
+    from .release_bound_scout_reaper_atomicity import (
+        install_release_bound_scout_reaper_atomicity,
+    )
+
+    install_release_bound_scout_classification_repair()
+    # Never delete a timed-out scout hydration row unless its exact trigger-epoch
+    # failure evidence has committed first. On SQLite contention cleanup yields and
+    # retries, preserving fail-closed certification truth.
+    install_release_bound_scout_reaper_atomicity()
+
 
 __all__ = ["install_final_certification_failure_accounting"]
