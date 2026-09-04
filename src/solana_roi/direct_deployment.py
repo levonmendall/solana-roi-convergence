@@ -15,39 +15,69 @@ from .shadow_execution import validate_solana_public_key
 from .solana_rpc import rpc_endpoints_from_env
 
 
-def _install_scout_candidate_repair_if_ready() -> None:
-    """Install the final scout repair only after production composition exists.
+_POSTCOMPOSE_HOOKS_INSTALLED = False
 
-    ``production.py`` imports this module through ``api.py`` after the candidate
-    execution-evidence plane has been installed. Some unit tests import deployment
-    helpers directly before production composition, so the readiness check keeps
-    those imports inert while the production import deterministically installs the
-    repair before the FastAPI runtime can be built.
+
+def _install_postcompose_repairs() -> None:
+    """Install or deterministically defer repairs that require final composition.
+
+    PR #119 originally installed the scout repair only when deployment preflight
+    happened to run after the candidate plane. Exact-release telemetry proved that
+    import timing was not a valid composition contract: the candidate plane was live
+    while the scout repair status was absent and all scout normalizations still
+    failed. This coordinator works in either import order without creating runtime
+    state or doing network I/O.
     """
 
-    try:
-        from . import candidate_execution_evidence_plane as candidate_plane
-        if candidate_plane._ORIGINAL_SERVICE_INGEST is None:
-            return
-        from .scout_candidate_continuity_repair import (
-            install_scout_candidate_continuity_repair,
-        )
-        install_scout_candidate_continuity_repair()
-        # The scout wrapper deliberately composes over the existing high-volume
-        # provider-affinity function. Preserve that intrinsic composition marker so
-        # production invariants and later installers can still prove PR #99 remains
-        # installed rather than mistaking a compatible outer wrapper for removal.
-        from . import continuity_storage_capacity_repair as storage
-        setattr(storage._assigned_endpoint, "_roi_high_volume_poll_affinity", True)
-    except (ImportError, RuntimeError):
-        # Direct deployment/preflight imports must remain safe outside the fully
-        # composed production entrypoint. Production will call this helper again
-        # below and on every preflight evaluation.
+    global _POSTCOMPOSE_HOOKS_INSTALLED
+    if _POSTCOMPOSE_HOOKS_INSTALLED:
         return
+
+    from . import candidate_execution_evidence_plane as candidate_plane
+    from . import continuity_storage_capacity_repair as storage
+    from . import poll_watermark_repair as watermark
+    from .high_volume_signature_cursor_repair import (
+        install_high_volume_signature_cursor_repair,
+    )
+    from .scout_candidate_continuity_repair import (
+        install_scout_candidate_continuity_repair,
+    )
+
+    if candidate_plane._ORIGINAL_SERVICE_INGEST is not None:
+        install_scout_candidate_continuity_repair()
+    else:
+        current_candidate_install = candidate_plane.install_candidate_execution_evidence_plane
+        if not bool(getattr(current_candidate_install, "_roi_postcompose_scout_install", False)):
+            def install_candidate_then_scout() -> None:
+                current_candidate_install()
+                install_scout_candidate_continuity_repair()
+
+            setattr(install_candidate_then_scout, "_roi_postcompose_scout_install", True)
+            candidate_plane.install_candidate_execution_evidence_plane = install_candidate_then_scout
+
+    if bool(getattr(watermark._slot_poll_page, "_roi_routine_provider_sharding", False)):
+        install_high_volume_signature_cursor_repair()
+    else:
+        current_storage_install = storage.install_continuity_storage_capacity_repair
+        if not bool(getattr(current_storage_install, "_roi_postcompose_high_volume_poll", False)):
+            def install_storage_then_high_volume() -> None:
+                current_storage_install()
+                install_high_volume_signature_cursor_repair()
+
+            setattr(install_storage_then_high_volume, "_roi_postcompose_high_volume_poll", True)
+            storage.install_continuity_storage_capacity_repair = install_storage_then_high_volume
+
+    _POSTCOMPOSE_HOOKS_INSTALLED = True
+
+
+def _install_scout_candidate_repair_if_ready() -> None:
+    """Backward-compatible entrypoint retained for existing callers/tests."""
+
+    _install_postcompose_repairs()
 
 
 def deployment_preflight(env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    _install_scout_candidate_repair_if_ready()
+    _install_postcompose_repairs()
     values: Mapping[str, str] = env or os.environ
     checks: list[PreflightCheck] = []
     checks.append(PreflightCheck("paper_only", _truthy(values.get("PAPER_ONLY")), "PAPER_ONLY must be true"))
@@ -139,6 +169,6 @@ def deployment_preflight(env: Mapping[str, str] | None = None) -> dict[str, Any]
     }
 
 
-# In the production entrypoint this import occurs after the candidate execution
-# plane is composed and before ``api.ingestion_runtime`` can build an instance.
-_install_scout_candidate_repair_if_ready()
+# Production may import this module before or after the lower-level installers. The
+# coordinator above makes either order deterministic and performs no runtime I/O.
+_install_postcompose_repairs()
