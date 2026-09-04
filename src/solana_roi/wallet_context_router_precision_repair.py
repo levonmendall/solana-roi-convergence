@@ -123,8 +123,6 @@ def _status_with_percent_and_fail_closed(self: WalletContextRouter) -> dict[str,
         raise RuntimeError("wallet context precision repair is not installed")
     payload = _ORIGINAL_STATUS(self)
     payload["router_version"] = REPAIR_VERSION
-    # Preserve the v1 status string exactly for callers/tests that treat it as a
-    # stable contract. The unit clarification is additive rather than a rename.
     payload["roi_output_unit"] = "percentage"
     payload["roi_percentage_fields_explicit"] = True
     payload["raw_fraction_fields_retained_for_backward_compatibility"] = True
@@ -193,7 +191,7 @@ def _manifest_with_percent_and_fail_closed(
 
 
 def install_wallet_context_router_precision_repair() -> None:
-    """Install the narrow v1.1 reporting/accessibility repair exactly once."""
+    """Install context precision, governance, then isolated FOMO shadow research."""
 
     global _ORIGINAL_CLASSIFY, _ORIGINAL_CONTEXT_METRICS, _ORIGINAL_STATUS, _ORIGINAL_MANIFEST
 
@@ -233,12 +231,17 @@ def install_wallet_context_router_precision_repair() -> None:
         setattr(_manifest_with_percent_and_fail_closed, "_roi_wallet_context_precision_repair", True)
         FinalProfitFirstResearchAdapter._manifest = _manifest_with_percent_and_fail_closed  # type: ignore[method-assign]
 
-    # This governance layer consumes the already-precision-wrapped context metrics.
-    # Install it here to preserve production composition ordering without touching
-    # any FOMO module or strategy authority.
     from .wallet_context_governance import install_wallet_context_governance
 
     install_wallet_context_governance()
+
+    # FOMO is installed only after venue/lifecycle/role routing and governance so it
+    # consumes those semantics rather than contaminating them. It remains a separate
+    # production-shadow observer with no tracking, strategy, signing, submission, or
+    # historical-promotion authority. Any collector failure is isolated from v4.
+    from .fomo_runtime_install import install_fomo_runtime
+
+    install_fomo_runtime()
 
 
 __all__ = [
