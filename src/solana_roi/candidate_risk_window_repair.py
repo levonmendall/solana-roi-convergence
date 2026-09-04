@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
+from .direct_solana import DirectSolanaIngestionPlane
 from .observation import TimedRiskCollectors
 
 
@@ -14,6 +15,7 @@ CANDIDATE_RECORDING_RESERVE_SECONDS = 0.10
 CANDIDATE_RETRY_YIELD_SECONDS = 0.20
 
 _ORIGINAL_REFRESH: Callable[..., Any] | None = None
+_ORIGINAL_STATUS: Callable[..., dict[str, Any]] | None = None
 
 
 def _inc(obj: Any, name: str, amount: int = 1) -> None:
@@ -37,19 +39,7 @@ async def _refresh_until_entry_ceiling(
     *,
     current_swap: Any = None,
 ) -> None:
-    """Keep the 5s latency target but allow evidence collection through the 20s entry ceiling.
-
-    The previous candidate hot path used the five-second latency-certification target
-    as an asyncio cancellation deadline. That made a candidate arriving after five
-    seconds incapable of ever completing launch/funding/dynamic risk even though the
-    strategy explicitly permits a first executable entry through twenty seconds.
-
-    This wrapper does not relax the five-second certification target. It records the
-    real end-to-end measurement exactly as before; samples completing after five
-    seconds still fail latency certification. It only prevents that diagnostic target
-    from cancelling point-in-time research that is still inside the unchanged twenty-
-    second strategy window.
-    """
+    """Keep the 5s latency target while allowing evidence collection through 20s."""
     if _ORIGINAL_REFRESH is None:
         raise RuntimeError("candidate risk-window repair is not installed")
     if not _eligible(self, current_swap):
@@ -84,10 +74,9 @@ async def _refresh_until_entry_ceiling(
             break
         rounds += 1
         try:
-            # Use the actual prospective decision time, not the original swap receipt
-            # time. This is required for an eight-second launch window to become
-            # observable without lookahead and keeps 5-second liquidity/flow evidence
-            # fresh at the time a delayed (but <=20s) paper entry would be evaluated.
+            # The collection timestamp is the actual prospective decision time.
+            # This lets the immutable eight-second launch window mature naturally
+            # and keeps five-second liquidity/flow evidence fresh without lookahead.
             await asyncio.wait_for(
                 asyncio.gather(
                     coverage_refresh(mint, attempt_at, current_swap=current_swap),
@@ -162,18 +151,57 @@ async def _refresh_until_entry_ceiling(
 setattr(_refresh_until_entry_ceiling, "_roi_candidate_risk_window", True)
 
 
+def _status_with_risk_window(self: DirectSolanaIngestionPlane) -> dict[str, Any]:
+    if _ORIGINAL_STATUS is None:
+        raise RuntimeError("candidate risk-window status is not installed")
+    payload = _ORIGINAL_STATUS(self)
+    collectors = getattr(getattr(self, "service", None), "collectors", None)
+    payload["candidate_risk_window"] = {
+        "installed": True,
+        "processing_target_seconds": CANDIDATE_PROCESSING_TARGET_SECONDS,
+        "entry_window_seconds": CANDIDATE_ENTRY_WINDOW_SECONDS,
+        "processing_target_is_entry_authority": False,
+        "processing_target_exceeded_session": int(getattr(collectors, "_roi_candidate_risk_window_processing_target_exceeded", 0) or 0),
+        "late_but_complete_session": int(getattr(collectors, "_roi_candidate_risk_window_late_but_complete", 0) or 0),
+        "entry_window_exhausted_session": int(getattr(collectors, "_roi_candidate_risk_window_entry_window_exhausted", 0) or 0),
+        "retry_rounds_session": int(getattr(collectors, "_roi_candidate_risk_window_retry_rounds", 0) or 0),
+        "measurements_recorded_session": int(getattr(collectors, "_roi_candidate_risk_window_measurements_recorded", 0) or 0),
+        "unexpected_errors_session": int(getattr(collectors, "_roi_candidate_risk_window_unexpected_errors", 0) or 0),
+        "uses_actual_prospective_decision_time": True,
+        "launch_window_may_mature_before_entry_ceiling": True,
+        "latency_certification_threshold_unchanged": True,
+        "risk_thresholds_unchanged": True,
+        "paper_only_authority_unchanged": True,
+        "signing_or_submission_available": False,
+    }
+    return payload
+
+
+setattr(_status_with_risk_window, "_roi_candidate_risk_window", True)
+
+
 def install_candidate_risk_window_repair() -> None:
-    global _ORIGINAL_REFRESH
-    current = TimedRiskCollectors.refresh
-    if bool(getattr(current, "_roi_candidate_risk_window", False)):
-        return
-    _ORIGINAL_REFRESH = current
-    try:
-        _refresh_until_entry_ceiling.__dict__.update(getattr(current, "__dict__", {}))
-    except Exception:
-        pass
-    setattr(_refresh_until_entry_ceiling, "_roi_candidate_risk_window", True)
-    TimedRiskCollectors.refresh = _refresh_until_entry_ceiling  # type: ignore[method-assign]
+    global _ORIGINAL_REFRESH, _ORIGINAL_STATUS
+
+    current_refresh = TimedRiskCollectors.refresh
+    if not bool(getattr(current_refresh, "_roi_candidate_risk_window", False)):
+        _ORIGINAL_REFRESH = current_refresh
+        try:
+            _refresh_until_entry_ceiling.__dict__.update(getattr(current_refresh, "__dict__", {}))
+        except Exception:
+            pass
+        setattr(_refresh_until_entry_ceiling, "_roi_candidate_risk_window", True)
+        TimedRiskCollectors.refresh = _refresh_until_entry_ceiling  # type: ignore[method-assign]
+
+    current_status = DirectSolanaIngestionPlane.status
+    if not bool(getattr(current_status, "_roi_candidate_risk_window", False)):
+        _ORIGINAL_STATUS = current_status
+        try:
+            _status_with_risk_window.__dict__.update(getattr(current_status, "__dict__", {}))
+        except Exception:
+            pass
+        setattr(_status_with_risk_window, "_roi_candidate_risk_window", True)
+        DirectSolanaIngestionPlane.status = _status_with_risk_window  # type: ignore[method-assign]
 
 
 __all__ = [
