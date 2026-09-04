@@ -4,12 +4,13 @@ import asyncio
 from collections import deque
 from types import SimpleNamespace
 
-from solana_roi import continuity_durability_repair as durability
 from solana_roi import continuity_high_volume_checkpoint_architecture as architecture
 from solana_roi import continuity_high_volume_poll_affinity_repair as affinity
 from solana_roi import continuity_target_frontier_repair as frontier
 from solana_roi import live_poll_redundancy as live_poll
+from solana_roi import poll_exception_rearm as exception_rearm
 from solana_roi import poll_recoverability_lease as lease
+from solana_roi import poll_watermark_repair as watermark
 from solana_roi.direct_solana import WatchTarget
 
 
@@ -152,7 +153,11 @@ def test_non_high_volume_target_keeps_existing_bounded_poll(monkeypatch):
     assert result == ([], True, "publicnode", 4.0)
 
 
-def test_checkpoint_wrapper_is_recognized_as_hedged_real_gap_boundary():
-    assert durability._requires_hedged_real_gap_fetch(
-        architecture._checkpointed_slot_fetch_delta
-    ) is True
+def test_outer_checkpoint_proxy_preserves_canonical_poll_contracts():
+    architecture.install_high_volume_standby_checkpoint_architecture()
+
+    assert isinstance(lease.watermark, architecture._HighVolumeCheckpointProxy)
+    assert watermark._slot_fetch_delta is exception_rearm._exception_rearm_fetch_delta
+    assert live_poll._fetch_delta is exception_rearm._exception_rearm_fetch_delta
+    assert lease.watermark._base is watermark
+    assert lease.watermark._slot_poll_page is watermark._slot_poll_page
