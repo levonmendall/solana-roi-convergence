@@ -4,9 +4,10 @@ services:
     runtime: python
     plan: 1c-2g
     buildCommand: pip install -e .
-    # Preserve the complete production composition, then add the isolated
-    # Robinhood Chain active-paper runtime around the already-built FastAPI app.
-    startCommand: uvicorn solana_roi.robinhood_production:app --host 0.0.0.0 --port $PORT
+    # Preserve the exact canonical production entrypoint. Robinhood Chain is
+    # installed additively inside solana_roi.production after all existing Solana
+    # continuity/certification composition has been established.
+    startCommand: uvicorn solana_roi.production:app --host 0.0.0.0 --port $PORT
     # Render liveness must remain constant-time and independent of SQLite,
     # certification scans, provider state, or the append-only event-chain audit.
     # Deep readiness remains available under /v1/ingestion/status and
