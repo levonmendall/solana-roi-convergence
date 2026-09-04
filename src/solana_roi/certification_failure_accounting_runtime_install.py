@@ -20,8 +20,9 @@ def install_final_certification_failure_accounting() -> None:
     affinity/priority, confirmed-WebSocket checkpoint architecture, hydration
     scheduling, candidate RPC-priority/hedging, universal continuity scheduling,
     the candidate-completion/standby-fairness repair, high-volume pre-gap frontier
-    maintenance, and the final realtime wallet-to-v4 handoff here so no older
-    installer can replace them before runtime tasks are created.
+    maintenance, exact durable-signature gap boundary, and the final realtime
+    wallet-to-v4 handoff here so no older installer can replace them before runtime
+    tasks are created.
     """
 
     from .candidate_completion_continuity_repair import (
@@ -37,6 +38,9 @@ def install_final_certification_failure_accounting() -> None:
     )
     from .continuity_early_loss_detection_repair import (
         install_continuity_early_loss_detection_repair,
+    )
+    from .continuity_exact_durable_signature_repair import (
+        install_exact_durable_signature_continuity_repair,
     )
     from .continuity_generation_floor_repair import (
         install_continuity_generation_floor_repair,
@@ -78,6 +82,11 @@ def install_final_certification_failure_accounting() -> None:
     # at sub-poll cadence while leaving transport memory, the four-second poll, the
     # fixed recovery bound, and PR99's generation guard unchanged.
     install_high_volume_pre_gap_frontier_repair()
+    # PR100 telemetry proved slot-1 can still require replaying >3,000 already-safe
+    # same-slot Pump signatures. Prefer an independently confirmed exact signature
+    # only after that WebSocket receipt has durably committed; preserve slot-1 as
+    # the fail-closed fallback and keep the 12-second / 3x1000 bounds unchanged.
+    install_exact_durable_signature_continuity_repair()
 
     current_discard = retention._discard_hydration_row
     if not bool(getattr(current_discard, "_roi_failure_accounting", False)):
