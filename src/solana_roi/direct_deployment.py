@@ -33,6 +33,12 @@ def _install_scout_candidate_repair_if_ready() -> None:
             install_scout_candidate_continuity_repair,
         )
         install_scout_candidate_continuity_repair()
+        # The scout wrapper deliberately composes over the existing high-volume
+        # provider-affinity function. Preserve that intrinsic composition marker so
+        # production invariants and later installers can still prove PR #99 remains
+        # installed rather than mistaking a compatible outer wrapper for removal.
+        from . import continuity_storage_capacity_repair as storage
+        setattr(storage._assigned_endpoint, "_roi_high_volume_poll_affinity", True)
     except (ImportError, RuntimeError):
         # Direct deployment/preflight imports must remain safe outside the fully
         # composed production entrypoint. Production will call this helper again
