@@ -85,5 +85,15 @@ def install_wallet_forward_pipeline_architecture() -> None:
         setattr(_status_with_forward_pipeline, "_roi_wallet_forward_pipeline_architecture", True)
         ContinuousWalletDiscovery.status = _status_with_forward_pipeline  # type: ignore[method-assign]
 
+    # Final production composition: remove mutable-global wallet status/run-once
+    # recursion, align candidate claims with actual RPC capacity, prewarm point-in-
+    # time risk evidence, and schedule funding provenance directly from launch
+    # attestation. This is intentionally installed after the v4 handoff so its safe
+    # wallet status becomes the final outer composition without touching record
+    # adapters or promotion authority.
+    from .forward_evidence_runtime_repair import install_forward_evidence_runtime_repair
+
+    install_forward_evidence_runtime_repair()
+
 
 __all__ = ["install_wallet_forward_pipeline_architecture"]
