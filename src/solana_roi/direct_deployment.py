@@ -39,12 +39,19 @@ def _install_postcompose_repairs() -> None:
     from .high_volume_signature_cursor_repair import (
         install_high_volume_signature_cursor_repair,
     )
+    from .release_bound_scout_classification_repair import (
+        install_release_bound_scout_classification_repair,
+    )
     from .scout_candidate_continuity_repair import (
         install_scout_candidate_continuity_repair,
     )
 
     def install_scout_and_preserve_markers() -> None:
         install_scout_candidate_continuity_repair()
+        # Once exact-scout identity is the active normalizer, complete the release-
+        # bound repair so supported-source-missing scout transactions can become
+        # terminal non-candidates instead of later anonymous expiry failures.
+        install_release_bound_scout_classification_repair()
         # The scout provider-assignment wrapper composes over the established
         # high-volume affinity function. Preserve its intrinsic marker so later
         # invariants can prove that PR #99 remains installed beneath the wrapper.
