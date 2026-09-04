@@ -325,6 +325,19 @@ from .post104_production_architecture_repair import (
 
 install_post104_production_architecture_repair()
 
+# Final candidate-path architecture: once a normalized frozen-scout buy exists,
+# release the hydration slot and move risk -> quote -> unsigned simulation onto an
+# isolated priority queue. Bound the shared SQLite writer hold with ordered durable
+# slices and overlap candidate launch/funding with the four already-parallel dynamic
+# dimensions. The 5-second certification target, 20-second entry ceiling, complete
+# raw market scope, paper-only authority, and no-signing/no-submission boundary are
+# unchanged.
+from .candidate_execution_evidence_plane import (
+    install_candidate_execution_evidence_plane,
+)
+
+install_candidate_execution_evidence_plane()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
