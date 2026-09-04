@@ -132,6 +132,16 @@ from .continuity_e2e_readiness_repair import install_continuity_e2e_readiness_re
 
 install_continuity_e2e_readiness_repair()
 
+# The current strategy is wallet/context driven rather than a first-slot firehose
+# sniper. Preserve broad raw program discovery and the unchanged program-coverage
+# certification gate, but make lossless execution continuity authoritative only for
+# strategy-relevant scout transport. Program-stream gaps remain durable discovery
+# degradation and cannot consume the critical recovery lane or poison a release's
+# strategy continuity by themselves.
+from .strategy_relevant_continuity import install_strategy_relevant_continuity
+
+install_strategy_relevant_continuity()
+
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 from .robinhood_chain_profit_maximizer import ROBINHOOD_V5_VERSION
 
