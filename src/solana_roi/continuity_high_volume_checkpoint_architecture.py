@@ -58,6 +58,11 @@ async def _checkpointed_slot_fetch_delta(
         return await _ORIGINAL_SLOT_FETCH(self, target, cursor_slot)
 
     latest_observed_slot = _latest_observed_target_slot(self, target)
+    # A transport-level "connected" bit is not sufficient authority for a
+    # checkpoint. Until at least one actual target receipt has crossed the socket
+    # boundary, preserve the canonical poll/fault/rearm path exactly.
+    if latest_observed_slot <= 0:
+        return await _ORIGINAL_SLOT_FETCH(self, target, cursor_slot)
     if latest_observed_slot <= int(cursor_slot) + 1:
         return [], True, None, None
 
@@ -168,6 +173,7 @@ def _status_with_checkpoint_architecture(self: DirectSolanaIngestionPlane) -> di
         "canonical_recoverability_proxy_preserved": True,
         "real_gap_hedged_recovery_path_unchanged": True,
         "healthy_websocket_avoids_replaying_suppressed_high_volume_history": True,
+        "checkpoint_requires_observed_target_frontier": True,
         "checkpoint_requires_confirmed_target_receipt": True,
         "checkpoint_requires_continuous_real_websocket_generation": True,
         "same_slot_replay_preserved": True,
