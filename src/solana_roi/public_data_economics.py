@@ -17,6 +17,7 @@ METERED_ALCHEMY_OPT_IN_ENV = "SOLANA_ROI_ENABLE_METERED_ALCHEMY"
 COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS = 2.0
 COVERAGE_BOOTSTRAP_MAX_OUTSTANDING_PER_SOURCE = 2
 LEGACY_SAMPLE_RETIREMENT_REASON = "superseded by selective public-data hydration"
+RAW_RECEIPT_SQLITE_OFFLOOP_VERSION = "raw-receipt-sqlite-offloop-v1"
 
 
 def _truthy(value: str | None) -> bool:
@@ -163,97 +164,113 @@ def _bootstrap_capacity_available(self: Any, source: str) -> bool:
     return True
 
 
+def _process_selective_notification_sync(
+    self: Any,
+    provider: str,
+    subscription_targets: dict[int, Any],
+    message: dict[str, Any],
+) -> None:
+    """Run the durable raw-receipt transaction chain outside Uvicorn's event loop.
+
+    The raw dispatcher is already single-consumer and ordered. Moving this complete
+    synchronous section to ``asyncio.to_thread`` therefore preserves receipt order,
+    durable-before-frontier semantics, the receipt ContextVar, bootstrap thresholds,
+    and all downstream queue decisions while making SQLite fsync/lock latency unable
+    to starve Render health requests.
+    """
+
+    if message.get("method") != "logsNotification":
+        return
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return
+    try:
+        subscription = int(params["subscription"])
+        result = params["result"]
+        slot = int(result["context"]["slot"])
+        value = result["value"]
+        signature = str(value["signature"])
+    except (KeyError, TypeError, ValueError):
+        return
+    if not isinstance(value, dict):
+        return
+    target = subscription_targets.get(subscription)
+    if target is None or not signature:
+        return
+
+    received_at = direct_solana_module.utcnow()
+    self.journal.touch_provider(provider, received_at)
+    launch_like = self._launch_like(value.get("logs") if isinstance(value, dict) else [])
+    source_key = target.source_hint or f"SCOUT:{target.address}"
+    inserted = self.journal.record_receipt(
+        signature=signature,
+        source_key=source_key,
+        slot=slot,
+        received_at=received_at,
+        launch_like=launch_like,
+    )
+    if not inserted or value.get("err") is not None:
+        return
+
+    if target.kind == "scout":
+        self.journal.enqueue(
+            signature=signature,
+            slot=slot,
+            trigger_received_at=received_at,
+            source_hint=None,
+            priority=0,
+            reason="frozen_scout_processed_trigger",
+        )
+        return
+
+    source = str(target.source_hint)
+    if launch_like:
+        self.journal.enqueue(
+            signature=signature,
+            slot=slot,
+            trigger_received_at=received_at,
+            source_hint=source,
+            priority=10,
+            reason="prospective_launch",
+        )
+        return
+
+    if _source_needs_bootstrap(self, source) and _bootstrap_capacity_available(self, source):
+        # Reuse the existing lightweight hydration reason so runtime_guards
+        # persists the normalized transaction without invoking deep risk work.
+        self.journal.enqueue(
+            signature=signature,
+            slot=slot,
+            trigger_received_at=received_at,
+            source_hint=source,
+            priority=20,
+            reason="deterministic_market_sample",
+        )
+
+
 async def _selective_notification_handler(
     self: Any,
     provider: str,
     subscription_targets: dict[int, Any],
     message: dict[str, Any],
 ) -> None:
-    """Persist every raw receipt but hydrate only decision-relevant evidence.
+    """Persist every raw receipt without executing canonical SQLite on Uvicorn."""
 
-    Scout activity and precise launch-like program events remain fully hydrated.
-    Ordinary program traffic is hydrated only as a tiny bounded bootstrap while a
-    source is below the unchanged empirical normalized-swap minimum. Once that
-    source minimum is met, the full raw stream continues to be journaled but no
-    random transaction hydration is created for it.
-    """
-
-    try:
-        if message.get("method") != "logsNotification":
-            return
-        params = message.get("params")
-        if not isinstance(params, dict):
-            return
-        try:
-            subscription = int(params["subscription"])
-            result = params["result"]
-            slot = int(result["context"]["slot"])
-            value = result["value"]
-            signature = str(value["signature"])
-        except (KeyError, TypeError, ValueError):
-            return
-        if not isinstance(value, dict):
-            return
-        target = subscription_targets.get(subscription)
-        if target is None or not signature:
-            return
-
-        received_at = direct_solana_module.utcnow()
-        self.journal.touch_provider(provider, received_at)
-        launch_like = self._launch_like(value.get("logs") if isinstance(value, dict) else [])
-        source_key = target.source_hint or f"SCOUT:{target.address}"
-        inserted = self.journal.record_receipt(
-            signature=signature,
-            source_key=source_key,
-            slot=slot,
-            received_at=received_at,
-            launch_like=launch_like,
-        )
-        if not inserted or value.get("err") is not None:
-            return
-
-        if target.kind == "scout":
-            self.journal.enqueue(
-                signature=signature,
-                slot=slot,
-                trigger_received_at=received_at,
-                source_hint=None,
-                priority=0,
-                reason="frozen_scout_processed_trigger",
-            )
-            return
-
-        source = str(target.source_hint)
-        if launch_like:
-            self.journal.enqueue(
-                signature=signature,
-                slot=slot,
-                trigger_received_at=received_at,
-                source_hint=source,
-                priority=10,
-                reason="prospective_launch",
-            )
-            return
-
-        if _source_needs_bootstrap(self, source) and _bootstrap_capacity_available(self, source):
-            # Reuse the existing lightweight hydration reason so runtime_guards
-            # persists the normalized transaction without invoking deep risk work.
-            self.journal.enqueue(
-                signature=signature,
-                slot=slot,
-                trigger_received_at=received_at,
-                source_hint=source,
-                priority=20,
-                reason="deterministic_market_sample",
-            )
-    finally:
-        # Preserve the cooperative event-loop handoff expected by the bounded
-        # WebSocket notification infrastructure.
-        await asyncio.sleep(0)
+    # asyncio.to_thread copies the current Context, including the socket-read
+    # receipt timestamp bound by raw_receipt_dispatch_repair. The single ordered
+    # dispatcher waits for this durable section before advancing to the next item.
+    await asyncio.to_thread(
+        _process_selective_notification_sync,
+        self,
+        provider,
+        subscription_targets,
+        message,
+    )
 
 
 setattr(_selective_notification_handler, "_roi_public_data_selective_hydration", True)
 setattr(_selective_notification_handler, "_roi_cooperative_yield", True)
+setattr(_selective_notification_handler, "_roi_raw_receipt_sqlite_offloop", True)
 
 
 def _journal_init_with_legacy_sample_retirement(
@@ -310,6 +327,9 @@ def _status_with_public_data_economics(
             "coverage_full_status_in_notification_hotpath": False,
             "coverage_probe_cache_seconds": COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS,
             "capacity_interval_checked_before_sqlite": True,
+            "raw_receipt_sqlite_offloop_version": RAW_RECEIPT_SQLITE_OFFLOOP_VERSION,
+            "raw_receipt_sqlite_execution": "ordered_worker_thread_via_asyncio_to_thread",
+            "uvicorn_event_loop_executes_raw_receipt_sqlite": False,
             "strategy_scope_reduced": False,
         }
         policy = payload.setdefault("provider_runtime_policy", {})
@@ -334,6 +354,7 @@ def _status_with_public_data_economics(
                     "random_market_sampling_after_source_minimum": False,
                     "launches_and_scouts_preserve_deep_analysis": True,
                     "coverage_full_status_in_notification_hotpath": False,
+                    "uvicorn_event_loop_executes_raw_receipt_sqlite": False,
                     "strategy_scope_reduced": False,
                 }
             )
@@ -418,5 +439,6 @@ __all__ = [
     "COVERAGE_BOOTSTRAP_MAX_OUTSTANDING_PER_SOURCE",
     "COVERAGE_BOOTSTRAP_MIN_INTERVAL_SECONDS",
     "METERED_ALCHEMY_OPT_IN_ENV",
+    "RAW_RECEIPT_SQLITE_OFFLOOP_VERSION",
     "install_public_data_economics",
 ]
