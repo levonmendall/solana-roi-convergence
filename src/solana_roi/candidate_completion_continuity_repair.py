@@ -8,7 +8,6 @@ from typing import Any
 
 from . import candidate_certification_hotpath_repair as candidate_hotpath
 from . import candidate_rpc_priority_repair as candidate_priority
-from . import certification_runtime_architecture_repair as runtime_arch
 from . import continuity_high_volume_checkpoint_architecture as checkpoint
 from . import continuity_standby_rpc_priority_repair as standby_priority
 from . import forward_evidence_runtime_repair as forward
@@ -18,10 +17,11 @@ from . import rpc_workload_governor as governor
 from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 
 
-# A processed logsSubscribe notification normally precedes confirmed getTransaction
-# availability by a short interval. Do not burn scarce read-only RPC capacity on an
-# immediate tight null-result loop; let other frozen scout triggers make progress.
-CANDIDATE_FIRST_FETCH_GRACE_SECONDS = 0.25
+# Processed logsSubscribe can precede confirmed getTransaction availability. Keep
+# the first read immediate for the repository's canonical claim contract, but do
+# not let the same null-result row spin continuously: queue re-admission supplies
+# retries and a short retry backoff lets untouched scout triggers make progress.
+CANDIDATE_FIRST_FETCH_GRACE_SECONDS = 0.0
 CANDIDATE_RETRY_BACKOFF_SECONDS = 0.20
 CANDIDATE_URGENT_REMAINING_SECONDS = 5.0
 CANDIDATE_FRESH_RPC_SLICE_SECONDS = 1.25
@@ -56,46 +56,33 @@ def _inc(obj: Any, name: str, amount: int = 1) -> None:
 
 
 def _deadline_aware_claim_candidate(journal: Any) -> dict[str, Any] | None:
-    """Claim a scout trigger only when a confirmed transaction read is useful.
+    """Claim scout work without letting null-result retries starve new triggers.
 
-    The old queue order was fair by last update, but a processed notification could
-    be claimed immediately and then reclaimed again while getTransaction was still
-    legitimately unavailable at confirmed commitment. Under bursts that spent the
-    two noncritical RPC slots on null-result retries while untouched scout triggers
-    aged out.
-
-    Keep the unchanged 20-second entry window. Give triggers with <=5 seconds left
-    first priority, then give every first attempt a short confirmation grace, then
-    rate-limit retries by a small backoff. No row is dropped or made authoritative
-    by this scheduler; the existing fail-closed reaper remains the deadline owner.
+    Every first attempt remains immediately claimable. A requeued row must wait a
+    short interval before another confirmed transaction read, except once it enters
+    the final five seconds of the unchanged 20-second entry window. Urgent rows are
+    then ordered first. The existing fail-closed reaper remains the hard deadline
+    owner and no candidate is made authoritative by this scheduler.
     """
 
     now = _utcnow()
-    urgent_age = max(0.0, float(forward.ENTRY_WINDOW_SECONDS) - CANDIDATE_URGENT_REMAINING_SECONDS)
+    urgent_age = max(
+        0.0,
+        float(forward.ENTRY_WINDOW_SECONDS) - CANDIDATE_URGENT_REMAINING_SECONDS,
+    )
     urgent_cutoff = (now - timedelta(seconds=urgent_age)).isoformat()
-    first_ready_cutoff = (now - timedelta(seconds=CANDIDATE_FIRST_FETCH_GRACE_SECONDS)).isoformat()
     retry_ready_cutoff = (now - timedelta(seconds=CANDIDATE_RETRY_BACKOFF_SECONDS)).isoformat()
-    now_iso = now.isoformat()
     reasons = tuple(sorted(forward.SCOUT_REASONS))
 
     sql = (
         "SELECT signature, slot, trigger_received_at, source_hint, priority, reason, attempts "
         "FROM direct_solana_hydration_queue "
         "WHERE status='pending' AND priority<=2 AND reason IN (?,?) AND ("
-        "trigger_received_at<=? OR "
-        "(attempts=0 AND trigger_received_at<=?) OR "
-        "(attempts>0 AND updated_at<=?)) "
-        "ORDER BY "
-        "CASE WHEN trigger_received_at<=? THEN 0 WHEN attempts=0 THEN 1 ELSE 2 END, "
+        "attempts=0 OR trigger_received_at<=? OR updated_at<=?) "
+        "ORDER BY CASE WHEN trigger_received_at<=? THEN 0 WHEN attempts=0 THEN 1 ELSE 2 END, "
         "trigger_received_at, updated_at, signature LIMIT 1"
     )
-    args = (
-        *reasons,
-        urgent_cutoff,
-        first_ready_cutoff,
-        retry_ready_cutoff,
-        urgent_cutoff,
-    )
+    args = (*reasons, urgent_cutoff, retry_ready_cutoff, urgent_cutoff)
     with journal.store._lock, journal.store.db:
         row = journal.store.db.execute(sql, args).fetchone()
         if row is None:
@@ -105,28 +92,11 @@ def _deadline_aware_claim_candidate(journal: Any) -> dict[str, Any] | None:
             "UPDATE direct_solana_hydration_queue "
             "SET status='processing', attempts=attempts+1, updated_at=? "
             "WHERE signature=? AND status='pending'",
-            (now_iso, signature),
+            (now.isoformat(), signature),
         )
         if updated.rowcount != 1:
             return None
-        result = dict(row)
-
-    try:
-        age = max(0.0, (now - _parse_dt(result["trigger_received_at"])).total_seconds())
-    except Exception:
-        age = 0.0
-    owner = getattr(journal, "_roi_ingestion_plane", None)
-    # The journal does not canonically retain its plane. Tests and older callers can
-    # therefore use this helper without telemetry ownership; production counters are
-    # also derived in the transaction wrapper below.
-    if owner is not None:
-        if age >= urgent_age:
-            _inc(owner, "urgent_claims")
-        elif int(result.get("attempts") or 0) == 0:
-            _inc(owner, "first_attempt_claims")
-        else:
-            _inc(owner, "retry_claims")
-    return result
+        return dict(row)
 
 
 async def _single_attempt_candidate_transaction_ready(
@@ -136,13 +106,13 @@ async def _single_attempt_candidate_transaction_ready(
     hedge: bool,
     attempts: int,
 ) -> tuple[Any, str | None, float | None]:
-    """Use one confirmed transaction read per candidate queue claim.
+    """Use one confirmed transaction read per scout queue claim.
 
-    Queue re-admission already supplies bounded retries. Repeating getTransaction
-    twice inside one claim adds a sleep and a second RPC round while every other
-    frozen scout trigger waits. One read per claim makes the queue work-conserving;
-    a null result is requeued by the unchanged canonical hydrator and becomes
-    eligible again after the short retry backoff above.
+    The canonical hydrator already requeues a null confirmed result. Repeating the
+    read multiple times inside one queue claim needlessly holds a scarce candidate
+    RPC slot while other frozen scout triggers age. One attempt per claim plus the
+    queue backoff above is work-conserving and retains the same 20-second fail-closed
+    boundary.
     """
 
     reason = candidate_hotpath._CURRENT_HYDRATION_REASON.get()
@@ -151,10 +121,7 @@ async def _single_attempt_candidate_transaction_ready(
         if _ORIGINAL_TRANSACTION_READY is None:
             raise RuntimeError("candidate completion repair is not installed")
         return await _ORIGINAL_TRANSACTION_READY(
-            self,
-            signature,
-            hedge=hedge,
-            attempts=attempts,
+            self, signature, hedge=hedge, attempts=attempts
         )
 
     age = max(0.0, (_utcnow() - trigger).total_seconds())
@@ -171,18 +138,16 @@ async def _single_attempt_candidate_transaction_ready(
     )
     slice_seconds = max(0.10, min(slice_seconds, remaining_entry))
 
+    # Bypass PR #98's two-inner-attempt wrapper only for the frozen scout path.
+    # Its captured delegate is the canonical pre-PR98 getTransaction readiness
+    # method; all RPC governor, cooldown and hedge wrappers remain underneath it.
     delegate = forward._ORIGINAL_GET_TRANSACTION_READY or _ORIGINAL_TRANSACTION_READY
     if delegate is None:
         raise RuntimeError("candidate transaction delegate is unavailable")
 
     try:
         result = await asyncio.wait_for(
-            delegate(
-                self,
-                signature,
-                hedge=True,
-                attempts=1,
-            ),
+            delegate(self, signature, hedge=True, attempts=1),
             timeout=slice_seconds,
         )
     except asyncio.TimeoutError:
@@ -195,15 +160,16 @@ async def _single_attempt_candidate_transaction_ready(
         raise
 
     tx = result[0] if isinstance(result, tuple) and result else None
-    if tx is None:
-        _inc(self, "transaction_unavailable")
-    else:
-        _inc(self, "transaction_ready")
+    _inc(self, "transaction_ready" if tx is not None else "transaction_unavailable")
     _inc(self, "rpc_claims_completed")
     return result
 
 
-setattr(_single_attempt_candidate_transaction_ready, "_roi_candidate_completion_single_attempt", True)
+setattr(
+    _single_attempt_candidate_transaction_ready,
+    "_roi_candidate_completion_single_attempt",
+    True,
+)
 
 
 def _fair_noncritical_allowed(
@@ -211,19 +177,14 @@ def _fair_noncritical_allowed(
     workload: str,
     policy: dict[str, float | int],
 ) -> tuple[bool, float]:
-    """Guarantee progress for both candidate and high-volume standby work.
+    """Guarantee progress for candidate and high-volume standby lanes.
 
-    The prior standby policy reserved a slot from certification/research but
-    explicitly exempted candidate work. With continuous candidate traffic, two
-    candidate calls could therefore occupy both noncritical slots forever while a
-    PUMP_FUN/PUMP_AMM standby waiter remained queued. That let the routine cursor go
-    stale and made the unchanged 3x1000 recovery window unnecessarily hard to meet.
-
-    Keep candidate priority: when both lanes are waiting and neither owns a slot,
-    the candidate takes the first one. Once one candidate is active, reserve the
-    second noncritical slot for one waiting standby read. The converse prevents a
-    second standby read from taking the candidate's first slot. Critical capacity is
-    unchanged and remains independently reserved.
+    Candidate keeps first claim on noncritical capacity. Once one candidate owns a
+    slot, a waiting standby read gets the second slot before candidate #2. The
+    symmetric rule prevents standby from taking both slots while a candidate waits.
+    Background certification/research uses only capacity not currently promised to
+    those forward lanes. Total endpoint concurrency and the independent critical
+    continuity reservation are unchanged.
     """
 
     total = int(policy["total_per_endpoint"])
@@ -248,22 +209,14 @@ def _fair_noncritical_allowed(
     )
 
     if workload == candidate_priority.WORKLOAD_CANDIDATE:
-        # Candidate gets the first noncritical slot. If standby is queued and has no
-        # slot yet, a second candidate yields until standby obtains the other slot.
         if standby_waiters > 0 and standby_active == 0 and candidate_active >= 1:
             _FAIRNESS_COUNTS["candidate_yields_to_waiting_standby"] += 1
             return False, 0.005
-
     elif workload == standby_priority.WORKLOAD_STANDBY:
-        # Symmetric guard: if a candidate is waiting and has no slot, do not let a
-        # second class of standby work win the first slot by scheduler timing.
         if candidate_waiters > 0 and candidate_active == 0:
             _FAIRNESS_COUNTS["standby_yields_to_waiting_candidate"] += 1
             return False, 0.005
-
     else:
-        # Background work may use only capacity not currently promised to a waiting
-        # forward lane. With both lanes waiting, both noncritical slots are reserved.
         reserved = 0
         if candidate_waiters > 0 and candidate_active == 0:
             reserved += 1
@@ -278,11 +231,17 @@ def _fair_noncritical_allowed(
         if int(state.active_by_workload.get(governor.WORKLOAD_RESEARCH, 0) or 0) >= research_max:
             return False, 0.05
         interval = float(policy["research_min_interval_seconds"])
-        remaining = max(0.0, state.last_research_started_monotonic + interval - now)
+        remaining = max(
+            0.0,
+            state.last_research_started_monotonic + interval - now,
+        )
         if remaining > 0.0:
             return False, min(0.10, remaining)
 
     return True, 0.0
+
+
+setattr(_fair_noncritical_allowed, "_roi_candidate_standby_fairness", True)
 
 
 async def _generation_safe_checkpoint_fetch(
@@ -290,22 +249,26 @@ async def _generation_safe_checkpoint_fetch(
     target: WatchTarget,
     cursor_slot: int,
 ) -> tuple[list[dict[str, Any]], bool, str | None, float | None]:
-    """Never checkpoint a standby cursor across an unrecovered WS generation.
+    """Never healthy-checkpoint across a known unrecovered WS generation.
 
-    A confirmed post-gap WebSocket frontier proves where healthy traffic is now; it
-    does not prove the missing interval between the old poll cursor and the new
-    generation. If the poll cursor still belongs to the prior generation, force the
-    canonical immediate bounded-recovery delegate. Only after that delegate updates
-    the cursor generation may healthy confirmed-frontier checkpointing resume.
+    Compatibility callers that do not expose the leased cursor-generation runtime
+    retain the exact existing universal-checkpoint delegate. Production leased
+    workers do expose it; only there do we compare cursor generation with the live
+    generation and force canonical bounded recovery before a post-gap healthy
+    frontier can advance the standby watermark.
     """
 
     if _ORIGINAL_CHECKPOINT_FETCH is None:
         raise RuntimeError("generation-safe checkpoint repair is not installed")
+
     key = live_poll._poll_target_key(target)
-    generation = int(lease._current_ws_generation(self, target))
     runtime = lease._runtime(self).get(key, {})
+    if not isinstance(runtime, dict) or "cursor_ws_generation" not in runtime:
+        return await _ORIGINAL_CHECKPOINT_FETCH(self, target, cursor_slot)
+
+    generation = int(lease._current_ws_generation(self, target))
     try:
-        cursor_generation = int(runtime.get("cursor_ws_generation", generation) or 0)
+        cursor_generation = int(runtime.get("cursor_ws_generation") or 0)
     except (TypeError, ValueError):
         cursor_generation = generation
 
@@ -335,7 +298,8 @@ def _candidate_queue_snapshot(self: DirectSolanaIngestionPlane) -> dict[str, Any
             rows = self.store.db.execute(
                 "SELECT status, COUNT(*) AS n, MIN(trigger_received_at) AS oldest, "
                 "MAX(attempts) AS max_attempts FROM direct_solana_hydration_queue "
-                "WHERE reason IN (?,?) AND status IN ('pending','processing') GROUP BY status",
+                "WHERE reason IN (?,?) AND status IN ('pending','processing') "
+                "GROUP BY status",
                 reasons,
             ).fetchall()
         now = _utcnow()
@@ -367,7 +331,7 @@ def _status_with_candidate_completion_and_fairness(
     payload["candidate_completion_continuity_repair"] = {
         "installed": True,
         "candidate_scheduler": {
-            "confirmation_first_fetch_grace_ms": CANDIDATE_FIRST_FETCH_GRACE_SECONDS * 1000.0,
+            "first_fetch_immediate": True,
             "retry_backoff_ms": CANDIDATE_RETRY_BACKOFF_SECONDS * 1000.0,
             "urgent_remaining_seconds": CANDIDATE_URGENT_REMAINING_SECONDS,
             "single_get_transaction_attempt_per_queue_claim": True,
@@ -388,10 +352,8 @@ def _status_with_candidate_completion_and_fairness(
             **dict(_FAIRNESS_COUNTS),
         },
         "continuity_checkpoint_guard": {
-            "healthy_frontier_cannot_cross_unrecovered_generation": True,
-            "blocked_checkpoint_count": int(
-                getattr(self, "_roi_candidate_completion_checkpoint_blocked_unrecovered_generation", 0) or 0
-            ),
+            "healthy_frontier_cannot_cross_known_unrecovered_generation": True,
+            "blocked_checkpoint_count": int(getattr(self, "_roi_candidate_completion_checkpoint_blocked_unrecovered_generation", 0) or 0),
             "canonical_immediate_recovery_required_first": True,
             "recoverability_lease_seconds": lease.POLL_RECOVERABILITY_LEASE_SECONDS,
             "hard_page_limit": live_poll.POLL_CURSOR_MAX_PAGES,
@@ -406,11 +368,11 @@ def _status_with_candidate_completion_and_fairness(
     if isinstance(policy, dict):
         policy.update(
             {
-                "candidate_confirmation_aware_claim_scheduling": True,
+                "candidate_retry_backoff_scheduling": True,
                 "candidate_single_transaction_read_per_claim": True,
                 "candidate_deadline_urgent_lane": True,
                 "candidate_and_standby_noncritical_slots_make_forward_progress": True,
-                "healthy_frontier_checkpoint_requires_recovered_ws_generation": True,
+                "healthy_frontier_checkpoint_requires_recovered_ws_generation_when_generation_state_is_known": True,
                 "continuity_lease_unchanged": True,
                 "recovery_bound_unchanged": True,
                 "candidate_latency_threshold_unchanged": True,
@@ -430,18 +392,15 @@ setattr(
 
 
 def install_candidate_completion_continuity_repair() -> None:
-    """Install the post-PR98 candidate/continuity production repair exactly once."""
+    """Install the post-PR98 candidate/continuity repair exactly once."""
 
     global _ORIGINAL_TRANSACTION_READY, _ORIGINAL_DIRECT_STATUS
     global _ORIGINAL_CHECKPOINT_FETCH, _ORIGINAL_ALLOWED
 
-    # Candidate queue scheduling is resolved dynamically by PR98's worker.
     forward._claim_candidate = _deadline_aware_claim_candidate  # type: ignore[assignment]
 
     current_transaction_ready = DirectSolanaIngestionPlane._get_transaction_ready
-    if not bool(
-        getattr(current_transaction_ready, "_roi_candidate_completion_single_attempt", False)
-    ):
+    if not bool(getattr(current_transaction_ready, "_roi_candidate_completion_single_attempt", False)):
         _ORIGINAL_TRANSACTION_READY = current_transaction_ready
         try:
             _single_attempt_candidate_transaction_ready.__dict__.update(
@@ -449,26 +408,14 @@ def install_candidate_completion_continuity_repair() -> None:
             )
         except Exception:
             pass
-        setattr(
-            _single_attempt_candidate_transaction_ready,
-            "_roi_candidate_completion_single_attempt",
-            True,
-        )
-        DirectSolanaIngestionPlane._get_transaction_ready = (  # type: ignore[method-assign]
-            _single_attempt_candidate_transaction_ready
-        )
+        DirectSolanaIngestionPlane._get_transaction_ready = _single_attempt_candidate_transaction_ready  # type: ignore[method-assign]
 
-    # Repair the exact starvation hole in the existing noncritical fairness policy.
     current_allowed = standby_priority._allowed_with_standby_priority
     if not bool(getattr(current_allowed, "_roi_candidate_standby_fairness", False)):
         _ORIGINAL_ALLOWED = current_allowed
-        setattr(_fair_noncritical_allowed, "_roi_candidate_standby_fairness", True)
         standby_priority._allowed_with_standby_priority = _fair_noncritical_allowed  # type: ignore[assignment]
         governor._allowed = _fair_noncritical_allowed  # type: ignore[assignment]
 
-    # PR97's universal healthy-frontier checkpoint is retained, but may run only
-    # when the standby cursor already belongs to the current real-WebSocket gap
-    # generation. A generation transition always falls back to canonical recovery.
     current_checkpoint = checkpoint._checkpointed_slot_fetch_delta
     if not bool(getattr(current_checkpoint, "_roi_generation_safe_checkpoint", False)):
         _ORIGINAL_CHECKPOINT_FETCH = current_checkpoint
@@ -478,13 +425,10 @@ def install_candidate_completion_continuity_repair() -> None:
             )
         except Exception:
             pass
-        setattr(_generation_safe_checkpoint_fetch, "_roi_generation_safe_checkpoint", True)
         checkpoint._checkpointed_slot_fetch_delta = _generation_safe_checkpoint_fetch  # type: ignore[assignment]
 
     current_status = DirectSolanaIngestionPlane.status
-    if not bool(
-        getattr(current_status, "_roi_candidate_completion_continuity_repair", False)
-    ):
+    if not bool(getattr(current_status, "_roi_candidate_completion_continuity_repair", False)):
         _ORIGINAL_DIRECT_STATUS = current_status
         try:
             _status_with_candidate_completion_and_fairness.__dict__.update(
@@ -492,9 +436,7 @@ def install_candidate_completion_continuity_repair() -> None:
             )
         except Exception:
             pass
-        DirectSolanaIngestionPlane.status = (  # type: ignore[method-assign]
-            _status_with_candidate_completion_and_fairness
-        )
+        DirectSolanaIngestionPlane.status = _status_with_candidate_completion_and_fairness  # type: ignore[method-assign]
 
 
 __all__ = [
