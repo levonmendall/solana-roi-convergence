@@ -43,7 +43,7 @@ def _legacy_admission_contract(row: dict[str, Any]) -> bool:
 
 
 def _compatible_chase_band(value: float | None) -> str:
-    """Keep established band labels while extending them beyond the old 40% ceiling."""
+    """Preserve historical v5 labels; continuation keeps richer bands separately."""
     if value is None:
         return "unknown"
     numeric = float(value)
@@ -56,11 +56,7 @@ def _compatible_chase_band(value: float | None) -> str:
         return "challenger_15_25pct"
     if numeric <= 0.40:
         return "challenger_25_40pct"
-    if numeric <= 0.75:
-        return "continuation_40_75pct"
-    if numeric <= 1.25:
-        return "continuation_75_125pct"
-    return "continuation_gt_125pct"
+    return "challenger_gt_40pct"
 
 
 def _compatible_latency_band(value: float | None) -> str:
@@ -121,9 +117,9 @@ def _fomo_continuation_classifier(features: Any, *, max_chase_fraction: float = 
         variants = [
             value
             for value in variants
-            if value not in {"challenger_15_25pct", "challenger_25_40pct"}
+            if value not in {"challenger_15_25pct", "challenger_25_40pct", "challenger_gt_40pct"}
         ]
-        variants.append(_compatible_chase_band(float(actual_chase)))
+        variants.append(continuation.continuation_chase_band(float(actual_chase)))
         if "hazard_fomo" not in variants:
             variants.append("hazard_fomo")
     return FomoState(
@@ -160,7 +156,8 @@ def _status_with_final_authority(self: Any) -> dict[str, Any]:
                     getattr(self, "_roi_continuation_late_admission_bypasses", 0) or 0
                 ),
                 "legacy_admission_helper_preserved": True,
-                "legacy_band_labels_preserved_through_40pct": True,
+                "legacy_v5_chase_labels_preserved": True,
+                "extended_continuation_bands_recorded_separately": True,
             }
         )
     return payload
@@ -177,8 +174,8 @@ def install_continuation_market_recalibration_finalize() -> None:
     admission.strategy_evaluation_eligible = _legacy_admission_contract
     admission.ENTRY_WINDOW_SECONDS = 20.0
 
-    # Preserve existing <=40% evidence labels so historical contexts do not fork,
-    # while adding new continuation bands beyond the former action ceiling.
+    # Preserve historical v5 labels so old evidence keys/tests stay stable. The new
+    # continuation audit/FOMO surfaces carry the richer 40-75/75-125/>125 bands.
     v5.chase_band = _compatible_chase_band
     v5.latency_band = _compatible_latency_band
 
