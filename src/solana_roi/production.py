@@ -290,6 +290,16 @@ from .wallet_venue_lifecycle_research import install_wallet_venue_lifecycle_rese
 
 install_wallet_venue_lifecycle_research()
 
+# Route the already-prospective wallet/entity evidence by venue, lifecycle, role and
+# regime. Percentage copyable residual ROI, trimmed-return robustness and observed
+# latency decay are research outputs only. Millisecond/first-slot Pump.fun sniping is
+# explicitly outside target capability while Pump.fun remains an observation and
+# residual-continuation source. Scout and momentum confirmation semantics remain
+# separate, and routing recommendations cannot mutate tracking or strategy authority.
+from .wallet_context_router import install_wallet_context_router
+
+install_wallet_context_router()
+
 # Post-PR104 production telemetry proved two composition gaps: the final set-based
 # writer bypassed PR102's per-receipt exact-durable frontier hook, and a frozen scout
 # arriving before launch attestation had no bounded mint-only way to acquire the
