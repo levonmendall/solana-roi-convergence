@@ -43,15 +43,26 @@ def _install_postcompose_repairs() -> None:
         install_scout_candidate_continuity_repair,
     )
 
-    if candidate_plane._ORIGINAL_SERVICE_INGEST is not None:
+    def install_scout_and_preserve_markers() -> None:
         install_scout_candidate_continuity_repair()
+        # The scout provider-assignment wrapper composes over the established
+        # high-volume affinity function. Preserve its intrinsic marker so later
+        # invariants can prove that PR #99 remains installed beneath the wrapper.
+        setattr(storage._assigned_endpoint, "_roi_high_volume_poll_affinity", True)
+
+    if candidate_plane._ORIGINAL_SERVICE_INGEST is not None:
+        install_scout_and_preserve_markers()
     else:
         current_candidate_install = candidate_plane.install_candidate_execution_evidence_plane
         if not bool(getattr(current_candidate_install, "_roi_postcompose_scout_install", False)):
             def install_candidate_then_scout() -> None:
                 current_candidate_install()
-                install_scout_candidate_continuity_repair()
+                install_scout_and_preserve_markers()
 
+            try:
+                install_candidate_then_scout.__dict__.update(getattr(current_candidate_install, "__dict__", {}))
+            except Exception:
+                pass
             setattr(install_candidate_then_scout, "_roi_postcompose_scout_install", True)
             candidate_plane.install_candidate_execution_evidence_plane = install_candidate_then_scout
 
@@ -64,6 +75,10 @@ def _install_postcompose_repairs() -> None:
                 current_storage_install()
                 install_high_volume_signature_cursor_repair()
 
+            try:
+                install_storage_then_high_volume.__dict__.update(getattr(current_storage_install, "__dict__", {}))
+            except Exception:
+                pass
             setattr(install_storage_then_high_volume, "_roi_postcompose_high_volume_poll", True)
             storage.install_continuity_storage_capacity_repair = install_storage_then_high_volume
 
