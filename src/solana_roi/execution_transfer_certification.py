@@ -59,6 +59,14 @@ def _profit_factor(values: list[float]) -> float:
     return math.inf if gains > 0.0 else 0.0
 
 
+def _public_number(value: float) -> float | str | None:
+    if math.isnan(value):
+        return None
+    if math.isinf(value):
+        return "infinity" if value > 0 else "-infinity"
+    return value
+
+
 def _geometric_growth(rows: list[dict[str, Any]], *, return_key: str) -> float:
     growth = 1.0
     for row in rows:
@@ -237,7 +245,7 @@ class V4ExecutionTransferCertification:
                 "samples": len(items),
                 "net_pnl_usd": sum(_pnl_usd(item, return_key=return_key) for item in items),
                 "mean_return": sum(float(item.get(return_key) or 0.0) for item in items) / len(items),
-                "profit_factor": _profit_factor([_pnl_usd(item, return_key=return_key) for item in items]),
+                "profit_factor": _public_number(_profit_factor([_pnl_usd(item, return_key=return_key) for item in items])),
             }
             for group, items in sorted(groups.items())
         }
@@ -346,14 +354,16 @@ class V4ExecutionTransferCertification:
             "net_pnl_usd": total_pnl,
             "return_on_starting_500_usd": total_pnl / STARTING_PAPER_NAV_USD,
             "geometric_growth": growth,
-            "profit_factor": profit_factor,
+            "profit_factor": _public_number(profit_factor),
+            "profit_factor_unbounded": math.isinf(profit_factor) and profit_factor > 0,
             "execution_transfer": {
                 "complete_samples": len(valid_stress),
                 "coverage_fraction": len(valid_stress) / len(selected) if selected else 0.0,
                 "stress_model": "observed_forward_return_plus_one_additional_observed_entry-fee-equivalent_failed-attempt",
                 "execution_stressed_net_pnl_usd": stressed_total,
                 "execution_stressed_geometric_growth": stressed_growth,
-                "execution_stressed_profit_factor": stressed_profit_factor,
+                "execution_stressed_profit_factor": _public_number(stressed_profit_factor),
+                "execution_stressed_profit_factor_unbounded": math.isinf(stressed_profit_factor) and stressed_profit_factor > 0,
                 "delayed_entry_price_path_stress": delayed,
                 "delayed_marks_have_promotion_authority": False,
                 "unsigned_simulation_required_by_entry_trial": True,
