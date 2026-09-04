@@ -63,14 +63,19 @@ def _status_with_high_volume_affinity(self: DirectSolanaIngestionPlane) -> dict[
     targets = storage._watch_targets(self)
     high_volume_assignments: dict[str, str] = {}
     high_volume_official_primaries: list[str] = []
-    for target in targets:
-        if not _is_high_volume_target(target):
-            continue
-        endpoint = storage._assigned_endpoint(self, target)
-        key = storage._target_key(target)
-        high_volume_assignments[key] = endpoint.name
-        if capacity._is_official_public(endpoint):
-            high_volume_official_primaries.append(key)
+
+    # Some intrinsic/status regressions intentionally construct a partial plane
+    # without configured endpoints. Telemetry must remain observational and may not
+    # make such a status call fail merely because assignment is not meaningful yet.
+    if endpoints:
+        for target in targets:
+            if not _is_high_volume_target(target):
+                continue
+            endpoint = storage._assigned_endpoint(self, target)
+            key = storage._target_key(target)
+            high_volume_assignments[key] = endpoint.name
+            if capacity._is_official_public(endpoint):
+                high_volume_official_primaries.append(key)
 
     poll = payload.get("live_poll_redundancy")
     if isinstance(poll, dict):
