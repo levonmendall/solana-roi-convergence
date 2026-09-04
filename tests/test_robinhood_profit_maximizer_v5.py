@@ -7,11 +7,14 @@ from solana_roi.robinhood_chain_profit_maximizer import (
 )
 
 
-def test_v5_policy_overrides_legacy_entry_and_exit_methods() -> None:
+def test_v5_policy_overrides_legacy_entry_and_dispatches_settlement_by_evidence_version() -> None:
     assert issubclass(RobinhoodChainPaperPlane, RobinhoodProfitMaximizerMixin)
     assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("robinhood_chain_profit_maximizer")
     assert RobinhoodChainPaperPlane._maybe_open_v2.__module__.endswith("robinhood_chain_profit_maximizer")
-    assert RobinhoodChainPaperPlane._settle_one.__module__.endswith("robinhood_chain_profit_maximizer")
+    # Settlement has a class-level compatibility dispatcher: v5 trials use learned
+    # exits while pre-v5 trials retain their exact historical reason semantics.
+    assert RobinhoodChainPaperPlane._settle_one.__module__.endswith("robinhood_chain_paper")
+    assert RobinhoodProfitMaximizerMixin._settle_one.__module__.endswith("robinhood_chain_profit_maximizer")
 
 
 def test_v5_version_is_distinct_from_original_bootstrap_policy() -> None:
