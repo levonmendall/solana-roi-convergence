@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 import threading
 
+import pytest
+
 from solana_roi.fomo_continuation_shadow import FomoContinuationShadow, FomoOutcome
 from solana_roi.fomo_venue_lifecycle_reporting import install_fomo_venue_lifecycle_reporting
 
@@ -45,11 +47,11 @@ def test_fomo_roi_is_reported_separately_by_venue_and_lifecycle() -> None:
     amm = segments[("PUMP_AMM", "pump_amm_post_bonding_curve")]
     raydium = segments[("RAYDIUM", "raydium_native_or_migration_unproven")]
     assert pump["sample_count"] == 2
-    assert pump["mean_residual_roi_pct"] == 15.0
+    assert pump["mean_residual_roi_pct"] == pytest.approx(15.0)
     assert amm["sample_count"] == 1
-    assert amm["mean_residual_roi_pct"] == -5.0
+    assert amm["mean_residual_roi_pct"] == pytest.approx(-5.0)
     assert raydium["sample_count"] == 1
-    assert raydium["mean_residual_roi_pct"] == 30.0
+    assert raydium["mean_residual_roi_pct"] == pytest.approx(30.0)
     assert pump["by_fomo_state"]["active_fomo"]["sample_count"] == 2
 
 
