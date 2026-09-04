@@ -24,7 +24,6 @@ from .stream_resilience import (
     SUBSCRIPTION_RETRIES_PER_TARGET,
     SUBSCRIPTION_RETRY_INITIAL_SECONDS,
     SUBSCRIPTION_RETRY_MAX_SECONDS,
-    SubscriptionSetupError,
     _error_parts,
     _retryable_subscription_error,
     _subscription_key,
@@ -52,8 +51,7 @@ def _targets_per_socket() -> int:
 def _rotated_targets(targets: tuple[WatchTarget, ...], provider: str) -> tuple[WatchTarget, ...]:
     if len(targets) <= 1:
         return targets
-    digest = hashlib.sha256(provider.encode("utf-8")).digest()
-    shift = int.from_bytes(digest[:2], "big") % len(targets)
+    shift = int.from_bytes(hashlib.sha256(provider.encode("utf-8")).digest()[:2], "big") % len(targets)
     return targets[shift:] + targets[:shift]
 
 
@@ -65,7 +63,20 @@ def _target_shards(
     return tuple(tuple(ordered[index : index + size]) for index in range(0, len(ordered), size))
 
 
-def _annotate_setup(self: Any, endpoint: RpcEndpoint, *, fallback_count: int = 0) -> None:
+def _fallback_counts(self: Any) -> dict[str, dict[int, int]]:
+    state = getattr(self, "_roi_public_ws_fallback_counts", None)
+    if not isinstance(state, dict):
+        state = {}
+        setattr(self, "_roi_public_ws_fallback_counts", state)
+    return state
+
+
+def _fallback_total(self: Any, provider: str) -> int:
+    provider_rows = _fallback_counts(self).get(provider, {})
+    return sum(int(value) for value in provider_rows.values()) if isinstance(provider_rows, dict) else 0
+
+
+def _annotate_setup(self: Any, endpoint: RpcEndpoint) -> None:
     setup = getattr(self, "_roi_subscription_setup", None)
     if not isinstance(setup, dict):
         setup = {}
@@ -76,12 +87,13 @@ def _annotate_setup(self: Any, endpoint: RpcEndpoint, *, fallback_count: int = 0
         setup[endpoint.name] = row
     targets = tuple(self.watch_targets)
     shards = _target_shards(targets, endpoint.name)
+    fallback_count = _fallback_total(self, endpoint.name)
     row.update(
         {
             "topology": PUBLIC_TOPOLOGY,
-            "physical_websocket_count": len(shards) + max(0, int(fallback_count)),
+            "physical_websocket_count": len(shards) + fallback_count,
             "planned_shard_websocket_count": len(shards),
-            "fallback_single_target_websocket_count": max(0, int(fallback_count)),
+            "fallback_single_target_websocket_count": fallback_count,
             "logs_subscription_count": len(targets),
             "targets_per_shard_socket": _targets_per_socket(),
             "shard_sizes": [len(shard) for shard in shards],
@@ -99,8 +111,8 @@ async def _set_target_state(
     error_code: int | None = None,
     error_message: str | None = None,
 ) -> None:
-    # Dynamic lookup is intentional. poll_recoverability_lease replaces this
-    # function later in package composition and must remain the final authority.
+    # Dynamic lookup is required: the 12-second recoverability lease replaces this
+    # target-quorum function later in package composition and remains authoritative.
     await target_quorum._quorum_set_target_state(
         self,
         endpoint,
@@ -146,6 +158,29 @@ async def _cooperative_dispatch_capacity(tasks: set[asyncio.Task[Any]]) -> None:
         )
 
 
+async def _single_target_fallback(
+    self: Any,
+    endpoint: RpcEndpoint,
+    target: WatchTarget,
+    stop: asyncio.Event,
+) -> None:
+    """Run the final single-target transport and withdraw state on cancellation."""
+    try:
+        await fanout._single_target_stream(self, endpoint, target, stop)
+    finally:
+        # The historical single-target loop intentionally re-raises cancellation
+        # before its normal disconnect branch. Runtime shard replacement can cancel
+        # a fallback while the service itself stays up, so explicitly withdraw it.
+        with suppress(Exception):
+            await _set_target_state(
+                self,
+                endpoint,
+                target,
+                connected=False,
+                error_type="ShardFallbackReplaced",
+            )
+
+
 async def _public_shard_stream(
     self: Any,
     endpoint: RpcEndpoint,
@@ -154,6 +189,7 @@ async def _public_shard_stream(
     stop: asyncio.Event,
 ) -> None:
     reconnect_backoff = STREAM_RECONNECT_INITIAL_SECONDS
+    provider_fallbacks = _fallback_counts(self).setdefault(endpoint.name, {})
     while not stop.is_set():
         acknowledged: dict[int, WatchTarget] = {}
         external_to_internal: dict[str, int] = {}
@@ -162,16 +198,15 @@ async def _public_shard_stream(
         dispatch_tasks: set[asyncio.Task[Any]] = set()
         ack_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         fallback_tasks: dict[str, asyncio.Task[Any]] = {}
-        setup_started = time.monotonic()
         error_code: int | None = None
+        provider_fallbacks[shard_index] = 0
         try:
-            max_queue = fanout.TARGET_WS_MAX_QUEUE * max(1, len(targets))
             async with direct_solana_module.websockets.connect(
                 endpoint.ws_url,
                 ping_interval=15,
                 ping_timeout=15,
                 close_timeout=2,
-                max_queue=max_queue,
+                max_queue=fanout.TARGET_WS_MAX_QUEUE * max(1, len(targets)),
                 max_size=fanout.TARGET_WS_MAX_SIZE_BYTES,
                 compression=None,
             ) as ws:
@@ -187,8 +222,7 @@ async def _public_shard_stream(
                     except Exception:
                         return
                     internal = external_to_internal.get(external)
-                    target = acknowledged.get(internal or -1)
-                    if internal is None or target is None:
+                    if internal is None or internal not in acknowledged:
                         return
                     mapped = dict(message)
                     mapped_params = dict(params)
@@ -206,13 +240,12 @@ async def _public_shard_stream(
 
                 async def reader() -> None:
                     while not stop.is_set():
-                        raw = await ws.recv()
-                        message = json.loads(raw)
+                        message = json.loads(await ws.recv())
                         if not isinstance(message, dict):
                             continue
-                        request_id = message.get("id")
-                        if request_id is not None:
-                            waiter = ack_waiters.get(str(request_id))
+                        raw_id = message.get("id")
+                        if raw_id is not None:
+                            waiter = ack_waiters.get(str(raw_id))
                             if waiter is not None and not waiter.done():
                                 waiter.set_result(message)
                                 continue
@@ -235,7 +268,7 @@ async def _public_shard_stream(
                     wait_set: set[asyncio.Future[Any] | asyncio.Task[Any]] = {waiter, reader_task}
                     if dispatch_failure is not None:
                         wait_set.add(dispatch_failure)
-                    done, _pending = await asyncio.wait(
+                    done, _ = await asyncio.wait(
                         wait_set,
                         timeout=fanout.TARGET_ACK_TIMEOUT_SECONDS,
                         return_when=asyncio.FIRST_COMPLETED,
@@ -251,7 +284,7 @@ async def _public_shard_stream(
                 request_id = shard_index * 1000
                 for internal_id, target in enumerate(targets, start=1):
                     retry_delay = SUBSCRIPTION_RETRY_INITIAL_SECONDS
-                    target_accepted = False
+                    accepted = False
                     last_error_type: str | None = None
                     last_error_message: str | None = None
                     for attempt in range(1, SUBSCRIPTION_RETRIES_PER_TARGET + 1):
@@ -304,12 +337,12 @@ async def _public_shard_stream(
                         acknowledged[internal_id] = target
                         external_to_internal[external] = internal_id
                         await _set_target_state(self, endpoint, target, connected=True)
-                        target_accepted = True
+                        accepted = True
                         break
 
                     if stop.is_set():
                         break
-                    if not target_accepted:
+                    if not accepted:
                         await _set_target_state(
                             self,
                             endpoint,
@@ -319,22 +352,20 @@ async def _public_shard_stream(
                             error_code=error_code,
                             error_message=last_error_message,
                         )
-                        # One rejected subscription must not tear down the accepted
-                        # subscriptions sharing this shard. Keep only that target on
-                        # the already-proven final single-target fallback path.
-                        fallback = asyncio.create_task(
-                            fanout._single_target_stream(self, endpoint, target, stop),
+                        fallback_tasks[fanout._target_key(target)] = asyncio.create_task(
+                            _single_target_fallback(self, endpoint, target, stop),
                             name=f"public-shard-fallback:{endpoint.name}:{target.kind}:{target.address[:8]}",
                         )
-                        fallback_tasks[fanout._target_key(target)] = fallback
+                        provider_fallbacks[shard_index] = len(fallback_tasks)
+                        _annotate_setup(self, endpoint)
 
-                _annotate_setup(self, endpoint, fallback_count=len(fallback_tasks))
+                _annotate_setup(self, endpoint)
                 stable_since = time.monotonic()
                 stop_task = asyncio.create_task(stop.wait(), name=f"public-shard-stop:{endpoint.name}:{shard_index}")
                 wait_set: set[asyncio.Future[Any] | asyncio.Task[Any]] = {stop_task, reader_task}
                 if dispatch_failure is not None:
                     wait_set.add(dispatch_failure)
-                done, _pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
                 if dispatch_failure is not None and dispatch_failure in done:
                     await dispatch_failure
                 if reader_task in done:
@@ -360,12 +391,7 @@ async def _public_shard_stream(
                 await asyncio.sleep(reconnect_backoff)
                 reconnect_backoff = min(STREAM_RECONNECT_MAX_SECONDS, reconnect_backoff * 2.0)
         else:
-            await _mark_disconnected(
-                self,
-                endpoint,
-                tuple(acknowledged.values()),
-                error_type=None,
-            )
+            await _mark_disconnected(self, endpoint, tuple(acknowledged.values()), error_type=None)
         finally:
             if reader_task is not None and not reader_task.done():
                 reader_task.cancel()
@@ -375,11 +401,7 @@ async def _public_shard_stream(
             for task in fallback_tasks.values():
                 if not task.done():
                     task.cancel()
-            awaitables: list[asyncio.Task[Any]] = []
-            if reader_task is not None:
-                awaitables.append(reader_task)
-            awaitables.extend(tuple(dispatch_tasks))
-            awaitables.extend(fallback_tasks.values())
+            awaitables = ([reader_task] if reader_task is not None else []) + list(dispatch_tasks) + list(fallback_tasks.values())
             for task in awaitables:
                 with suppress(asyncio.CancelledError, Exception):
                     await task
@@ -389,12 +411,11 @@ async def _public_shard_stream(
                 elif not dispatch_failure.cancelled():
                     with suppress(Exception):
                         dispatch_failure.exception()
-            _annotate_setup(self, endpoint, fallback_count=0)
+            provider_fallbacks[shard_index] = 0
+            _annotate_setup(self, endpoint)
 
 
-async def _public_sharded_provider_fanout(
-    self: Any, endpoint: RpcEndpoint, stop: asyncio.Event
-) -> None:
+async def _public_sharded_provider_fanout(self: Any, endpoint: RpcEndpoint, stop: asyncio.Event) -> None:
     assert _ORIGINAL_PROVIDER_FANOUT is not None
     if alchemy._is_alchemy_endpoint(endpoint):
         await _ORIGINAL_PROVIDER_FANOUT(self, endpoint, stop)
@@ -403,10 +424,11 @@ async def _public_sharded_provider_fanout(
     targets = tuple(self.watch_targets)
     shards = _target_shards(targets, endpoint.name)
     tasks: list[asyncio.Task[Any]] = []
-    setattr(self, "_roi_public_ws_shard_plan", getattr(self, "_roi_public_ws_shard_plan", {}) or {})
-    plan = getattr(self, "_roi_public_ws_shard_plan")
-    if isinstance(plan, dict):
-        plan[endpoint.name] = [[fanout._target_key(target) for target in shard] for shard in shards]
+    plan = getattr(self, "_roi_public_ws_shard_plan", None)
+    if not isinstance(plan, dict):
+        plan = {}
+        setattr(self, "_roi_public_ws_shard_plan", plan)
+    plan[endpoint.name] = [[fanout._target_key(target) for target in shard] for shard in shards]
     _annotate_setup(self, endpoint)
     try:
         for index, shard in enumerate(shards):
@@ -424,12 +446,13 @@ async def _public_sharded_provider_fanout(
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+# Preserve the marker contract of the provider-specific Alchemy wrapper because this
+# replacement delegates Alchemy endpoints to that exact captured implementation.
+setattr(_public_sharded_provider_fanout, "_roi_alchemy_provider_specific", True)
 setattr(_public_sharded_provider_fanout, "_roi_public_ws_sharded", True)
 
 
-def _status_with_public_ws_shards(
-    original: Callable[[Any], dict[str, Any]]
-) -> Callable[[Any], dict[str, Any]]:
+def _status_with_public_ws_shards(original: Callable[[Any], dict[str, Any]]) -> Callable[[Any], dict[str, Any]]:
     def status(self: Any) -> dict[str, Any]:
         payload = original(self)
         targets = tuple(self.watch_targets)
@@ -438,6 +461,7 @@ def _status_with_public_ws_shards(
         shard_size = _targets_per_socket()
         planned_per_provider = math.ceil(target_count / shard_size) if target_count else 0
         plans = getattr(self, "_roi_public_ws_shard_plan", {})
+        fallbacks = _fallback_counts(self)
 
         stream = payload.setdefault("target_stream_fanout", {})
         if isinstance(stream, dict):
@@ -445,16 +469,17 @@ def _status_with_public_ws_shards(
             if isinstance(providers, dict):
                 for endpoint in public_endpoints:
                     row = providers.get(endpoint.name)
-                    if not isinstance(row, dict):
-                        continue
-                    row.update(
-                        {
-                            "topology": PUBLIC_TOPOLOGY,
-                            "websocket_connection_count": planned_per_provider,
-                            "logs_subscription_count": target_count,
-                            "target_shards": plans.get(endpoint.name) if isinstance(plans, dict) else None,
-                        }
-                    )
+                    if isinstance(row, dict):
+                        row.update(
+                            {
+                                "topology": PUBLIC_TOPOLOGY,
+                                "websocket_connection_count": planned_per_provider + _fallback_total(self, endpoint.name),
+                                "planned_shard_websocket_count": planned_per_provider,
+                                "fallback_single_target_websocket_count": _fallback_total(self, endpoint.name),
+                                "logs_subscription_count": target_count,
+                                "target_shards": plans.get(endpoint.name) if isinstance(plans, dict) else None,
+                            }
+                        )
             stream["public_provider_topology"] = PUBLIC_TOPOLOGY
             stream["public_targets_per_socket"] = shard_size
             stream["public_planned_websocket_connections_per_provider"] = planned_per_provider
@@ -501,9 +526,11 @@ def _status_with_public_ws_shards(
             "targets_per_socket": shard_size,
             "planned_connections_per_public_provider": planned_per_provider,
             "planned_public_connections_total": planned_per_provider * len(public_endpoints),
+            "active_fallback_connections_total": sum(_fallback_total(self, endpoint.name) for endpoint in public_endpoints),
             "previous_public_connections_total": target_count * len(public_endpoints),
             "logical_subscriptions_unchanged": target_count * len(public_endpoints),
             "provider_rotated_shards": plans if isinstance(plans, dict) else {},
+            "fallbacks_by_provider_shard": fallbacks,
             "paper_only": True,
             "live_money_authority": False,
             "signing_available": False,
