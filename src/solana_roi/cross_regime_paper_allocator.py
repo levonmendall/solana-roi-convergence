@@ -15,6 +15,7 @@ TRANSACTION_SUBMISSION_AVAILABLE = False
 MIN_SEGMENT_SAMPLES = 30
 MAX_SEGMENT_WEIGHT = 0.50
 UNKNOWN_CORRELATION_WEIGHT_CAP = 0.25
+ALLOCATOR_EVIDENCE_POSITION_GRID = (0.005, 0.01, 0.02, 0.05)
 
 
 def _table_exists(store: Any, table: str) -> bool:
@@ -104,13 +105,22 @@ def build_cross_regime_allocation(store: Any, release_commit: str) -> dict[str, 
     forward observations exist to estimate it reliably, any one regime is capped at
     25% rather than assuming independence. Once correlation evidence is added, that
     cap can be relaxed up to the hard 50% per-regime ceiling.
+
+    The evidence profile uses at most a 5% per-observation trial fraction. Meta-level
+    regime weights are decided separately below, so the allocator does not reject a
+    profitable regime merely because a hypothetical 20% single-trade fraction would
+    have breached the strategy-level drawdown constraint.
     """
     grouped = _segment_returns(store, release_commit)
     profiles: dict[str, dict[str, Any]] = {}
     scores: dict[str, float] = {}
     caps: dict[str, float] = {}
     for segment, values in grouped.items():
-        profile = robust_return_profile(values, max_fraction=0.20)
+        profile = robust_return_profile(
+            values,
+            grid=ALLOCATOR_EVIDENCE_POSITION_GRID,
+            max_fraction=0.05,
+        )
         profiles[segment] = asdict(profile)
         mature = profile.sample_count >= MIN_SEGMENT_SAMPLES
         promoted = profile.state == "promoted_positive_log_growth"
