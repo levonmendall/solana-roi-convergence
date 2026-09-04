@@ -1,42 +1,49 @@
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 from solana_roi import robinhood_runtime_install as runtime_install
+from solana_roi import robinhood_worker_isolation_repair as isolation
+
+
+def _canonical_store(path: Path) -> SimpleNamespace:
+    db = sqlite3.connect(path, check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    return SimpleNamespace(path=path, db=db, _lock=threading.RLock())
 
 
 def test_dedicated_store_is_separate_sibling_by_default(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("ROBINHOOD_ISOLATED_STORE_PATH", raising=False)
-    canonical = tmp_path / "solana-roi.sqlite3"
-    isolated = runtime_install._dedicated_store_path(canonical)
+    monkeypatch.delenv("ROBINHOOD_CHAIN_STORE_PATH", raising=False)
+    canonical = SimpleNamespace(path=tmp_path / "solana-roi.sqlite3")
 
-    assert isolated == tmp_path / "solana-roi-robinhood.sqlite3"
-    assert isolated != canonical
-    assert isolated.parent == canonical.parent
+    isolated = isolation._dedicated_store_path(canonical)
+
+    assert isolated == (tmp_path / "solana-roi-robinhood-chain.sqlite3").resolve()
+    assert isolated != Path(canonical.path).resolve()
+    assert isolated.parent == Path(canonical.path).resolve().parent
 
 
 def test_dedicated_store_path_can_be_explicit(tmp_path: Path, monkeypatch) -> None:
+    canonical = SimpleNamespace(path=tmp_path / "canonical.sqlite3")
     explicit = tmp_path / "robinhood-only.sqlite3"
-    monkeypatch.setenv("ROBINHOOD_ISOLATED_STORE_PATH", str(explicit))
+    monkeypatch.setenv("ROBINHOOD_CHAIN_STORE_PATH", str(explicit))
 
-    assert runtime_install._dedicated_store_path(tmp_path / "canonical.sqlite3") == explicit
+    assert isolation._dedicated_store_path(canonical) == explicit.resolve()
 
 
-def test_cursor_seed_is_read_only_and_only_when_isolated_cursor_missing(tmp_path: Path) -> None:
-    canonical = tmp_path / "canonical.sqlite3"
-    connection = sqlite3.connect(canonical)
-    connection.execute(
+def test_cursor_seed_copies_only_processed_block_cursor(tmp_path: Path) -> None:
+    canonical = _canonical_store(tmp_path / "canonical.sqlite3")
+    canonical.db.execute(
         "CREATE TABLE robinhood_chain_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)"
     )
-    connection.execute(
+    canonical.db.execute(
         "INSERT INTO robinhood_chain_state(key,value,updated_at) VALUES ('cursor_block','9123456','now')"
     )
-    connection.commit()
-    connection.close()
+    canonical.db.commit()
 
     class Plane:
         def __init__(self) -> None:
@@ -48,62 +55,92 @@ def test_cursor_seed_is_read_only_and_only_when_isolated_cursor_missing(tmp_path
             self.values.append(value)
 
     plane = Plane()
-    seeded, error = runtime_install._seed_cursor_from_canonical(plane, canonical)  # type: ignore[arg-type]
-    assert seeded is True
-    assert error is None
+    seeded = isolation._seed_cursor_from_canonical(plane, canonical)
+    assert seeded == 9_123_456
     assert plane._cursor == 9_123_456
     assert plane.values == [9_123_456]
 
-    seeded_again, second_error = runtime_install._seed_cursor_from_canonical(plane, canonical)  # type: ignore[arg-type]
-    assert seeded_again is False
-    assert second_error is None
+    seeded_again = isolation._seed_cursor_from_canonical(plane, canonical)
+    assert seeded_again == 9_123_456
     assert plane.values == [9_123_456]
+    canonical.db.close()
 
 
-def test_status_is_served_from_cached_snapshot_not_live_plane(monkeypatch) -> None:
+def test_status_is_served_from_cache_without_live_worker_store_access(monkeypatch) -> None:
     snapshot = {
         "runtime_ready": True,
         "paper_only": True,
-        "block_lag": 7,
-        "production_install": {"state": "stale-copy"},
+        "paper_trading_authority": True,
+        "caught_up_for_paper_decisions": True,
+        "paper_decision_transport_ready": True,
+        "block_lag": 1,
+        "worker_isolation": {"dedicated_store_path": "/tmp/robinhood.sqlite3"},
     }
-    monkeypatch.setattr(runtime_install, "_STATUS_SNAPSHOT", snapshot)
-    monkeypatch.setattr(runtime_install, "_PLANE", SimpleNamespace(status=lambda: (_ for _ in ()).throw(AssertionError())))
+    monkeypatch.setattr(isolation, "_STATUS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(isolation, "_STATUS_PUBLISHED_MONOTONIC", time.monotonic())
+    monkeypatch.setattr(isolation, "_WORKER_THREAD", threading.current_thread())
     runtime_install._STATE["state"] = "running"
 
-    payload = runtime_install._status()
+    payload = isolation._nonblocking_status()
 
     assert payload["runtime_ready"] is True
-    assert payload["block_lag"] == 7
+    assert payload["block_lag"] == 1
     assert payload["production_install"]["state"] == "running"
-    assert payload["worker_isolation"]["dedicated_thread"] is True
-    assert payload["worker_isolation"]["dedicated_asyncio_event_loop"] is True
-    assert payload["worker_isolation"]["dedicated_sqlite_file"] is True
-    assert payload["worker_isolation"]["canonical_sqlite_shared"] is False
-    assert payload["worker_isolation"]["uvicorn_event_loop_runs_robinhood_polling"] is False
-    assert payload["worker_isolation"]["uvicorn_event_loop_runs_robinhood_sqlite"] is False
+    worker = payload["worker_isolation"]
+    assert worker["worker_topology"] == "dedicated_os_thread_with_private_asyncio_loop"
+    assert worker["dedicated_sqlite_store"] is True
+    assert worker["canonical_store_shared_for_robinhood_writes"] is False
+    assert worker["uvicorn_event_loop_runs_robinhood_chain_worker"] is False
+    assert worker["status_served_from_nonblocking_cache"] is True
+    assert worker["status_cache_stale"] is False
 
 
-def test_runtime_wrapper_starts_robinhood_on_dedicated_thread(monkeypatch, tmp_path: Path) -> None:
-    calls: list[tuple[str, int]] = []
+def test_runtime_install_composes_isolation_before_production_start() -> None:
+    assert runtime_install._runtime_workers_with_robinhood is isolation._isolated_runtime_workers
+    assert runtime_install._status is isolation._nonblocking_status
+    assert runtime_install._STATE["worker_isolation_repair"] == isolation.REPAIR_VERSION
+    assert runtime_install._STATE["worker_isolation"] == "dedicated_os_thread_with_private_asyncio_loop"
+
+
+def test_worker_constructs_plane_on_dedicated_thread_with_private_store(tmp_path: Path, monkeypatch) -> None:
+    canonical = _canonical_store(tmp_path / "canonical.sqlite3")
     parent_thread = threading.get_ident()
+    observed: dict[str, object] = {}
 
-    def fake_thread_entry(path: str, stop_event: threading.Event) -> None:
-        calls.append((path, threading.get_ident()))
-        stop_event.wait(2.0)
+    class Store:
+        def __init__(self, path: Path) -> None:
+            observed["store_path"] = Path(path)
 
-    async def canonical_workers(_runtime, _stop) -> None:
-        await asyncio.sleep(0.02)
+        def close(self) -> None:
+            observed["store_closed"] = True
 
-    monkeypatch.setattr(runtime_install, "_thread_entry", fake_thread_entry)
-    monkeypatch.setattr(runtime_install, "_ORIGINAL_RUNTIME_WORKERS", canonical_workers)
-    runtime = SimpleNamespace(store=SimpleNamespace(path=tmp_path / "canonical.sqlite3"))
-    stop = asyncio.Event()
+    class Plane:
+        enabled = False
+        _cursor = None
+
+        def __init__(self, store: Store) -> None:
+            self.store = store
+            observed["plane_thread"] = threading.get_ident()
+
+        def _set_cursor(self, value: int) -> None:
+            self._cursor = value
+
+        async def close(self) -> None:
+            observed["plane_closed"] = True
+
+    monkeypatch.setattr(isolation, "_ORIGINAL_STATUS", lambda: {"runtime_ready": False, "paper_only": True})
+    thread, stop = isolation._start_worker_thread(
+        canonical,
+        plane_factory=Plane,
+        store_factory=Store,
+    )
+    thread.join(2.0)
     stop.set()
 
-    asyncio.run(runtime_install._runtime_workers_with_robinhood(runtime, stop))
-
-    assert calls
-    assert calls[0][0] == str(tmp_path / "canonical.sqlite3")
-    assert calls[0][1] != parent_thread
-    assert runtime_install._STATE["dedicated_thread_alive"] is False
+    assert thread.is_alive() is False
+    assert observed["plane_thread"] != parent_thread
+    assert observed["store_path"] == (tmp_path / "canonical-robinhood-chain.sqlite3").resolve()
+    assert observed["store_path"] != Path(canonical.path).resolve()
+    assert observed["store_closed"] is True
+    assert observed["plane_closed"] is True
+    canonical.db.close()
