@@ -8,9 +8,11 @@ from .robinhood_chain_ingest import RobinhoodIngestMixin
 from .robinhood_chain_decision import RobinhoodDecisionMixin
 from .robinhood_chain_settlement import RobinhoodSettlementMixin
 from .robinhood_chain_runtime import RobinhoodRuntimeMixin
+from .robinhood_chain_profit_maximizer import RobinhoodProfitMaximizerMixin
 
 
 class RobinhoodChainPaperPlane(
+    RobinhoodProfitMaximizerMixin,
     RobinhoodStateMixin,
     RobinhoodIdentityMixin,
     RobinhoodMetricsMixin,
@@ -19,7 +21,7 @@ class RobinhoodChainPaperPlane(
     RobinhoodSettlementMixin,
     RobinhoodRuntimeMixin,
 ):
-    """Active Robinhood Chain paper-trading plane using forward on-chain evidence only."""
+    """Active Robinhood Chain paper plane with risk-conditioned v5 policy authority."""
 
 
 __all__ = [
