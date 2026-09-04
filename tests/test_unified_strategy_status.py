@@ -139,6 +139,7 @@ def test_unified_status_exposes_all_three_planes_and_separates_capability_from_p
     robinhood = {
         "runtime_ready": True,
         "paper_trading_authority": True,
+        "caught_up_for_paper_decisions": True,
         "failed_closed": False,
         "paper_only": True,
         "live_money_authority": False,

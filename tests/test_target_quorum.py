@@ -47,13 +47,16 @@ def test_two_partial_providers_can_preserve_full_scope_without_false_outage(tmp_
         # Moving the scout from provider-a to provider-b with a real uncovered
         # interval creates a true prospective continuity gap.
         await _quorum_set_target_state(plane, a, scout, connected=False, error_type="ConnectionClosedError")
-        assert plane.journal.outage_started_at() is not None
+        outage_boundary = plane.journal.outage_started_at()
+        assert outage_boundary is not None
         await _quorum_set_target_state(plane, b, scout, connected=True)
 
         recovered = plane.journal.status()
         assert recovered["unresolved_gap"] is True
         assert recovered["last_backfill_error"] == GAP_ERROR
-        assert recovered["outage_started_at"] is None
+        # Failed recovery must retain the exact retry boundary. Clearing this while
+        # unresolved would orphan the gap and make continuity permanently false.
+        assert recovered["outage_started_at"] == outage_boundary.isoformat()
 
     asyncio.run(scenario())
 

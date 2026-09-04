@@ -115,6 +115,15 @@ from .unified_strategy_status import (
 
 install_regime_paper_e2e_probe()
 
+# The first production all-strategy status exposed two continuity truth gaps: a
+# failed direct-Solana gap recovery could erase its own retry boundary, while
+# Robinhood could be reported E2E-achievable before it was caught up enough to make
+# paper decisions. Install the fail-closed continuity/readiness repair before the
+# ASGI routes are wrapped and before background workers start.
+from .continuity_e2e_readiness_repair import install_continuity_e2e_readiness_repair
+
+install_continuity_e2e_readiness_repair()
+
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 from .robinhood_chain_profit_maximizer import ROBINHOOD_V5_VERSION
 
