@@ -215,6 +215,22 @@ def install_strategy_candidate_admission_repair() -> None:
     FinalProfitFirstResearchAdapter.status = _status_with_modern_admission  # type: ignore[method-assign]
     _INSTALLED = True
 
+    # The current strategy is continuation-first rather than a sniper. Compose the
+    # final paper-only recalibration here so it wraps the already-final v5.1/wallet
+    # authority path and is in place before the unified regime probe is installed.
+    from .continuation_market_recalibration import install_continuation_market_recalibration
+
+    install_continuation_market_recalibration()
+
+    # Restore legacy helper/band/version contracts around the new final authority.
+    # This keeps historical evidence labels and direct helper tests stable while the
+    # outer runtime buy/FOMO/Robinhood policies remain continuation-first.
+    from .continuation_market_recalibration_finalize import (
+        install_continuation_market_recalibration_finalize,
+    )
+
+    install_continuation_market_recalibration_finalize()
+
 
 __all__ = [
     "ENTRY_WINDOW_SECONDS",
