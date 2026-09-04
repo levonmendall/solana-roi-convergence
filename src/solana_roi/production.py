@@ -270,6 +270,16 @@ from .render_runtime_bootstrap_repair import install_render_runtime_bootstrap_ha
 
 install_render_runtime_bootstrap_handoff()
 
+# PR #104 fixes the semantic mismatch between the five-second latency target and
+# the unchanged twenty-second executable-entry ceiling. The complete production
+# composition above installs the existing candidate hot path first; this final
+# wrapper keeps >5s samples as latency failures while allowing point-in-time risk
+# evidence to mature prospectively until 20s. No strategy threshold, continuity
+# rule, paper authority, signing, submission, or live-money boundary changes.
+from .candidate_risk_window_repair import install_candidate_risk_window_repair
+
+install_candidate_risk_window_repair()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 
 __all__ = [
