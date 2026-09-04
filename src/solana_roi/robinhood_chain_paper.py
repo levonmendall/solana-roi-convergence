@@ -11,6 +11,16 @@ from .robinhood_chain_decision import RobinhoodDecisionMixin
 from .robinhood_chain_settlement import RobinhoodSettlementMixin
 from .robinhood_chain_runtime import RobinhoodRuntimeMixin
 from .robinhood_chain_profit_maximizer import RobinhoodProfitMaximizerMixin
+from .strategy_specialist_wallet_allocator_repair import (
+    install_strategy_specialist_wallet_allocator_repair,
+)
+
+# robinhood_runtime_install composes PR120 v5 and then installs the Solana specialist
+# wallet allocator before importing this module. Apply the narrow fairness repair at
+# that boundary so each strategy family gets a specialist before a second regime of
+# the same strategy can consume scarce capacity. This changes no Robinhood entity
+# authority, strategy threshold, mechanical hard stop, signing, or live-money scope.
+install_strategy_specialist_wallet_allocator_repair()
 
 
 class RobinhoodChainPaperPlane(
