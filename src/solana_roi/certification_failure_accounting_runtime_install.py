@@ -19,10 +19,14 @@ def install_final_certification_failure_accounting() -> None:
     Install the exact-release transport, generation-safe recovery, standby
     affinity/priority, confirmed-WebSocket checkpoint architecture, hydration
     scheduling, candidate RPC-priority/hedging, universal continuity scheduling,
-    and the final realtime wallet-to-v4 handoff here so no older installer can
-    replace them before runtime tasks are created.
+    the candidate-completion/standby-fairness repair, and the final realtime
+    wallet-to-v4 handoff here so no older installer can replace them before runtime
+    tasks are created.
     """
 
+    from .candidate_completion_continuity_repair import (
+        install_candidate_completion_continuity_repair,
+    )
     from .candidate_hydration_work_conserving_repair import (
         install_candidate_hydration_work_conserving_repair,
     )
@@ -60,6 +64,11 @@ def install_final_certification_failure_accounting() -> None:
     install_high_volume_standby_checkpoint_architecture()
     install_certification_runtime_architecture_repair()
     install_wallet_forward_pipeline_architecture()
+    # This must remain after PR97/PR98 composition. It closes the two production
+    # races proved by exact-release telemetry: candidate retry churn can consume the
+    # entire scout entry window, and continuous candidate traffic can starve the
+    # high-volume standby lane that keeps the fixed 3x1000 recovery bound useful.
+    install_candidate_completion_continuity_repair()
 
     current_discard = retention._discard_hydration_row
     if not bool(getattr(current_discard, "_roi_failure_accounting", False)):
