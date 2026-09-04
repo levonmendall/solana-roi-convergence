@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 
 from solana_roi import robinhood_chain_runtime as robinhood_runtime
+from solana_roi import robinhood_event_loop_fairness_repair as fairness_module
 from solana_roi.robinhood_chain_ingest import RobinhoodIngestMixin
 from solana_roi.robinhood_chain_paper import RobinhoodChainPaperPlane
 from solana_roi.robinhood_catchup_capacity_repair import (
@@ -12,7 +13,9 @@ from solana_roi.robinhood_catchup_capacity_repair import (
     _catchup_poll_seconds,
 )
 from solana_roi.robinhood_event_loop_fairness_repair import (
+    DEFAULT_CATCHUP_CPU_DUTY_CYCLE,
     REPAIR_VERSION,
+    _cooperative_catchup_checkpoint,
     _status_with_event_loop_fairness,
     _wrap_ingest_method,
 )
@@ -53,15 +56,27 @@ def test_dense_catchup_processing_yields_to_health_like_coroutine() -> None:
 
     asyncio.run(scenario())
 
-    # Without the cooperative checkpoint the dense worker can consume the event
-    # loop until every synchronous handler finishes. The repair must schedule the
-    # health-like coroutine throughout the batch, not only after it.
     assert heartbeat_ticks >= 20
     assert plane._roi_catchup_cooperative_yields_total == 40
     assert plane._roi_catchup_last_checkpoint_phase == "dense_test"
 
 
-def test_fairness_repair_does_not_throttle_or_relax_catchup_policy() -> None:
+def test_cpu_governor_reserves_headroom_from_thread_cpu_not_wall_time(monkeypatch) -> None:
+    plane = SimpleNamespace(_roi_catchup_mode=True, _caught_up=False)
+    readings = iter((1.000, 1.025, 1.026))
+    monkeypatch.setattr(fairness_module.time, "thread_time", lambda: next(readings))
+    monkeypatch.setenv("ROBINHOOD_CATCHUP_CPU_DUTY_CYCLE", "0.5")
+    monkeypatch.setenv("ROBINHOOD_CATCHUP_CPU_BURST_SECONDS", "0.02")
+
+    asyncio.run(_cooperative_catchup_checkpoint(plane, phase="cpu_budget_test"))
+
+    assert plane._roi_catchup_cpu_governor_sleeps_total == 1
+    assert plane._roi_catchup_cpu_governor_sleep_seconds_total >= 0.024
+    assert plane._roi_catchup_cpu_governor_last_sleep_seconds >= 0.024
+    assert plane._roi_catchup_cpu_since_governor_seconds == 0.0
+
+
+def test_cpu_governor_preserves_catchup_policy_and_paper_boundaries() -> None:
     plane = SimpleNamespace(
         _roi_catchup_mode=True,
         _caught_up=False,
@@ -82,11 +97,15 @@ def test_fairness_repair_does_not_throttle_or_relax_catchup_policy() -> None:
 
     assert fairness["repair_version"] == REPAIR_VERSION
     assert fairness["cooperative_yield_after_each_processed_catchup_log"] is True
+    assert fairness["thread_cpu_governor_enabled_during_catchup"] is True
+    assert fairness["catchup_cpu_duty_cycle"] == DEFAULT_CATCHUP_CPU_DUTY_CYCLE
     assert fairness["catchup_batch_limit_changed"] is False
     assert fairness["catchup_poll_cadence_changed"] is False
+    assert fairness["historical_work_skipped"] is False
     assert fairness["block_ranges_skipped"] is False
     assert fairness["cursor_advance_semantics_changed"] is False
     assert fairness["paper_decision_gate_changed"] is False
+    assert fairness["governor_inert_once_caught_up"] is True
     assert fairness["paper_only"] is True
     assert fairness["live_money_authority"] is False
     assert payload["catchup_capacity"]["catchup_batch_limit_blocks"] == 800
