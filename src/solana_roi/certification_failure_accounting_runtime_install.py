@@ -16,11 +16,11 @@ def install_final_certification_failure_accounting() -> None:
     continuity/research/quote wrapper marker.
 
     This is also the final post-frontier composition point in Render bootstrap.
-    Install the exact-release transport, generation-safe recovery, high-volume
-    standby affinity/priority, confirmed-WebSocket standby checkpoint architecture,
-    hydration scheduling, candidate RPC-priority/hedging, and the final realtime
-    wallet-to-v4 handoff here so no older installer can replace them before runtime
-    tasks are created.
+    Install the exact-release transport, generation-safe recovery, standby
+    affinity/priority, confirmed-WebSocket checkpoint architecture, hydration
+    scheduling, candidate RPC-priority/hedging, universal continuity scheduling,
+    and the final realtime wallet-to-v4 handoff here so no older installer can
+    replace them before runtime tasks are created.
     """
 
     from .candidate_hydration_work_conserving_repair import (
@@ -28,6 +28,9 @@ def install_final_certification_failure_accounting() -> None:
     )
     from .candidate_rpc_hedge_repair import install_candidate_rpc_hedge_repair
     from .candidate_rpc_priority_repair import install_candidate_rpc_priority_repair
+    from .certification_runtime_architecture_repair import (
+        install_certification_runtime_architecture_repair,
+    )
     from .continuity_early_loss_detection_repair import (
         install_continuity_early_loss_detection_repair,
     )
@@ -55,6 +58,7 @@ def install_final_certification_failure_accounting() -> None:
     install_continuity_standby_rpc_priority_repair()
     install_candidate_rpc_hedge_repair()
     install_high_volume_standby_checkpoint_architecture()
+    install_certification_runtime_architecture_repair()
     install_wallet_forward_pipeline_architecture()
 
     current_discard = retention._discard_hydration_row
