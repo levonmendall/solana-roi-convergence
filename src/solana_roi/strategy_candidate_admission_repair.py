@@ -222,6 +222,15 @@ def install_strategy_candidate_admission_repair() -> None:
 
     install_continuation_market_recalibration()
 
+    # Restore legacy helper/band/version contracts around the new final authority.
+    # This keeps historical evidence labels and direct helper tests stable while the
+    # outer runtime buy/FOMO/Robinhood policies remain continuation-first.
+    from .continuation_market_recalibration_finalize import (
+        install_continuation_market_recalibration_finalize,
+    )
+
+    install_continuation_market_recalibration_finalize()
+
 
 __all__ = [
     "ENTRY_WINDOW_SECONDS",
