@@ -390,31 +390,32 @@ def _manifest_with_fomo(self: FinalProfitFirstResearchAdapter) -> dict[str, Any]
 
 
 def install_fomo_runtime() -> None:
+    """Install each FOMO wrapper exactly once, even if a later outer wrapper hides its marker."""
     global _ORIGINAL_OBSERVE, _ORIGINAL_SELL, _ORIGINAL_STATUS, _ORIGINAL_MANIFEST
 
     current_observe = FinalProfitFirstResearchAdapter.observe
-    if not bool(getattr(current_observe, "_roi_fomo_runtime", False)):
+    if _ORIGINAL_OBSERVE is None:
         _ORIGINAL_OBSERVE = current_observe
         _inherit_markers(_observe_with_fomo, current_observe)
         setattr(_observe_with_fomo, "_roi_fomo_runtime", True)
         FinalProfitFirstResearchAdapter.observe = _observe_with_fomo  # type: ignore[method-assign]
 
     current_sell = FinalProfitFirstResearchAdapter._sell
-    if not bool(getattr(current_sell, "_roi_fomo_runtime", False)):
+    if _ORIGINAL_SELL is None:
         _ORIGINAL_SELL = current_sell
         _inherit_markers(_sell_with_fomo, current_sell)
         setattr(_sell_with_fomo, "_roi_fomo_runtime", True)
         FinalProfitFirstResearchAdapter._sell = _sell_with_fomo  # type: ignore[method-assign]
 
     current_status = FinalProfitFirstResearchAdapter.status
-    if not bool(getattr(current_status, "_roi_fomo_runtime", False)):
+    if _ORIGINAL_STATUS is None:
         _ORIGINAL_STATUS = current_status
         _inherit_markers(_status_with_fomo, current_status)
         setattr(_status_with_fomo, "_roi_fomo_runtime", True)
         FinalProfitFirstResearchAdapter.status = _status_with_fomo  # type: ignore[method-assign]
 
     current_manifest = FinalProfitFirstResearchAdapter._manifest
-    if not bool(getattr(current_manifest, "_roi_fomo_runtime", False)):
+    if _ORIGINAL_MANIFEST is None:
         _ORIGINAL_MANIFEST = current_manifest
         _inherit_markers(_manifest_with_fomo, current_manifest)
         setattr(_manifest_with_fomo, "_roi_fomo_runtime", True)
