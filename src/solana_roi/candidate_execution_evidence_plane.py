@@ -193,7 +193,14 @@ def _direct_init_with_candidate_plane(
     if _ORIGINAL_DIRECT_INIT is None:
         raise RuntimeError("candidate execution-evidence plane init is not installed")
     _ORIGINAL_DIRECT_INIT(self, *args, **kwargs)
-    setattr(self.service, "_roi_candidate_execution_plane", self)
+    # Production uses a mutable CollectingLiveEvidenceIngestionService. A few
+    # low-level transport tests intentionally pass a bare object() because they do
+    # not exercise ingestion. Keep those immutable test doubles on the original
+    # path instead of making candidate-plane attachment a constructor requirement.
+    try:
+        setattr(self.service, "_roi_candidate_execution_plane", self)
+    except (AttributeError, TypeError):
+        pass
 
 
 setattr(_direct_init_with_candidate_plane, "_roi_candidate_execution_evidence_plane", True)
