@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from types import SimpleNamespace
 
+from solana_roi import continuity_durability_repair as durability
 from solana_roi import continuity_high_volume_checkpoint_architecture as architecture
 from solana_roi import continuity_high_volume_poll_affinity_repair as affinity
 from solana_roi import continuity_target_frontier_repair as frontier
@@ -149,3 +150,9 @@ def test_non_high_volume_target_keeps_existing_bounded_poll(monkeypatch):
     result = asyncio.run(architecture._checkpointed_slot_fetch_delta(plane, target, 44))
     assert calls == [44]
     assert result == ([], True, "publicnode", 4.0)
+
+
+def test_checkpoint_wrapper_is_recognized_as_hedged_real_gap_boundary():
+    assert durability._requires_hedged_real_gap_fetch(
+        architecture._checkpointed_slot_fetch_delta
+    ) is True
