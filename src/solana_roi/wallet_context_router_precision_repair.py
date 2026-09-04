@@ -264,6 +264,15 @@ def install_wallet_context_router_precision_repair() -> None:
 
     install_fomo_paper_strategy()
 
+    # Keep the current FOMO/scout decisions unchanged while recording enough
+    # prospective evidence to improve them later: alternative FOMO entry windows,
+    # post-entry flow rollover, generic price paths/MFE/MAE, exit giveback and
+    # rejected-candidate counterfactuals. The learner has no mutation authority and
+    # adds no RPC/quote work to the candidate hot path.
+    from .continuous_strategy_learning import install_continuous_strategy_learning
+
+    install_continuous_strategy_learning()
+
 
 __all__ = [
     "ACTIVE_STRATEGY_MUTATION_ALLOWED",
