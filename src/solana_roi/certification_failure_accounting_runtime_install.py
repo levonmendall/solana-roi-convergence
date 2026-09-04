@@ -16,14 +16,15 @@ def install_final_certification_failure_accounting() -> None:
     continuity/research/quote wrapper marker.
 
     This is also the final post-frontier composition point in Render bootstrap.
-    Install the exact-release transport, generation-safe recovery, and hydration
-    scheduling repairs here so no older quorum/worker installer can replace them
-    before runtime tasks are created.
+    Install the exact-release transport, generation-safe recovery, hydration
+    scheduling, and candidate RPC-priority repairs here so no older installer can
+    replace them before runtime tasks are created.
     """
 
     from .candidate_hydration_work_conserving_repair import (
         install_candidate_hydration_work_conserving_repair,
     )
+    from .candidate_rpc_priority_repair import install_candidate_rpc_priority_repair
     from .continuity_early_loss_detection_repair import (
         install_continuity_early_loss_detection_repair,
     )
@@ -34,6 +35,7 @@ def install_final_certification_failure_accounting() -> None:
     install_continuity_early_loss_detection_repair()
     install_continuity_generation_floor_repair()
     install_candidate_hydration_work_conserving_repair()
+    install_candidate_rpc_priority_repair()
 
     current_discard = retention._discard_hydration_row
     if not bool(getattr(current_discard, "_roi_failure_accounting", False)):
