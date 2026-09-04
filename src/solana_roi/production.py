@@ -9,7 +9,8 @@ from .direct_solana import DirectSolanaIngestionPlane
 
 
 NotificationHandler = Callable[[Any, str, dict[int, Any], dict[str, Any]], Awaitable[None]]
-ContextPrefill = Callable[[Any, Any], Awaitable[bool]]
+ContextPrefill = Callable[[Any, Any], Awaitable[bool]
+]
 
 # These are hard production memory ceilings, not strategy/sample ceilings.
 # The raw Solana feed remains full-scope; when a provider outruns the process,
@@ -299,6 +300,17 @@ install_wallet_venue_lifecycle_research()
 from .wallet_context_router import install_wallet_context_router
 
 install_wallet_context_router()
+
+# Tighten only the wallet-context research surface after the base router is installed.
+# Missing latency/processing/chase evidence now fails closed, and percentage ROI is
+# exposed explicitly while existing raw fraction fields remain for compatibility.
+# This has no strategy/tracking mutation authority and does not alter separate FOMO
+# work, continuity limits, chase cap, entry ceiling, signing, or paper-only authority.
+from .wallet_context_router_precision_repair import (
+    install_wallet_context_router_precision_repair,
+)
+
+install_wallet_context_router_precision_repair()
 
 # Post-PR104 production telemetry proved two composition gaps: the final set-based
 # writer bypassed PR102's per-receipt exact-durable frontier hook, and a frozen scout
