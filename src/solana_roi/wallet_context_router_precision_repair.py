@@ -240,6 +240,16 @@ def install_wallet_context_router_precision_repair() -> None:
 
     install_wallet_context_governance()
 
+    # Governance recommendations now control only final-V4 research task bandwidth.
+    # Broad market observation, realtime wallet receipt collection and the direct
+    # candidate-certification path remain full-rate. Mature negative contexts retain
+    # deterministic exploration so a context can recover when its forward edge changes.
+    from .context_research_bandwidth_governor import (
+        install_context_research_bandwidth_governor,
+    )
+
+    install_context_research_bandwidth_governor()
+
 
 __all__ = [
     "ACTIVE_STRATEGY_MUTATION_ALLOWED",
