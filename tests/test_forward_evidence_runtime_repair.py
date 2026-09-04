@@ -54,10 +54,11 @@ def test_final_wallet_status_is_acyclic_even_if_legacy_delegate_globals_self_ref
 
     # Reproduce the exact class of production defect: mutable module globals in old
     # wrapper layers point back at their own wrapper. The final composition must not
-    # traverse any of them.
-    final_research._ORIGINAL_STATUS = final_research._status_with_final
-    v4._ORIGINAL_STATUS = v4._status_with_v4_universe
-    pipeline._ORIGINAL_DISCOVERY_STATUS = pipeline._status_with_forward_pipeline
+    # traverse any of them. Use monkeypatch so the poisoned legacy globals cannot
+    # leak into unrelated regressions.
+    monkeypatch.setattr(final_research, "_ORIGINAL_STATUS", final_research._status_with_final)
+    monkeypatch.setattr(v4, "_ORIGINAL_STATUS", v4._status_with_v4_universe)
+    monkeypatch.setattr(pipeline, "_ORIGINAL_DISCOVERY_STATUS", pipeline._status_with_forward_pipeline)
 
     monkeypatch.setattr(final_research, "_adapter", lambda _discovery: _Overlay({"ok": True}))
     monkeypatch.setattr(v4, "_universe", lambda _discovery: _UniverseOverlay({"ok": True}))
