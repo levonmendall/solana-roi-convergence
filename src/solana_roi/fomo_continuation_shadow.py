@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from statistics import mean, median
 from typing import Any
 
@@ -50,6 +50,7 @@ class FomoFeatures:
     depth_growth_fraction: float | None
     exit_slippage_deterioration_fraction: float | None
     risk_complete: bool
+    trigger_is_proven_wallet: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class FomoState:
     score: float
     structurally_accessible: bool
     blockers: tuple[str, ...]
+    experiment_variants: tuple[str, ...] = ()
     feature_version: str = FOMO_RESEARCH_VERSION
 
 
@@ -117,6 +119,7 @@ def build_fomo_features(
     depth_growth_fraction: float | None = None,
     exit_slippage_deterioration_fraction: float | None = None,
     risk_complete: bool = True,
+    trigger_is_proven_wallet: bool = False,
 ) -> FomoFeatures:
     buyer_acceleration = _ratio(float(independent_buyers_short), float(independent_buyers_long))
     tx_acceleration = _ratio(float(buys_short), float(buys_long))
@@ -157,7 +160,21 @@ def build_fomo_features(
         depth_growth_fraction=_safe_float(depth_growth_fraction),
         exit_slippage_deterioration_fraction=_safe_float(exit_slippage_deterioration_fraction),
         risk_complete=bool(risk_complete),
+        trigger_is_proven_wallet=bool(trigger_is_proven_wallet),
     )
+
+
+def _experiment_variants(features: FomoFeatures, state: str) -> tuple[str, ...]:
+    variants: list[str] = []
+    if features.trigger_is_proven_wallet:
+        variants.append("wallet_signal_only")
+        if features.independent_buyers_long >= 1:
+            variants.append("wallet_plus_entity_confirmation")
+        if state in {"pre_fomo", "active_fomo"}:
+            variants.append("wallet_plus_fomo_acceleration")
+    elif state in {"pre_fomo", "active_fomo"} and features.independent_buyers_long >= 1:
+        variants.append("pure_entity_flow_fomo")
+    return tuple(variants)
 
 
 def classify_fomo_state(features: FomoFeatures, *, max_chase_fraction: float = 0.15, max_latency_seconds: float = 20.0) -> FomoState:
@@ -193,13 +210,28 @@ def classify_fomo_state(features: FomoFeatures, *, max_chase_fraction: float = 0
     if features.depth_growth_fraction is not None and features.depth_growth_fraction > 0:
         score += min(1.0, features.depth_growth_fraction * 5.0)
 
-    if blockers:
-        return FomoState("late_or_inaccessible_fomo", score, False, tuple(dict.fromkeys(blockers)))
-    if score >= 5.0 and features.new_buyer_acceleration > 1.0 and features.net_buy_flow_acceleration > 1.0:
-        return FomoState("active_fomo", score, True, ())
-    if score >= 2.5 and features.new_buyer_acceleration >= 1.0:
-        return FomoState("pre_fomo", score, True, ())
-    return FomoState("no_fomo", score, True, ())
+    exhaustion = (
+        features.transaction_frequency_acceleration < 0.8
+        and features.net_buy_flow_acceleration < 0.8
+        and (features.buy_sell_imbalance < 0.0 or features.creator_distributing or features.early_holder_exit_fraction >= 0.20)
+    )
+    if exhaustion:
+        state = "fomo_exhaustion"
+    elif blockers:
+        state = "late_or_inaccessible_fomo"
+    elif score >= 5.0 and features.new_buyer_acceleration > 1.0 and features.net_buy_flow_acceleration > 1.0:
+        state = "active_fomo"
+    elif score >= 2.5 and features.new_buyer_acceleration >= 1.0:
+        state = "pre_fomo"
+    else:
+        state = "no_fomo"
+    return FomoState(
+        state=state,
+        score=score,
+        structurally_accessible=not blockers,
+        blockers=tuple(dict.fromkeys(blockers)),
+        experiment_variants=_experiment_variants(features, state),
+    )
 
 
 class FomoContinuationShadow:
@@ -285,19 +317,30 @@ class FomoContinuationShadow:
         return SIGNAL_DECAY_DELAYS_SECONDS[-1]
 
     def status(self) -> dict[str, Any]:
+        import json
         with self.store._lock:
             observations = self.store.db.execute(
-                "SELECT COUNT(*) n, SUM(CASE WHEN json_extract(state_json,'$.state')='pre_fomo' THEN 1 ELSE 0 END) pre, "
-                "SUM(CASE WHEN json_extract(state_json,'$.state')='active_fomo' THEN 1 ELSE 0 END) active, "
-                "SUM(CASE WHEN json_extract(state_json,'$.state')='late_or_inaccessible_fomo' THEN 1 ELSE 0 END) late "
-                "FROM fomo_shadow_observations WHERE release_commit=?",
+                "SELECT state_json FROM fomo_shadow_observations WHERE release_commit=? ORDER BY id",
                 (self.release_commit,),
-            ).fetchone()
+            ).fetchall()
             rows = self.store.db.execute(
                 "SELECT fomo_state,signal_to_entry_seconds,net_return,venue,lifecycle,regime FROM fomo_shadow_outcomes "
                 "WHERE release_commit=? ORDER BY id",
                 (self.release_commit,),
             ).fetchall()
+
+        state_counts: dict[str, int] = {}
+        variant_counts: dict[str, int] = {}
+        for row in observations:
+            try:
+                payload = json.loads(str(row["state_json"] or "{}"))
+            except Exception:
+                payload = {}
+            state = str(payload.get("state") or "unknown")
+            state_counts[state] = state_counts.get(state, 0) + 1
+            for variant in payload.get("experiment_variants") or []:
+                key = str(variant)
+                variant_counts[key] = variant_counts.get(key, 0) + 1
 
         values = [float(row["net_return"]) for row in rows]
         latency: dict[str, dict[str, Any]] = {}
@@ -315,6 +358,9 @@ class FomoContinuationShadow:
                 "median_residual_roi_pct": median(bucket_values) * 100.0 if bucket_values else None,
             }
 
+        trim1 = self._trimmed(values, 1)
+        trim3 = self._trimmed(values, 3)
+        trim5 = self._trimmed(values, 5)
         return {
             "research_version": FOMO_RESEARCH_VERSION,
             "lane": FOMO_LANE,
@@ -325,16 +371,15 @@ class FomoContinuationShadow:
             "transaction_submission_available": False,
             "active_strategy_mutation_allowed": False,
             "historical_promotion_authority": False,
-            "observation_count": int(observations["n"] or 0) if observations else 0,
-            "pre_fomo_count": int(observations["pre"] or 0) if observations else 0,
-            "active_fomo_count": int(observations["active"] or 0) if observations else 0,
-            "late_or_inaccessible_fomo_count": int(observations["late"] or 0) if observations else 0,
+            "observation_count": len(observations),
+            "state_counts": state_counts,
+            "experiment_variant_counts": variant_counts,
             "outcome_count": len(values),
             "mean_residual_roi_pct": mean(values) * 100.0 if values else None,
             "median_residual_roi_pct": median(values) * 100.0 if values else None,
-            "trimmed_mean_residual_roi_ex_best_1_pct": self._trimmed(values, 1) * 100.0 if self._trimmed(values, 1) is not None else None,
-            "trimmed_mean_residual_roi_ex_best_3_pct": self._trimmed(values, 3) * 100.0 if self._trimmed(values, 3) is not None else None,
-            "trimmed_mean_residual_roi_ex_best_5_pct": self._trimmed(values, 5) * 100.0 if self._trimmed(values, 5) is not None else None,
+            "trimmed_mean_residual_roi_ex_best_1_pct": trim1 * 100.0 if trim1 is not None else None,
+            "trimmed_mean_residual_roi_ex_best_3_pct": trim3 * 100.0 if trim3 is not None else None,
+            "trimmed_mean_residual_roi_ex_best_5_pct": trim5 * 100.0 if trim5 is not None else None,
             "positive_rate_pct": (sum(value > 0 for value in values) / len(values) * 100.0) if values else None,
             "signal_decay": latency,
             "by_fomo_state": {
@@ -360,6 +405,7 @@ __all__ = [
     "HISTORICAL_PROMOTION_AUTHORITY",
     "LIVE_MONEY_AUTHORITY",
     "PAPER_ONLY",
+    "SIGNAL_DECAY_DELAYS_SECONDS",
     "SIGNING_AVAILABLE",
     "TRANSACTION_SUBMISSION_AVAILABLE",
     "build_fomo_features",
