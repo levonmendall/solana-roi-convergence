@@ -29,8 +29,6 @@ def test_durable_frontier_is_published_only_after_real_websocket_commit(monkeypa
     monkeypatch.setattr(repair, "_ORIGINAL_RECORD_RECEIPT", original)
     now = datetime.now(timezone.utc)
 
-    # A live-poll/history write uses the same durable receipt table but cannot
-    # establish exact WebSocket recovery authority.
     assert repair._record_receipt_with_durable_frontier(
         journal,
         signature="poll-row",
@@ -97,15 +95,20 @@ def test_gap_kick_snapshots_only_immediately_preceding_recovered_generation(monk
     assert boundary["confirmed"] is False
     assert delegated == [7]
 
-    # If the live-poll cursor still belongs to an older unrecovered generation,
-    # the newer exact signature must not be allowed to skip it.
     plane2 = SimpleNamespace(journal=journal)
     monkeypatch.setattr(lease, "_runtime", lambda _self: {key: {"cursor_ws_generation": 5}})
     repair._kick_with_exact_durable_boundary(plane2, target, 7)
     assert key not in repair._boundaries(plane2)
 
+    # Missing generation state must also fail closed rather than defaulting to the
+    # expected generation.
+    plane3 = SimpleNamespace(journal=journal)
+    monkeypatch.setattr(lease, "_runtime", lambda _self: {key: {}})
+    repair._kick_with_exact_durable_boundary(plane3, target, 7)
+    assert key not in repair._boundaries(plane3)
 
-def test_exact_signature_fetch_excludes_only_already_durable_same_slot_history(monkeypatch):
+
+def test_exact_signature_fetch_excludes_only_proved_durable_same_slot_history(monkeypatch):
     target = _pump_target()
     key = live_poll._poll_target_key(target)
     plane = SimpleNamespace()
@@ -115,6 +118,7 @@ def test_exact_signature_fetch_excludes_only_already_durable_same_slot_history(m
         "slot": 100,
         "confirmed": True,
         "confirmation_failed": False,
+        "same_slot_durability_failed": False,
     }
 
     monkeypatch.setattr(immediate, "_generation", lambda _self, _target: 7)
@@ -130,6 +134,12 @@ def test_exact_signature_fetch_excludes_only_already_durable_same_slot_history(m
             }
         },
     )
+    proved = []
+    monkeypatch.setattr(
+        repair,
+        "_durable_signatures_present",
+        lambda _self, source, signatures: proved.append((source, list(signatures))) or True,
+    )
 
     class Rpc:
         async def call_with_meta(self, method, params, hedge=False):
@@ -144,6 +154,7 @@ def test_exact_signature_fetch_excludes_only_already_durable_same_slot_history(m
                     {"signature": "same-slot-newer", "slot": 100, "err": None},
                     {"signature": "lower", "slot": 100, "err": None},
                     {"signature": "same-slot-older", "slot": 100, "err": None},
+                    {"signature": "older-slot", "slot": 99, "err": None},
                 ],
                 "publicnode",
                 12.5,
@@ -159,14 +170,57 @@ def test_exact_signature_fetch_excludes_only_already_durable_same_slot_history(m
     assert provider == "publicnode"
     assert latency == 12.5
     assert [row["signature"] for row in rows] == ["same-slot-newer", "new-slot"]
-    assert "lower" not in {row["signature"] for row in rows}
-    assert "same-slot-older" not in {row["signature"] for row in rows}
+    assert proved == [("PUMP_FUN", ["lower", "same-slot-older"])]
     assert meta["exact_durable_lower_boundary_applied"] is True
     assert meta["exact_durable_lower_reached"] is True
-    assert meta["same_slot_already_durable_rows_can_be_excluded"] is True
+    assert meta["same_slot_tail_proven"] is True
+    assert meta["same_slot_older_rows_durable"] is True
     assert meta["hard_page_limit"] == 3
     assert meta["hard_page_size"] == 1000
     assert meta["generation_upper_boundary_applied"] is True
+
+
+def test_same_slot_not_durable_falls_back_to_slot_minus_one(monkeypatch):
+    target = _pump_target()
+    key = live_poll._poll_target_key(target)
+    plane = SimpleNamespace()
+    repair._boundaries(plane)[key] = {
+        "generation": 7,
+        "signature": "lower",
+        "slot": 100,
+        "confirmed": True,
+        "confirmation_failed": False,
+        "same_slot_durability_failed": False,
+    }
+    monkeypatch.setattr(immediate, "_generation", lambda _self, _target: 7)
+    monkeypatch.setattr(runtime_arch, "_recovery_upper_boundaries", lambda _self: {})
+    monkeypatch.setattr(repair, "_durable_signatures_present", lambda *_args: False)
+
+    class Rpc:
+        async def call_with_meta(self, method, params, hedge=False):
+            return (
+                [
+                    {"signature": "newer", "slot": 101},
+                    {"signature": "lower", "slot": 100},
+                    {"signature": "same-slot-older", "slot": 100},
+                    {"signature": "older-slot", "slot": 99},
+                ],
+                "publicnode",
+                2.0,
+            )
+
+    delegated = []
+
+    async def fallback(_self, _target, cursor_slot):
+        delegated.append(cursor_slot)
+        return ([{"signature": "slot-fallback", "slot": 101}], True, "fallback", 1.0, {"fallback": True})
+
+    monkeypatch.setattr(isolation, "_recovery_rpc", lambda _self: Rpc())
+    monkeypatch.setattr(repair, "_ORIGINAL_INTERVAL_FETCH", fallback)
+    result = asyncio.run(repair._exact_signature_interval_fetch(plane, target, 90))
+    assert result[0][0]["signature"] == "slot-fallback"
+    assert delegated == [90]
+    assert repair._boundaries(plane)[key]["same_slot_durability_failed"] is True
 
 
 def test_unconfirmed_exact_boundary_delegates_to_unchanged_slot_fallback(monkeypatch):
@@ -179,6 +233,7 @@ def test_unconfirmed_exact_boundary_delegates_to_unchanged_slot_fallback(monkeyp
         "slot": 100,
         "confirmed": False,
         "confirmation_failed": False,
+        "same_slot_durability_failed": False,
     }
     delegated = []
 
@@ -210,6 +265,7 @@ def test_exact_boundary_incomplete_never_claims_short_page_as_complete(monkeypat
         "slot": 100,
         "confirmed": True,
         "confirmation_failed": False,
+        "same_slot_durability_failed": False,
     }
     monkeypatch.setattr(immediate, "_generation", lambda _self, _target: 8)
     monkeypatch.setattr(runtime_arch, "_recovery_upper_boundaries", lambda _self: {})
