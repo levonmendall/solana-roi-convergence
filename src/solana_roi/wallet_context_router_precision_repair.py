@@ -273,6 +273,14 @@ def install_wallet_context_router_precision_repair() -> None:
 
     install_continuous_strategy_learning()
 
+    # Raw market observation stays full scope, but scarce high-priority wallet and
+    # noncritical final-research capacity is now earned by exact forward percentage
+    # ROI rather than fixed venue reservations. Robinhood joins this comparison only
+    # after actual paper outcomes exist.
+    from .venue_resource_governance import install_venue_resource_governance
+
+    install_venue_resource_governance()
+
 
 __all__ = [
     "ACTIVE_STRATEGY_MUTATION_ALLOWED",
