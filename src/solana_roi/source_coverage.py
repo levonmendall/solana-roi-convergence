@@ -31,6 +31,8 @@ FROZEN_SUPPORTED_PROGRAM_IDS_BY_SOURCE: tuple[tuple[str, tuple[str, ...]], ...] 
     ),
 )
 
+SOURCE_COVERAGE_HOTPATH_VERSION = "source-coverage-hotpath-v1"
+
 
 @dataclass(frozen=True, slots=True)
 class SourceAwareCoverageCertificationPolicy(CoverageCertificationPolicy):
@@ -54,6 +56,14 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
     ):
         super().__init__(store, configured_fn=configured_fn, policy=policy or SourceAwareCoverageCertificationPolicy())
         self.prospective_start_at = prospective_start_at
+        # Production constructs this gate in the already-background-isolated runtime
+        # bootstrap. Index the exact prospective/source lookup used by the bounded
+        # hot-path probe so a raw WebSocket receipt never needs a table-wide scan.
+        with self.store._lock, self.store.db:
+            self.store.db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_swaps_received_source_signature "
+                "ON normalized_swaps(received_at, source, signature)"
+            )
 
     @property
     def source_policy(self) -> SourceAwareCoverageCertificationPolicy:
@@ -65,6 +75,43 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='direct_solana_hydration_metrics'"
             ).fetchone()
         return row is not None
+
+    def source_needs_bootstrap(self, source: str) -> bool:
+        """Bound the notification-path coverage decision to one source and threshold.
+
+        The full certification status also computes launch fractions, chronology
+        conflicts and all-source counts. None of that belongs on the raw WebSocket
+        receipt path. This probe preserves the exact prospective-release boundary,
+        accepted source encodings, recovery exclusion and minimum sample threshold,
+        but stops reading as soon as the threshold is satisfied.
+        """
+
+        source_key = str(source or "").upper()
+        if source_key not in self.source_policy.required_program_sources:
+            return True
+        required = max(1, int(self.source_policy.min_normalized_swaps_per_source))
+        sql = (
+            "SELECT 1 FROM normalized_swaps WHERE ("
+            "source LIKE ? OR source LIKE ? OR source LIKE ?)"
+        )
+        args: list[Any] = [
+            f"solana-direct:{source_key}:%",
+            f"helius-enhanced-webhook:{source_key}:%",
+            f"helius-raw-webhook:{source_key}:%",
+        ]
+        if self.prospective_start_at is not None:
+            sql += " AND received_at>=?"
+            args.append(self.prospective_start_at.isoformat())
+        if self._has_direct_recovery_ledger():
+            sql += (
+                " AND NOT EXISTS (SELECT 1 FROM direct_solana_hydration_metrics recovery "
+                "WHERE recovery.signature=normalized_swaps.signature AND recovery.historical_recovery=1)"
+            )
+        sql += " LIMIT ?"
+        args.append(required)
+        with self.store._lock:
+            rows = self.store.db.execute(sql, tuple(args)).fetchall()
+        return len(rows) < required
 
     def _source_counts(self) -> dict[str, int]:
         counts = {source: 0 for source in self.source_policy.required_program_sources}
@@ -163,4 +210,6 @@ class SourceAwareProgramCoverageCertificationGate(ProgramCoverageCertificationGa
             },
             "prospective_start_at": self.prospective_start_at.isoformat() if self.prospective_start_at else None,
             "requirements": requirements,
+            "hotpath_probe_version": SOURCE_COVERAGE_HOTPATH_VERSION,
+            "full_status_used_by_raw_notification_hotpath": False,
         }
