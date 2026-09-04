@@ -233,6 +233,13 @@ def install_wallet_context_router_precision_repair() -> None:
         setattr(_manifest_with_percent_and_fail_closed, "_roi_wallet_context_precision_repair", True)
         FinalProfitFirstResearchAdapter._manifest = _manifest_with_percent_and_fail_closed  # type: ignore[method-assign]
 
+    # This governance layer consumes the already-precision-wrapped context metrics.
+    # Install it here to preserve production composition ordering without touching
+    # any FOMO module or strategy authority.
+    from .wallet_context_governance import install_wallet_context_governance
+
+    install_wallet_context_governance()
+
 
 __all__ = [
     "ACTIVE_STRATEGY_MUTATION_ALLOWED",
