@@ -103,6 +103,14 @@ from .regime_roi_wallet_authority import (
 
 install_regime_roi_wallet_authority()
 
+# Later touches from dynamically tracked wallets must never disappear merely because
+# the in-memory strategy task set is full. Install a durable paper-strategy handoff
+# after v5.1/regime authority composition, and partition only observed same-venue age
+# into later-life contexts without fabricating a launch or pool timestamp.
+from .later_activity_execution_repair import install_later_activity_execution_repair
+
+install_later_activity_execution_repair()
+
 # The unified status contract is installed at the same final production-composition
 # boundary so it can observe Solana, FOMO and Robinhood without replacing any data
 # plane. The regime probe now wraps the already-installed v5.1 buy path and reuses its
