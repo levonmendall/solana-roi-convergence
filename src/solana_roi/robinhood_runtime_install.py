@@ -84,6 +84,17 @@ from .strategy_specialist_wallet_allocator import (
 
 install_strategy_specialist_wallet_allocator()
 
+# Make PR122's fairness repair part of actual production composition and tighten the
+# selection rule to regime-specific robust ROI percentage. Assigned leaders can use
+# normal v5 paper sizing; lower-ranked/nonleader wallets remain bounded challengers
+# so a new wallet can still dethrone an incumbent. No dollar-P/L ranking is used.
+from .regime_roi_wallet_authority import (
+    install_regime_roi_wallet_authority,
+    robinhood_regime_entity_authority_status,
+)
+
+install_regime_roi_wallet_authority()
+
 # The unified status contract is installed at the same final production-composition
 # boundary so it can observe Solana, FOMO and Robinhood without replacing any data
 # plane. The regime probe wraps the already-installed v5 buy path and reuses its
@@ -174,6 +185,16 @@ def _status() -> dict[str, Any]:
                 ).fetchone()[0])
         except Exception:
             contexts = challengers = marks = 0
+        try:
+            regime_authority = robinhood_regime_entity_authority_status(_PLANE)
+        except Exception as exc:
+            regime_authority = {
+                "authority_version": "regime-roi-wallet-authority-v2",
+                "failed_closed": True,
+                "error": f"{type(exc).__name__}: Robinhood regime entity authority unavailable",
+                "paper_only": True,
+                "live_money_authority": False,
+            }
         payload.update(
             {
                 "strategy_version": ROBINHOOD_V5_VERSION,
@@ -199,6 +220,7 @@ def _status() -> dict[str, Any]:
                     "threshold_challenger_rows": challengers,
                     "mark_to_market_rows": marks,
                 },
+                "regime_roi_entity_authority": regime_authority,
                 "paper_only": True,
                 "live_money_authority": False,
                 "signing_available": False,
