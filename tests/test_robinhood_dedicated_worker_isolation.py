@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 import time
@@ -100,6 +101,28 @@ def test_runtime_install_composes_isolation_before_production_start() -> None:
     assert runtime_install._status is isolation._nonblocking_status
     assert runtime_install._STATE["worker_isolation_repair"] == isolation.REPAIR_VERSION
     assert runtime_install._STATE["worker_isolation"] == "dedicated_os_thread_with_private_asyncio_loop"
+
+
+def test_minimal_runtime_without_store_delegates_to_canonical_workers(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def original_workers(runtime, stop) -> None:
+        calls.append("canonical")
+        assert not hasattr(runtime, "store")
+        assert stop.is_set()
+
+    def forbidden_start(_store):
+        raise AssertionError("Robinhood isolation must not start without a production store")
+
+    monkeypatch.setattr(runtime_install, "_ORIGINAL_RUNTIME_WORKERS", original_workers)
+    monkeypatch.setattr(isolation, "_start_worker_thread", forbidden_start)
+    stop = asyncio.Event()
+    stop.set()
+
+    asyncio.run(isolation._isolated_runtime_workers(SimpleNamespace(), stop))
+
+    assert calls == ["canonical"]
+    assert runtime_install._STATE["worker_isolation_skipped_no_store"] is True
 
 
 def test_worker_constructs_plane_on_dedicated_thread_with_private_store(tmp_path: Path, monkeypatch) -> None:
