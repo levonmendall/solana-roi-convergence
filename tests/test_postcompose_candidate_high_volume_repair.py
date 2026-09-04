@@ -7,6 +7,7 @@ from types import SimpleNamespace
 def test_production_composition_installs_scout_and_high_volume_repairs():
     from solana_roi import high_volume_signature_cursor_repair as repair
     from solana_roi import poll_exception_rearm as exception_rearm
+    from solana_roi import poll_pagination_context as pagination
     from solana_roi import poll_watermark_repair as watermark
     from solana_roi.direct_solana import DirectSolanaIngestionPlane
     from solana_roi.production import app  # noqa: F401
@@ -14,12 +15,12 @@ def test_production_composition_installs_scout_and_high_volume_repairs():
     assert getattr(DirectSolanaIngestionPlane.status, "_roi_scout_candidate_continuity", False) is True
     assert getattr(watermark._slot_poll_page, "_roi_high_volume_signature_cursor", False) is True
     assert watermark._slot_fetch_delta is exception_rearm._exception_rearm_fetch_delta
-    assert exception_rearm._ORIGINAL_FETCH_DELTA is repair._fetch_delta_with_high_volume_exact_cursor
+    assert exception_rearm._ORIGINAL_FETCH_DELTA is pagination._context_fresh_fetch_delta
+    assert pagination._HIGH_VOLUME_DELTA_HOOK is repair._maybe_fetch_high_volume_exact_cursor
 
 
 def test_high_volume_exact_cursor_preserves_same_slot_rows(monkeypatch):
     from solana_roi import high_volume_signature_cursor_repair as repair
-    from solana_roi import poll_watermark_repair as watermark
     from solana_roi.direct_solana import WatchTarget
 
     target = WatchTarget(kind="program", address="pump-amm", source_hint="PUMP_AMM")
@@ -46,15 +47,9 @@ def test_high_volume_exact_cursor_preserves_same_slot_rows(monkeypatch):
             return ([{"signature": "same-slot-new", "slot": 100}], "publicnode", 1.0)
 
     monkeypatch.setattr(repair.storage, "_routine_poll_pool", lambda self, target: FakePool())
-    original_fetch = repair._ORIGINAL_SLOT_FETCH_DELTA
-    if original_fetch is None:
-        repair._ORIGINAL_SLOT_FETCH_DELTA = watermark._slot_fetch_delta
-    try:
-        rows, complete, provider, _latency = asyncio.run(
-            repair._fetch_delta_with_high_volume_exact_cursor(plane, target, 100)
-        )
-    finally:
-        repair._ORIGINAL_SLOT_FETCH_DELTA = original_fetch
+    result = asyncio.run(repair._maybe_fetch_high_volume_exact_cursor(plane, target, 100))
+    assert result is not None
+    rows, complete, provider, _latency = result
 
     assert complete is True
     assert provider == "publicnode"
@@ -69,7 +64,6 @@ def test_high_volume_exact_cursor_preserves_same_slot_rows(monkeypatch):
 def test_high_volume_exact_cursor_keeps_hard_3x1000_fail_closed(monkeypatch):
     from solana_roi import high_volume_signature_cursor_repair as repair
     from solana_roi import live_poll_redundancy as live_poll
-    from solana_roi import poll_watermark_repair as watermark
     from solana_roi.direct_solana import WatchTarget
 
     target = WatchTarget(kind="program", address="pump-fun", source_hint="PUMP_FUN")
@@ -99,18 +93,21 @@ def test_high_volume_exact_cursor_keeps_hard_3x1000_fail_closed(monkeypatch):
             return rows, "publicnode", 1.0
 
     monkeypatch.setattr(repair.storage, "_routine_poll_pool", lambda self, target: FakePool())
-    original_fetch = repair._ORIGINAL_SLOT_FETCH_DELTA
-    if original_fetch is None:
-        repair._ORIGINAL_SLOT_FETCH_DELTA = watermark._slot_fetch_delta
-    try:
-        rows, complete, _provider, _latency = asyncio.run(
-            repair._fetch_delta_with_high_volume_exact_cursor(plane, target, 200)
-        )
-    finally:
-        repair._ORIGINAL_SLOT_FETCH_DELTA = original_fetch
+    result = asyncio.run(repair._maybe_fetch_high_volume_exact_cursor(plane, target, 200))
+    assert result is not None
+    rows, complete, _provider, _latency = result
 
     assert complete is False
     assert rows == []
     assert page_number == live_poll.POLL_CURSOR_MAX_PAGES
     cursor = plane._roi_high_volume_exact_poll_cursors["program:pump-fun"]
     assert cursor["signature"] == "boundary"
+
+
+def test_non_high_volume_target_uses_canonical_pagination_path():
+    from solana_roi import high_volume_signature_cursor_repair as repair
+    from solana_roi.direct_solana import WatchTarget
+
+    target = WatchTarget(kind="program", address="raydium", source_hint="RAYDIUM")
+    plane = SimpleNamespace()
+    assert asyncio.run(repair._maybe_fetch_high_volume_exact_cursor(plane, target, 1)) is None
