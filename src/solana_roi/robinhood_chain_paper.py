@@ -22,6 +22,16 @@ from .strategy_specialist_wallet_allocator_repair import (
 # authority, strategy threshold, mechanical hard stop, signing, or live-money scope.
 install_strategy_specialist_wallet_allocator_repair()
 
+# Production status proved the persistent Robinhood cursor could remain behind the
+# live chain when the public rate-limited RPC was scanned in 200-block batches with
+# a mandatory five-second sleep after every successful historical batch. Increase
+# only non-live acquisition capacity, parallelize independent market-log reads with
+# a small bound, and expose catch-up rate/lag telemetry. The existing <=2-block
+# paper-decision gate remains authoritative, so historical catch-up cannot trade.
+from .robinhood_catchup_capacity_repair import install_robinhood_catchup_capacity_repair
+
+install_robinhood_catchup_capacity_repair()
+
 
 class RobinhoodChainPaperPlane(
     RobinhoodProfitMaximizerMixin,

@@ -170,6 +170,16 @@ from .public_data_economics import install_public_data_economics
 
 install_public_data_economics()
 
+# Exact-release production telemetry then showed that ten independent WebSockets per
+# public provider create avoidable connection churn and real target-coverage gaps.
+# Keep every one of the frozen subscriptions, quorum rules, 12-second recovery lease
+# and 3x1000 bounded delta, but multiplex small provider-rotated target shards over
+# a bounded number of public sockets. A target rejected by a shard alone falls back
+# to the existing single-target path without tearing down accepted sibling targets.
+from .public_ws_shard_transport_repair import install_public_ws_shard_transport_repair
+
+install_public_ws_shard_transport_repair()
+
 # A precise launch transaction is usually a creation transaction rather than a
 # simple swap, so it cannot pass the normal swap parser. Resolve its mint directly
 # from standard transaction metadata, hydrate only that mint's launch-window
