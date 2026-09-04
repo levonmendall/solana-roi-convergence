@@ -16,9 +16,10 @@ def install_final_certification_failure_accounting() -> None:
     continuity/research/quote wrapper marker.
 
     This is also the final post-frontier composition point in Render bootstrap.
-    Install the exact-release transport, generation-safe recovery, hydration
-    scheduling, candidate RPC-priority, and candidate-only hedge repairs here so no
-    older installer can replace them before runtime tasks are created.
+    Install the exact-release transport, generation-safe recovery, high-volume
+    standby affinity, hydration scheduling, candidate RPC-priority, and candidate-
+    only hedge repairs here so no older installer can replace them before runtime
+    tasks are created.
     """
 
     from .candidate_hydration_work_conserving_repair import (
@@ -32,9 +33,13 @@ def install_final_certification_failure_accounting() -> None:
     from .continuity_generation_floor_repair import (
         install_continuity_generation_floor_repair,
     )
+    from .continuity_high_volume_poll_affinity_repair import (
+        install_continuity_high_volume_poll_affinity_repair,
+    )
 
     install_continuity_early_loss_detection_repair()
     install_continuity_generation_floor_repair()
+    install_continuity_high_volume_poll_affinity_repair()
     install_candidate_hydration_work_conserving_repair()
     install_candidate_rpc_priority_repair()
     install_candidate_rpc_hedge_repair()
