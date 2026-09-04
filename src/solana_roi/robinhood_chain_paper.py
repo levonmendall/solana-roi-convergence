@@ -32,6 +32,18 @@ from .robinhood_catchup_capacity_repair import install_robinhood_catchup_capacit
 
 install_robinhood_catchup_capacity_repair()
 
+# The larger historical batches above can contain many SQLite-backed swap handlers.
+# Those async handlers intentionally perform synchronous durable writes and, while
+# live=False, can return without yielding control. On Render's single Uvicorn event
+# loop that starved the five-second HTTP health check. Yield cooperatively after every
+# processed catch-up log while retaining the same 800-block acquisition, 0.25-second
+# cadence, no-skip ordering, cursor durability and <=2-block paper-decision boundary.
+from .robinhood_event_loop_fairness_repair import (
+    install_robinhood_event_loop_fairness_repair,
+)
+
+install_robinhood_event_loop_fairness_repair()
+
 
 class RobinhoodChainPaperPlane(
     RobinhoodProfitMaximizerMixin,
