@@ -4,7 +4,7 @@ import asyncio
 
 from solana_roi import strategy_relevant_continuity as repair
 from solana_roi import target_stream_fanout as fanout
-from solana_roi.direct_solana import DirectSolanaJournal, WatchTarget
+from solana_roi.direct_solana import DirectSolanaJournal, RpcEndpoint, WatchTarget
 from solana_roi.live_poll_redundancy import POLL_PROVIDER_NAME
 from solana_roi.observation_store import ObservationEventStore
 
@@ -69,6 +69,7 @@ def test_strategy_epoch_arms_without_full_program_firehose_and_archives_prior_ga
     assert payload["unresolved_gap"] is False
     assert payload["strategy_relevant_continuity"]["epoch_started"] is True
     assert payload["strategy_relevant_continuity"]["websocket_coverage_ok"] is True
+    assert payload["strategy_relevant_continuity"]["transport_coverage_ok"] is True
     assert payload["discovery_continuity"]["websocket_coverage_ok"] is False
     assert payload["discovery_continuity"]["blocks_strategy_execution_continuity"] is False
 
@@ -77,6 +78,7 @@ def test_strategy_epoch_arms_without_full_program_firehose_and_archives_prior_ga
         "FROM direct_solana_strategy_continuity_epoch WHERE release_commit=?",
         ("strategy-continuity-test-release",),
     ).fetchone()
+    assert row is not None
     assert bool(row["archived_unresolved_gap"]) is True
     assert row["archived_backfill_error"] == "legacy full-program gap"
 
@@ -105,17 +107,13 @@ def test_program_irrecoverable_gap_is_discovery_degradation_not_strategy_gap(tmp
 def test_scout_irrecoverable_gap_keeps_existing_fail_closed_semantics(tmp_path):
     plane = _plane(tmp_path)
     scout = plane.watch_targets[0]
-    original = repair._ORIGINAL_LATCH_GENERATION
-    repair._ORIGINAL_LATCH_GENERATION = repair.lease._latch_irrecoverable_generation_once
-    try:
-        assert repair._latch_generation_scoped(
-            plane,
-            scout,
-            3,
-            repair.direct_module.utcnow().isoformat(),
-        ) is True
-    finally:
-        repair._ORIGINAL_LATCH_GENERATION = original
+    assert repair._ORIGINAL_LATCH_GENERATION is not None
+    assert repair._latch_generation_scoped(
+        plane,
+        scout,
+        3,
+        repair.direct_module.utcnow().isoformat(),
+    ) is True
 
     status = plane.journal.status()
     assert status["unresolved_gap"] is True
@@ -151,6 +149,41 @@ def test_program_poll_fallback_is_raw_only_and_never_enters_hydration_queue(tmp_
     asyncio.run(scenario())
 
 
+def test_scout_poll_bridge_preserved_after_strategy_epoch_arms(tmp_path, monkeypatch):
+    async def scenario():
+        plane = _plane(tmp_path)
+        monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", "poll-bridge-test-release")
+        websocket = RpcEndpoint("provider-a", "https://a.invalid", "wss://a.invalid")
+        poll = RpcEndpoint(POLL_PROVIDER_NAME, "https://poll.invalid", "wss://poll.invalid")
+        scout, _program = plane.watch_targets
+
+        _set_coverage(plane, scout_ws=True, scout_poll=True)
+        assert repair._start_strategy_epoch_if_ready(plane) is True
+        assert plane.journal.outage_started_at() is None
+
+        # Losing the real WS copy alone is bridged by the confirmed live-poll lane.
+        await repair._set_target_state_scoped(
+            plane,
+            websocket,
+            scout,
+            connected=False,
+            error_type="ConnectionClosedError",
+        )
+        assert plane.journal.outage_started_at() is None
+
+        # Losing the bridge too is a genuine strategy transport outage.
+        await repair._set_target_state_scoped(
+            plane,
+            poll,
+            scout,
+            connected=False,
+            error_type="LivePollUnavailable",
+        )
+        assert plane.journal.outage_started_at() is not None
+
+    asyncio.run(scenario())
+
+
 def test_strategy_status_preserves_paper_only_and_raw_discovery_separation(tmp_path, monkeypatch):
     plane = _plane(tmp_path)
     monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", "status-test-release")
@@ -175,7 +208,9 @@ def test_strategy_status_preserves_paper_only_and_raw_discovery_separation(tmp_p
     assert payload["strategy_relevant_continuity"]["live_money_authority"] is False
     assert payload["strategy_relevant_continuity"]["signing_available"] is False
     assert payload["strategy_relevant_continuity"]["transaction_submission_available"] is False
+    assert payload["strategy_relevant_continuity"]["post_start_poll_can_bridge_websocket_loss"] is True
     assert payload["throughput_policy"]["full_raw_market_scope_preserved"] is True
     assert payload["throughput_policy"]["program_gap_fallback_hydration"] is False
     assert payload["provider_runtime_policy"]["scout_gap_fail_closed_semantics_unchanged"] is True
+    assert payload["provider_runtime_policy"]["scout_poll_bridge_semantics_unchanged"] is True
     assert payload["raw_discovery_startup_barrier"]["armed"] is False
