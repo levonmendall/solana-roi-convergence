@@ -10,7 +10,7 @@ from .post161_candidate_attribution_repair import install_post161_candidate_attr
 from .robinhood_rpc_rate_limit_repair import install_robinhood_rpc_rate_limit_repair
 
 
-COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v5-pumpfun-shadow-boundary"
+COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v6-native-shadow-learning"
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 
 
@@ -107,23 +107,29 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
 
     install_robinhood_entity_universe(plane_cls)
 
-    # Install the trading boundary LAST so it wraps the final global-universe chooser.
-    # Robinhood therefore follows the same promotion sequence as Pump.fun:
-    # wallet signal -> opportunity classification -> executable/copyable test ->
-    # zero-allocation contextual shadow evidence -> positive geometric edge -> sizing
-    # -> paper entry. Bootstrap paper allocation is prohibited.
+    # Keep PR #162's zero-allocation shadow-first decision boundary. It remains the
+    # only path from opportunity classification to paper-entry sizing.
     from .robinhood_pumpfun_shadow_boundary import (
         install_robinhood_pumpfun_shadow_boundary,
     )
 
     install_robinhood_pumpfun_shadow_boundary(plane_cls)
 
-    # Preserve the existing regression-visible fact that the global entity universe
-    # remains in the final poll/status composition even though the shadow boundary is
-    # now the outermost wrapper.
+    # Make the PR #162 boundary Robinhood-native without creating a second strategy
+    # authority: chase, latency and measurable cost become learned context; compatible
+    # shadow evidence survives deployments; and sparse exact buckets borrow only
+    # conservatively shrunk mature parent evidence.
+    from .robinhood_native_shadow_learning import (
+        install_robinhood_native_shadow_learning,
+    )
+
+    install_robinhood_native_shadow_learning(plane_cls)
+
+    # Preserve regression-visible composition lineage after the outer status wrapper.
     setattr(plane_cls._poll_once, "_roi_robinhood_entity_universe", True)
     setattr(plane_cls.status, "_roi_robinhood_entity_universe", True)
     setattr(plane_cls._v5_choose_lane_fraction, "_roi_robinhood_pumpfun_shadow_boundary", True)
+    setattr(plane_cls._v5_choose_lane_fraction, "_roi_robinhood_native_shadow_learning", True)
 
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", True)
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_version", COMPOSITION_VERSION)
