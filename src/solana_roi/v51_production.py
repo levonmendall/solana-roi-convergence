@@ -11,9 +11,14 @@ above those internals.
 from .production import app as app
 from .api import ingestion_runtime
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
+from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
+# Order is deliberate: first replace the generic Solana/FOMO/Robinhood evidence
+# profile authority, then add Robinhood's exact-severity selection, frozen-epoch
+# exit learning, and candidate attribution over that profile.
 install_v51_consolidated_strategy()
+install_v51_robinhood_consolidation()
 install_v51_strategy_api(app, ingestion_runtime)
 
 __all__ = ["app"]
