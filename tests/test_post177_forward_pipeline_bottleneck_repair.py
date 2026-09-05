@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from solana_roi import ephemeral_candidate_retention as retention
 from solana_roi import post177_forward_pipeline_bottleneck_repair as repair
 from solana_roi import robinhood_live_frontier_verification_repair as frontier
 
@@ -90,6 +91,15 @@ def test_fomo_strategy_window_uses_event_time_not_delivery_timestamp() -> None:
     assert candidates[0]["state"] == "active_fomo"
     assert diagnostics["event_time_authoritative"] is True
     assert diagnostics["delivery_latency_changes_strategy_window"] is False
+
+
+def test_scout_hydration_retention_extends_without_extending_candidate_state() -> None:
+    assert retention.ENTRY_WINDOW_SECONDS == 20.0
+    assert retention.SCOUT_HYDRATION_RETENTION_SECONDS == 60.0
+    assert retention._hydration_retention_seconds("frozen_scout_processed_trigger") == 60.0
+    assert retention._hydration_retention_seconds("frozen_scout_live_poll_trigger") == 60.0
+    assert retention._hydration_retention_seconds("prospective_launch") == 20.0
+    assert retention._hydration_retention_seconds("deterministic_market_sample") == 20.0
 
 
 def test_candidate_retention_distinguishes_immediate_copy_from_operational_timeout() -> None:
