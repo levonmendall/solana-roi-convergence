@@ -338,6 +338,20 @@ from .candidate_execution_evidence_plane import (
 
 install_candidate_execution_evidence_plane()
 
+# Production scout telemetry proved candidate identity inference itself was the
+# remaining dominant loss boundary. Decode supported venue transaction facts first,
+# resolve direction before choosing the scout-owned endpoint, persist a durable
+# mint+venue watch ledger, and snapshot already-known risk readiness without giving
+# either ledger entry authority. Later proven activity gets a fresh prospective
+# clock; the 20-second entry ceiling, 5-second latency target, 15% chase cap, full
+# scope, six-dimension authority, paper-only boundary, signing and submission remain
+# unchanged.
+from .semantic_candidate_attribution_architecture import (
+    install_semantic_candidate_attribution_architecture,
+)
+
+install_semantic_candidate_attribution_architecture()
+
 from .api import app as app  # noqa: E402  (installation must happen first)
 from .api import ingestion_runtime  # noqa: E402
 from .robinhood_runtime_install import install_robinhood_chain_paper_runtime  # noqa: E402
