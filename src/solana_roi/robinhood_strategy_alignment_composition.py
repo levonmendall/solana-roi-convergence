@@ -11,7 +11,7 @@ from .post164_invocation_source_repair import install_post164_invocation_source_
 from .robinhood_rpc_rate_limit_repair import install_robinhood_rpc_rate_limit_repair
 
 
-COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v7-invocation-source-authority"
+COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v6-native-shadow-learning"
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 
 
