@@ -8,7 +8,7 @@ from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
 
 
-COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v1"
+COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v2-global-entity-universe"
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 
 
@@ -60,16 +60,14 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     _ORIGINAL_POLL = plane_cls._poll_once
     plane_cls._poll_once = _poll_once_with_research_discovery  # type: ignore[method-assign]
 
-    # Pump.fun maintains a persistent role/specialist wallet universe and then uses
-    # regime as context. Mirror that structure for Robinhood: one ranked specialist
-    # watchlist per profit lane, with regimes retained only inside the underlying
-    # execution/promotion context. The watchlist reuses already-ingested evidence,
-    # adds no provider polling and cannot independently authorize a paper entry.
-    from .robinhood_lane_specialist_watchlist import (
-        install_robinhood_lane_specialist_watchlist,
-    )
+    # Pump.fun has one dynamic high-priority wallet universe. Roles describe what a
+    # wallet is good at; lanes and regimes do not create separate watchlists. Mirror
+    # that exact structural separation for Robinhood economic entities. Continuous
+    # discovery supplies global challengers, forward role evidence determines current
+    # value, and the selected universe itself has no paper-entry authority.
+    from .robinhood_entity_universe import install_robinhood_entity_universe
 
-    install_robinhood_lane_specialist_watchlist(plane_cls)
+    install_robinhood_entity_universe(plane_cls)
 
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", True)
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_version", COMPOSITION_VERSION)
