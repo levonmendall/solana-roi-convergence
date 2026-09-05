@@ -10,7 +10,7 @@ from .post161_candidate_attribution_repair import install_post161_candidate_attr
 from .robinhood_rpc_rate_limit_repair import install_robinhood_rpc_rate_limit_repair
 
 
-COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v5-post161-runtime-repair"
+COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v5-pumpfun-shadow-boundary"
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 
 
@@ -51,15 +51,14 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     """Keep PR146 continuation flow authoritative and attach research below it."""
     global _ORIGINAL_POLL
 
-    # PR #161 proved that jsonParsed is not sufficient for every live scout
-    # transaction shape. Add standardized compiled SPL/System transfer decoding and
-    # bounded sanitized failure-shape evidence at the already-composed venue graph.
-    # This has no strategy or paper-entry authority.
+    # The post-161 Solana repair extends only transaction-fact decoding and bounded
+    # diagnostics at the already fail-closed venue graph. It has no entry authority
+    # and is installed before runtime workers start so fresh scout transactions use it.
     install_post161_candidate_attribution_repair()
 
-    # Robinhood's public RPC intermittently returns HTTP 429 during exact historical
-    # catch-up. Retry the same read with shared Retry-After/cooldown coordination;
-    # never skip a block range and never allow historical rows to authorize entries.
+    # Robinhood's public RPC can return HTTP 429 during exact catch-up. Coordinate
+    # Retry-After/cooldown on the same read without skipping block ranges or changing
+    # catch-up capacity, strategy thresholds, or the historical-entry prohibition.
     install_robinhood_rpc_rate_limit_repair(plane_cls)
 
     if bool(getattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", False)):
@@ -107,6 +106,24 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     from .robinhood_entity_universe import install_robinhood_entity_universe
 
     install_robinhood_entity_universe(plane_cls)
+
+    # Install the trading boundary LAST so it wraps the final global-universe chooser.
+    # Robinhood therefore follows the same promotion sequence as Pump.fun:
+    # wallet signal -> opportunity classification -> executable/copyable test ->
+    # zero-allocation contextual shadow evidence -> positive geometric edge -> sizing
+    # -> paper entry. Bootstrap paper allocation is prohibited.
+    from .robinhood_pumpfun_shadow_boundary import (
+        install_robinhood_pumpfun_shadow_boundary,
+    )
+
+    install_robinhood_pumpfun_shadow_boundary(plane_cls)
+
+    # Preserve the existing regression-visible fact that the global entity universe
+    # remains in the final poll/status composition even though the shadow boundary is
+    # now the outermost wrapper.
+    setattr(plane_cls._poll_once, "_roi_robinhood_entity_universe", True)
+    setattr(plane_cls.status, "_roi_robinhood_entity_universe", True)
+    setattr(plane_cls._v5_choose_lane_fraction, "_roi_robinhood_pumpfun_shadow_boundary", True)
 
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", True)
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_version", COMPOSITION_VERSION)
