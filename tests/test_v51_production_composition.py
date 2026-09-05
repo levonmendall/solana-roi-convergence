@@ -1,0 +1,36 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def test_render_preserves_certified_production_entrypoint() -> None:
+    blueprint = Path("render.yaml").read_text()
+    assert "startCommand: uvicorn solana_roi.production:app" in blueprint
+    assert "SOLANA_ROI_ACTIVE_STRATEGY_AUTHORITY" in blueprint
+    assert "roi-convergence-v5.1-consolidated-proof-1" in blueprint
+
+
+def test_production_installs_final_v51_authority_and_routes() -> None:
+    from solana_roi import production
+
+    assert production.app.state.roi_v51_final_economic_authority is True
+    paths = {getattr(route, "path", None) for route in production.app.routes}
+    assert "/v1/strategy/authority" in paths
+    assert "/v1/strategy/consolidation" in paths
+    assert "/v1/strategy/candidate-coverage" in paths
+    assert "/v1/strategy/economic-certification" in paths
+    assert "/v1/strategy/incremental-alpha" in paths
+    assert "/v1/strategy/research-allocation" in paths
+    assert "/v1/strategy/execution-stress" in paths
+
+
+def test_final_strategy_functions_are_marked_as_consolidated() -> None:
+    from solana_roi import production  # noqa: F401
+    from solana_roi import fomo_paper_strategy as fomo
+    from solana_roi import risk_conditioned_alpha_v5 as v5
+    from solana_roi.robinhood_chain_profit_maximizer import RobinhoodProfitMaximizerMixin
+
+    assert v5._choose_lane_and_fraction.__module__.endswith("v51_consolidated_strategy")
+    assert fomo._paper_decision.__module__.endswith("v51_consolidated_strategy")
+    assert RobinhoodProfitMaximizerMixin._v5_choose_lane_fraction.__module__.endswith("v51_robinhood_consolidation")
+    assert RobinhoodProfitMaximizerMixin._v5_learned_exit_policy.__module__.endswith("v51_robinhood_consolidation")
