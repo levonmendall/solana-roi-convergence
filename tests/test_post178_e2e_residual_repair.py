@@ -128,27 +128,28 @@ def test_unified_status_uses_forward_frontier_not_historical_catchup(monkeypatch
     assert payload["overall"]["all_paper_planes_e2e_achievable"] is True
 
 
-@pytest.mark.asyncio
-async def test_head_rpc_stall_does_not_advance_observer_generation(monkeypatch: pytest.MonkeyPatch) -> None:
-    stop = asyncio.Event()
+def test_head_rpc_stall_does_not_advance_observer_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> SimpleNamespace:
+        stop = asyncio.Event()
 
-    class Rpc:
-        async def block_number(self) -> int:
-            stop.set()
-            raise RuntimeError("temporary head read failure")
+        class Rpc:
+            async def block_number(self) -> int:
+                stop.set()
+                raise RuntimeError("temporary head read failure")
 
-    plane = SimpleNamespace(rpc=Rpc(), _roi_post177_head_observer_generation=7)
+        plane = SimpleNamespace(rpc=Rpc(), _roi_post177_head_observer_generation=7)
+        await repair._observe_robinhood_head_without_false_generation(plane, stop)
+        return plane
+
     monkeypatch.setattr(repair.post177, "_inc", lambda *args, **kwargs: None)
-
-    await repair._observe_robinhood_head_without_false_generation(plane, stop)
+    plane = asyncio.run(scenario())
 
     assert plane._roi_post177_head_observer_generation == 7
     assert plane._roi_post177_head_observer_continuity_ok is False
     assert plane._roi_post177_head_observer_last_gap_reason == "observer_rpc_stall_no_reanchor"
 
 
-@pytest.mark.asyncio
-async def test_robinhood_large_backlog_jumps_to_current_bounded_window(
+def test_robinhood_large_backlog_jumps_to_current_bounded_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: dict[str, object] = {}
@@ -179,7 +180,7 @@ async def test_robinhood_large_backlog_jumps_to_current_bounded_window(
     monkeypatch.setattr(repair.frontier, "_fetch_market_logs", fetch_logs)
     monkeypatch.setattr(repair.frontier, "_fresh_head_ready", fresh)
 
-    await repair._advance_robinhood_current_window(plane)
+    asyncio.run(repair._advance_robinhood_current_window(plane))
 
     window = int(repair.frontier.MAX_LIVE_FRONTIER_GAP_BLOCKS)
     assert calls["factory"] == (1000 - window + 1, 1000)
