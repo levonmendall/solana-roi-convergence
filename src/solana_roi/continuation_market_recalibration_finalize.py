@@ -228,6 +228,16 @@ def install_continuation_market_recalibration_finalize() -> None:
 
     _INSTALLED = True
 
+    # A release SHA is audit lineage, not an economic reset. Install the explicit
+    # compatibility epoch only after continuation is the final authority. The schema
+    # compatibility wrapper retains historical/minimal direct-call contracts while
+    # production tables use the new cross-release statistical population.
+    from .cross_release_learning_schema_compat import (
+        install_cross_release_learning_schema_compat,
+    )
+
+    install_cross_release_learning_schema_compat()
+
 
 __all__ = [
     "FINALIZER_VERSION",
