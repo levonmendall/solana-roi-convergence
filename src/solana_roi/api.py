@@ -13,6 +13,8 @@ from typing import Any
 from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
+from . import risk_conditioned_alpha_v5 as risk_v5
+from . import risk_conditioned_alpha_v51 as risk_v51
 from .activation import ARM_CONFIRMATION
 from .config import BASELINE
 from .direct_deployment import deployment_preflight
@@ -22,6 +24,20 @@ from .runtime import IngestionRuntime, build_runtime
 @lru_cache(maxsize=1)
 def ingestion_runtime() -> IngestionRuntime:
     return build_runtime()
+
+
+def _active_strategy_version() -> str:
+    """Return the strategy actually composed into the live decision path.
+
+    ``BASELINE.version`` is retained as immutable lineage for the original forward
+    harness, but production installs risk-conditioned v5.1 after the API module is
+    imported. Read the mutable strategy module at request time only when the v5.1
+    installer has actually completed, so direct/unit API imports cannot falsely
+    advertise an uninstalled strategy.
+    """
+    if bool(getattr(risk_v51, "_INSTALLED", False)):
+        return str(getattr(risk_v5, "STRATEGY_VERSION", risk_v51.V51_VERSION))
+    return str(BASELINE.version)
 
 
 @asynccontextmanager
@@ -156,10 +172,14 @@ def strategy_baseline() -> dict[str, object]:
 @app.get("/v1/ingestion/status")
 def ingestion_status() -> dict[str, object]:
     runtime = ingestion_runtime()
+    active_strategy_version = _active_strategy_version()
     return {
         "paper_only": True,
         "live_money_authority": False,
-        "strategy_version": BASELINE.version,
+        "strategy_version": active_strategy_version,
+        "active_strategy_version": active_strategy_version,
+        "baseline_strategy_version": BASELINE.version,
+        "strategy_version_source": "active_runtime_composition",
         "paper_nav_usd": runtime.engine.nav_usd,
         "paper_cash_usd": runtime.engine.portfolio.cash_usd,
         "paper_signal_promotion_enabled": runtime.paper_signal_promotion_enabled,
