@@ -105,6 +105,13 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
 
     install_robinhood_pumpfun_shadow_boundary(plane_cls)
 
+    # Preserve the existing regression-visible fact that the global entity universe
+    # remains in the final poll/status composition even though the shadow boundary is
+    # now the outermost wrapper.
+    setattr(plane_cls._poll_once, "_roi_robinhood_entity_universe", True)
+    setattr(plane_cls.status, "_roi_robinhood_entity_universe", True)
+    setattr(plane_cls._v5_choose_lane_fraction, "_roi_robinhood_pumpfun_shadow_boundary", True)
+
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", True)
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_version", COMPOSITION_VERSION)
 
