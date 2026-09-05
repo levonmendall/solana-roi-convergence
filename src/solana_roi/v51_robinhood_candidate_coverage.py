@@ -3,10 +3,10 @@ from __future__ import annotations
 from functools import wraps
 from typing import Any, Awaitable, Callable
 
-from .v51_candidate_pipeline import _record as _record_stage
+from .v51_candidate_ledger import record_stage_event as _record_stage
 from .v51_robinhood_consolidation import _candidate_id, _upsert_ledger
 
-COVERAGE_VERSION = "v51-robinhood-prelane-coverage-v1"
+COVERAGE_VERSION = "v51-robinhood-prelane-coverage-v2-append-only-stages"
 _INSTALLED = False
 
 
