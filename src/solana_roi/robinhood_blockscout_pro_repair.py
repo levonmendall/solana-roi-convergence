@@ -9,10 +9,18 @@ from . import robinhood_entity_resolution_repair as entity_repair
 from .robinhood_chain_core import KNOWN_NON_ACTORS, ROBINHOOD_CHAIN_ID, _clean_address
 
 
-REPAIR_VERSION = "robinhood-blockscout-pro-entity-v1"
+REPAIR_VERSION = "robinhood-blockscout-pro-entity-v2-secret-binding"
 DEFAULT_PRO_API_URL = "https://api.blockscout.com/v2/api"
 MISSING_KEY_BACKOFF_SECONDS = 300.0
 TXLIST_OFFSET = 50
+# Canonical first. The aliases make existing Render secret naming resilient without
+# exposing or copying secret material, while the Blueprint now declares the canonical
+# binding so new releases cannot silently omit it.
+API_KEY_ENV_NAMES = (
+    "BLOCKSCOUT_API_KEY",
+    "BLOCKSCOUT_PRO_API_KEY",
+    "BLOCKSCOUT_API_TOKEN",
+)
 _ORIGINAL_STATUS: Callable[..., Any] | None = None
 
 
@@ -24,8 +32,16 @@ def _required() -> bool:
     }
 
 
+def _api_key_source() -> tuple[str | None, str]:
+    for name in API_KEY_ENV_NAMES:
+        value = os.getenv(name, "").strip()
+        if value:
+            return name, value
+    return None, ""
+
+
 def _api_key() -> str:
-    return os.getenv("BLOCKSCOUT_API_KEY", "").strip()
+    return _api_key_source()[1]
 
 
 def _api_url() -> str:
@@ -165,6 +181,7 @@ def _status_with_pro_api(original: Callable[[Any], dict[str, Any]]) -> Callable[
     def status(self: Any) -> dict[str, Any]:
         payload = original(self)
         stats = entity_repair._stats(self)
+        key_env_name, key = _api_key_source()
         entity = payload.setdefault("entity_resolution", {})
         if isinstance(entity, dict):
             entity.update(
@@ -172,7 +189,9 @@ def _status_with_pro_api(original: Callable[[Any], dict[str, Any]]) -> Callable[
                     "provider_api": "blockscout-pro-universal",
                     "provider_chain_id": ROBINHOOD_CHAIN_ID,
                     "provider_api_url": _api_url(),
-                    "api_key_configured": bool(_api_key()),
+                    "api_key_configured": bool(key),
+                    "api_key_env_name": key_env_name,
+                    "api_key_supported_env_names": list(API_KEY_ENV_NAMES),
                     "api_key_value_exposed": False,
                     "query_shape": "account.txlist inbound sort=asc single-request",
                     "max_provider_calls_per_uncached_actor": 1,
@@ -188,6 +207,9 @@ def _status_with_pro_api(original: Callable[[Any], dict[str, Any]]) -> Callable[
             "enabled": True,
             "legacy_403_path_removed": True,
             "single_request_ascending_funder_resolution": True,
+            "canonical_secret_binding": "BLOCKSCOUT_API_KEY",
+            "secret_alias_fallback_supported": True,
+            "secret_value_exposed": False,
             "strategy_thresholds_changed": False,
             "entity_independence_rules_changed": False,
             "paper_only": True,
@@ -236,8 +258,17 @@ def install_robinhood_blockscout_pro_repair(plane_cls: type[Any]) -> None:
         quota_provider_active,
     )
 
+    # This installer sits at the final Robinhood production-policy boundary and is
+    # imported before the ASGI startup workers begin. Install the shared runtime
+    # readiness repair here so the Solana/FOMO continuity proof and Robinhood entry
+    # guard are composed without adding a new startup dependency or market authority.
+    from .all_regime_runtime_boundary_repair import install_all_regime_runtime_boundary_repair
+
+    install_all_regime_runtime_boundary_repair(plane_cls)
+
 
 __all__ = [
+    "API_KEY_ENV_NAMES",
     "REPAIR_VERSION",
     "DEFAULT_PRO_API_URL",
     "install_robinhood_blockscout_pro_repair",
