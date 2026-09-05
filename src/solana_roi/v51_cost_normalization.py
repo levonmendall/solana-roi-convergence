@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any
+from functools import wraps
+from typing import Any, Callable
 
 from .v51_economic_core import robust_profile
 from .v51_evidence_analytics import _audit_records, _surface_for_row, _safe, refresh_execution_cost_ledger
 
 
-COST_NORMALIZATION_VERSION = "v51-certification-cost-normalization-v1"
+COST_NORMALIZATION_VERSION = "v51-certification-cost-normalization-v2"
+_INSTALLED = False
+_ORIGINAL_API_BUILD: Callable[[Any], dict[str, Any]] | None = None
 
 
 def _band(value: float | None) -> str:
@@ -71,4 +74,39 @@ def normalize_certification_execution_costs(store: Any, certification: dict[str,
     return result
 
 
-__all__ = ["COST_NORMALIZATION_VERSION", "normalize_certification_execution_costs"]
+def install_api_cost_normalization() -> None:
+    """Decorate the public audit-certification builder without changing economics."""
+    global _INSTALLED, _ORIGINAL_API_BUILD
+    from . import v51_strategy_api as api
+
+    current = api.build_economic_certification
+    if bool(getattr(current, "_roi_v51_cost_normalized", False)):
+        _INSTALLED = True
+        return
+    _ORIGINAL_API_BUILD = current
+
+    @wraps(current)
+    def normalized(store: Any) -> dict[str, Any]:
+        return normalize_certification_execution_costs(store, current(store))
+
+    setattr(normalized, "_roi_v51_cost_normalized", True)
+    api.build_economic_certification = normalized  # type: ignore[assignment]
+    _INSTALLED = True
+
+
+def status() -> dict[str, Any]:
+    return {
+        "version": COST_NORMALIZATION_VERSION,
+        "installed": _INSTALLED,
+        "audit_certification_uses_normalized_round_trip_cost": _INSTALLED,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+
+
+__all__ = [
+    "COST_NORMALIZATION_VERSION",
+    "install_api_cost_normalization",
+    "normalize_certification_execution_costs",
+    "status",
+]
