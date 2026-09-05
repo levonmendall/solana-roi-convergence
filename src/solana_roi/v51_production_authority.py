@@ -104,7 +104,11 @@ def install_v51_production_authority(
         runtime_provider,
         robinhood_status_provider=module._status,
     )
-    install_forward_certification(app, runtime_provider=runtime_provider)
+    install_forward_certification(
+        app,
+        runtime_provider=runtime_provider,
+        robinhood_status_provider=module._status,
+    )
     app.state.roi_v51_final_economic_authority = True
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
@@ -125,7 +129,7 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
-        "forward_certification_installation": "read_only_composition_of_existing_transport_and_evidence_proof_planes",
+        "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
         "live_release_attestation": promotion_proof_status(),
