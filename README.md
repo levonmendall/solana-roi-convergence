@@ -10,7 +10,8 @@ The current economic authority is **ROI Convergence v5.1 consolidated proof**:
 - authority id: `roi-convergence-v5.1-consolidated-proof-1`;
 - frozen economic evidence epoch: `v51-consolidated-proof-20260905`;
 - machine-readable authority: [`strategy_v51_authority.json`](strategy_v51_authority.json);
-- production entrypoint: `solana_roi.v51_production:app`.
+- certified production entrypoint: `solana_roi.production:app`;
+- final economic-composition hook: `v51_final_production_install.py`.
 
 Older v3.1/v4/v5 documents, scout cohorts, tables and repair modules remain only where needed for audit, evidence lineage or transport/reliability compatibility. They do **not** override the canonical v5.1 selection, sizing, promotion, exit-learning or allocation authority.
 
@@ -74,7 +75,7 @@ The system may construct unsigned/read-only execution evidence for paper evaluat
 
 ## Production
 
-The Render Blueprint runs one web service with a persistent SQLite disk. Standard Solana RPC/WebSocket ingestion, Jupiter amount-specific quotes, adaptive wallet research, FOMO and Robinhood Chain are composed under the canonical v5.1 production entrypoint.
+The Render Blueprint keeps the certified `solana_roi.production:app` entrypoint and its constant-time liveness contract. The final v5.1 authority hook is installed at the end of the existing Robinhood production-composition boundary, after all Solana/FOMO/Robinhood compatibility installers have loaded. This makes v5.1 the last economic authority without replacing the certified ASGI startup architecture.
 
 The legacy Jijo/Wugi/The Doc public cohort remains configured only for baseline/audit and compatibility ingestion. It is not final strategy authority.
 
@@ -85,7 +86,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 pytest
-uvicorn solana_roi.v51_production:app --reload
+uvicorn solana_roi.production:app --reload
 ```
 
 See [`docs/V51_CONSOLIDATED_STRATEGY.md`](docs/V51_CONSOLIDATED_STRATEGY.md) for the design and proof contract.
