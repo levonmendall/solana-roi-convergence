@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: live-forward-proof-once
+  cancel-in-progress: true
+
 jobs:
   verify-live-main:
     runs-on: ubuntu-latest
@@ -16,11 +20,76 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Verify deployed main forward proof
+      - name: Inspect exact deployed main proof surfaces
         env:
           EXPECTED_RELEASE_COMMIT: 49b1a1d5eae23ca15d0aa6351eed985c9318adee
-          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
-          FORWARD_PROOF_PROBE_ATTEMPTS: '30'
-          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
-          FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '10'
-        run: python tests/production_forward_proof_probe.py
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          base = 'https://solana-roi-convergence.onrender.com'
+          expected = os.environ['EXPECTED_RELEASE_COMMIT']
+
+          def get(path):
+              req = urllib.request.Request(
+                  base + path,
+                  headers={'Accept': 'application/json', 'User-Agent': 'solana-roi-live-proof-diagnostic/1'},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      payload = json.loads(response.read().decode('utf-8'))
+                      print(path, 'HTTP', response.status)
+                      return payload
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode('utf-8', errors='replace')
+                  print(path, 'HTTP', exc.code, body[:20000])
+                  raise
+
+          health = get('/health')
+          print('HEALTH', json.dumps({
+              'paper_only': health.get('paper_only'),
+              'live_money_authority': health.get('live_money_authority'),
+              'release_commit': health.get('release_commit'),
+              'status': health.get('status'),
+          }, sort_keys=True))
+
+          e2e = get('/v1/strategy/e2e-status')
+          e2e_summary = {
+              'release_commit': e2e.get('release_commit'),
+              'overall': e2e.get('overall'),
+              'solana': e2e.get('solana'),
+              'fomo': e2e.get('fomo'),
+              'robinhood': e2e.get('robinhood'),
+          }
+          print('E2E', json.dumps(e2e_summary, sort_keys=True))
+
+          cert = get('/v1/strategy/forward-certification')
+          cert_summary = {
+              'release_commit': cert.get('release_commit'),
+              'expected_release_commit': cert.get('expected_release_commit'),
+              'state': cert.get('state'),
+              'system_forward_certified': cert.get('system_forward_certified'),
+              'hard_operational_gates_ok': cert.get('hard_operational_gates_ok'),
+              'evidence_maturity_ok': cert.get('evidence_maturity_ok'),
+              'blockers': cert.get('blockers'),
+              'checks': cert.get('checks'),
+              'promotion_eligible_families': cert.get('promotion_eligible_families_under_existing_v51_claims'),
+              'future_mature_scaling_eligible_families': cert.get('future_mature_scaling_eligible_families'),
+              'paper_only': cert.get('paper_only'),
+              'live_money_authority': cert.get('live_money_authority'),
+              'signing_available': cert.get('signing_available'),
+              'transaction_submission_available': cert.get('transaction_submission_available'),
+          }
+          print('CERT', json.dumps(cert_summary, sort_keys=True))
+
+          assert e2e.get('release_commit') == expected
+          assert cert.get('release_commit') == expected
+          assert cert.get('expected_release_commit') == expected
+          assert cert.get('paper_only') is True
+          assert cert.get('live_money_authority') is False
+          assert cert.get('signing_available') is False
+          assert cert.get('transaction_submission_available') is False
+          PY
