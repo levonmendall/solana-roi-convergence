@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from solana_roi import v51_measurement_integrity as measurement
+from solana_roi.v51_attestation_sources import install_primary_attestation_sources
 from solana_roi.v51_candidate_ledger import ensure_schema, record_solana_candidate, record_stage_event
 from solana_roi.v51_evidence_analytics import (
     _portfolio_reconcile,
@@ -79,6 +80,8 @@ def test_23_current_release_starts_unattested_then_earns_solana_attestation(monk
 
         base = _ensure_release_compatibility_fail_closed
     monkeypatch.setattr(promotion, "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY", base)
+    install_primary_attestation_sources()
+
     row = _ensure_release_with_attestation(store, release)
     assert row is not None
     assert int(row["promotion_eligible"]) == 0
@@ -105,6 +108,14 @@ def test_23_current_release_starts_unattested_then_earns_solana_attestation(monk
     )
     with store._lock, store.db:
         store.db.execute(
+            "CREATE TABLE risk_conditioned_alpha_v5_trials("
+            "release_commit TEXT,source_signature TEXT,entry_executable INTEGER,exit_executable INTEGER)"
+        )
+        store.db.execute(
+            "INSERT INTO risk_conditioned_alpha_v5_trials VALUES (?,?,1,1)",
+            (release, "sig-attested"),
+        )
+        store.db.execute(
             "CREATE TABLE v51_wallet_discovery_forward_lineage("
             "release_commit TEXT,measurement_epoch TEXT,source_candidate_id TEXT)"
         )
@@ -116,6 +127,7 @@ def test_23_current_release_starts_unattested_then_earns_solana_attestation(monk
     attestation = refresh_release_attestation(store, release_commit=release, surfaces=("SOLANA",))
     assert attestation["attested"] is True
     assert attestation["surfaces"]["SOLANA"]["candidate_coverage_valid"] is True
+    assert attestation["surfaces"]["SOLANA"]["requires_api_reconciliation"] is False
     with store._lock:
         compatibility = store.db.execute(
             "SELECT promotion_eligible,reason FROM v51_release_compatibility WHERE release_commit=?", (release,)
