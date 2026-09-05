@@ -9,6 +9,7 @@ from .strategy_v51_authority import authority, authority_fingerprint
 from .v51_candidate_pipeline import refresh_candidate_pipeline
 from .v51_consolidated_strategy import status as consolidation_status
 from .v51_economic_certification import build_economic_certification
+from .v51_robinhood_consolidation import refresh_robinhood_candidate_learning
 
 API_VERSION = "v51-strategy-proof-api-v1"
 _INSTALLED = False
@@ -48,7 +49,14 @@ def install_v51_strategy_api(app: FastAPI, runtime_provider: Callable[[], Any] |
     @app.get("/v1/strategy/candidate-coverage")
     def v51_candidate_coverage() -> dict[str, Any]:
         runtime = _runtime(runtime_provider)
-        return refresh_candidate_pipeline(runtime.store)
+        robinhood = refresh_robinhood_candidate_learning(runtime.store)
+        payload = refresh_candidate_pipeline(runtime.store)
+        payload["robinhood_candidate_learning"] = robinhood
+        payload["robinhood_detection_coverage"] = (
+            "canonical_lane-selection candidates are durably attributed without a second polling path; "
+            "preselection noise that never reaches entity/lifecycle/risk lane evaluation is not counted as an economic opportunity"
+        )
+        return payload
 
     @app.get("/v1/strategy/economic-certification")
     def v51_economic_certification() -> dict[str, Any]:
