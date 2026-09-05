@@ -176,6 +176,17 @@ from .robinhood_strategy_alignment_composition import (
 
 install_robinhood_strategy_alignment_composition(RobinhoodChainPaperPlane)
 
+# A historical gap must remain losslessly backfilled, but it no longer has to make the
+# current Robinhood paper lane unavailable. Install the verified live epoch last so it
+# wraps the final v5.1/continuation/entity policy methods: factory definitions are
+# synchronized through a fresh anchor, only post-anchor contiguous swap flow can
+# authorize new paper entries, and the durable historical cursor continues separately.
+from .robinhood_live_frontier_verification_repair import (
+    install_robinhood_live_frontier_verification_repair,
+)
+
+install_robinhood_live_frontier_verification_repair(RobinhoodChainPaperPlane)
+
 
 __all__ = [
     "RobinhoodChainPaperPlane",
