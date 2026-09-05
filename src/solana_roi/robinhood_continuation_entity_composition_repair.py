@@ -6,7 +6,7 @@ from . import continuation_market_recalibration as continuation
 from . import robinhood_entity_resolution_repair as entity_repair
 
 
-REPAIR_VERSION = "robinhood-continuation-entity-composition-v1"
+REPAIR_VERSION = "robinhood-continuation-entity-composition-v2"
 
 
 def install_robinhood_continuation_entity_composition_repair(plane_cls: type[Any]) -> None:
@@ -22,10 +22,21 @@ def install_robinhood_continuation_entity_composition_repair(plane_cls: type[Any
     bootstrap/extended-continuation state machine, while unresolved raw addresses
     still cannot count as independent evidence and decision-critical identities still
     fail closed.
+
+    The paper settlement dispatcher also uses the active v2/v3 method ``__module__``
+    as version-lineage metadata. The entity funnel wrappers therefore inherit the
+    exact already-composed module identity from the methods they wrapped rather than
+    presenting themselves as a new trading-policy authority.
     """
 
     if bool(getattr(plane_cls, "_roi_continuation_entity_composition_repair", False)):
         return
+
+    if entity_repair._ORIGINAL_MAYBE_OPEN_V2 is not None:
+        plane_cls._maybe_open_v2.__module__ = entity_repair._ORIGINAL_MAYBE_OPEN_V2.__module__
+    if entity_repair._ORIGINAL_MAYBE_OPEN_V3 is not None:
+        plane_cls._maybe_open_v3.__module__ = entity_repair._ORIGINAL_MAYBE_OPEN_V3.__module__
+
     if not bool(getattr(continuation, "_INSTALLED", False)):
         # Direct/test imports that do not install the continuation policy retain the
         # entity repair's own flow method. Do not invent continuation authority.
