@@ -4,20 +4,18 @@ from typing import Any, Callable
 
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
-from .v51_robinhood_proof import cached_robinhood_proof
 from .v51_strategy_api import install_v51_strategy_api
 
 _INSTALLED = False
 
 
 def _install_isolated_robinhood_proof_cache(module: Any) -> None:
-    """Publish proof from Robinhood's private store through its status cache.
+    """Publish v5.1 proof from Robinhood's private worker/store.
 
-    Robinhood intentionally owns a separate SQLite database and OS thread. The
-    Uvicorn/canonical path must not reopen that database merely to build a combined
-    dashboard. The isolation worker already calls ``_ORIGINAL_STATUS`` inside its
-    private thread before deep-copying the result into a nonblocking status cache;
-    enrich that exact publication point with a 30-second proof snapshot.
+    The worker-isolation repair calls ``_ORIGINAL_STATUS`` from the dedicated
+    Robinhood thread and then deep-copies the result into a nonblocking cache.
+    Enriching that producer is therefore the safe place to read Robinhood SQLite:
+    Uvicorn and the canonical Solana store only consume the copied proof object.
     """
     from . import robinhood_worker_isolation_repair as isolation
 
@@ -37,13 +35,25 @@ def _install_isolated_robinhood_proof_cache(module: Any) -> None:
             }
             return payload
         try:
+            from .v51_robinhood_consolidation import refresh_robinhood_candidate_learning
+            from .v51_robinhood_proof import cached_robinhood_proof
+
+            # Register this private store's exact release into the frozen epoch.
+            # The installer is already globally active; supplying a store here only
+            # establishes evidence lineage for this isolated SQLite database.
+            install_v51_consolidated_strategy(
+                store=plane.store,
+                release_commit=getattr(plane, "release_commit", None),
+            )
+            refresh_robinhood_candidate_learning(plane.store)
             proof = cached_robinhood_proof(plane.store)
             proof["available"] = True
             payload["v51_proof"] = proof
         except Exception as exc:
             payload["v51_proof"] = {
                 "available": False,
-                "reason": f"{type(exc).__name__}: isolated Robinhood proof unavailable",
+                "reason": "isolated_robinhood_proof_failed_closed",
+                "error_type": type(exc).__name__,
                 "paper_only": True,
                 "live_money_authority": False,
             }
@@ -54,14 +64,13 @@ def _install_isolated_robinhood_proof_cache(module: Any) -> None:
 
 
 def install_v51_final_production_hook() -> None:
-    """Wrap the existing production Robinhood installer at its final import boundary.
+    """Wrap the existing production Robinhood installer at its final boundary.
 
-    `production.py` intentionally remains the canonical Render entrypoint because
-    its constant-time liveness and post104 continuity invariants are separately
-    certified. `robinhood_runtime_install` is imported only after the Solana app is
-    constructed and all prior economic/transport wrappers are installed, so wrapping
-    its final installer gives v5.1 one last economic-authority boundary without
-    replacing the ASGI entrypoint or startup architecture.
+    ``solana_roi.production:app`` intentionally remains the certified Render
+    entrypoint. ``robinhood_runtime_install`` is imported only after all prior
+    Solana/FOMO/Robinhood compatibility composition exists, so its final installer
+    is the last safe place to make v5.1 the economic authority without replacing
+    constant-time liveness or startup architecture.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -73,17 +82,21 @@ def install_v51_final_production_hook() -> None:
         _INSTALLED = True
         return
 
-    # This function is called from the end of robinhood_worker_isolation_repair,
-    # after that repair has captured the original deep status provider. Enrich the
-    # private-thread publication point before any production worker can start.
+    # Called from the end of robinhood_worker_isolation_repair, after that repair
+    # captured the worker-thread status producer but before any lifespan worker can
+    # start. The proof is therefore produced in the isolated thread and consumed
+    # from module._status's existing nonblocking cache reader.
     _install_isolated_robinhood_proof_cache(module)
 
     def install(app: Any, runtime_provider: Callable[[], Any]) -> None:
         original(app, runtime_provider)
         install_v51_consolidated_strategy()
         install_v51_robinhood_consolidation()
-        # module._status is the worker-isolation repair's nonblocking cache reader.
-        install_v51_strategy_api(app, runtime_provider, robinhood_status_provider=module._status)
+        install_v51_strategy_api(
+            app,
+            runtime_provider,
+            robinhood_status_provider=module._status,
+        )
         app.state.roi_v51_final_economic_authority = True
 
     setattr(install, "_roi_v51_final_authority", True)
