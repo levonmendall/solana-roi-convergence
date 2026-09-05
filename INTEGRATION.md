@@ -1,39 +1,46 @@
-# Integration contract for current production release
+# Integration contract for canonical v5.1 production
 
-Observed deployed baseline before this change:
+The repository's current production authority is:
 
-- release: `74b218cb32de656611a7c46cbbcf995aa9f4cd74`
-- strategy: `roi-convergence-v3.1-forward-1`
-- continuity healthy (`continuity_ok=true`, `unresolved_gap=false`)
-- process-wide RPC governor installed
-- wallet research isolated as workload `research`
-- v3.1 active cohort mutation disabled
-- current risk/entity plane connected
+- strategy version: `roi-convergence-v5.1-context-exactness-1`;
+- economic authority: `roi-convergence-v5.1-consolidated-proof-1`;
+- economic freeze epoch: `v51-consolidated-proof-20260905`;
+- production ASGI entrypoint: `solana_roi.production:app`;
+- final economic composition boundary: `install_v51_production_authority(app, ingestion_runtime)`;
+- execution authority: paper-only, with no signer, transaction submission, custody, deposits, withdrawals, or live-money balance authority.
 
-## Required repository integration
+Older v3.1/v4/v5 modules remain only where required for transport, liveness, audit lineage, immutable baseline compatibility, or historical evidence. Import order cannot make those modules the final economic authority.
 
-The GitHub connector was unavailable in the build session, so exact current source filenames for the wallet discovery/intelligence owner could not be fetched. The merge session must identify that owner and wire the new engine without source-text guessing.
+## Required production integration
 
-The production adapter should:
-
-1. Instantiate `ProfitFirstEntityStrategy` in the existing **wallet research process**, never in the critical continuity/hydration path.
-2. Feed point-in-time entity links from the existing risk/entity plane into `EntityGraph`.
-3. On every fresh copyability-eligible wallet/token observation, create an `OpportunitySnapshot` using only evidence available at that timestamp.
-4. Emit shadow trials for every eligible lane on the same chronological observation.
-5. Record realized residual net return from the first executable quote available to the system; do not use the source wallet's privileged fill.
-6. Persist `ForwardOutcome` rows append-only and release-bound.
-7. Expose `profit_first_entity_strategy` status alongside `wallet_intelligence` and `wallet_discovery`.
-8. Keep current `strategy_version=roi-convergence-v3.1-forward-1` until a governed v4 cohort/manifest is explicitly armed. Do not silently replace it at import time.
-9. Preserve the current RPC workload governor and tag all additional reads as `research`.
-10. Add no signing, submission or live-money capability.
+1. Observe the configured Solana market scope through direct standard Solana HTTP/WebSocket providers. Legacy Helius compatibility endpoints have no canonical readiness or promotion authority.
+2. Register canonical Solana candidates at the normalized scout ingress before risk, quote, strategy, or wallet-research filtering.
+3. Preserve append-only candidate stage history through `ingestion → candidate → context → execution_evidence → decision → position → settlement → learning`.
+4. Use venue-native executed instruction/transfer proof for Pump.fun, Pump AMM and Raydium candidate attribution. Account-key presence alone is not venue authority.
+5. Preserve programIdIndex, address-lookup-table, temporary-token-account, sponsored execution, split quote-leg, compiled SPL/System transfer and fail-closed ambiguity handling.
+6. Keep wallet/entity discovery a secondary research consumer with immutable release/economic/measurement/execution lineage; it is not candidate-coverage truth.
+7. Keep Robinhood Chain forward-only for strategy opportunity detection. Historical/backfill state is archival only and cannot authorize retrospective entries.
+8. Keep Robinhood SQLite ownership inside its isolated worker. The main API thread consumes only cached proof/status payloads.
+9. Require amount-specific executable evidence and unsigned/read-only simulation where applicable. Missing execution evidence may create explicit zero-allocation research evidence but cannot create a paper entry or promotion sample.
+10. Publish proof freshness, release SHA, economic epoch, measurement epoch, execution-model epoch and proof state on canonical v5.1 proof surfaces.
+11. Preserve measurement compatibility: known defective and unclassified historical measurement releases remain auditable but cannot contribute live promotion evidence.
+12. Add no private-key, signing, transaction-submission or live-money capability.
 
 ## Merge acceptance
 
-- current main SHA checked before branch creation;
-- no equivalent v4 strategy already landed;
-- existing continuity/capacity tests remain green;
-- focused v4 tests green;
-- full repository CI green;
-- paper-only/no-signing tests green;
-- production status after deploy reports the exact merged release;
-- continuity remains healthy before any v4 paper cohort is armed.
+Every production change must satisfy all of the following:
+
+- branch begins from the latest canonical `main`;
+- exact dependencies are installed from `requirements.lock` in CI;
+- canonical architecture and transfer-certification invariants pass;
+- wallet/entity regressions pass;
+- full repository regressions pass;
+- forward-cohort certification regressions pass;
+- audit 11–22 closure regressions pass;
+- a separate smoke starts the real `uvicorn solana_roi.production:app` process and verifies the v5.1 authority over HTTP;
+- `python -m compileall -q src` passes;
+- merge is performed against the exact tested PR head SHA;
+- post-merge `main` CI is green;
+- Render automatically deploys that exact `main` SHA and reaches `live`.
+
+GitHub branch/ruleset administration should require the stable `required-ci` check and pull-request review before `main` is updated. The repository workflow supplies that stable check name; server-side enforcement is a GitHub repository setting.

@@ -8,16 +8,29 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  required-ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-      - run: python -m pip install -e '.[dev]'
+          cache-dependency-path: requirements.lock
+      - name: Install exact locked dependencies
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Audit 11-22 closure regressions
+        run: python -m pytest tests/test_audit_11_22_closure.py
+      - name: Launched production HTTP smoke
+        run: python tests/launched_production_smoke.py
       - name: Canonical architecture and transfer-certification invariants
         run: python -m pytest tests/test_five_phase_certification_consolidation.py
       - name: Final v4 wallet entity universe regressions
@@ -26,4 +39,5 @@ jobs:
         run: python -m pytest --ignore=tests/test_forward_activation.py
       - name: Forward cohort certification regressions
         run: python -m pytest tests/test_forward_activation.py
-      - run: python -m compileall -q src
+      - name: Compile production package
+        run: python -m compileall -q src
