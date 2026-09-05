@@ -18,6 +18,10 @@ class _Rpc:
         return self.heads[0]
 
 
+def _head(offset: int = 1000) -> int:
+    return forward.runtime.PONS_V1_LEGACY_START_BLOCK + offset
+
+
 def test_decision_transport_can_be_live_while_historical_cursor_is_behind() -> None:
     plane = SimpleNamespace(
         _caught_up=False,
@@ -30,6 +34,8 @@ def test_decision_transport_can_be_live_while_historical_cursor_is_behind() -> N
 
 def test_epoch_anchor_keeps_archival_cursor_and_only_recovers_bounded_factory_metadata(monkeypatch) -> None:
     synced: list[tuple[int, int]] = []
+    latest = _head()
+    archival_cursor = forward.runtime.PONS_V1_LEGACY_START_BLOCK
 
     async def sync(_self, *, from_block: int, to_block: int) -> int:
         synced.append((from_block, to_block))
@@ -37,13 +43,13 @@ def test_epoch_anchor_keeps_archival_cursor_and_only_recovers_bounded_factory_me
 
     class Rpc(_Rpc):
         async def chain_id(self) -> int:
-            return 46630
+            return forward.runtime.ROBINHOOD_CHAIN_ID
 
     monkeypatch.setattr(repair, "_sync_factory_state", sync)
     monkeypatch.setattr(repair, "_record_epoch", lambda *_args, **_kwargs: None)
     plane = SimpleNamespace(
-        rpc=Rpc(2000, 2000),
-        _cursor=1000,
+        rpc=Rpc(latest, latest),
+        _cursor=archival_cursor,
         _latest_block=None,
         _caught_up=False,
         v3_pools={},
@@ -51,14 +57,14 @@ def test_epoch_anchor_keeps_archival_cursor_and_only_recovers_bounded_factory_me
     )
 
     asyncio.run(forward._forward_only_advance_live_epoch(plane))
-    assert plane._cursor == 1000
-    assert plane._roi_live_epoch_anchor_block == 2000
-    assert plane._roi_live_epoch_cursor == 2000
+    assert plane._cursor == archival_cursor
+    assert plane._roi_live_epoch_anchor_block == latest
+    assert plane._roi_live_epoch_cursor == latest
     assert plane._roi_live_epoch_ready is False
-    assert synced == [(1937, 2000)]
+    assert synced == [(latest - 63, latest)]
 
     asyncio.run(forward._forward_only_advance_live_epoch(plane))
-    assert plane._cursor == 1000
+    assert plane._cursor == archival_cursor
     assert plane._roi_live_epoch_ready is True
 
 
@@ -131,6 +137,9 @@ def test_fresh_entry_guard_uses_live_cursor_not_historical_cursor() -> None:
 
 def test_large_live_gap_reanchors_without_swap_replay(monkeypatch) -> None:
     synced: list[tuple[int, int]] = []
+    live_cursor = _head()
+    latest = live_cursor + 100
+    archival_cursor = forward.runtime.PONS_V1_LEGACY_START_BLOCK
 
     async def sync(_self, *, from_block: int, to_block: int) -> int:
         synced.append((from_block, to_block))
@@ -139,23 +148,23 @@ def test_large_live_gap_reanchors_without_swap_replay(monkeypatch) -> None:
     monkeypatch.setattr(repair, "_sync_factory_state", sync)
     monkeypatch.setattr(repair, "_record_epoch", lambda *_args, **_kwargs: None)
     plane = SimpleNamespace(
-        rpc=_Rpc(2100),
-        _cursor=1000,
-        _latest_block=2000,
+        rpc=_Rpc(latest),
+        _cursor=archival_cursor,
+        _latest_block=live_cursor,
         _caught_up=False,
         _roi_forward_only_chain_id_verified=True,
-        _roi_live_epoch_anchor_block=2000,
-        _roi_live_epoch_cursor=2000,
+        _roi_live_epoch_anchor_block=live_cursor,
+        _roi_live_epoch_cursor=live_cursor,
         _roi_live_epoch_ready=True,
         v3_pools={},
         v2_curves={},
     )
     asyncio.run(forward._forward_only_advance_live_epoch(plane))
-    assert synced == [(2037, 2100)]
-    assert plane._roi_live_epoch_anchor_block == 2100
-    assert plane._roi_live_epoch_cursor == 2100
+    assert synced == [(latest - 63, latest)]
+    assert plane._roi_live_epoch_anchor_block == latest
+    assert plane._roi_live_epoch_cursor == latest
     assert plane._roi_live_epoch_ready is False
-    assert plane._cursor == 1000
+    assert plane._cursor == archival_cursor
 
 
 def test_status_exposes_live_readiness_separately_from_archival_cursor() -> None:
