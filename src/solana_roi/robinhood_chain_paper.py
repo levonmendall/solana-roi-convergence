@@ -165,6 +165,17 @@ from .robinhood_strategy_alignment_repair import (
 
 install_robinhood_strategy_alignment_repair(RobinhoodChainPaperPlane)
 
+# Keep the existing PR146 continuation function as the exact final strategy method.
+# Entity discovery is observational bookkeeping, so attach it after each completed
+# poll instead of wrapping flow classification. This preserves the protected method
+# identity and makes it impossible for the research lane to become alternate paper
+# authority while still evaluating resolved entities continuously.
+from .robinhood_strategy_alignment_composition import (
+    install_robinhood_strategy_alignment_composition,
+)
+
+install_robinhood_strategy_alignment_composition(RobinhoodChainPaperPlane)
+
 
 __all__ = [
     "RobinhoodChainPaperPlane",
