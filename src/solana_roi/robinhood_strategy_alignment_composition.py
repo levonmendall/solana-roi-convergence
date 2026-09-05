@@ -60,6 +60,17 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     _ORIGINAL_POLL = plane_cls._poll_once
     plane_cls._poll_once = _poll_once_with_research_discovery  # type: ignore[method-assign]
 
+    # Pump.fun maintains a persistent role/specialist wallet universe and then uses
+    # regime as context. Mirror that structure for Robinhood: one ranked specialist
+    # watchlist per profit lane, with regimes retained only inside the underlying
+    # execution/promotion context. The watchlist reuses already-ingested evidence,
+    # adds no provider polling and cannot independently authorize a paper entry.
+    from .robinhood_lane_specialist_watchlist import (
+        install_robinhood_lane_specialist_watchlist,
+    )
+
+    install_robinhood_lane_specialist_watchlist(plane_cls)
+
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", True)
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_version", COMPOSITION_VERSION)
 
