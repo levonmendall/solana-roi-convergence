@@ -117,6 +117,10 @@ services:
         value: "true"
       - key: ROBINHOOD_ENTITY_RESOLUTION_REQUIRED
         value: "true"
+      # Canonical secret binding for the Blockscout universal API. The value stays
+      # in Render only and is never committed or exposed through status telemetry.
+      - key: BLOCKSCOUT_API_KEY
+        sync: false
       # Optional production RPC override. When absent, the implementation falls
       # back to Robinhood's official rate-limited public read-only RPC and reports
       # that condition in telemetry. No private key is ever configured.
