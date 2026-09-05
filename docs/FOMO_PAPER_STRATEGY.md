@@ -1,32 +1,34 @@
 # FOMO Paper Strategy
 
+> **Canonical authority:** `strategy_v51_authority.json` and `docs/V51_CONSOLIDATED_STRATEGY.md`. This document describes the FOMO transport/paper mechanism; any older threshold or promotion wording that conflicts with the canonical v5.1 authority is superseded.
+
 The FOMO implementation has two deliberately separate layers.
 
-1. `fomo_continuation_shadow` remains the point-in-time evidence collector. Keeping that surface shadow-only preserves the existing audit contract and makes it possible to compare FOMO state classifications without granting the collector execution authority.
+1. `fomo_continuation_shadow` remains the point-in-time evidence collector. Keeping that surface shadow-only preserves the audit contract and lets FOMO state classifications be compared without granting the collector execution authority.
 2. `fomo_continuation_paper` is the active simulation strategy. It can create and settle paper positions only. It has no signing, transaction-submission, or live-money authority.
 
-## Wallet selection
+## Wallet and context evidence
 
-FOMO wallet performance is evaluated only inside the exact `wallet × venue × lifecycle × regime` context and only from same-release forward FOMO outcomes. Historical wallet performance may help discovery, but it cannot promote a wallet into FOMO paper authority.
+FOMO evidence remains exact-context and forward-only for promotion. Under the consolidated v5.1 epoch, compatible deployment SHAs may pool only after registration to `v51-consolidated-proof-20260905`; pre-epoch outcomes remain audit-only.
 
-A FOMO wallet context becomes mature after the existing minimum forward sample requirement. Promotion requires positive median residual ROI, positive mean after removing the single best trade, and at least a 50% positive-outcome rate. A mature context with non-positive trimmed or median ROI is demoted for FOMO entries. Success in one FOMO context does not transfer automatically to another venue/lifecycle/regime.
-
-Before maturity, accessible `pre_fomo` and `active_fomo` observations receive a 1% bootstrap paper probe so forward evidence can accumulate. This is the mechanism by which paper trading proves or rejects the FOMO thesis rather than waiting for a separate research-only promotion event.
+FOMO is split into **clean** and **hazard** cohorts. Wallet identity does not automatically receive authority because it was historically profitable: the economic-certification layer compares wallet/entity outcomes with matched contexts that exclude identity and grants wallet-specific research priority only when identity adds positive forward residual lift.
 
 ## Entry and sizing
 
-FOMO paper entries require the existing point-in-time FOMO classifier to report `pre_fomo` or `active_fomo` and `structurally_accessible=true`. The existing FOMO classifier already fails closed on incomplete risk evidence, missing/late execution timing, chase above the unchanged 15% ceiling, creator distribution, material early-holder distribution, and deteriorating execution evidence.
+An actionable FOMO observation must be `pre_fomo` or `active_fomo`, structurally tradeable and supported by exact entry/immediate-exit execution evidence. Twenty seconds remains the maximum operational observation boundary, but being inside it is not economic approval. Residual edge is conditioned on actual latency, chase and execution cost.
 
-The paper strategy reuses the already-canonical amount-specific Jupiter/unsigned-simulation entry and immediate-exit snapshot from the unified forward research trial. It does not issue an additional quote or RPC fanout merely to create a FOMO paper position.
+The 15% chase level is the baseline rather than a universal hard reject. The 15–25% and 25–40% bands remain paper challenger contexts; above 40% is observe-only during the frozen epoch.
 
-Promoted FOMO wallet contexts choose among 0.5%, 1%, 2%, and 5% paper fractions by forward expected log growth, with a hard 5% per-position cap. Bootstrap probes use 1%. Only one FOMO paper position per token can remain open at a time.
+Creator distribution, early-holder distribution, bundling, sniper concentration, common funding, moderate quote/slippage deterioration and similar probabilistic hazards are not automatic vetoes. They increase the forward sample/growth burden and reduce bootstrap paper sizing. Mechanical inability to exit or unavailable critical execution evidence remains fail-closed.
+
+The active FOMO per-position cap remains 5%. Hazard bootstrap sizing is smaller than clean FOMO sizing. Mature fractions are governed by robust forward expected log growth and the cross-family allocator rather than hit rate alone.
 
 ## Settlement and learning
 
-FOMO paper outcomes settle from the same-release unified forward settlement record. The outcome retains the FOMO trigger wallet, venue, lifecycle, regime, FOMO state, chosen paper fraction, residual ROI, and fractional paper-NAV contribution. Those forward outcomes continuously rebuild the FOMO-specific wallet cohort and can promote or demote contexts prospectively.
+FOMO paper outcomes settle from the same canonical forward settlement evidence. The outcome retains trigger wallet, venue, lifecycle, regime, FOMO state, paper fraction and residual ROI. Those outcomes are available to the frozen-epoch economic certification, winner-removal tests, latency/cost sensitivity and execution-stress analysis.
 
-The FOMO cohort is logically separate from scout wallet authority. This release does not mutate the existing scout cohort or allow FOMO performance to promote a wallet into the scout strategy.
+A mature FOMO context can be killed after sufficient independent evidence when shrunk expected log growth, leave-best-trade-out mean and the 95% upper confidence bound are all non-positive. A killed lane cannot retain active paper allocation merely to keep generating trades.
 
-## Fixed safety boundary
+## Safety boundary
 
-The FOMO strategy is paper-only. `live_money_authority=false`, signing is unavailable, and transaction submission is unavailable. Existing 20-second entry, 15% chase, continuity, RPC, certification, and canonical-evidence boundaries are unchanged.
+The FOMO strategy is paper-only. `live_money_authority=false`, signing is unavailable and transaction submission is unavailable.
