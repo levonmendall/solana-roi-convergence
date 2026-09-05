@@ -6,6 +6,8 @@ import time
 from typing import Any
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, PIPELINE_STAGES
+from .v51_cost_normalization import normalize_certification_execution_costs
+from .v51_counterfactual_extension import refresh_all_rejected_counterfactuals
 from .v51_economic_certification import build_economic_certification
 from .v51_evidence_analytics import (
     build_forward_proof_slo,
@@ -14,7 +16,6 @@ from .v51_evidence_analytics import (
     build_promotion_certification,
     promotion_records,
     refresh_execution_cost_ledger,
-    refresh_rejected_counterfactuals,
 )
 from .v51_execution_stress_diagnostics import build_execution_mechanism_stress
 from .v51_promotion_proof import refresh_release_attestation
@@ -111,9 +112,11 @@ def build_robinhood_proof(store: Any) -> dict[str, Any]:
     # Everything below executes inside the isolated Robinhood worker. The main Uvicorn
     # process receives only this cached payload and never reads Robinhood SQLite.
     attestation = refresh_release_attestation(store, surfaces=("ROBINHOOD_CHAIN",))
-    certification = build_economic_certification(store)
+    raw_certification = build_economic_certification(store)
+    certification = normalize_certification_execution_costs(store, raw_certification)
     promotion = build_promotion_certification(store)
     promotion_rows = promotion_records(store)
+    counterfactuals = refresh_all_rejected_counterfactuals(store)
     unexpected = sorted(name for name in certification.get("families", {}) if name != "ROBINHOOD_CHAIN")
     return {
         "authority_id": AUTHORITY_ID,
@@ -124,7 +127,7 @@ def build_robinhood_proof(store: Any) -> dict[str, Any]:
         "release_attestation": attestation,
         "candidate_coverage": _candidate_coverage(store),
         "execution_cost_ledger": refresh_execution_cost_ledger(store),
-        "rejected_counterfactuals": refresh_rejected_counterfactuals(store),
+        "rejected_counterfactuals": counterfactuals,
         "hazard_calibration": build_hazard_calibration(store),
         "portfolio_reconciliation": build_portfolio_reconciliation(store),
         "forward_proof_slo": build_forward_proof_slo(store),
