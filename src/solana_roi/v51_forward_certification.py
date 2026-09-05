@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
-from .strategy_v51_consolidated import authority
+from .strategy_v51_authority import authority
 from .v51_evidence_analytics import build_evidence_validity_bundle
 
 CERTIFICATION_VERSION = "v51-live-forward-certification-v1"
@@ -17,10 +17,6 @@ CERTIFICATION_VERSION = "v51-live-forward-certification-v1"
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
-
-
-def _bool(value: Any) -> bool:
-    return bool(value)
 
 
 def _eligible_families(promotion: dict[str, Any]) -> list[str]:
