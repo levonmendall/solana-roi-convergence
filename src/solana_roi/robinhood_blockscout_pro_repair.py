@@ -206,14 +206,35 @@ def _status_with_pro_api(original: Callable[[Any], dict[str, Any]]) -> Callable[
 
 
 def install_robinhood_blockscout_pro_repair(plane_cls: type[Any]) -> None:
+    """Install the Pro provider without downgrading a newer identity adapter.
+
+    The provider hook is process-global because the entity resolver delegates through
+    ``entity_repair._entity_anchor_fetch``. A later/direct installer invocation must
+    therefore never replace the quota-aware durable cache-miss provider once it has
+    become authoritative. Checking the active provider's module avoids importing the
+    newer module here and keeps the dependency direction acyclic.
+    """
+
     global _ORIGINAL_STATUS
-    entity_repair._entity_anchor_fetch = _entity_anchor_fetch_pro
+    current_fetch = entity_repair._entity_anchor_fetch
+    current_provider_module = str(getattr(current_fetch, "__module__", ""))
+    quota_provider_active = current_provider_module.endswith(
+        ".robinhood_entity_quota_architecture"
+    )
+    if not quota_provider_active:
+        entity_repair._entity_anchor_fetch = _entity_anchor_fetch_pro
+
     current_status = plane_cls.status
     if not bool(getattr(current_status, "_roi_blockscout_pro_entity_repair", False)):
         _ORIGINAL_STATUS = current_status
         plane_cls.status = _status_with_pro_api(current_status)  # type: ignore[method-assign]
     setattr(plane_cls, "_roi_blockscout_pro_entity_repair_installed", True)
     setattr(plane_cls, "_roi_blockscout_pro_entity_repair_version", REPAIR_VERSION)
+    setattr(
+        plane_cls,
+        "_roi_blockscout_provider_downgrade_prevented",
+        quota_provider_active,
+    )
 
 
 __all__ = [
