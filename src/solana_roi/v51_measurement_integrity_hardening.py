@@ -4,7 +4,7 @@ from typing import Any, Callable
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority_fingerprint
 
-HARDENING_VERSION = "v51-measurement-integrity-hardening-v1"
+HARDENING_VERSION = "v51-measurement-integrity-hardening-v2"
 _ORIGINAL_WALLET_RECORD: Callable[..., Any] | None = None
 _INSTALLED = False
 
@@ -24,11 +24,11 @@ def _ensure_release_compatibility_fail_closed(store: Any, release_commit: str | 
     if existing is not None:
         return dict(existing)
 
-    # Only the release that is actually running may self-register as measurement
-    # valid. A historical SHA discovered later is not silently blessed. Known bad
-    # releases are already seeded fail-closed by the base compatibility schema.
     if release == measurement.current_release_commit():
-        return measurement._ORIGINAL_ENSURE_RELEASE_COMPATIBILITY(store, release)  # type: ignore[attr-defined]
+        original = getattr(measurement, "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY", None)
+        if not callable(original) or original is _ensure_release_compatibility_fail_closed:
+            raise RuntimeError("base measurement compatibility registrar unavailable")
+        return original(store, release)
 
     with store._lock, store.db:
         store.db.execute(
@@ -63,10 +63,6 @@ async def _wallet_record_with_candidate_schema(self: Any, swap: Any) -> bool:
         raise RuntimeError("measurement-integrity wallet hardening is not installed")
     from .v51_candidate_ledger import ensure_schema
 
-    # Wallet discovery is a secondary research poller and can observe a transaction
-    # before the primary scout candidate ledger has ever written a row in a fresh DB.
-    # Ensure the canonical schema exists before the lineage wrapper attempts its
-    # optional candidate-id lookup.
     ensure_schema(self.store)
     return bool(await _ORIGINAL_WALLET_RECORD(self, swap))
 
@@ -78,6 +74,7 @@ def install_measurement_integrity_hardening() -> None:
     global _INSTALLED, _ORIGINAL_WALLET_RECORD
     if _INSTALLED:
         return
+    from . import runtime
     from . import v51_measurement_compatibility_filters as filters
     from . import v51_measurement_integrity as measurement
     from .wallet_discovery import ContinuousWalletDiscovery
@@ -85,9 +82,15 @@ def install_measurement_integrity_hardening() -> None:
     if not hasattr(measurement, "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY"):
         measurement._ORIGINAL_ENSURE_RELEASE_COMPATIBILITY = measurement.ensure_release_compatibility  # type: ignore[attr-defined]
     measurement.ensure_release_compatibility = _ensure_release_compatibility_fail_closed  # type: ignore[assignment]
-    # The filter module imported the function before installers ran; update its bound
-    # reference too so promotion/certification share the same fail-closed semantics.
     filters.ensure_release_compatibility = _ensure_release_compatibility_fail_closed  # type: ignore[assignment]
+
+    # Keep the immutable v3.1 runtime policy factory itself unchanged for baseline
+    # lineage/certification compatibility. The v5.1 measurement wrapper reclassifies
+    # persisted wallet observations using the <=40% research ceiling, so research
+    # evidence is no longer censored without pretending the legacy policy changed.
+    original_policy = getattr(measurement, "_ORIGINAL_WALLET_POLICY", None)
+    if callable(original_policy):
+        runtime._wallet_discovery_policy = original_policy  # type: ignore[assignment]
 
     current = ContinuousWalletDiscovery._record_forward_swap
     if not bool(getattr(current, "_roi_v51_measurement_integrity_hardening", False)):
@@ -108,6 +111,8 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "only_current_release_can_auto_register_measurement_valid": True,
         "unclassified_historical_release_promotion_eligible": False,
+        "legacy_wallet_policy_factory_preserved": True,
+        "v51_wallet_research_reclassification_ceiling_fraction": 0.40,
         "wallet_lineage_candidate_schema_precreated": True,
         "paper_only": True,
         "live_money_authority": False,
