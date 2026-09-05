@@ -117,6 +117,18 @@ from .robinhood_entity_resolution_repair import (
 
 install_robinhood_entity_resolution_repair(RobinhoodChainPaperPlane)
 
+# PR146 installs the continuation-first Robinhood state machine before this concrete
+# production class is created. The entity repair above must remain a substrate repair,
+# not replace that newer strategy authority. Rebind PR146's captured base flow to the
+# repaired entity resolver, then restore its bootstrap/extended-continuation wrapper
+# as the final method. This changes no continuation threshold, position limit, hard
+# exit, signing, submission, or live-money boundary.
+from .robinhood_continuation_entity_composition_repair import (
+    install_robinhood_continuation_entity_composition_repair,
+)
+
+install_robinhood_continuation_entity_composition_repair(RobinhoodChainPaperPlane)
+
 
 __all__ = [
     "RobinhoodChainPaperPlane",
