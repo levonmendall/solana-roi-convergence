@@ -35,14 +35,24 @@ def test_public_shards_preserve_full_scope_with_fewer_physical_connections() -> 
     a = _target_shards(targets, "publicnode", DEFAULT_TARGETS_PER_SOCKET)
     b = _target_shards(targets, "onfinality", DEFAULT_TARGETS_PER_SOCKET)
 
-    assert [len(shard) for shard in a] == [4, 4, 2]
-    assert [len(shard) for shard in b] == [4, 4, 2]
+    # The strategy-critical repair deliberately packs the three scouts onto one
+    # scout-only socket and the seven high-volume programs onto two program-only
+    # sockets. This preserves the existing three physical sockets/provider while
+    # removing program-firehose head-of-line pressure from scout continuity.
+    assert len(a) == 3
+    assert len(b) == 3
+    assert sorted(len(shard) for shard in a) == [3, 3, 4]
+    assert sorted(len(shard) for shard in b) == [3, 3, 4]
     assert {row.address for shard in a for row in shard} == {row.address for row in targets}
     assert {row.address for shard in b for row in shard} == {row.address for row in targets}
     assert len(a) < len(targets)
     assert len(b) < len(targets)
-    # Provider-specific rotation avoids making the same socket failure correlate
-    # over the exact same target group on both public providers.
+    assert all(len({row.kind for row in shard}) == 1 for shard in a)
+    assert all(len({row.kind for row in shard}) == 1 for shard in b)
+    assert sum(1 for shard in a if shard and shard[0].kind == "scout") == 1
+    assert sum(1 for shard in b if shard and shard[0].kind == "scout") == 1
+    # Provider-specific rotation still avoids making program socket failures
+    # correlate over the exact same target ordering on both public providers.
     assert [[row.address for row in shard] for shard in a] != [
         [row.address for row in shard] for shard in b
     ]
