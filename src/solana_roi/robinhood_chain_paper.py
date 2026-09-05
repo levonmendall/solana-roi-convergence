@@ -22,18 +22,17 @@ from .strategy_specialist_wallet_allocator_repair import (
 # authority, strategy threshold, mechanical hard stop, signing, or live-money scope.
 install_strategy_specialist_wallet_allocator_repair()
 
-# Production status proved the persistent Robinhood cursor could remain behind the
-# live chain when the public rate-limited RPC was scanned in 200-block batches with
-# a mandatory five-second sleep after every successful historical batch. Increase
-# only non-live acquisition capacity, parallelize independent market-log reads with
-# a small bound, and expose catch-up rate/lag telemetry. The existing <=2-block
-# paper-decision gate remains authoritative, so historical catch-up cannot trade.
+# Keep the historical range helpers available for resilient bounded live queries and
+# regression lineage. Production paper runtime later replaces the historical scanner
+# itself with the forward-only repair; no old swap range is replayed just to close an
+# archival cursor.
 from .robinhood_catchup_capacity_repair import install_robinhood_catchup_capacity_repair
 
 install_robinhood_catchup_capacity_repair()
 
-# Historical catch-up remains bounded to the same exact block work, but its dense
-# Python work is CPU-governed so it cannot consume the full single-CPU service budget.
+# Retain the existing CPU governor around legacy helper work. In forward-only
+# production the historical catch-up loop is retired, so the governor is normally
+# inert for that path and remains available only to bounded live acquisition helpers.
 from .robinhood_event_loop_fairness_repair import (
     install_robinhood_event_loop_fairness_repair,
 )
@@ -165,6 +164,17 @@ from .robinhood_strategy_alignment_repair import (
 
 install_robinhood_strategy_alignment_repair(RobinhoodChainPaperPlane)
 
+# Retire the historical swap scanner before the research-composition wrapper captures
+# its base poll. Existing paper outcomes, wallet intelligence, launch metadata and the
+# old cursor remain durable; runtime ingestion becomes current-frontier only with a
+# bounded 64-block factory-metadata recovery window after restarts. The old cursor is
+# archival and receives no further RPC work.
+from .robinhood_forward_only_runtime_repair import (
+    install_robinhood_forward_only_runtime_repair,
+)
+
+install_robinhood_forward_only_runtime_repair(RobinhoodChainPaperPlane)
+
 # Keep the existing PR146 continuation function as the exact final strategy method.
 # Entity discovery is observational bookkeeping, so attach it after each completed
 # poll instead of wrapping flow classification. This preserves the protected method
@@ -176,11 +186,10 @@ from .robinhood_strategy_alignment_composition import (
 
 install_robinhood_strategy_alignment_composition(RobinhoodChainPaperPlane)
 
-# A historical gap must remain losslessly backfilled, but it no longer has to make the
-# current Robinhood paper lane unavailable. Install the verified live epoch last so it
-# wraps the final v5.1/continuation/entity policy methods: factory definitions are
-# synchronized through a fresh anchor, only post-anchor contiguous swap flow can
-# authorize new paper entries, and the durable historical cursor continues separately.
+# Install the verified live epoch last so it wraps the final v5.1/continuation/entity
+# policy methods. In forward-only production it is the sole chain-ingestion authority:
+# current contiguous ranges may authorize paper decisions; long outages re-anchor
+# after bounded factory metadata recovery and are never replayed as historical swaps.
 from .robinhood_live_frontier_verification_repair import (
     install_robinhood_live_frontier_verification_repair,
 )
