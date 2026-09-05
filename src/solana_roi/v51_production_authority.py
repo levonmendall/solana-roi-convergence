@@ -12,13 +12,14 @@ from .v51_measurement_integrity_hardening import (
     install_measurement_integrity_hardening,
     status as measurement_hardening_status,
 )
+from .v51_promotion_proof import install_release_attestation_gate, status as promotion_proof_status
 from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_coverage
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
-# Measurement integrity is a separate compatibility plane; the frozen economic
-# composition identity remains unchanged because entry/sizing/promotion/kill/exit
-# economics are unchanged.
+# Evidence-validity analytics and release attestation are separate proof planes; the
+# frozen economic composition identity remains unchanged because entry/sizing/
+# promotion-threshold/kill/exit economics are unchanged.
 COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
 _INSTALLED = False
 
@@ -76,9 +77,10 @@ def install_v51_production_authority(
 ) -> None:
     """Install frozen v5.1 economics explicitly at the production boundary.
 
-    Measurement integrity is installed before the runtime object is lazily
-    constructed so upstream legacy evidence filters cannot censor v5.1 research
-    observations. No frozen v5.1 economic rule is changed.
+    Measurement integrity and live-release attestation are installed before the
+    promotion selectors. A current release begins promotion-ineligible and earns
+    surface-specific authority only after its live candidate/latency/execution/
+    attribution evidence attests successfully. No frozen v5.1 economic rule changes.
     """
     global _INSTALLED
     from . import robinhood_runtime_install as module
@@ -90,6 +92,7 @@ def install_v51_production_authority(
     install_post183_production_proof_wiring_repair()
     install_measurement_integrity()
     install_measurement_integrity_hardening()
+    install_release_attestation_gate()
     install_measurement_compatible_promotion_filters()
 
     install_v51_consolidated_strategy()
@@ -105,6 +108,7 @@ def install_v51_production_authority(
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
     app.state.roi_v51_measurement_integrity = True
+    app.state.roi_v51_release_attestation_gate = True
     app.state.roi_v51_measurement_compatibility_filters = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
@@ -119,6 +123,7 @@ def status() -> dict[str, Any]:
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
+        "live_release_attestation": promotion_proof_status(),
         "measurement_compatibility_filters": compatibility_filter_status(),
         "proof_readiness_prepared_before_robinhood_transport": True,
         "post183_production_proof_wiring": True,
