@@ -7,7 +7,7 @@ from typing import Any, Callable
 from . import fomo_paper_strategy as fomo_paper
 from . import risk_conditioned_alpha_v5 as v5
 from . import risk_conditioned_alpha_v51 as v51
-from .robinhood_chain_profit_maximizer import RobinhoodChainProfitMaximizerMixin
+from .robinhood_chain_profit_maximizer import RobinhoodProfitMaximizerMixin
 from .strategy_v51_authority import (
     AUTHORITY_ID,
     ECONOMIC_FREEZE_EPOCH,
@@ -343,11 +343,11 @@ def install_v51_consolidated_strategy(*, store: Any | None = None, release_commi
         return
     _ORIGINAL_SOLANA_CHOOSE = v5._choose_lane_and_fraction
     _ORIGINAL_FOMO_DECISION = fomo_paper._paper_decision
-    _ORIGINAL_RH_PROFILE = RobinhoodChainProfitMaximizerMixin._v5_profile
+    _ORIGINAL_RH_PROFILE = RobinhoodProfitMaximizerMixin._v5_profile
     v5._choose_lane_and_fraction = _solana_choose_consolidated
     v51._fomo_context_returns_v51 = _fomo_epoch_returns
     fomo_paper._paper_decision = _fomo_decision_consolidated
-    RobinhoodChainProfitMaximizerMixin._v5_profile = _rh_epoch_profile
+    RobinhoodProfitMaximizerMixin._v5_profile = _rh_epoch_profile
     if store is not None:
         _ensure_epoch(store, release_commit)
     _INSTALLED = True
