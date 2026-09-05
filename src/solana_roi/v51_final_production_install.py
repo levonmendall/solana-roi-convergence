@@ -90,6 +90,17 @@ def install_v51_final_production_hook() -> None:
         return
 
     def install(app: Any, runtime_provider: Callable[[], Any]) -> None:
+        # Final code-side proof/readiness repair must be installed before the
+        # existing Robinhood installer captures its app-facing status provider.
+        # This keeps internal compatibility shims available while removing obsolete
+        # historical catch-up terminology from the public status surface. It also
+        # attaches the zero-allocation current-context quote proof to the final
+        # Direct-Solana composition without changing v5.1 or certification gates.
+        from .final_production_proof_readiness_repair import (
+            install_final_production_proof_readiness_repair,
+        )
+
+        install_final_production_proof_readiness_repair()
         original(app, runtime_provider)
         install_v51_consolidated_strategy()
         install_v51_robinhood_consolidation()
@@ -99,6 +110,7 @@ def install_v51_final_production_hook() -> None:
             robinhood_status_provider=module._status,
         )
         app.state.roi_v51_final_economic_authority = True
+        app.state.roi_final_production_proof_readiness = True
 
     setattr(install, "_roi_v51_final_authority", True)
     module.install_robinhood_chain_paper_runtime = install
