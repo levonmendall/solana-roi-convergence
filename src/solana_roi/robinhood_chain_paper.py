@@ -117,6 +117,16 @@ from .robinhood_entity_resolution_repair import (
 
 install_robinhood_entity_resolution_repair(RobinhoodChainPaperPlane)
 
+# Blockscout retired unauthenticated per-instance API traffic on 2026-07-01. Replace
+# only the identity provider adapter with the universal chain-scoped Pro API. The
+# resolver now asks for inbound transactions oldest-first, so one provider request
+# yields the earliest positive native funder instead of approximating from up to
+# three newest-first pages. A missing key fails closed and never makes raw addresses
+# independent evidence.
+from .robinhood_blockscout_pro_repair import install_robinhood_blockscout_pro_repair
+
+install_robinhood_blockscout_pro_repair(RobinhoodChainPaperPlane)
+
 # PR146 installs the continuation-first Robinhood state machine before this concrete
 # production class is created. The entity repair above must remain a substrate repair,
 # not replace that newer strategy authority. Rebind PR146's captured base flow to the

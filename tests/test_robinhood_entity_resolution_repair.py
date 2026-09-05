@@ -49,7 +49,9 @@ class EntityDummy:
         self.rpc = SimpleNamespace(client=RateLimitedClient())
 
 
-def test_failed_entity_lookup_is_negatively_cached_and_does_not_count_raw_actor() -> None:
+def test_failed_entity_lookup_is_negatively_cached_and_does_not_count_raw_actor(monkeypatch) -> None:
+    monkeypatch.setenv("BLOCKSCOUT_API_KEY", "proapi_test_only")
+
     async def scenario() -> None:
         plane = EntityDummy()
         first = await _entity_anchor(plane, ACTOR_A)
