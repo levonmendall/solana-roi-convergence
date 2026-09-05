@@ -128,6 +128,17 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
 
     install_robinhood_pumpfun_wallet_intelligence_integration(plane_cls)
 
+    # v5.1 removed the sniper-era 15% chase / 20s latency kill switches from the
+    # executable Robinhood strategy. Align wallet teacher qualification with that same
+    # authority boundary: retain <=15%/<=20s as an immediate-copy diagnostic, but let
+    # every mechanically measurable forward mark contribute to after-cost/geometric
+    # teacher evidence. Existing rows are migrated before ranking or demotion.
+    from .robinhood_wallet_intelligence_v51_alignment import (
+        install_robinhood_wallet_intelligence_v51_alignment,
+    )
+
+    install_robinhood_wallet_intelligence_v51_alignment(plane_cls)
+
     # Keep one dynamic global entity universe. Roles describe what a wallet/entity is
     # good at; lanes and regimes remain execution context and never create watchlists.
     from .robinhood_entity_universe import install_robinhood_entity_universe
