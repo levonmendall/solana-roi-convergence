@@ -15,7 +15,6 @@ from .v51_execution_stress_diagnostics import build_execution_mechanism_stress
 from .v51_measurement_integrity import (
     cached_proof_state,
     decorate_proof,
-    proof_age_seconds,
     proof_metadata,
     status as measurement_status,
 )
@@ -40,7 +39,11 @@ def _release_commit() -> str | None:
 def _isolated_robinhood_proof_state(
     status_provider: Callable[[], dict[str, Any]] | None,
 ) -> tuple[dict[str, Any] | None, str]:
-    """Read only the already-cached Robinhood proof from the main API thread."""
+    """Read only the already-cached Robinhood proof from the main API thread.
+
+    Proof state is returned separately so callers can enforce freshness without
+    mutating the cached payload or breaking established proof consumers.
+    """
     if status_provider is None:
         return None, "unavailable"
     try:
@@ -54,13 +57,10 @@ def _isolated_robinhood_proof_state(
     proof = status.get("v51_proof")
     if not isinstance(proof, dict) or not bool(proof.get("available")):
         return None, "unavailable"
-    snapshot = dict(proof)
-    state = cached_proof_state(snapshot)
-    snapshot["proof_state"] = state
-    snapshot["proof_age_seconds"] = proof_age_seconds(snapshot)
+    state = cached_proof_state(proof)
     if state not in {"confirmed", "partial"}:
         return None, state
-    return snapshot, state
+    return proof, state
 
 
 def _isolated_robinhood_proof(
@@ -282,5 +282,6 @@ __all__ = [
     "_merged_certification",
     "_merged_coverage",
     "_merged_mechanism_stress",
+    "_robinhood_coverage_text",
     "install_v51_strategy_api",
 ]
