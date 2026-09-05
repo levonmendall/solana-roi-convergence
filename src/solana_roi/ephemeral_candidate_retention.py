@@ -84,7 +84,7 @@ def _ensure_schema_conn(db: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS anonymous_certification_outcomes ("
         "bucket TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL, outcome TEXT NOT NULL, "
         "count INTEGER NOT NULL, max_age_ms REAL NOT NULL DEFAULT 0, "
-        "PRIMARY KEY(bucket, source, reason,outcome))"
+        "PRIMARY KEY(bucket, source, reason, outcome))"
     )
 
 
@@ -178,23 +178,16 @@ async def _bounded_ephemeral_hydrate_one(self: DirectSolanaIngestionPlane, row: 
     age_seconds = max(0.0, (_utcnow() - trigger).total_seconds())
     remaining = retention_seconds - age_seconds
     if remaining <= 0.0:
-        outcome = (
-            "expired_before_continuation_hydration"
-            if reason in CONTINUATION_HYDRATION_REASONS
-            else "expired_before_entry"
-        )
-        _discard_hydration_row(self, row, outcome=outcome)
+        # Preserve the existing outcome contract for dashboards and certification
+        # accounting. The changed behavior is the later scout cutoff, not a new
+        # terminal category.
+        _discard_hydration_row(self, row, outcome="expired_before_entry")
         return
 
     try:
         await asyncio.wait_for(_ORIGINAL_HYDRATE_ONE(self, row), timeout=remaining)
     except asyncio.TimeoutError:
-        outcome = (
-            "expired_in_flight_before_continuation_hydration"
-            if reason in CONTINUATION_HYDRATION_REASONS
-            else "expired_in_flight_before_entry"
-        )
-        _discard_hydration_row(self, row, outcome=outcome)
+        _discard_hydration_row(self, row, outcome="expired_in_flight_before_entry")
         return
 
     signature = str(row.get("signature") or "")
@@ -292,7 +285,7 @@ def _reap_sqlite(path: Path, now: datetime | None = None) -> dict[str, Any]:
                 at=at,
                 reasons=scout_reasons,
                 cutoff=scout_cutoff,
-                outcome="expired_before_continuation_hydration",
+                outcome="expired_before_entry",
             )
             result["queue_rows"] = int(result["queue_rows"]) + _reap_queue_group(
                 db,
