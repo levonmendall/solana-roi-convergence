@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
 from .v51_measurement_compatibility_filters import (
     install_measurement_compatible_promotion_filters,
@@ -25,11 +26,7 @@ _INSTALLED = False
 
 
 def install_isolated_robinhood_proof_cache(module: Any) -> None:
-    """Publish Robinhood proof from its private worker/store into status cache.
-
-    This function is observability plumbing only. It does not install strategy
-    economics or wrap the Robinhood production installer.
-    """
+    """Publish Robinhood proof from its private worker/store into status cache."""
     from . import robinhood_worker_isolation_repair as isolation
 
     current = isolation._ORIGINAL_STATUS
@@ -77,10 +74,9 @@ def install_v51_production_authority(
 ) -> None:
     """Install frozen v5.1 economics explicitly at the production boundary.
 
-    Measurement integrity and live-release attestation are installed before the
-    promotion selectors. A current release begins promotion-ineligible and earns
-    surface-specific authority only after its live candidate/latency/execution/
-    attribution evidence attests successfully. No frozen v5.1 economic rule changes.
+    A current release begins promotion-ineligible and earns surface-specific proof
+    only from primary production tables. No API poll is required to create attestation,
+    and no frozen v5.1 economic rule changes.
     """
     global _INSTALLED
     from . import robinhood_runtime_install as module
@@ -93,6 +89,7 @@ def install_v51_production_authority(
     install_measurement_integrity()
     install_measurement_integrity_hardening()
     install_release_attestation_gate()
+    install_primary_attestation_sources()
     install_measurement_compatible_promotion_filters()
 
     install_v51_consolidated_strategy()
@@ -109,6 +106,7 @@ def install_v51_production_authority(
     app.state.roi_v51_economic_composition_explicit = True
     app.state.roi_v51_measurement_integrity = True
     app.state.roi_v51_release_attestation_gate = True
+    app.state.roi_v51_primary_attestation_sources = True
     app.state.roi_v51_measurement_compatibility_filters = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
@@ -124,6 +122,7 @@ def status() -> dict[str, Any]:
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
         "live_release_attestation": promotion_proof_status(),
+        "attestation_sources": attestation_source_status(),
         "measurement_compatibility_filters": compatibility_filter_status(),
         "proof_readiness_prepared_before_robinhood_transport": True,
         "post183_production_proof_wiring": True,
