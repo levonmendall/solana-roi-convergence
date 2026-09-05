@@ -466,6 +466,7 @@ def _normalize_tracked_wallet_v2(
 
 
 setattr(_normalize_tracked_wallet_v2, "_roi_venue_native_candidate_graph", True)
+setattr(_normalize_tracked_wallet_v2, "_roi_semantic_candidate_attribution", True)
 
 
 def _status_v2(self: DirectSolanaIngestionPlane) -> dict[str, Any]:
