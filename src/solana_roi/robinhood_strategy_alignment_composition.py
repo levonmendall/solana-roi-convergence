@@ -147,6 +147,19 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
 
     install_robinhood_wallet_intelligence_v51_alignment(plane_cls)
 
+    # The two layers above are retained only so old release lineage can be unwound
+    # deterministically. They must not remain wallet-selection authority: wallet
+    # discovery/selection is based on wallet quality and fresh forward follow-through;
+    # chase, latency, execution cost, risk and flow belong downstream in v5.1
+    # opportunity/shadow context. Retract the misplaced authority before the entity
+    # universe wraps the final poll/status methods, repair any exact-prefix state
+    # demotions it produced on the persistent disk, and keep copyability diagnostic.
+    from .robinhood_wallet_selection_authority_boundary_repair import (
+        install_robinhood_wallet_selection_authority_boundary,
+    )
+
+    install_robinhood_wallet_selection_authority_boundary(plane_cls)
+
     # Keep one dynamic global entity universe. Roles describe what a wallet/entity is
     # good at; lanes and regimes remain execution context and never create watchlists.
     from .robinhood_entity_universe import install_robinhood_entity_universe
