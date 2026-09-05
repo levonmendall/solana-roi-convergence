@@ -55,11 +55,21 @@ def _pool() -> V3Pool:
     )
 
 
+def _set_verified_frontier(plane: RobinhoodChainPaperPlane, *, caught_up: bool) -> None:
+    # The final production entry guard requires a fresh head read and a durable
+    # decision cursor. Mock only that external head seam; all downstream strategy,
+    # store, trial, settlement and learning code remains real.
+    plane._caught_up = caught_up
+    plane._cursor = 100
+    plane._latest_block = 100
+    plane.rpc.block_number = AsyncMock(return_value=100)
+
+
 def test_real_production_robinhood_path_reaches_entry_settlement_and_learning(tmp_path, monkeypatch) -> None:
     plane = _plane(tmp_path, monkeypatch)
     pool = _pool()
     plane.v3_pools[pool.pool] = pool
-    plane._caught_up = True
+    _set_verified_frontier(plane, caught_up=True)
     actor = "0x" + "7" * 40
     entity = "0x" + "9" * 40
 
@@ -152,7 +162,7 @@ def test_real_production_robinhood_path_reaches_entry_settlement_and_learning(tm
 def test_real_production_robinhood_preselection_return_is_never_silent(tmp_path, monkeypatch) -> None:
     plane = _plane(tmp_path, monkeypatch)
     pool = _pool()
-    plane._caught_up = False
+    _set_verified_frontier(plane, caught_up=False)
 
     asyncio.run(plane._maybe_open_v3(pool, current_block=100))
 
