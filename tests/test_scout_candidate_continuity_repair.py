@@ -40,7 +40,18 @@ def _sponsored_scout_buy(*, second_scout: bool = False):
     return {
         "slot": 444_000_000,
         "blockTime": 1_788_321_600,
-        "transaction": {"message": {"accountKeys": keys, "instructions": []}},
+        "transaction": {
+            "message": {
+                "accountKeys": keys,
+                # A venue label is now candidate-authoritative only when the
+                # transaction actually invokes that program. The previous empty
+                # instruction list encoded the account-key false positive repaired
+                # after PR163 production diagnostics.
+                "instructions": [
+                    {"programIdIndex": 2, "accounts": [1, 3], "data": "1"}
+                ],
+            }
+        },
         "meta": {
             "err": None,
             "fee": 5_000,
