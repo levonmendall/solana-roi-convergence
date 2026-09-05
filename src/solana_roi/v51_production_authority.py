@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
+from .v51_measurement_compatibility_filters import (
+    install_measurement_compatible_promotion_filters,
+    status as compatibility_filter_status,
+)
 from .v51_measurement_integrity import install_measurement_integrity, proof_metadata, status as measurement_status
 from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_coverage
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
@@ -86,6 +90,7 @@ def install_v51_production_authority(
     # append-only stage lineage, v5.1 research observation ceilings, release
     # compatibility epochs and proof freshness before any lazy runtime construction.
     install_measurement_integrity()
+    install_measurement_compatible_promotion_filters()
 
     install_v51_consolidated_strategy()
     install_v51_robinhood_consolidation()
@@ -100,6 +105,7 @@ def install_v51_production_authority(
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
     app.state.roi_v51_measurement_integrity = True
+    app.state.roi_v51_measurement_compatibility_filters = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -112,6 +118,7 @@ def status() -> dict[str, Any]:
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
         "measurement_integrity_installation": "explicit_same_production_boundary_before_lazy_runtime_construction",
         "measurement_integrity": measurement_status(),
+        "measurement_compatibility_filters": compatibility_filter_status(),
         "proof_readiness_prepared_before_robinhood_transport": True,
         "post183_production_proof_wiring": True,
         "legacy_repair_modules_are_final_economic_authority": False,
