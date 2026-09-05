@@ -6,9 +6,11 @@ from typing import Any, Callable
 from . import continuation_market_recalibration as continuation
 from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
+from .post161_candidate_attribution_repair import install_post161_candidate_attribution_repair
+from .robinhood_rpc_rate_limit_repair import install_robinhood_rpc_rate_limit_repair
 
 
-COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v4-pumpfun-intelligence-parity"
+COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v5-post161-runtime-repair"
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 
 
@@ -48,6 +50,18 @@ async def _poll_once_with_research_discovery(self: Any) -> None:
 def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> None:
     """Keep PR146 continuation flow authoritative and attach research below it."""
     global _ORIGINAL_POLL
+
+    # PR #161 proved that jsonParsed is not sufficient for every live scout
+    # transaction shape. Add standardized compiled SPL/System transfer decoding and
+    # bounded sanitized failure-shape evidence at the already-composed venue graph.
+    # This has no strategy or paper-entry authority.
+    install_post161_candidate_attribution_repair()
+
+    # Robinhood's public RPC intermittently returns HTTP 429 during exact historical
+    # catch-up. Retry the same read with shared Retry-After/cooldown coordination;
+    # never skip a block range and never allow historical rows to authorize entries.
+    install_robinhood_rpc_rate_limit_repair(plane_cls)
+
     if bool(getattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", False)):
         return
 
