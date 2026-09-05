@@ -196,5 +196,5 @@ def test_chase_latency_and_cost_remain_downstream_v51_strategy_context() -> None
     parsed = _parse_context_key(key)
     assert parsed["entity"] == "entity:wallet"
     assert parsed["chase_band"] == "challenger_15_25pct"
-    assert parsed["latency_band"] == "gt_20s"
+    assert parsed["latency_band"] == "30_60s"
     assert parsed["execution_cost_band"] == "7_15pct"
