@@ -178,7 +178,7 @@ def test_robinhood_counterfactual_refresh_is_incremental_and_preserves_resolutio
         assert float(row["forward_net_return"]) == 0.25
         assert row["resolution_source"] == "future_mark"
     finally:
-        store.close()
+        store.db.close()
 
 
 def test_post_deploy_probe_default_timeout_covers_deep_proof_reads() -> None:
