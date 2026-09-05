@@ -9,11 +9,16 @@ from .v51_evidence_analytics import (
     _portfolio_reconcile,
     _promotion_certification_from_records,
     build_cross_family_correlation,
+    build_evidence_validity_bundle,
     promotion_records,
 )
 
 
-CROSS_SURFACE_VERSION = "v51-cross-surface-proof-v1"
+CROSS_SURFACE_VERSION = "v51-cross-surface-proof-v2-forward-certification"
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _secondary_records(robinhood_proof: dict[str, Any] | None, key: str) -> list[dict[str, Any]]:
@@ -131,11 +136,193 @@ def build_cross_surface_portfolio(
     }
 
 
+def combine_release_attestation(
+    local: dict[str, Any],
+    robinhood: dict[str, Any] | None,
+    *,
+    robinhood_proof_state: str,
+) -> dict[str, Any]:
+    local = _dict(local)
+    rh = _dict(robinhood)
+    release = str(local.get("release_commit") or rh.get("release_commit") or "") or None
+    local_surfaces = dict(_dict(local.get("surfaces")))
+    rh_surfaces = dict(_dict(rh.get("surfaces")))
+    surfaces = {**local_surfaces, **rh_surfaces}
+    local_required = bool(local_surfaces) and all(bool(_dict(row).get("attested")) for row in local_surfaces.values())
+    robinhood_required = bool(_dict(rh_surfaces.get("ROBINHOOD_CHAIN")).get("attested"))
+    rh_usable = robinhood_proof_state == "confirmed"
+    return {
+        "release_commit": release,
+        "measurement_epoch": local.get("measurement_epoch") or rh.get("measurement_epoch"),
+        "attested": bool(local_required and robinhood_required and rh_usable),
+        "surfaces": surfaces,
+        "local_attested": local_required,
+        "robinhood_attested": robinhood_required,
+        "robinhood_proof_state": robinhood_proof_state,
+        "requires_all_detected_local_surfaces_and_robinhood": True,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+
+
+def combine_rejected_counterfactuals(
+    local: dict[str, Any],
+    robinhood: dict[str, Any] | None,
+    *,
+    robinhood_proof_state: str,
+) -> dict[str, Any]:
+    local = _dict(local)
+    rh = _dict(robinhood)
+    total = int(local.get("rejected_candidate_count") or 0) + int(rh.get("rejected_candidate_count") or 0)
+    resolved = int(local.get("resolved_count") or 0) + int(rh.get("resolved_count") or 0)
+    pending = int(local.get("pending_count") or 0) + int(rh.get("pending_count") or 0)
+    positive = int(local.get("resolved_positive_count") or 0) + int(rh.get("resolved_positive_count") or 0)
+    return {
+        "cross_surface_version": CROSS_SURFACE_VERSION,
+        "rejected_candidate_count": total,
+        "resolved_count": resolved,
+        "pending_count": pending,
+        "resolved_positive_count": positive,
+        "local_solana_fomo": local,
+        "isolated_robinhood": rh if rh else None,
+        "robinhood_proof_state": robinhood_proof_state,
+        "counterfactual_complete": pending == 0,
+        "retrospective_entry_authority": False,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+
+
+def combine_forward_proof_slo(
+    local: dict[str, Any],
+    robinhood: dict[str, Any] | None,
+    *,
+    robinhood_proof_state: str,
+) -> dict[str, Any]:
+    local = _dict(local)
+    rh = _dict(robinhood)
+    local_state = str(local.get("proof_state") or "unavailable")
+    rh_state = str(rh.get("proof_state") or "unavailable") if rh else "unavailable"
+    if "degraded" in {local_state, rh_state}:
+        state = "degraded"
+    elif local_state == "confirmed" and rh_state == "confirmed" and robinhood_proof_state == "confirmed":
+        state = "confirmed"
+    elif local_state == "confirmed" and not rh:
+        state = "partial"
+    else:
+        state = "unavailable"
+    return {
+        "cross_surface_version": CROSS_SURFACE_VERSION,
+        "proof_state": state,
+        "local_proof_state": local_state,
+        "robinhood_forward_proof_state": rh_state,
+        "robinhood_proof_state": robinhood_proof_state,
+        "stage_events_last_5m": int(local.get("stage_events_last_5m") or 0) + int(rh.get("stage_events_last_5m") or 0),
+        "stage_events_last_60m": int(local.get("stage_events_last_60m") or 0) + int(rh.get("stage_events_last_60m") or 0),
+        "coverage_debt_count": int(local.get("coverage_debt_count") or 0) + int(rh.get("coverage_debt_count") or 0),
+        "local_solana_fomo": local,
+        "isolated_robinhood": rh if rh else None,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+
+
+def combine_hazard_calibration(
+    local: dict[str, Any],
+    robinhood: dict[str, Any] | None,
+    *,
+    robinhood_proof_state: str,
+) -> dict[str, Any]:
+    local = _dict(local)
+    rh = _dict(robinhood)
+    observation_count = 0
+    for payload in (local, rh):
+        for row in _dict(payload.get("bins")).values():
+            if isinstance(row, dict):
+                observation_count += int(row.get("settled_entered_count") or 0)
+                observation_count += int(row.get("rejected_resolved_count") or 0)
+    return {
+        "cross_surface_version": CROSS_SURFACE_VERSION,
+        "observation_count": observation_count,
+        "local_solana_fomo": local,
+        "isolated_robinhood": rh if rh else None,
+        "robinhood_proof_state": robinhood_proof_state,
+        "changes_current_hazard_multipliers": False,
+        "diagnostic_only": True,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+
+
+def build_cross_surface_evidence_bundle(
+    store: Any,
+    robinhood_proof: dict[str, Any] | None,
+    *,
+    robinhood_proof_state: str,
+) -> dict[str, Any]:
+    """Compose the 35-46 proof plane without reading the private Robinhood SQLite file."""
+    local = build_evidence_validity_bundle(store)
+    rh = _dict(robinhood_proof)
+    portfolio = build_cross_surface_portfolio(store, robinhood_proof)
+    rh_portfolio = _dict(portfolio.get("robinhood_audit_portfolio"))
+    return {
+        "analytics_version": local.get("analytics_version"),
+        "cross_surface_version": CROSS_SURFACE_VERSION,
+        "release_attestation": combine_release_attestation(
+            _dict(local.get("release_attestation")),
+            _dict(rh.get("release_attestation")) if rh else None,
+            robinhood_proof_state=robinhood_proof_state,
+        ),
+        "execution_cost_ledger": {
+            "local_solana_fomo": local.get("execution_cost_ledger"),
+            "isolated_robinhood": rh.get("execution_cost_ledger") if rh else None,
+            "robinhood_proof_state": robinhood_proof_state,
+        },
+        "promotion_certification": build_cross_surface_promotion_certification(store, robinhood_proof),
+        "rejected_counterfactuals": combine_rejected_counterfactuals(
+            _dict(local.get("rejected_counterfactuals")),
+            _dict(rh.get("rejected_counterfactuals")) if rh else None,
+            robinhood_proof_state=robinhood_proof_state,
+        ),
+        "hazard_calibration": combine_hazard_calibration(
+            _dict(local.get("hazard_calibration")),
+            _dict(rh.get("hazard_calibration")) if rh else None,
+            robinhood_proof_state=robinhood_proof_state,
+        ),
+        "cross_family_correlation": build_cross_surface_correlation(store, robinhood_proof),
+        "maturity_allocation_proof": build_cross_surface_maturity_allocation(store, robinhood_proof),
+        "portfolio_reconciliation": {
+            "cross_surface_version": CROSS_SURFACE_VERSION,
+            "family_navs_are_not_summed_as_independent_capital": bool(
+                portfolio.get("family_navs_are_not_summed_as_independent_capital")
+            ),
+            "audit_epoch_portfolio": portfolio.get("canonical_solana_fomo_audit_one_capital_base"),
+            "promotion_compatible_portfolio": portfolio.get("promotion_compatible_one_capital_base"),
+            "robinhood_audit_portfolio": rh_portfolio if rh_portfolio else None,
+            "paper_only": True,
+            "live_money_authority": False,
+        },
+        "forward_proof_slo": combine_forward_proof_slo(
+            _dict(local.get("forward_proof_slo")),
+            _dict(rh.get("forward_proof_slo")) if rh else None,
+            robinhood_proof_state=robinhood_proof_state,
+        ),
+        "robinhood_proof_state": robinhood_proof_state,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+
+
 __all__ = [
     "CROSS_SURFACE_VERSION",
     "build_cross_surface_correlation",
+    "build_cross_surface_evidence_bundle",
     "build_cross_surface_maturity_allocation",
     "build_cross_surface_portfolio",
     "build_cross_surface_promotion_certification",
+    "combine_forward_proof_slo",
+    "combine_hazard_calibration",
+    "combine_rejected_counterfactuals",
+    "combine_release_attestation",
     "combined_promotion_records",
 ]

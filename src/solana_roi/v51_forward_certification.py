@@ -10,9 +10,10 @@ import os
 from typing import Any, Callable
 
 from .strategy_v51_authority import authority
-from .v51_evidence_analytics import build_evidence_validity_bundle
+from .v51_cross_surface_proof import build_cross_surface_evidence_bundle
+from .v51_measurement_integrity import cached_proof_state
 
-CERTIFICATION_VERSION = "v51-live-forward-certification-v1"
+CERTIFICATION_VERSION = "v51-live-forward-certification-v2-cross-surface"
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -38,6 +39,8 @@ def _future_mature_families(maturity: dict[str, Any]) -> list[str]:
 
 
 def _hazard_observations(hazard: dict[str, Any]) -> int:
+    if hazard.get("observation_count") is not None:
+        return int(hazard.get("observation_count") or 0)
     total = 0
     for row in _dict(hazard.get("bins")).values():
         if not isinstance(row, dict):
@@ -53,6 +56,50 @@ def _mature_correlation_pairs(correlation: dict[str, Any]) -> int:
         for row in _dict(correlation.get("pairs")).values()
         if isinstance(row, dict) and bool(row.get("mature"))
     )
+
+
+def _one_capital_base(evidence: dict[str, Any]) -> bool:
+    portfolio = _dict(evidence.get("portfolio_reconciliation"))
+    audit_portfolio = _dict(portfolio.get("audit_epoch_portfolio"))
+    promotion_portfolio = _dict(portfolio.get("promotion_compatible_portfolio"))
+    robinhood_portfolio = _dict(portfolio.get("robinhood_audit_portfolio"))
+    local_ok = bool(
+        portfolio.get("family_navs_are_not_summed_as_independent_capital")
+        and audit_portfolio.get("overlapping_positions_share_one_capital_base")
+        and promotion_portfolio.get("overlapping_positions_share_one_capital_base")
+    )
+    if robinhood_portfolio:
+        local_ok = local_ok and bool(
+            _dict(robinhood_portfolio.get("audit_epoch_portfolio")).get(
+                "overlapping_positions_share_one_capital_base"
+            )
+            and _dict(robinhood_portfolio.get("promotion_compatible_portfolio")).get(
+                "overlapping_positions_share_one_capital_base"
+            )
+        )
+    return local_ok
+
+
+def _cached_robinhood_proof(
+    status_provider: Callable[[], dict[str, Any]] | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read cached proof independently from current transport readiness.
+
+    Transport readiness is gate 39. Historical/current-release evidence already
+    published by the isolated worker remains auditable even if the transport later
+    degrades; stale/incompatible proof still cannot satisfy attestation or SLO gates.
+    """
+    if status_provider is None:
+        return None, "unavailable"
+    try:
+        status = status_provider()
+    except Exception:
+        return None, "unavailable"
+    proof = status.get("v51_proof") if isinstance(status, dict) else None
+    if not isinstance(proof, dict) or not bool(proof.get("available")):
+        return None, "unavailable"
+    state = cached_proof_state(proof)
+    return proof, state
 
 
 def compose_forward_certification(
@@ -118,15 +165,7 @@ def compose_forward_certification(
     mature_correlation_pairs = _mature_correlation_pairs(correlation)
     maturity = _dict(evidence.get("maturity_allocation_proof"))
     future_mature_families = _future_mature_families(maturity)
-
-    portfolio = _dict(evidence.get("portfolio_reconciliation"))
-    audit_portfolio = _dict(portfolio.get("audit_epoch_portfolio"))
-    promotion_portfolio = _dict(portfolio.get("promotion_compatible_portfolio"))
-    one_capital_base = bool(
-        portfolio.get("family_navs_are_not_summed_as_independent_capital")
-        and audit_portfolio.get("overlapping_positions_share_one_capital_base")
-        and promotion_portfolio.get("overlapping_positions_share_one_capital_base")
-    )
+    one_capital_base = _one_capital_base(evidence)
 
     hard_operational_gates_ok = bool(
         release_bound and safety_ok and transports_ready and measurement_slo_ok and one_capital_base
@@ -185,6 +224,7 @@ def compose_forward_certification(
         "hard_operational_gates_ok": hard_operational_gates_ok,
         "evidence_maturity_ok": evidence_maturity_ok,
         "blockers": list(dict.fromkeys(blockers)),
+        "robinhood_proof_state": evidence.get("robinhood_proof_state"),
         "checks": {
             "35_exact_live_release": {
                 "pass": release_bound,
@@ -206,11 +246,15 @@ def compose_forward_certification(
                 "proof_state": proof_state,
                 "stage_events_last_60m": recent_stage_events,
                 "coverage_debt_count": int(slo.get("coverage_debt_count") or 0),
+                "local_proof_state": slo.get("local_proof_state"),
+                "robinhood_forward_proof_state": slo.get("robinhood_forward_proof_state"),
             },
             "41_current_release_attestation": {
                 "pass": release_attested,
                 "attested": bool(attestation.get("attested")),
                 "attested_release_commit": attested_release or None,
+                "surfaces": attestation.get("surfaces"),
+                "robinhood_proof_state": attestation.get("robinhood_proof_state"),
             },
             "42_validation_holdout_family_economics": {
                 "pass": family_promotion_evidence_ready,
@@ -224,6 +268,7 @@ def compose_forward_certification(
                 "resolved_count": rejected_resolved,
                 "pending_count": rejected_pending,
                 "resolved_positive_count": rejected_positive,
+                "robinhood_proof_state": counterfactual.get("robinhood_proof_state"),
                 "retrospective_entry_authority": False,
             },
             "44_hazard_calibration": {
@@ -268,10 +313,17 @@ def build_forward_certification(
     *,
     unified_status: dict[str, Any],
     expected_release_commit: str | None = None,
+    robinhood_proof: dict[str, Any] | None = None,
+    robinhood_proof_state: str = "unavailable",
 ) -> dict[str, Any]:
+    evidence = build_cross_surface_evidence_bundle(
+        store,
+        robinhood_proof,
+        robinhood_proof_state=robinhood_proof_state,
+    )
     return compose_forward_certification(
         unified_status=unified_status,
-        evidence=build_evidence_validity_bundle(store),
+        evidence=evidence,
         expected_release_commit=expected_release_commit,
     )
 
@@ -290,6 +342,7 @@ def install_forward_certification(
     app: Any,
     *,
     runtime_provider: Callable[[], Any],
+    robinhood_status_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     if bool(getattr(app.state, "roi_v51_forward_certification", False)):
         return
@@ -298,10 +351,13 @@ def install_forward_certification(
         def forward_certification_status() -> dict[str, Any]:
             runtime = runtime_provider()
             expected_release = os.getenv("RENDER_GIT_COMMIT", "").strip() or None
+            proof, proof_state = _cached_robinhood_proof(robinhood_status_provider)
             return build_forward_certification(
                 runtime.store,
                 unified_status=_e2e_status(app),
                 expected_release_commit=expected_release,
+                robinhood_proof=proof,
+                robinhood_proof_state=proof_state,
             )
 
         app.add_api_route(
@@ -315,6 +371,7 @@ def install_forward_certification(
 
 __all__ = [
     "CERTIFICATION_VERSION",
+    "_cached_robinhood_proof",
     "build_forward_certification",
     "compose_forward_certification",
     "install_forward_certification",

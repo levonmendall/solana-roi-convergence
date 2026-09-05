@@ -10,13 +10,16 @@ BASE_URL = os.getenv("SOLANA_ROI_PRODUCTION_URL", "https://solana-roi-convergenc
 EXPECTED_SHA = os.getenv("EXPECTED_RELEASE_COMMIT", "").strip()
 ATTEMPTS = int(os.getenv("FORWARD_PROOF_PROBE_ATTEMPTS", "30"))
 SLEEP_SECONDS = float(os.getenv("FORWARD_PROOF_PROBE_SLEEP_SECONDS", "10"))
-TIMEOUT_SECONDS = float(os.getenv("FORWARD_PROOF_HTTP_TIMEOUT_SECONDS", "10"))
+# These endpoints intentionally aggregate durable evidence across independent paper
+# planes. Production observation showed valid 200 responses can exceed 10 seconds;
+# this verifier is post-deploy and must distinguish a slow deep proof from an outage.
+TIMEOUT_SECONDS = float(os.getenv("FORWARD_PROOF_HTTP_TIMEOUT_SECONDS", "60"))
 
 
 def _get(path: str) -> dict:
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
-        headers={"Accept": "application/json", "User-Agent": "solana-roi-forward-proof-ci/1"},
+        headers={"Accept": "application/json", "User-Agent": "solana-roi-forward-proof-ci/2"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
