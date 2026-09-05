@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
+from .v51_measurement_integrity import install_measurement_integrity, proof_metadata, status as measurement_status
 from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_coverage
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v2-measurement-integrity"
 _INSTALLED = False
 
 
@@ -30,8 +31,7 @@ def install_isolated_robinhood_proof_cache(module: Any) -> None:
             payload["v51_proof"] = {
                 "available": False,
                 "reason": "isolated_robinhood_plane_not_ready",
-                "paper_only": True,
-                "live_money_authority": False,
+                **proof_metadata(None, proof_state="unavailable"),
             }
             return payload
         try:
@@ -51,8 +51,7 @@ def install_isolated_robinhood_proof_cache(module: Any) -> None:
                 "available": False,
                 "reason": "isolated_robinhood_proof_failed_closed",
                 "error_type": type(exc).__name__,
-                "paper_only": True,
-                "live_money_authority": False,
+                **proof_metadata(plane.store, proof_state="unavailable"),
             }
         return payload
 
@@ -69,7 +68,9 @@ def install_v51_production_authority(
     ``production.py`` calls this only after the canonical Solana/FOMO graph and the
     Robinhood transport worker are installed. Reliability/compatibility modules may
     remain underneath, but none of them can become the final economic authority by
-    import order. This function changes no frozen v5.1 economic rule.
+    import order. Measurement integrity is installed before the runtime object is
+    lazily constructed so upstream v3.1 evidence filters cannot censor canonical
+    v5.1 research observations. No frozen v5.1 economic rule is changed.
     """
     global _INSTALLED
     from . import robinhood_runtime_install as module
@@ -78,12 +79,13 @@ def install_v51_production_authority(
     )
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
-    # The first production proof after PR #182 showed two observability/evidence
-    # call sites were still one wrapper below the live graph. PR #183 gives us this
-    # explicit final production boundary, so attach the actual economic scout
-    # normalizer and final real-WebSocket durable-frontier verifier here. These are
-    # evidence-only repairs: they cannot select, size, promote or allocate.
+    # PR #185 binds proof/frontier behavior to the actual final live call sites.
     install_post183_production_proof_wiring_repair()
+
+    # Items 1-10 measurement-integrity release: install canonical candidate ingress,
+    # append-only stage lineage, v5.1 research observation ceilings, release
+    # compatibility epochs and proof freshness before any lazy runtime construction.
+    install_measurement_integrity()
 
     install_v51_consolidated_strategy()
     install_v51_robinhood_consolidation()
@@ -97,10 +99,8 @@ def install_v51_production_authority(
     app.state.roi_v51_final_economic_authority = True
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
+    app.state.roi_v51_measurement_integrity = True
     app.state.roi_post183_production_proof_wiring = True
-    # PR #182 proof/readiness is prepared before Robinhood transport captures its
-    # status provider. Mark that proof surface explicitly here without granting it
-    # strategy or allocation authority.
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
 
@@ -110,6 +110,8 @@ def status() -> dict[str, Any]:
         "composition_version": COMPOSITION_VERSION,
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
+        "measurement_integrity_installation": "explicit_same_production_boundary_before_lazy_runtime_construction",
+        "measurement_integrity": measurement_status(),
         "proof_readiness_prepared_before_robinhood_transport": True,
         "post183_production_proof_wiring": True,
         "legacy_repair_modules_are_final_economic_authority": False,
