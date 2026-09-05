@@ -8,7 +8,7 @@ from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
 
 
-COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v2-global-entity-universe"
+COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v3-pumpfun-quality-selection"
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 
 
@@ -60,11 +60,22 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     _ORIGINAL_POLL = plane_cls._poll_once
     plane_cls._poll_once = _poll_once_with_research_discovery  # type: ignore[method-assign]
 
-    # Pump.fun has one dynamic high-priority wallet universe. Roles describe what a
-    # wallet is good at; lanes and regimes do not create separate watchlists. Mirror
-    # that exact structural separation for Robinhood economic entities. Continuous
-    # discovery supplies global challengers, forward role evidence determines current
-    # value, and the selected universe itself has no paper-entry authority.
+    # Mirror Pump.fun at both layers, not only in roster shape. First install the same
+    # broad discovery -> historical quality screen -> fresh prospective tracking
+    # policy. The 12-wallet limit is a ceiling rather than a quota: weak candidates do
+    # not consume empty slots merely to make the list full. Public high-ROI Robinhood
+    # wallets are research seeds exactly like Pump.fun named seeds, with no automatic
+    # paper authority and mature negative forward evidence able to release their slot.
+    from .robinhood_pumpfun_wallet_selection import (
+        install_robinhood_pumpfun_wallet_selection,
+    )
+
+    install_robinhood_pumpfun_wallet_selection(plane_cls)
+
+    # Keep one dynamic global entity universe. Roles describe what a wallet/entity is
+    # good at; lanes and regimes remain execution context and never create watchlists.
+    # The selector above patches this universe's candidate builder before installation
+    # so every persisted/status roster uses quality-gated Pump.fun-equivalent inputs.
     from .robinhood_entity_universe import install_robinhood_entity_universe
 
     install_robinhood_entity_universe(plane_cls)
