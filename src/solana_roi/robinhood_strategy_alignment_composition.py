@@ -7,10 +7,11 @@ from . import continuation_market_recalibration as continuation
 from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
 from .post161_candidate_attribution_repair import install_post161_candidate_attribution_repair
+from .post164_invocation_source_repair import install_post164_invocation_source_repair
 from .robinhood_rpc_rate_limit_repair import install_robinhood_rpc_rate_limit_repair
 
 
-COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v6-native-shadow-learning"
+COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v7-invocation-source-authority"
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 
 
@@ -55,6 +56,13 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     # diagnostics at the already fail-closed venue graph. It has no entry authority
     # and is installed before runtime workers start so fresh scout transactions use it.
     install_post161_candidate_attribution_repair()
+
+    # Production diagnostics then proved that account-key presence could be mistaken
+    # for venue proof before the venue graph found zero actual supported instruction
+    # groups. Narrow candidate source authority to executed top-level/inner program
+    # invocations while preserving programIdIndex/ALT resolution and leaving the
+    # broader observation helper unchanged for non-candidate consumers.
+    install_post164_invocation_source_repair()
 
     # Robinhood's public RPC can return HTTP 429 during exact catch-up. Coordinate
     # Retry-After/cooldown on the same read without skipping block ranges or changing
