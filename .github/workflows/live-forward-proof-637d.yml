@@ -1,0 +1,105 @@
+name: Live Forward Proof 637d
+
+on:
+  push:
+    branches: [verify/live-forward-proof-637d]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-forward-proof-637d
+  cancel-in-progress: true
+
+jobs:
+  verify-live-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Inspect exact deployed 35-46 proof
+        env:
+          EXPECTED_RELEASE_COMMIT: 637d9688724a2c29422ef91c6c8a468c29935062
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          base='https://solana-roi-convergence.onrender.com'
+          expected=os.environ['EXPECTED_RELEASE_COMMIT']
+          def get(path):
+              req=urllib.request.Request(base+path,headers={'Accept':'application/json','User-Agent':'roi-final-35-46/1'})
+              with urllib.request.urlopen(req,timeout=60) as r:
+                  payload=json.loads(r.read().decode())
+                  print(path, 'HTTP', r.status)
+                  return payload
+          h=get('/health')
+          e=get('/v1/strategy/e2e-status')
+          c=get('/v1/strategy/forward-certification')
+          r=e.get('robinhood') or {}
+          iso=r.get('worker_isolation') or {}
+          fr=r.get('forward_frontier_readiness') or {}
+          lv=r.get('live_frontier_verification') or {}
+          print('HEALTH',json.dumps({
+              'status':h.get('status'),'release_commit':h.get('release_commit'),
+              'paper_only':h.get('paper_only'),'live_money_authority':h.get('live_money_authority')
+          },sort_keys=True))
+          print('E2E',json.dumps({
+              'release_commit':e.get('release_commit'),
+              'overall_blockers':(e.get('overall') or {}).get('blocking_components'),
+              'solana_ready':(e.get('solana') or {}).get('runtime_ready'),
+              'solana_blockers':(e.get('solana') or {}).get('blockers'),
+              'fomo_ready':(e.get('fomo') or {}).get('runtime_ready'),
+              'fomo_blockers':(e.get('fomo') or {}).get('blockers'),
+              'robinhood_ready':r.get('runtime_ready'),
+              'robinhood_blockers':r.get('blockers'),
+              'robinhood_error':r.get('error'),
+              'worker_alive':iso.get('worker_thread_alive'),
+              'status_cache_age_seconds':iso.get('status_cache_age_seconds'),
+              'status_cache_stale_after_seconds':iso.get('status_cache_stale_after_seconds'),
+              'observer_continuity_ok':fr.get('observer_continuity_ok'),
+              'processing_lag_blocks':fr.get('processing_lag_blocks'),
+              'forward_frontier_ready':r.get('forward_frontier_ready'),
+              'live_epoch_ready':lv.get('live_epoch_ready'),
+              'live_epoch_lag_blocks':lv.get('live_epoch_lag_blocks'),
+              'paper_only':(e.get('overall') or {}).get('paper_only'),
+              'live_money_authority':(e.get('overall') or {}).get('live_money_authority'),
+              'signing_available':(e.get('overall') or {}).get('signing_available'),
+              'transaction_submission_available':(e.get('overall') or {}).get('transaction_submission_available'),
+          },sort_keys=True))
+          checks=c.get('checks') or {}
+          compact_checks={k:v for k,v in checks.items() if k.startswith(tuple(f'{n}_' for n in range(35,47)))}
+          print('CERT',json.dumps({
+              'release_commit':c.get('release_commit'),
+              'expected_release_commit':c.get('expected_release_commit'),
+              'certification_version':c.get('certification_version'),
+              'state':c.get('state'),
+              'hard_operational_gates_ok':c.get('hard_operational_gates_ok'),
+              'evidence_maturity_ok':c.get('evidence_maturity_ok'),
+              'system_forward_certified':c.get('system_forward_certified'),
+              'blockers':c.get('blockers'),
+              'robinhood_proof_state':c.get('robinhood_proof_state'),
+              'checks':compact_checks,
+              'promotion_eligible_families':c.get('promotion_eligible_families_under_existing_v51_claims'),
+              'future_mature_scaling_eligible_families':c.get('future_mature_scaling_eligible_families'),
+              'paper_only':c.get('paper_only'),
+              'live_money_authority':c.get('live_money_authority'),
+              'signing_available':c.get('signing_available'),
+              'transaction_submission_available':c.get('transaction_submission_available'),
+          },sort_keys=True))
+          assert e.get('release_commit') == expected
+          assert c.get('release_commit') == expected
+          assert c.get('expected_release_commit') == expected
+          assert h.get('paper_only') is True and h.get('live_money_authority') is False
+          assert (e.get('overall') or {}).get('paper_only') is True
+          assert (e.get('overall') or {}).get('live_money_authority') is False
+          assert (e.get('overall') or {}).get('signing_available') is False
+          assert (e.get('overall') or {}).get('transaction_submission_available') is False
+          assert c.get('paper_only') is True and c.get('live_money_authority') is False
+          assert c.get('signing_available') is False and c.get('transaction_submission_available') is False
+          # Engineering closure: isolated Robinhood counterfactuals must be visible.
+          check43=checks.get('43_rejected_opportunity_counterfactuals') or {}
+          assert int(check43.get('rejected_candidate_count') or 0) > 0
+          assert int(check43.get('pending_count') or 0) > 0
+          PY
