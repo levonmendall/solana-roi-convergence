@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
+from .v51_cost_normalization import install_api_cost_normalization, status as cost_normalization_status
 from .v51_measurement_compatibility_filters import (
     install_measurement_compatible_promotion_filters,
     status as compatibility_filter_status,
@@ -91,6 +92,7 @@ def install_v51_production_authority(
     install_release_attestation_gate()
     install_primary_attestation_sources()
     install_measurement_compatible_promotion_filters()
+    install_api_cost_normalization()
 
     install_v51_consolidated_strategy()
     install_v51_robinhood_consolidation()
@@ -108,6 +110,7 @@ def install_v51_production_authority(
     app.state.roi_v51_release_attestation_gate = True
     app.state.roi_v51_primary_attestation_sources = True
     app.state.roi_v51_measurement_compatibility_filters = True
+    app.state.roi_v51_cost_normalization = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -124,6 +127,7 @@ def status() -> dict[str, Any]:
         "live_release_attestation": promotion_proof_status(),
         "attestation_sources": attestation_source_status(),
         "measurement_compatibility_filters": compatibility_filter_status(),
+        "execution_cost_normalization": cost_normalization_status(),
         "proof_readiness_prepared_before_robinhood_transport": True,
         "post183_production_proof_wiring": True,
         "legacy_repair_modules_are_final_economic_authority": False,
