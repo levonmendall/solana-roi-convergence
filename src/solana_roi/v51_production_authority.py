@@ -87,6 +87,10 @@ def install_v51_production_authority(
     app.state.roi_v51_final_economic_authority = True
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
+    # PR #182 proof/readiness is prepared before Robinhood transport captures its
+    # status provider. Mark that proof surface explicitly here without granting it
+    # strategy or allocation authority.
+    app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
 
 
@@ -95,6 +99,7 @@ def status() -> dict[str, Any]:
         "composition_version": COMPOSITION_VERSION,
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
+        "proof_readiness_prepared_before_robinhood_transport": True,
         "legacy_repair_modules_are_final_economic_authority": False,
         "paper_only": True,
         "live_money_authority": False,
