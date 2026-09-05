@@ -16,6 +16,12 @@ from solana_roi.v51_candidate_ledger import (
 from solana_roi.v51_measurement_integrity_hardening import _ensure_release_compatibility_fail_closed
 from solana_roi.v51_strategy_api import _robinhood_coverage_text
 
+BASE_ENSURE_RELEASE_COMPATIBILITY = getattr(
+    measurement,
+    "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY",
+    measurement.ensure_release_compatibility,
+)
+
 
 class Store:
     def __init__(self) -> None:
@@ -96,8 +102,7 @@ def test_canonical_candidate_ingress_and_stage_history_are_append_only(monkeypat
 
     with store._lock:
         history = store.db.execute(
-            "SELECT status,reason FROM v51_candidate_stage_events "
-            "WHERE stage='context' ORDER BY id"
+            "SELECT status,reason FROM v51_candidate_stage_events WHERE stage='context' ORDER BY id"
         ).fetchall()
         current = store.db.execute(
             "SELECT status,reason FROM v51_candidate_current_state "
@@ -150,12 +155,10 @@ def test_measurement_compatibility_fails_known_and_unclassified_history_closed(m
     assert int(unknown_history["promotion_eligible"]) == 0
     assert str(unknown_history["measurement_epoch"]) == "unclassified-historical-release"
 
-    # The hardening helper delegates current-release registration to the base
-    # function exactly as production does after installation.
     monkeypatch.setattr(
         measurement,
         "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY",
-        measurement.ensure_release_compatibility,
+        BASE_ENSURE_RELEASE_COMPATIBILITY,
         raising=False,
     )
     current_row = _ensure_release_compatibility_fail_closed(store, current)
