@@ -7,7 +7,17 @@ from typing import Any
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, PIPELINE_STAGES
 from .v51_economic_certification import build_economic_certification
+from .v51_evidence_analytics import (
+    build_forward_proof_slo,
+    build_hazard_calibration,
+    build_portfolio_reconciliation,
+    build_promotion_certification,
+    promotion_records,
+    refresh_execution_cost_ledger,
+    refresh_rejected_counterfactuals,
+)
 from .v51_execution_stress_diagnostics import build_execution_mechanism_stress
+from .v51_promotion_proof import refresh_release_attestation
 
 PROOF_CACHE_SECONDS = 30.0
 _CACHE_LOCK = threading.Lock()
@@ -64,10 +74,6 @@ def _candidate_coverage(store: Any) -> dict[str, Any]:
                 ).fetchone()
                 settled = int(settled_row["settled"] or 0) if settled_row else 0
 
-    # Every concrete v2/v3 opportunity delivered by forward-only transport is now
-    # registered before the production strategy can return. Every row must finish as
-    # paper_enter or paper_reject. Coarse fail-closed reasons remain separately
-    # visible so observability never claims more diagnostic precision than exists.
     decision_debt = max(0, candidates - entries - rejections)
     entry_settlement_debt = max(0, entries - settled)
     coverage_debt = decision_debt + (0 if ledger_available else 1)
@@ -102,16 +108,31 @@ def _candidate_coverage(store: Any) -> dict[str, Any]:
 
 
 def build_robinhood_proof(store: Any) -> dict[str, Any]:
+    # Everything below executes inside the isolated Robinhood worker. The main Uvicorn
+    # process receives only this cached payload and never reads Robinhood SQLite.
+    attestation = refresh_release_attestation(store, surfaces=("ROBINHOOD_CHAIN",))
     certification = build_economic_certification(store)
+    promotion = build_promotion_certification(store)
+    promotion_rows = promotion_records(store)
     unexpected = sorted(name for name in certification.get("families", {}) if name != "ROBINHOOD_CHAIN")
     return {
         "authority_id": AUTHORITY_ID,
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "economic_certification": certification,
+        "promotion_certification": promotion,
+        "promotion_records": promotion_rows,
+        "release_attestation": attestation,
         "candidate_coverage": _candidate_coverage(store),
+        "execution_cost_ledger": refresh_execution_cost_ledger(store),
+        "rejected_counterfactuals": refresh_rejected_counterfactuals(store),
+        "hazard_calibration": build_hazard_calibration(store),
+        "portfolio_reconciliation": build_portfolio_reconciliation(store),
+        "forward_proof_slo": build_forward_proof_slo(store),
         "execution_mechanism_stress": build_execution_mechanism_stress(store),
         "unexpected_non_robinhood_families": unexpected,
         "proof_store_role": "isolated_robinhood_chain_sqlite",
+        "proof_transport_to_main_api": "deep_copied_nonblocking_worker_status_cache",
+        "main_thread_robinhood_sqlite_reads": False,
         "paper_only": True,
         "live_money_authority": False,
     }
