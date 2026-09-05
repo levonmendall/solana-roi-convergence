@@ -139,6 +139,19 @@ from .robinhood_continuation_entity_composition_repair import (
 
 install_robinhood_continuation_entity_composition_repair(RobinhoodChainPaperPlane)
 
+# Treat Blockscout as a persistent cache-miss-only identity oracle. Successful
+# chain->actor funding proofs are stored in the dedicated Robinhood SQLite database
+# across releases, trigger/deployer identities keep protected decision-critical
+# credits, and non-trigger buyers are enriched progressively without ever allowing
+# unresolved raw addresses to count as independent evidence. This changes provider
+# work only: token/venue universe, continuation thresholds, position limits and all
+# paper-only/no-signing/no-submission boundaries remain unchanged.
+from .robinhood_entity_quota_architecture import (
+    install_robinhood_entity_quota_architecture,
+)
+
+install_robinhood_entity_quota_architecture(RobinhoodChainPaperPlane)
+
 
 __all__ = [
     "RobinhoodChainPaperPlane",
