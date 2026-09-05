@@ -6,6 +6,7 @@ from typing import Any, Callable
 from . import continuation_market_recalibration as continuation
 from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
+from .candidate_fomo_runtime_repair import install_candidate_fomo_runtime_repair
 from .economic_signal_continuation_repair import install_economic_signal_continuation_repair
 from .post161_candidate_attribution_repair import install_post161_candidate_attribution_repair
 from .post164_invocation_source_repair import install_post164_invocation_source_repair
@@ -73,6 +74,14 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     # context bands rather than sniper-era kill switches, and allow incomplete
     # non-mechanical risk to create zero-allocation shadow evidence only.
     install_economic_signal_continuation_repair()
+
+    # Post-PR167 production evidence separates two remaining observability boundaries:
+    # a directly invoked Pump.fun transaction can have a uniquely proven scout
+    # economic endpoint even when token-account owner metadata is incomplete, and the
+    # independent FOMO scanner needs stage-by-stage evidence to distinguish an empty
+    # market window from a disconnected scanner. This repair adds no threshold,
+    # provider, signing, submission, live-money, or alternate strategy authority.
+    install_candidate_fomo_runtime_repair()
 
     # Robinhood's public RPC can return HTTP 429 during exact catch-up. Coordinate
     # Retry-After/cooldown on the same read without skipping block ranges or changing
