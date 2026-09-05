@@ -9,7 +9,6 @@ from . import continuation_market_recalibration as continuation
 from . import economic_signal_continuation_repair as economic
 from . import scout_candidate_continuity_repair as scout
 from . import venue_native_candidate_graph_repair as venue
-from .direct_solana import DirectSolanaIngestionPlane
 from .profit_first_entity_final_research import FinalProfitFirstResearchAdapter
 
 
@@ -35,7 +34,6 @@ _GRAPH_FALLBACK_ERRORS = frozenset(
 )
 
 _ORIGINAL_GRAPH_SWAP_FACTS: Callable[..., Any] | None = None
-_ORIGINAL_DIRECT_STATUS: Callable[..., dict[str, Any]] | None = None
 _ORIGINAL_FOMO_OPEN: Callable[..., Any] | None = None
 _ORIGINAL_FINAL_STATUS: Callable[..., dict[str, Any]] | None = None
 _INSTALLED = False
@@ -152,15 +150,24 @@ def _reclassify_candidate_telemetry(payload: dict[str, Any], obj: Any) -> None:
     )
 
 
-def _direct_status_with_candidate_semantics(self: Any) -> dict[str, Any]:
-    if _ORIGINAL_DIRECT_STATUS is None:
-        raise RuntimeError("candidate telemetry status repair is not installed")
-    payload = _ORIGINAL_DIRECT_STATUS(self)
-    _reclassify_candidate_telemetry(payload, self)
-    return payload
+def _candidate_semantics_inner_status(original: Callable[[Any], dict[str, Any]]) -> Callable[[Any], dict[str, Any]]:
+    """Insert semantics below PR167 without adding another class-level status wrapper.
 
+    Multiple production repairs own status wrappers with module-level predecessor
+    references. Adding another late DirectSolanaIngestionPlane.status assignment can
+    create a cycle when tests reinstall older continuity wrappers. Instead, replace
+    only PR167's captured predecessor with this closure. The predecessor object is
+    immutable inside the closure, so later wrapper installation cannot recurse back
+    through this layer.
+    """
 
-setattr(_direct_status_with_candidate_semantics, "_roi_candidate_fomo_runtime_repair", True)
+    def status(self: Any) -> dict[str, Any]:
+        payload = original(self)
+        _reclassify_candidate_telemetry(payload, self)
+        return payload
+
+    setattr(status, "_roi_candidate_fomo_runtime_repair", True)
+    return status
 
 
 def _finite_nonnegative(value: Any) -> float:
@@ -417,19 +424,28 @@ setattr(_final_status_with_fomo_scanner, "_roi_candidate_fomo_runtime_repair", T
 
 def install_candidate_fomo_runtime_repair() -> None:
     """Install narrow post-PR167 candidate/FOMO repairs before runtime workers start."""
-    global _ORIGINAL_GRAPH_SWAP_FACTS, _ORIGINAL_DIRECT_STATUS, _ORIGINAL_FOMO_OPEN
-    global _ORIGINAL_FINAL_STATUS, _INSTALLED
+    global _ORIGINAL_GRAPH_SWAP_FACTS, _ORIGINAL_FOMO_OPEN, _ORIGINAL_FINAL_STATUS, _INSTALLED
 
     if _INSTALLED:
         return
-
-    continuation.install_continuation_market_recalibration()
+    if not bool(getattr(continuation, "_INSTALLED", False)):
+        raise RuntimeError("candidate/FOMO repair requires continuation market recalibration")
+    if not bool(getattr(economic, "_INSTALLED", False)):
+        raise RuntimeError("candidate/FOMO repair requires PR167 economic-signal composition")
 
     _ORIGINAL_GRAPH_SWAP_FACTS = venue._graph_swap_facts
     venue._graph_swap_facts = _pump_graph_with_economic_endpoint  # type: ignore[assignment]
 
-    _ORIGINAL_DIRECT_STATUS = DirectSolanaIngestionPlane.status
-    DirectSolanaIngestionPlane.status = _direct_status_with_candidate_semantics  # type: ignore[method-assign]
+    # Do not add another DirectSolanaIngestionPlane.status class wrapper here. PR167
+    # already owns the final economic-signal status layer and calls its captured
+    # predecessor through economic._ORIGINAL_DIRECT_STATUS. Insert candidate telemetry
+    # semantics into that predecessor using a closure over the exact prior function;
+    # this cannot form a late wrapper cycle when continuity tests reinstall wrappers.
+    prior_direct_status = economic._ORIGINAL_DIRECT_STATUS
+    if prior_direct_status is None:
+        raise RuntimeError("PR167 direct status predecessor is unavailable")
+    if not bool(getattr(prior_direct_status, "_roi_candidate_fomo_runtime_repair", False)):
+        economic._ORIGINAL_DIRECT_STATUS = _candidate_semantics_inner_status(prior_direct_status)
 
     continuation._fomo_flow_candidates = _fomo_flow_candidates_with_diagnostics  # type: ignore[assignment]
     _ORIGINAL_FOMO_OPEN = continuation._open_independent_fomo
@@ -444,6 +460,7 @@ def install_candidate_fomo_runtime_repair() -> None:
 __all__ = [
     "REPAIR_VERSION",
     "FOMO_SCANNER_DIAGNOSTICS_VERSION",
+    "_candidate_semantics_inner_status",
     "_fomo_scan_rows",
     "_pump_graph_with_economic_endpoint",
     "_reclassify_candidate_telemetry",
