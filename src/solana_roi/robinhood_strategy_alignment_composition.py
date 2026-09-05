@@ -6,6 +6,7 @@ from typing import Any, Callable
 from . import continuation_market_recalibration as continuation
 from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
+from .economic_signal_continuation_repair import install_economic_signal_continuation_repair
 from .post161_candidate_attribution_repair import install_post161_candidate_attribution_repair
 from .post164_invocation_source_repair import install_post164_invocation_source_repair
 from .robinhood_rpc_rate_limit_repair import install_robinhood_rpc_rate_limit_repair
@@ -63,6 +64,15 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     # invocations while preserving programIdIndex/ALT resolution and leaving the
     # broader observation helper unchanged for non-candidate consumers.
     install_post164_invocation_source_repair()
+
+    # PR165 correctly removed account-key pseudo-sources, which exposed the next
+    # boundary: economically real scout token movement can occur through routers or
+    # other programs that do not directly invoke one of the frozen venue programs.
+    # Install the final economic-signal-first authority after invocation validation:
+    # prove actor movement first, resolve current venue independently, make 20s/15%
+    # context bands rather than sniper-era kill switches, and allow incomplete
+    # non-mechanical risk to create zero-allocation shadow evidence only.
+    install_economic_signal_continuation_repair()
 
     # Robinhood's public RPC can return HTTP 429 during exact catch-up. Coordinate
     # Retry-After/cooldown on the same read without skipping block ranges or changing
