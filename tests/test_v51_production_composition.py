@@ -51,5 +51,11 @@ def test_final_strategy_functions_are_marked_as_consolidated() -> None:
     assert fomo._paper_decision.__module__.endswith("v51_consolidated_strategy")
     assert RobinhoodProfitMaximizerMixin._v5_choose_lane_fraction.__module__.endswith("v51_robinhood_consolidation")
     assert RobinhoodProfitMaximizerMixin._v5_learned_exit_policy.__module__.endswith("v51_robinhood_consolidation")
-    assert RobinhoodChainPaperPlane._maybe_open_v2.__module__.endswith("v51_robinhood_candidate_coverage")
-    assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("v51_robinhood_candidate_coverage")
+
+    # Pre-lane coverage composes around the already-certified final entry methods.
+    # functools.wraps preserves their module lineage and live-frontier markers while
+    # the dedicated coverage marker proves the audit wrapper is present.
+    assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v2, "_roi_v51_prelane_coverage", False)) is True
+    assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v3, "_roi_v51_prelane_coverage", False)) is True
+    assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v3, "_roi_fresh_live_frontier_entry_guard", False)) is True
+    assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("robinhood_chain_profit_maximizer")
