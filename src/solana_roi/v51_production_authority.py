@@ -16,7 +16,10 @@ from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_co
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v2-measurement-integrity"
+# Measurement integrity is a separate compatibility plane; the frozen economic
+# composition identity remains unchanged because entry/sizing/promotion/kill/exit
+# economics are unchanged.
+COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
 _INSTALLED = False
 
 
@@ -73,12 +76,9 @@ def install_v51_production_authority(
 ) -> None:
     """Install frozen v5.1 economics explicitly at the production boundary.
 
-    ``production.py`` calls this only after the canonical Solana/FOMO graph and the
-    Robinhood transport worker are installed. Reliability/compatibility modules may
-    remain underneath, but none of them can become the final economic authority by
-    import order. Measurement integrity is installed before the runtime object is
-    lazily constructed so upstream v3.1 evidence filters cannot censor canonical
-    v5.1 research observations. No frozen v5.1 economic rule is changed.
+    Measurement integrity is installed before the runtime object is lazily
+    constructed so upstream legacy evidence filters cannot censor v5.1 research
+    observations. No frozen v5.1 economic rule is changed.
     """
     global _INSTALLED
     from . import robinhood_runtime_install as module
@@ -87,12 +87,7 @@ def install_v51_production_authority(
     )
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
-    # PR #185 binds proof/frontier behavior to the actual final live call sites.
     install_post183_production_proof_wiring_repair()
-
-    # Items 1-10 measurement-integrity release: install canonical candidate ingress,
-    # append-only stage lineage, v5.1 research observation ceilings, release
-    # compatibility epochs and proof freshness before any lazy runtime construction.
     install_measurement_integrity()
     install_measurement_integrity_hardening()
     install_measurement_compatible_promotion_filters()
@@ -121,7 +116,7 @@ def status() -> dict[str, Any]:
         "composition_version": COMPOSITION_VERSION,
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
-        "measurement_integrity_installation": "explicit_same_production_boundary_before_lazy_runtime_construction",
+        "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
         "measurement_compatibility_filters": compatibility_filter_status(),
