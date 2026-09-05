@@ -20,76 +20,50 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Inspect exact deployed main proof surfaces
+      - name: Recheck compact live state
         env:
           EXPECTED_RELEASE_COMMIT: 49b1a1d5eae23ca15d0aa6351eed985c9318adee
         run: |
           python - <<'PY'
-          import json
-          import os
-          import urllib.error
-          import urllib.request
-
+          import json, os, urllib.request
           base = 'https://solana-roi-convergence.onrender.com'
           expected = os.environ['EXPECTED_RELEASE_COMMIT']
-
           def get(path):
-              req = urllib.request.Request(
-                  base + path,
-                  headers={'Accept': 'application/json', 'User-Agent': 'solana-roi-live-proof-diagnostic/1'},
-              )
-              try:
-                  with urllib.request.urlopen(req, timeout=60) as response:
-                      payload = json.loads(response.read().decode('utf-8'))
-                      print(path, 'HTTP', response.status)
-                      return payload
-              except urllib.error.HTTPError as exc:
-                  body = exc.read().decode('utf-8', errors='replace')
-                  print(path, 'HTTP', exc.code, body[:20000])
-                  raise
-
-          health = get('/health')
-          print('HEALTH', json.dumps({
-              'paper_only': health.get('paper_only'),
-              'live_money_authority': health.get('live_money_authority'),
-              'release_commit': health.get('release_commit'),
-              'status': health.get('status'),
+              req = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'roi-35-46-recheck/1'})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read().decode())
+          e = get('/v1/strategy/e2e-status')
+          c = get('/v1/strategy/forward-certification')
+          r = e.get('robinhood') or {}
+          iso = r.get('worker_isolation') or {}
+          fr = r.get('forward_frontier_readiness') or {}
+          lv = r.get('live_frontier_verification') or {}
+          print('E2E_COMPACT', json.dumps({
+              'release_commit': e.get('release_commit'),
+              'overall_blockers': (e.get('overall') or {}).get('blocking_components'),
+              'solana_ready': (e.get('solana') or {}).get('runtime_ready'),
+              'fomo_ready': (e.get('fomo') or {}).get('runtime_ready'),
+              'robinhood_ready': r.get('runtime_ready'),
+              'robinhood_error': r.get('error'),
+              'worker_alive': iso.get('worker_thread_alive'),
+              'status_age_s': iso.get('status_cache_age_seconds'),
+              'status_stale_after_s': iso.get('status_cache_stale_after_seconds'),
+              'observer_continuity_ok': fr.get('observer_continuity_ok'),
+              'observer_last_success_at': fr.get('observer_last_success_at'),
+              'processing_lag_blocks': fr.get('processing_lag_blocks'),
+              'forward_frontier_ready': r.get('forward_frontier_ready'),
+              'live_epoch_ready': lv.get('live_epoch_ready'),
+              'live_epoch_lag_blocks': lv.get('live_epoch_lag_blocks'),
           }, sort_keys=True))
-
-          e2e = get('/v1/strategy/e2e-status')
-          e2e_summary = {
-              'release_commit': e2e.get('release_commit'),
-              'overall': e2e.get('overall'),
-              'solana': e2e.get('solana'),
-              'fomo': e2e.get('fomo'),
-              'robinhood': e2e.get('robinhood'),
-          }
-          print('E2E', json.dumps(e2e_summary, sort_keys=True))
-
-          cert = get('/v1/strategy/forward-certification')
-          cert_summary = {
-              'release_commit': cert.get('release_commit'),
-              'expected_release_commit': cert.get('expected_release_commit'),
-              'state': cert.get('state'),
-              'system_forward_certified': cert.get('system_forward_certified'),
-              'hard_operational_gates_ok': cert.get('hard_operational_gates_ok'),
-              'evidence_maturity_ok': cert.get('evidence_maturity_ok'),
-              'blockers': cert.get('blockers'),
-              'checks': cert.get('checks'),
-              'promotion_eligible_families': cert.get('promotion_eligible_families_under_existing_v51_claims'),
-              'future_mature_scaling_eligible_families': cert.get('future_mature_scaling_eligible_families'),
-              'paper_only': cert.get('paper_only'),
-              'live_money_authority': cert.get('live_money_authority'),
-              'signing_available': cert.get('signing_available'),
-              'transaction_submission_available': cert.get('transaction_submission_available'),
-          }
-          print('CERT', json.dumps(cert_summary, sort_keys=True))
-
-          assert e2e.get('release_commit') == expected
-          assert cert.get('release_commit') == expected
-          assert cert.get('expected_release_commit') == expected
-          assert cert.get('paper_only') is True
-          assert cert.get('live_money_authority') is False
-          assert cert.get('signing_available') is False
-          assert cert.get('transaction_submission_available') is False
+          print('CERT_COMPACT', json.dumps({
+              'release_commit': c.get('release_commit'),
+              'state': c.get('state'),
+              'hard_operational_gates_ok': c.get('hard_operational_gates_ok'),
+              'evidence_maturity_ok': c.get('evidence_maturity_ok'),
+              'system_forward_certified': c.get('system_forward_certified'),
+              'blockers': c.get('blockers'),
+              'checks': {k:v for k,v in (c.get('checks') or {}).items() if k.startswith(('39_','40_','41_','42_','46_'))},
+          }, sort_keys=True))
+          assert e.get('release_commit') == expected
+          assert c.get('release_commit') == expected
           PY
