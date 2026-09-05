@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any
 
 from . import robinhood_chain_runtime as runtime
@@ -250,6 +251,7 @@ async def _advance_live_epoch(self: Any) -> None:
 def _poll_with_live_epoch(
     original: Callable[..., Awaitable[Any]],
 ) -> Callable[..., Awaitable[Any]]:
+    @wraps(original)
     async def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         try:
             await _advance_live_epoch(self)
@@ -263,10 +265,6 @@ def _poll_with_live_epoch(
         # lane failure must never erase or skip that backlog.
         return await original(self, *args, **kwargs)
 
-    try:
-        wrapped.__dict__.update(getattr(original, "__dict__", {}))
-    except Exception:
-        pass
     setattr(wrapped, "_roi_verified_live_epoch_poll", True)
     return wrapped
 
@@ -286,6 +284,8 @@ async def _fresh_head_ready(self: Any) -> bool:
         setattr(self, "_roi_live_frontier_last_error_type", type(exc).__name__)
         setattr(self, "_roi_live_frontier_last_checked_at", _utcnow())
         setattr(self, "_roi_live_epoch_ready", False)
+        if not _live_epoch_active(self):
+            self._caught_up = False
         return False
 
     decision_cursor = _live_cursor(self) if _live_epoch_active(self) else _historical_cursor(self)
@@ -294,6 +294,8 @@ async def _fresh_head_ready(self: Any) -> bool:
         setattr(self, "_roi_live_frontier_last_error_type", "MissingDecisionCursor")
         setattr(self, "_roi_live_frontier_last_checked_at", _utcnow())
         setattr(self, "_roi_live_epoch_ready", False)
+        if not _live_epoch_active(self):
+            self._caught_up = False
         self._latest_block = fresh_latest
         return False
 
@@ -317,15 +319,12 @@ async def _fresh_head_ready(self: Any) -> bool:
 
 
 def _entry_guard(original: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    @wraps(original)
     async def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
         if not await _fresh_head_ready(self):
             return None
         return await original(self, *args, **kwargs)
 
-    try:
-        guarded.__dict__.update(getattr(original, "__dict__", {}))
-    except Exception:
-        pass
     setattr(guarded, "_roi_fresh_live_frontier_entry_guard", True)
     return guarded
 
@@ -333,6 +332,7 @@ def _entry_guard(original: Callable[..., Awaitable[Any]]) -> Callable[..., Await
 def _status_with_frontier_verification(
     original: Callable[[Any], dict[str, Any]],
 ) -> Callable[[Any], dict[str, Any]]:
+    @wraps(original)
     def status(self: Any) -> dict[str, Any]:
         payload = original(self)
         historical_cursor = _historical_cursor(self)
@@ -407,10 +407,6 @@ def _status_with_frontier_verification(
         }
         return payload
 
-    try:
-        status.__dict__.update(getattr(original, "__dict__", {}))
-    except Exception:
-        pass
     setattr(status, "_roi_fresh_live_frontier_status", True)
     return status
 
