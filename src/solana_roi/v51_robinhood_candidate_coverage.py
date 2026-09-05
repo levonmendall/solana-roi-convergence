@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from functools import wraps
+from typing import Any, Awaitable, Callable
 
 from .v51_candidate_pipeline import _record as _record_stage
 from .v51_robinhood_consolidation import _candidate_id, _upsert_ledger
 
 COVERAGE_VERSION = "v51-robinhood-prelane-coverage-v1"
 _INSTALLED = False
-_ORIGINAL_OPEN_V2: Callable[..., Any] | None = None
-_ORIGINAL_OPEN_V3: Callable[..., Any] | None = None
 
 
 def _ledger_row(self: Any, candidate_id: str) -> Any | None:
@@ -43,10 +42,6 @@ def _local_preselection_reason(
         restrictions = getattr(subject, "restrictions_end_block", None)
         if restrictions is not None and current_block is not None and int(current_block) <= int(restrictions):
             return "launch_protection_window_active", "exact_local_state"
-    # The remaining gates can depend on identity, RWA registry, flow, launch phase,
-    # chase, risk, evidence maturity, or exact provider evidence. Re-running them only
-    # for telemetry would duplicate RPC/provider work and could change timing. The
-    # coarse fail-closed category is therefore explicit and intentionally honest.
     return "preselection_policy_or_evidence_failed_closed_before_lane", "coarse_no_duplicate_rpc"
 
 
@@ -61,21 +56,17 @@ def _trace_seed(kind: str, subject: Any) -> tuple[str, str, str, str, Any]:
         market = str(subject.curve)
         venue = "PONS_V2_CURVE"
         lifecycle = "bonding_curve"
-    recent = subject.recent_swaps
-    return token, market, venue, lifecycle, recent
+    return token, market, venue, lifecycle, subject.recent_swaps
 
 
 async def _observe_and_delegate(
     self: Any,
     *,
+    original: Callable[..., Awaitable[Any]],
     kind: str,
     subject: Any,
     current_block: int | None = None,
 ) -> None:
-    original = _ORIGINAL_OPEN_V3 if kind == "v3" else _ORIGINAL_OPEN_V2
-    if original is None:
-        raise RuntimeError("v5.1 Robinhood pre-lane coverage is not installed")
-
     token, market, venue, lifecycle, recent = _trace_seed(kind, subject)
     candidate = _candidate_id(token, market, recent)
     trace = {
@@ -89,9 +80,6 @@ async def _observe_and_delegate(
     }
     release = str(getattr(self, "release_commit", "") or "") or None
 
-    # This is the earliest canonical economic boundary after the forward-only chain
-    # transport has identified a concrete v2/v3 opportunity. Recording it before the
-    # strategy method runs makes every subsequent early return auditable.
     _record_stage(
         self.store,
         surface="ROBINHOOD_CHAIN",
@@ -152,9 +140,6 @@ async def _observe_and_delegate(
         _upsert_ledger(self, trace, decision="paper_reject", reason=reason)
         raise
 
-    # The v5.1 economic wrapper writes a ledger row whenever lane selection is
-    # reached, including quote/cost rejection. If it did, do not overwrite its more
-    # precise attribution. Otherwise close the formerly silent pre-lane path here.
     if _ledger_row(self, candidate) is not None:
         return
 
@@ -206,30 +191,41 @@ async def _observe_and_delegate(
     _upsert_ledger(self, trace, decision="paper_reject", reason=reason)
 
 
-async def _open_v3(self: Any, pool: Any, *, current_block: int) -> None:
-    await _observe_and_delegate(self, kind="v3", subject=pool, current_block=current_block)
+def _wrap_v3(original: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    @wraps(original)
+    async def wrapped(self: Any, pool: Any, *, current_block: int) -> None:
+        await _observe_and_delegate(
+            self,
+            original=original,
+            kind="v3",
+            subject=pool,
+            current_block=current_block,
+        )
+
+    # functools.wraps deliberately preserves all existing composition metadata,
+    # including the verified-live-frontier guard marker and original module lineage.
+    setattr(wrapped, "_roi_v51_prelane_coverage", True)
+    return wrapped
 
 
-async def _open_v2(self: Any, curve: Any) -> None:
-    await _observe_and_delegate(self, kind="v2", subject=curve)
+def _wrap_v2(original: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    @wraps(original)
+    async def wrapped(self: Any, curve: Any) -> None:
+        await _observe_and_delegate(self, original=original, kind="v2", subject=curve)
+
+    setattr(wrapped, "_roi_v51_prelane_coverage", True)
+    return wrapped
 
 
 def install_v51_robinhood_candidate_coverage(plane_cls: type[Any]) -> None:
     """Make every delivered Robinhood opportunity auditable before lane selection."""
-    global _INSTALLED, _ORIGINAL_OPEN_V2, _ORIGINAL_OPEN_V3
+    global _INSTALLED
     current_v2 = plane_cls._maybe_open_v2
     current_v3 = plane_cls._maybe_open_v3
-    if bool(getattr(current_v2, "_roi_v51_prelane_coverage", False)) and bool(
-        getattr(current_v3, "_roi_v51_prelane_coverage", False)
-    ):
-        _INSTALLED = True
-        return
-    _ORIGINAL_OPEN_V2 = current_v2
-    _ORIGINAL_OPEN_V3 = current_v3
-    setattr(_open_v2, "_roi_v51_prelane_coverage", True)
-    setattr(_open_v3, "_roi_v51_prelane_coverage", True)
-    plane_cls._maybe_open_v2 = _open_v2
-    plane_cls._maybe_open_v3 = _open_v3
+    if not bool(getattr(current_v2, "_roi_v51_prelane_coverage", False)):
+        plane_cls._maybe_open_v2 = _wrap_v2(current_v2)
+    if not bool(getattr(current_v3, "_roi_v51_prelane_coverage", False)):
+        plane_cls._maybe_open_v3 = _wrap_v3(current_v3)
     _INSTALLED = True
 
 
