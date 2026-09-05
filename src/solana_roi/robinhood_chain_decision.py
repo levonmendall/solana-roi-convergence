@@ -4,6 +4,14 @@ from .robinhood_chain_core import *
 
 
 class RobinhoodDecisionMixin:
+    def _paper_decision_transport_ready(self) -> bool:
+        """Separate current live-entry readiness from historical backfill completeness."""
+        if bool(getattr(self, "_roi_live_epoch_suppress_entries", False)):
+            return False
+        if getattr(self, "_roi_live_epoch_cursor", None) is not None:
+            return bool(getattr(self, "_roi_live_epoch_ready", False))
+        return bool(self._caught_up)
+
     async def _quote_v3_round_trip(self, pool: V3Pool, fraction: float) -> dict[str, Any] | None:
         eth_usd = await self._eth_usd()
         if eth_usd is None or eth_usd <= 0:
@@ -45,7 +53,7 @@ class RobinhoodDecisionMixin:
         }
 
     async def _maybe_open_v3(self, pool: V3Pool, *, current_block: int) -> None:
-        if not self._caught_up or self._token_open(pool.token):
+        if not self._paper_decision_transport_ready() or self._token_open(pool.token):
             return
         if pool.restrictions_end_block and current_block <= pool.restrictions_end_block:
             return
@@ -94,7 +102,7 @@ class RobinhoodDecisionMixin:
         )
 
     async def _maybe_open_v2(self, curve: V2Curve) -> None:
-        if not self._caught_up or self._token_open(curve.token):
+        if not self._paper_decision_transport_ready() or self._token_open(curve.token):
             return
         raw_metrics = self._recent_metrics(curve.recent_swaps, now_ts=time.time())
         if raw_metrics["state"] not in {"pre_fomo", "active_fomo"}:
