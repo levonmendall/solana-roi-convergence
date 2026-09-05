@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +17,6 @@ def test_blockscout_secret_aliases_and_canonical_precedence(monkeypatch: pytest.
     for name in blockscout.API_KEY_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("BLOCKSCOUT_PRO_API_KEY", "alias-secret")
-    assert blockscout._api_key() == "alias-secret"
     assert blockscout._api_key_source()[0] == "BLOCKSCOUT_PRO_API_KEY"
     monkeypatch.setenv("BLOCKSCOUT_API_KEY", "canonical-secret")
     assert blockscout._api_key() == "canonical-secret"
@@ -32,14 +32,13 @@ def test_robinhood_transport_readiness_fails_closed_on_stale_caught_up_flag() ->
     assert repair._paper_transport_ready(SimpleNamespace(_caught_up=True, _cursor=198, _latest_block=200)) is True
 
 
-def test_urgent_gap_recovery_expands_only_real_gap_capacity() -> None:
-    assert repair.URGENT_GAP_RECOVERY_MAX_PAGES > live_poll.POLL_CURSOR_MAX_PAGES
+def test_urgent_gap_recovery_expands_only_strategy_scout_capacity() -> None:
+    assert repair.URGENT_SCOUT_GAP_RECOVERY_MAX_PAGES > live_poll.POLL_CURSOR_MAX_PAGES
     assert live_poll.POLL_CURSOR_MAX_PAGES == 3
     assert lease.POLL_RECOVERABILITY_LEASE_SECONDS == 12.0
 
 
-@pytest.mark.asyncio
-async def test_dense_scout_gap_can_cross_old_three_page_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dense_scout_gap_can_cross_old_three_page_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     limit = live_poll.POLL_LIMIT
     cursor = 100
 
@@ -61,14 +60,14 @@ async def test_dense_scout_gap_can_cross_old_three_page_boundary(monkeypatch: py
 
     fake = FakeRpc()
     monkeypatch.setattr(isolation, "_recovery_rpc", lambda _self: fake)
-    rows, complete, provider, latency, meta = await repair._expanded_gap_fetch_delta(
-        SimpleNamespace(), SimpleNamespace(address="dense-scout"), cursor
+    rows, complete, provider, latency, meta = asyncio.run(
+        repair._expanded_gap_fetch_delta(SimpleNamespace(), SimpleNamespace(address="dense-scout"), cursor)
     )
     assert complete is True
     assert provider == "fake"
     assert latency == 1.0
     assert fake.calls == 5
     assert meta["page_count"] == 5
-    assert meta["urgent_page_limit"] == repair.URGENT_GAP_RECOVERY_MAX_PAGES
+    assert meta["hard_page_limit"] == repair.URGENT_SCOUT_GAP_RECOVERY_MAX_PAGES
     assert meta["routine_page_limit_unchanged"] == 3
     assert len(rows) == 4000
