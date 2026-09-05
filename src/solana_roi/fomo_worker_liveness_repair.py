@@ -8,7 +8,7 @@ from . import candidate_fomo_runtime_repair as candidate
 from . import continuation_market_recalibration as continuation
 
 
-REPAIR_VERSION = "fomo-worker-liveness-v1"
+REPAIR_VERSION = "fomo-worker-liveness-v2-canonical-bound"
 RESTART_BACKOFF_SECONDS = 1.0
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
@@ -44,12 +44,7 @@ def _parse_runtime_value(value: str) -> Any:
 
 
 async def _supervised_independent_fomo_worker(runtime: Any, stop: asyncio.Event) -> None:
-    """Restart the existing independent-FOMO worker only if it exits unexpectedly.
-
-    The original worker remains the sole scanner/open/settlement authority and already
-    catches ordinary per-cycle failures. This wrapper exists for initialization-time
-    or otherwise terminal failures that occur outside that inner cycle handler.
-    """
+    """Restart the existing independent-FOMO worker only if it exits unexpectedly."""
     if _ORIGINAL_FOMO_WORKER is None:
         raise RuntimeError("FOMO worker liveness repair is not installed")
 
@@ -85,7 +80,7 @@ setattr(_supervised_independent_fomo_worker, "_roi_fomo_worker_liveness", True)
 
 
 def _read_runtime_with_liveness(adapter: Any) -> dict[str, Any]:
-    """Expose the existing scanner-cycle heartbeat alongside PR168 diagnostics."""
+    """Expose scanner-cycle heartbeat plus the final canonical binding state."""
     if _ORIGINAL_READ_RUNTIME is None:
         raise RuntimeError("FOMO runtime reader liveness repair is not installed")
 
@@ -116,6 +111,19 @@ def _read_runtime_with_liveness(adapter: Any) -> dict[str, Any]:
     if latest_updated_at:
         output["updated_at"] = latest_updated_at
 
+    try:
+        from .fomo_canonical_worker_binding_repair import binding_status
+
+        output["canonical_worker_binding"] = binding_status()
+    except Exception as exc:
+        output["canonical_worker_binding"] = {
+            "bound": False,
+            "state": "status_unavailable",
+            "error": f"{type(exc).__name__}: canonical FOMO binding status unavailable",
+            "paper_only": True,
+            "live_money_authority": False,
+        }
+
     output["worker_liveness_version"] = REPAIR_VERSION
     output["worker_state"] = str(_STATE.get("state") or "unknown")
     output["worker_starts"] = int(_STATE.get("starts", 0) or 0)
@@ -135,7 +143,7 @@ setattr(_read_runtime_with_liveness, "_roi_fomo_worker_liveness", True)
 
 
 def install_fomo_worker_liveness_repair() -> None:
-    """Make independent-FOMO activity and terminal failures observable and restartable."""
+    """Make independent-FOMO activity observable, restartable and actually reachable."""
     global _ORIGINAL_FOMO_WORKER, _ORIGINAL_READ_RUNTIME, _INSTALLED
     if _INSTALLED:
         return
@@ -153,6 +161,13 @@ def install_fomo_worker_liveness_repair() -> None:
     if not bool(getattr(current_reader, "_roi_fomo_worker_liveness", False)):
         _ORIGINAL_READ_RUNTIME = current_reader
         candidate._read_fomo_runtime = _read_runtime_with_liveness  # type: ignore[assignment]
+
+    # Production showed the liveness wrapper could be installed before continuation
+    # had a real canonical predecessor to wrap. Finalize canonical isolation first,
+    # then bind the already-existing FOMO graph before any ASGI worker starts.
+    from .fomo_canonical_worker_binding_repair import install_fomo_canonical_worker_binding
+
+    install_fomo_canonical_worker_binding()
 
     _STATE.update(
         {
