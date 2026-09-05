@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH
 from .v51_economic_core import hierarchical_profile
 from .v51_measurement_integrity import MEASUREMENT_EPOCH, ensure_release_compatibility
 
-FILTER_VERSION = "v51-measurement-compatible-promotion-filter-v1"
-_ORIGINAL_CERT_RECORDS: Callable[..., Any] | None = None
+FILTER_VERSION = "v51-measurement-compatible-promotion-filter-v2"
 _INSTALLED = False
 
 
@@ -226,47 +225,20 @@ def _rh_epoch_profile_compatible(self: Any, **context: Any) -> dict[str, Any]:
     }
 
 
-def _cert_records_compatible(store: Any) -> list[dict[str, Any]]:
-    if _ORIGINAL_CERT_RECORDS is None:
-        raise RuntimeError("measurement-compatible certification records are not installed")
-    rows = list(_ORIGINAL_CERT_RECORDS(store))
-    compatible: list[dict[str, Any]] = []
-    for row in rows:
-        release = str(row.get("release_commit") or "").strip().lower()
-        if not release:
-            continue
-        status = ensure_release_compatibility(store, release)
-        if status is None:
-            continue
-        if not bool(status.get("promotion_eligible")):
-            continue
-        if str(status.get("measurement_epoch") or "") != MEASUREMENT_EPOCH:
-            continue
-        compatible.append(row)
-    return compatible
-
-
 setattr(_solana_evidence_compatible, "_roi_v51_measurement_compatibility", True)
 setattr(_fomo_epoch_returns_compatible, "_roi_v51_measurement_compatibility", True)
 setattr(_rh_epoch_profile_compatible, "_roi_v51_measurement_compatibility", True)
-setattr(_cert_records_compatible, "_roi_v51_measurement_compatibility", True)
 
 
 def install_measurement_compatible_promotion_filters() -> None:
-    global _INSTALLED, _ORIGINAL_CERT_RECORDS
+    global _INSTALLED
     if _INSTALLED:
         return
     from . import v51_consolidated_strategy as consolidated
-    from . import v51_economic_certification as certification
 
     consolidated._solana_evidence = _solana_evidence_compatible  # type: ignore[assignment]
     consolidated._fomo_epoch_returns = _fomo_epoch_returns_compatible  # type: ignore[assignment]
     consolidated._rh_epoch_profile = _rh_epoch_profile_compatible  # type: ignore[assignment]
-
-    current_records = certification._records
-    if not bool(getattr(current_records, "_roi_v51_measurement_compatibility", False)):
-        _ORIGINAL_CERT_RECORDS = current_records
-        certification._records = _cert_records_compatible  # type: ignore[assignment]
     _INSTALLED = True
 
 
@@ -278,7 +250,9 @@ def status() -> dict[str, Any]:
         "solana_promotion_requires_measurement_compatible_release": True,
         "fomo_promotion_requires_measurement_compatible_release": True,
         "robinhood_promotion_requires_measurement_compatible_release": True,
-        "economic_certification_requires_measurement_compatible_release": True,
+        "economic_certification_scope": "economic_epoch_audit_including_nonpromotable_rows",
+        "economic_certification_grants_promotion_authority": False,
+        "defective_release_promotion_authority": False,
         "historical_rows_deleted": False,
         "paper_only": True,
         "live_money_authority": False,
