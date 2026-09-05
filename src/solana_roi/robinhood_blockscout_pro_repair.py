@@ -10,6 +10,7 @@ from .robinhood_chain_core import KNOWN_NON_ACTORS, ROBINHOOD_CHAIN_ID, _clean_a
 
 
 REPAIR_VERSION = "robinhood-blockscout-pro-entity-v2-secret-binding"
+SECRET_DISCOVERY_VERSION = "blockscout-secret-discovery-v1"
 DEFAULT_PRO_API_URL = "https://api.blockscout.com/v2/api"
 MISSING_KEY_BACKOFF_SECONDS = 300.0
 TXLIST_OFFSET = 50
@@ -25,11 +26,40 @@ def _required() -> bool:
     return os.getenv("ROBINHOOD_ENTITY_RESOLUTION_REQUIRED", "true").strip().lower() not in {"0", "false", "no"}
 
 
+def _dynamic_api_key_candidates() -> list[tuple[str, str]]:
+    """Find one non-standard Blockscout API secret name without exposing values.
+
+    Render secret names are user-controlled and cannot be read back through the
+    management connector. Canonical names remain authoritative. As a compatibility
+    fallback, accept exactly one non-empty environment variable whose name clearly
+    identifies a Blockscout API key/token. Multiple candidates remain fail-closed.
+    """
+
+    rows: list[tuple[str, str]] = []
+    canonical = set(API_KEY_ENV_NAMES)
+    for name, raw in os.environ.items():
+        if name in canonical:
+            continue
+        upper = name.upper()
+        if "BLOCKSCOUT" not in upper or "API" not in upper:
+            continue
+        if "KEY" not in upper and "TOKEN" not in upper:
+            continue
+        value = str(raw or "").strip()
+        if value:
+            rows.append((name, value))
+    rows.sort(key=lambda item: item[0])
+    return rows
+
+
 def _api_key_source() -> tuple[str | None, str]:
     for name in API_KEY_ENV_NAMES:
         value = os.getenv(name, "").strip()
         if value:
             return name, value
+    dynamic = _dynamic_api_key_candidates()
+    if len(dynamic) == 1:
+        return dynamic[0]
     return None, ""
 
 
@@ -143,6 +173,7 @@ def _status_with_pro_api(original: Callable[[Any], dict[str, Any]]) -> Callable[
         payload = original(self)
         stats = entity_repair._stats(self)
         key_env_name, key = _api_key_source()
+        dynamic_candidates = _dynamic_api_key_candidates()
         entity = payload.setdefault("entity_resolution", {})
         if isinstance(entity, dict):
             entity.update({
@@ -152,6 +183,9 @@ def _status_with_pro_api(original: Callable[[Any], dict[str, Any]]) -> Callable[
                 "api_key_configured": bool(key),
                 "api_key_env_name": key_env_name,
                 "api_key_supported_env_names": list(API_KEY_ENV_NAMES),
+                "api_key_dynamic_discovery_enabled": True,
+                "api_key_dynamic_candidate_count": len(dynamic_candidates),
+                "api_key_dynamic_discovery_ambiguous": len(dynamic_candidates) > 1 and not bool(key),
                 "api_key_value_exposed": False,
                 "query_shape": "account.txlist inbound sort=asc single-request",
                 "max_provider_calls_per_uncached_actor": 1,
@@ -163,11 +197,14 @@ def _status_with_pro_api(original: Callable[[Any], dict[str, Any]]) -> Callable[
             })
         payload["blockscout_pro_entity_repair"] = {
             "repair_version": REPAIR_VERSION,
+            "secret_discovery_version": SECRET_DISCOVERY_VERSION,
             "enabled": True,
             "legacy_403_path_removed": True,
             "single_request_ascending_funder_resolution": True,
             "canonical_secret_binding": "BLOCKSCOUT_API_KEY",
             "secret_alias_fallback_supported": True,
+            "single_unambiguous_dynamic_secret_name_supported": True,
+            "ambiguous_dynamic_secret_names_fail_closed": True,
             "secret_value_exposed": False,
             "strategy_thresholds_changed": False,
             "entity_independence_rules_changed": False,
@@ -199,8 +236,22 @@ def install_robinhood_blockscout_pro_repair(plane_cls: type[Any]) -> None:
     setattr(plane_cls, "_roi_blockscout_pro_entity_repair_installed", True)
     setattr(plane_cls, "_roi_blockscout_pro_entity_repair_version", REPAIR_VERSION)
     setattr(plane_cls, "_roi_blockscout_provider_downgrade_prevented", quota_provider_active)
+
     from .all_regime_runtime_boundary_repair import install_all_regime_runtime_boundary_repair
     install_all_regime_runtime_boundary_repair(plane_cls)
 
+    from .robinhood_live_frontier_verification_repair import (
+        install_robinhood_live_frontier_verification_repair,
+    )
+    install_robinhood_live_frontier_verification_repair(plane_cls)
 
-__all__ = ["API_KEY_ENV_NAMES", "REPAIR_VERSION", "DEFAULT_PRO_API_URL", "install_robinhood_blockscout_pro_repair"]
+
+__all__ = [
+    "API_KEY_ENV_NAMES",
+    "DEFAULT_PRO_API_URL",
+    "REPAIR_VERSION",
+    "SECRET_DISCOVERY_VERSION",
+    "_api_key_source",
+    "_dynamic_api_key_candidates",
+    "install_robinhood_blockscout_pro_repair",
+]
