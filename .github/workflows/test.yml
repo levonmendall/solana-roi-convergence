@@ -31,6 +31,8 @@ jobs:
         run: python -m pytest tests/test_audit_11_22_closure.py
       - name: Audit 23-34 evidence-validity regressions
         run: python -m pytest tests/test_v51_evidence_validity_23_34.py
+      - name: Audit 35-46 live forward-proof regressions
+        run: python -m pytest tests/test_v51_forward_proof_35_46.py
       - name: Launched production HTTP smoke
         run: python tests/launched_production_smoke.py
       - name: Canonical architecture and transfer-certification invariants

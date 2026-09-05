@@ -5,6 +5,7 @@ from typing import Any, Callable
 from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
 from .v51_cost_normalization import install_api_cost_normalization, status as cost_normalization_status
+from .v51_forward_certification import install_forward_certification
 from .v51_measurement_compatibility_filters import (
     install_measurement_compatible_promotion_filters,
     status as compatibility_filter_status,
@@ -19,9 +20,9 @@ from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_co
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
-# Evidence-validity analytics and release attestation are separate proof planes; the
-# frozen economic composition identity remains unchanged because entry/sizing/
-# promotion-threshold/kill/exit economics are unchanged.
+# Evidence-validity analytics, release attestation and forward certification are
+# separate proof planes; the frozen economic composition identity remains unchanged
+# because entry/sizing/promotion-threshold/kill/exit economics are unchanged.
 COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
 _INSTALLED = False
 
@@ -103,6 +104,7 @@ def install_v51_production_authority(
         runtime_provider,
         robinhood_status_provider=module._status,
     )
+    install_forward_certification(app, runtime_provider=runtime_provider)
     app.state.roi_v51_final_economic_authority = True
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
@@ -111,6 +113,7 @@ def install_v51_production_authority(
     app.state.roi_v51_primary_attestation_sources = True
     app.state.roi_v51_measurement_compatibility_filters = True
     app.state.roi_v51_cost_normalization = True
+    app.state.roi_v51_forward_certification = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -122,6 +125,7 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
+        "forward_certification_installation": "read_only_composition_of_existing_transport_and_evidence_proof_planes",
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
         "live_release_attestation": promotion_proof_status(),
@@ -131,6 +135,7 @@ def status() -> dict[str, Any]:
         "proof_readiness_prepared_before_robinhood_transport": True,
         "post183_production_proof_wiring": True,
         "legacy_repair_modules_are_final_economic_authority": False,
+        "forward_certification_changes_strategy_authority": False,
         "paper_only": True,
         "live_money_authority": False,
     }

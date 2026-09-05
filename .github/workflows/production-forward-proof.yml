@@ -1,0 +1,31 @@
+name: Production Forward Proof
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-forward-proof
+  cancel-in-progress: true
+
+jobs:
+  exact-release-forward-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Wait for exact Render release and verify paper transports
+        env:
+          EXPECTED_RELEASE_COMMIT: ${{ github.sha }}
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          FORWARD_PROOF_PROBE_ATTEMPTS: '30'
+          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
+          FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '10'
+        run: python tests/production_forward_proof_probe.py
