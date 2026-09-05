@@ -4,7 +4,7 @@
 
 `strategy_v51_authority.json` is the canonical machine-readable economic specification. The active authority id is `roi-convergence-v5.1-consolidated-proof-1` and the economic freeze epoch is `v51-consolidated-proof-20260905`.
 
-Economic selection, sizing, promotion, kill, exit-learning and allocation rules are frozen for the evidence epoch. Reliability fixes may be made only when they do not change those economics. A change to the economics requires a new freeze epoch; older outcomes remain audit evidence and cannot silently promote the changed strategy.
+Economic selection, sizing, promotion, kill, exit-learning and allocation rules are frozen for the evidence epoch. Reliability, proof and observability fixes may be made only when they do not change those economics. A change to the economics requires a new freeze epoch; older outcomes remain audit evidence and cannot silently promote the changed strategy.
 
 The system remains paper-only with no signing, transaction submission, private-key or live-money authority.
 
@@ -28,7 +28,7 @@ Promotion requires both exact evidence and sufficient independent same-entity ev
 
 A context is killed only after sufficient independent forward evidence and all of the following are non-positive: shrunk expected log growth, leave-best-trade-out mean and the 95% upper confidence bound of mean return. Killed contexts receive no active paper allocation; a small research floor may remain for detecting regime recovery without re-granting authority automatically.
 
-## Candidate pipeline
+## Candidate pipeline and coverage
 
 Every canonical economic opportunity follows:
 
@@ -41,7 +41,11 @@ Every canonical economic opportunity follows:
 7. settlement
 8. learning
 
-Solana and FOMO are reconciled from their durable observation/trial/outcome records. Robinhood instruments the existing `_maybe_open_v2/_maybe_open_v3` path when a candidate reaches canonical lane selection, so no second polling path is introduced. A candidate selected for a lane but not opened is explicitly classified as an exact-quote / executable-round-trip cost failure. A candidate with no viable lane is rejected with the corresponding evidence/exposure reason.
+Solana and FOMO are reconciled from their durable observation/trial/outcome records. Robinhood now registers every concrete forward-only v2/v3 opportunity **before** `_maybe_open_v2/_maybe_open_v3` can return. Every registered candidate must finish as `paper_enter` or an explicit fail-closed `paper_reject`.
+
+Robinhood coverage does not issue duplicate RPC/provider requests merely to explain an early rejection. Cheap local causes such as runtime-not-ready, an already-open token or a launch-protection window are attributed exactly. Provider-dependent failures that occurred before lane selection are deliberately reported as `preselection_policy_or_evidence_failed_closed_before_lane` with coarse attribution instead of being silently dropped or falsely assigned a more precise cause.
+
+The isolated Robinhood worker computes this proof against its own SQLite store and publishes only a copied proof object through the existing nonblocking status cache. Uvicorn never queries the Robinhood SQLite store directly.
 
 ## Incremental wallet alpha
 
@@ -64,8 +68,20 @@ Actual mature forward capital efficiency overrides this tie-break. Unknown corre
 
 The certification surface reports closed N, independent event N, sum of net returns, compounded NAV using actual paper fractions, expected log growth, 95% confidence interval, expected shortfall, drawdown, top-1/top-3/top-5 winner-removal results, latency sensitivity, execution-cost sensitivity, and execution-stress scenarios.
 
-Execution stress deliberately worsens latency, round-trip costs, adverse selection and failure probability. This quantifies the paper-to-live uncertainty but does not grant live execution authority or claim that paper results equal real-money results.
+`/v1/strategy/economic-dashboard` renders the same canonical proof as a lightweight server-side dashboard. It has no independent authority and does not run a separate calculation path.
+
+Execution stress now has two layers. The frozen strategy authority retains its conservative combined mild/material/severe shocks. A diagnostic-only mechanism surface additionally isolates priority-fee drag, block-placement delay, MEV/adverse selection, quote deterioration and transaction-failure probability. These mechanism diagnostics do not change the authority fingerprint, select trades, size positions or claim that paper fills equal live fills.
+
+## Production-path equivalence
+
+The deterministic seeded harness remains useful for proving the abstract eight-stage contract. In addition, the repository now has a production-path E2E regression that instantiates the real `RobinhoodChainPaperPlane` on a durable SQLite store, executes the final v5.1 preselection/lane/quote/paper-entry path with deterministic provider responses, settles the resulting paper trial through the real settlement method, and verifies settlement and learning attribution. A companion case proves an early preselection rejection is durable and explicit.
+
+No network dependency is required for CI; provider responses are deterministic mocks at the existing RPC seams, while the production strategy, store, candidate, trial, settlement and learning code remains real.
 
 ## Architecture boundary
 
-Legacy `*_repair.py` modules remain compatibility internals where removing them immediately would risk production continuity. They may transport observations or preserve old audit surfaces. Render keeps the separately certified `solana_roi.production:app` ASGI entrypoint; `v51_final_production_install.py` wraps the final existing Robinhood production-installer boundary so the consolidated v5.1 strategy is applied after every Solana/FOMO/Robinhood compatibility installer has composed. New economic behavior must be expressed through the canonical authority/economic core rather than by adding another independent strategy wrapper.
+Legacy `*_repair.py` modules remain compatibility internals where immediate deletion would risk production continuity. They may transport observations, preserve liveness or maintain old audit surfaces, but they are **not final economic authority**.
+
+`solana_roi.production:app` remains the certified Render entrypoint. After the canonical Solana/FOMO graph and Robinhood transport worker are installed, `production.py` explicitly calls `install_v51_production_authority(app, ingestion_runtime)`. That explicit function installs the frozen Solana/FOMO economics, Robinhood consolidation, pre-lane candidate coverage, nonblocking isolated proof publisher and strategy proof API.
+
+`v51_final_production_install.py` is retained only as a reload-compatibility shim for the isolated proof-cache publisher. It no longer monkeypatches `install_robinhood_chain_paper_runtime` and cannot install, replace or alter strategy economics. New economic behavior must be expressed through a new authority/freeze epoch rather than another repair wrapper.
