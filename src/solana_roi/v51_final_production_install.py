@@ -93,11 +93,12 @@ def install_v51_final_production_hook() -> None:
         # Final code-side proof/readiness repair must be installed before the
         # existing Robinhood installer captures its app-facing status provider.
         # This keeps internal compatibility shims available while removing obsolete
-        # historical catch-up terminology from the public status surface. It also
-        # attaches the zero-allocation current-context quote proof to the final
-        # Direct-Solana composition without changing v5.1 or certification gates.
+        # historical catch-up terminology from the public status surface.
         from .final_production_proof_readiness_repair import (
             install_final_production_proof_readiness_repair,
+        )
+        from .post182_production_proof_wiring_repair import (
+            install_post182_production_proof_wiring_repair,
         )
         from . import robinhood_worker_isolation_repair as isolation
 
@@ -115,6 +116,15 @@ def install_v51_final_production_hook() -> None:
         isolation._nonblocking_status = module._status
 
         original(app, runtime_provider)
+
+        # Production proof showed that PR #182's intended behavior was installed
+        # one wrapper too early: unpriced economic scout observations bypassed its
+        # tx-level hook, and the final WebSocket handler bypassed the older exact
+        # frontier publication path. Attach both at the last production boundary,
+        # after every predecessor has composed. This remains evidence-only and
+        # cannot create retrospective entry, signing, submission, or live money.
+        install_post182_production_proof_wiring_repair()
+
         install_v51_consolidated_strategy()
         install_v51_robinhood_consolidation()
         install_v51_strategy_api(
@@ -124,6 +134,7 @@ def install_v51_final_production_hook() -> None:
         )
         app.state.roi_v51_final_economic_authority = True
         app.state.roi_final_production_proof_readiness = True
+        app.state.roi_post182_production_proof_wiring = True
 
     setattr(install, "_roi_v51_final_authority", True)
     module.install_robinhood_chain_paper_runtime = install
