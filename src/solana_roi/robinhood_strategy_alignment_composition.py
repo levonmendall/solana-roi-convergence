@@ -6,6 +6,8 @@ from typing import Any, Callable
 from . import continuation_market_recalibration as continuation
 from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
+from .post161_candidate_attribution_repair import install_post161_candidate_attribution_repair
+from .robinhood_rpc_rate_limit_repair import install_robinhood_rpc_rate_limit_repair
 
 
 COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v5-pumpfun-shadow-boundary"
@@ -48,6 +50,17 @@ async def _poll_once_with_research_discovery(self: Any) -> None:
 def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> None:
     """Keep PR146 continuation flow authoritative and attach research below it."""
     global _ORIGINAL_POLL
+
+    # The post-161 Solana repair extends only transaction-fact decoding and bounded
+    # diagnostics at the already fail-closed venue graph. It has no entry authority
+    # and is installed before runtime workers start so fresh scout transactions use it.
+    install_post161_candidate_attribution_repair()
+
+    # Robinhood's public RPC can return HTTP 429 during exact catch-up. Coordinate
+    # Retry-After/cooldown on the same read without skipping block ranges or changing
+    # catch-up capacity, strategy thresholds, or the historical-entry prohibition.
+    install_robinhood_rpc_rate_limit_repair(plane_cls)
+
     if bool(getattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", False)):
         return
 
