@@ -79,6 +79,9 @@ def main() -> int:
             authority = _get_json(
                 f"http://127.0.0.1:{port}/v1/strategy/authority", deadline=deadline
             )
+            forward = _get_json(
+                f"http://127.0.0.1:{port}/v1/strategy/forward-certification", deadline=deadline
+            )
 
             assert health["status"] == "ok"
             assert health["paper_only"] is True
@@ -92,12 +95,30 @@ def main() -> int:
             assert authority["transaction_submission_available"] is False
             assert authority["canonical"] is True
 
+            # The smoke intentionally disables transports. The forward endpoint must
+            # still launch through the exact production composition and fail closed
+            # as evidence/transport state, never by exposing execution authority.
+            assert forward["authority_id"] == AUTHORITY_ID
+            assert forward["strategy_version"] == STRATEGY_VERSION
+            assert forward["paper_only"] is True
+            assert forward["live_money_authority"] is False
+            assert forward["signing_available"] is False
+            assert forward["transaction_submission_available"] is False
+            assert forward["changes_strategy_authority"] is False
+            assert forward["changes_economic_thresholds"] is False
+            assert forward["state"] in {
+                "transport_degraded",
+                "measurement_degraded",
+                "collecting_forward_evidence",
+            }
+
             print(
                 json.dumps(
                     {
                         "launched_production": True,
                         "authority_id": authority["authority_id"],
                         "strategy_version": authority["strategy_version"],
+                        "forward_certification_state": forward["state"],
                         "paper_only": authority["paper_only"],
                         "live_money_authority": authority["live_money_authority"],
                     },
