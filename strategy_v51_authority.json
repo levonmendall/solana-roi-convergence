@@ -1,0 +1,71 @@
+{
+  "authority_id": "roi-convergence-v5.1-consolidated-proof-1",
+  "strategy_version": "roi-convergence-v5.1-context-exactness-1",
+  "economic_freeze_epoch": "v51-consolidated-proof-20260905",
+  "paper_only": true,
+  "live_money_authority": false,
+  "signing_available": false,
+  "transaction_submission_available": false,
+  "objective": "maximize_forward_executable_percentage_roi_and_compounded_paper_growth_after_costs",
+  "change_policy": "economic_rules_frozen_during_evidence_epoch; reliability_repairs_allowed_only_when_they_do_not_change_selection_sizing_exit_or_promotion_economics",
+  "pipeline_stages": ["ingestion", "candidate", "context", "execution_evidence", "decision", "position", "settlement", "learning"],
+  "mechanical_hard_stops": ["unavailable_sell_route", "transfer_restriction", "unexitable_liquidity", "unavailable_exact_entry_or_exit_quote", "authority_can_block_transfer_or_exit", "linked_entity_can_remove_required_exit_liquidity"],
+  "hazards_are_not_blanket_vetoes": ["bundled_launch", "sniper_concentration", "common_funding", "creator_linkage_or_distribution", "mint_authority", "early_holder_distribution", "quote_or_slippage_deterioration", "late_lifecycle", "high_snipe_tax"],
+  "execution": {
+    "latency_hard_max_seconds": 20.0,
+    "latency_policy": "being_under_20_seconds_is_not_economic_approval; residual_forward_edge_in_the_actual_latency_chase_and_cost_context_governs",
+    "chase_baseline_fraction": 0.15,
+    "chase_challenger_bands": [[0.15, 0.25], [0.25, 0.40]],
+    "chase_observe_only_above_fraction": 0.40,
+    "amount_specific_entry_and_exit_quotes_required": true,
+    "maximum_sizing_requotes": 2
+  },
+  "hazard_evidence_burden": {
+    "clean": {"minimum_independent_outcomes": 30, "minimum_exact_outcomes": 10, "minimum_expected_log_growth": 0.0, "bootstrap_size_multiplier": 1.0},
+    "low": {"minimum_independent_outcomes": 36, "minimum_exact_outcomes": 12, "minimum_expected_log_growth": 0.00025, "bootstrap_size_multiplier": 0.80},
+    "moderate": {"minimum_independent_outcomes": 45, "minimum_exact_outcomes": 15, "minimum_expected_log_growth": 0.00050, "bootstrap_size_multiplier": 0.60},
+    "high": {"minimum_independent_outcomes": 60, "minimum_exact_outcomes": 18, "minimum_expected_log_growth": 0.00100, "bootstrap_size_multiplier": 0.40},
+    "extreme": {"minimum_independent_outcomes": 90, "minimum_exact_outcomes": 24, "minimum_expected_log_growth": 0.00200, "bootstrap_size_multiplier": 0.25}
+  },
+  "hierarchical_pooling": {
+    "enabled": true,
+    "exact_context_weight": 1.0,
+    "parent_effective_sample_cap": 12,
+    "family_effective_sample_cap": 6,
+    "promotion_requires_exact_and_independent_minima": true,
+    "entity_identity_never_borrows_promotion_authority_from_another_entity": true
+  },
+  "kill_policy": {
+    "minimum_independent_outcomes": 60,
+    "requires_nonpositive_shrunk_expected_log_growth": true,
+    "requires_nonpositive_leave_best_trade_out_mean": true,
+    "requires_nonpositive_95pct_upper_confidence_bound": true,
+    "killed_lane_research_floor_fraction": 0.10
+  },
+  "venues": {
+    "PUMP_FUN": "residual_continuation_and_information_not_first_slot_sniping",
+    "PUMP_AMM": "graduation_and_post_graduation_continuation",
+    "RAYDIUM": "isolated_native_or_post_pump_continuation",
+    "FOMO": "clean_and_hazard_flow_acceleration_cohorts",
+    "ROBINHOOD_CHAIN": "independent_forward_experimental_surface"
+  },
+  "research_family_priority": ["PUMP_AMM", "RAYDIUM", "FOMO_CLEAN", "FOMO_HAZARD", "PUMP_FUN", "ROBINHOOD_CHAIN"],
+  "allocation": {
+    "rank_by": "forward_capital_efficiency_after_costs_tail_risk_and_evidence_confidence",
+    "unknown_correlation_is_zero": false,
+    "immature_family_max_weight": 0.25,
+    "permanent_family_max_weight": 0.50,
+    "killed_context_weight": 0.0
+  },
+  "incremental_alpha": {
+    "required": true,
+    "baseline_excludes_entity_identity": true,
+    "baseline_dimensions": ["lane", "venue", "lifecycle", "regime", "risk_signature", "flow_state", "chase_band", "latency_band", "execution_cost_band"],
+    "wallet_identity_can_receive_research_priority_only_when_forward_residual_lift_is_positive": true
+  },
+  "execution_stress": [
+    {"name": "mild", "extra_latency_seconds": 2.0, "extra_round_trip_cost_fraction": 0.02, "adverse_selection_fraction": 0.02, "failure_probability": 0.05},
+    {"name": "material", "extra_latency_seconds": 5.0, "extra_round_trip_cost_fraction": 0.05, "adverse_selection_fraction": 0.05, "failure_probability": 0.10},
+    {"name": "severe", "extra_latency_seconds": 10.0, "extra_round_trip_cost_fraction": 0.10, "adverse_selection_fraction": 0.10, "failure_probability": 0.20}
+  ]
+}

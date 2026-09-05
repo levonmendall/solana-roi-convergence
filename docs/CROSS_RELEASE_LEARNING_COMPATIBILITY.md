@@ -1,11 +1,21 @@
 # Cross-release learning compatibility
 
-Production strategy evidence uses an explicit economic compatibility epoch rather than treating a deployment SHA as a statistical reset.
+Deployment SHA remains permanent audit lineage, but a deployment is not automatically a new statistical strategy. Releases may pool only when they are explicitly registered to the same **economic freeze epoch** and therefore implement the same selection, sizing, promotion, kill and exit-learning economics.
 
-`release_commit` remains permanent audit lineage. Solana/Pump/Raydium and FOMO evidence can pool across releases only after each release is registered into the same compatibility epoch. Releases predating the epoch are preserved but have no promotion authority in the new pooled statistics.
+## Canonical epoch
 
-The current epoch is `continuation-v1-cross-release-20260905`. It begins after the continuation-first policy is the final production authority, preventing older v5.1 releases with different timing/chase economics from being mixed solely because they share the same v5.1 version string.
+The current production economic epoch is:
 
-Repeated economic signals are deduplicated across compatible releases. Tracked-wallet FOMO and independent-market-flow FOMO remain separate evidence lanes even though they share the same underlying venue correlation family.
+`v51-consolidated-proof-20260905`
 
-Authority remains paper-only. This repair adds no signer, private key surface, transaction submission, or live-money capability.
+Its authority id is:
+
+`roi-convergence-v5.1-consolidated-proof-1`
+
+The predecessor compatibility epoch `continuation-v1-cross-release-20260905` remains durable audit history. It does **not** have promotion authority for the consolidated epoch because the consolidation changes latency-decay, hazard evidence burden, hierarchical pooling and kill economics.
+
+Each compatible release is registered in `v51_economic_freeze_releases` with its authority fingerprint. Solana, FOMO and Robinhood promotion/exit-learning queries join through that registration. A normal reliability deployment can therefore keep learning without a statistical reset, while an economic change must start a new epoch rather than contaminating forward evidence.
+
+Repeated source signatures/trial ids are deduplicated where evidence is pooled. Cross-entity evidence cannot grant a specific entity promotion authority. Tracked-wallet FOMO and independent-market-flow FOMO remain separate economic contexts.
+
+Authority remains paper-only. No compatibility mechanism may add signing, transaction submission, private-key or live-money capability.

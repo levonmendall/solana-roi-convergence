@@ -366,6 +366,16 @@ def install_robinhood_worker_isolation_repair() -> None:
     _INSTALLED = True
 
 
+# This module is imported at the very end of robinhood_runtime_install, after that
+# module has defined its app-facing installer. Wrap that final production function
+# so the consolidated v5.1 authority is installed only after every existing Solana,
+# FOMO and Robinhood compatibility layer has finished composing. This preserves the
+# certified solana_roi.production:app Render entrypoint and constant-time liveness.
+from .v51_final_production_install import install_v51_final_production_hook
+
+install_v51_final_production_hook()
+
+
 __all__ = [
     "REPAIR_VERSION",
     "STATUS_STALE_SECONDS",
