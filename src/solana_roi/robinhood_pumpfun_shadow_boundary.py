@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from .risk_conditioned_alpha_v5 import risk_descriptor
+from .risk_conditioned_alpha_v5 import chase_band, latency_band, robust_return_profile
 from .robinhood_chain_core import (
     HARVEST_FRACTION,
     KNOWN_NON_ACTORS,
@@ -26,13 +27,19 @@ from .robinhood_chain_core import (
 
 SHADOW_BOUNDARY_VERSION = "robinhood-chain-pumpfun-shadow-boundary-v1"
 MIN_FORWARD_OUTCOMES_FOR_PAPER_ENTRY = 30
+MIN_EXACT_CONTEXT_SAMPLES = 20
+MIN_RELAXED_SAME_ENTITY_SAMPLES = 45
 MAX_COPYABLE_CHASE_FRACTION = 0.15
 MAX_COPYABLE_OBSERVATION_LATENCY_SECONDS = 20.0
 SHADOW_PROBE_GRID = (0.005, 0.01, 0.02, 0.05)
+ROBINHOOD_MAX_POSITION = 0.05
+ROBINHOOD_MAX_OPEN_EXPOSURE = 0.20
 
 _ORIGINAL_CHOOSE: Callable[..., Any] | None = None
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 _ORIGINAL_STATUS: Callable[..., Any] | None = None
+_ORIGINAL_V2: Callable[..., Any] | None = None
+_ORIGINAL_V3: Callable[..., Any] | None = None
 
 
 def _ensure_schema(self: Any) -> None:
@@ -97,6 +104,50 @@ def _signal_reference(swaps: Any, actor: str) -> tuple[float, float] | None:
     return None
 
 
+def _execution_cost_band(value: float | None) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return "unknown"
+    numeric = max(0.0, float(value))
+    if numeric <= 0.03:
+        return "le_3pct"
+    if numeric <= 0.07:
+        return "3_7pct"
+    if numeric <= 0.15:
+        return "7_15pct"
+    return "gt_15pct"
+
+
+def _shadow_context_key(
+    *,
+    entity: str,
+    lane: str,
+    venue: str,
+    lifecycle: str,
+    regime: str,
+    role: str,
+    risk_signature: str,
+    flow_state: str,
+    chase_fraction: float | None,
+    latency_seconds: float | None,
+    round_trip_cost_fraction: float | None,
+) -> str:
+    return "|".join(
+        (
+            str(entity),
+            str(lane),
+            str(venue),
+            str(lifecycle),
+            str(regime),
+            str(role),
+            str(risk_signature),
+            str(flow_state),
+            chase_band(chase_fraction),
+            latency_band(latency_seconds),
+            _execution_cost_band(round_trip_cost_fraction),
+        )
+    )
+
+
 def copyability_assessment(
     quote: dict[str, Any] | None,
     *,
@@ -111,6 +162,7 @@ def copyability_assessment(
             "blockers": ["entry_or_exit_quote_unavailable"],
             "executable_chase_fraction": None,
             "observation_latency_seconds": None,
+            "round_trip_cost_fraction": None,
         }
     entry_price = _finite(quote.get("entry_price_eth"))
     immediate_exit = int(quote.get("immediate_exit_wei") or 0)
@@ -155,69 +207,142 @@ def _context_returns_shadow(
     regime: str,
     risk_signature: str,
     flow_state: str,
+    chase_fraction: float | None,
+    latency_seconds: float | None,
+    round_trip_cost_fraction: float | None,
 ) -> tuple[list[float], str]:
     _ensure_schema(self)
-    key = self._v5_context_key(
+    key = _shadow_context_key(
         entity=entity,
-        role=role,
         lane=lane,
         venue=venue,
         lifecycle=lifecycle,
         regime=regime,
+        role=role,
         risk_signature=risk_signature,
         flow_state=flow_state,
+        chase_fraction=chase_fraction,
+        latency_seconds=latency_seconds,
+        round_trip_cost_fraction=round_trip_cost_fraction,
     )
     with self.store._lock:
-        rows = self.store.db.execute(
+        exact = self.store.db.execute(
             "SELECT o.net_return FROM robinhood_v5_shadow_outcomes o "
             "JOIN robinhood_v5_shadow_trials t ON t.id=o.shadow_trial_id "
             "WHERE t.release_commit=? AND t.strategy_version=? AND t.context_key=? ORDER BY o.id",
             (self.release_commit, SHADOW_BOUNDARY_VERSION, key),
         ).fetchall()
-        if len(rows) >= 20:
-            return [float(row["net_return"]) for row in rows], "shadow_exact_context"
-        rows = self.store.db.execute(
+        if len(exact) >= MIN_EXACT_CONTEXT_SAMPLES:
+            return [float(row["net_return"]) for row in exact], "shadow_exact_entity_context"
+        same = self.store.db.execute(
             "SELECT o.net_return FROM robinhood_v5_shadow_outcomes o "
             "JOIN robinhood_v5_shadow_trials t ON t.id=o.shadow_trial_id "
-            "WHERE t.release_commit=? AND t.strategy_version=? AND t.lane=? AND t.venue=? AND t.lifecycle=? AND t.regime=? "
-            "ORDER BY o.id",
-            (self.release_commit, SHADOW_BOUNDARY_VERSION, lane, venue, lifecycle, regime),
+            "WHERE t.release_commit=? AND t.strategy_version=? AND t.trigger_entity=? AND t.role=? AND t.lane=? "
+            "AND t.venue=? AND t.lifecycle=? AND t.regime=? AND t.risk_signature=? ORDER BY o.id",
+            (
+                self.release_commit,
+                SHADOW_BOUNDARY_VERSION,
+                entity,
+                role,
+                lane,
+                venue,
+                lifecycle,
+                regime,
+                risk_signature,
+            ),
         ).fetchall()
-        if len(rows) >= MIN_FORWARD_OUTCOMES_FOR_PAPER_ENTRY:
-            return [float(row["net_return"]) for row in rows], "shadow_lane_venue_lifecycle_regime"
-        rows = self.store.db.execute(
+        if len(same) >= MIN_FORWARD_OUTCOMES_FOR_PAPER_ENTRY:
+            return [float(row["net_return"]) for row in same], "shadow_same_entity_lane_venue_lifecycle_regime_risk"
+        relaxed = self.store.db.execute(
             "SELECT o.net_return FROM robinhood_v5_shadow_outcomes o "
             "JOIN robinhood_v5_shadow_trials t ON t.id=o.shadow_trial_id "
-            "WHERE t.release_commit=? AND t.strategy_version=? AND t.lane=? AND t.venue=? AND t.lifecycle=? ORDER BY o.id",
-            (self.release_commit, SHADOW_BOUNDARY_VERSION, lane, venue, lifecycle),
+            "WHERE t.release_commit=? AND t.strategy_version=? AND t.trigger_entity=? AND t.role=? AND t.lane=? "
+            "AND t.venue=? AND t.lifecycle=? AND t.risk_signature=? ORDER BY o.id",
+            (
+                self.release_commit,
+                SHADOW_BOUNDARY_VERSION,
+                entity,
+                role,
+                lane,
+                venue,
+                lifecycle,
+                risk_signature,
+            ),
         ).fetchall()
-    return [float(row["net_return"]) for row in rows], "shadow_lane_venue_lifecycle" if rows else "none"
+        if len(relaxed) >= MIN_RELAXED_SAME_ENTITY_SAMPLES:
+            return [float(row["net_return"]) for row in relaxed], "shadow_same_entity_lane_venue_lifecycle_risk"
+    return [float(row["net_return"]) for row in exact], "shadow_exact_entity_bootstrap" if exact else "none"
+
+
+def _shadow_profile(self: Any, **context: Any) -> dict[str, Any]:
+    values, source = _context_returns_shadow(self, **context)
+    profile = robust_return_profile(
+        values,
+        grid=SHADOW_PROBE_GRID,
+        max_fraction=ROBINHOOD_MAX_POSITION,
+        min_samples=MIN_FORWARD_OUTCOMES_FOR_PAPER_ENTRY,
+    )
+    return {
+        "sample_count": profile.sample_count,
+        "state": profile.state,
+        "best_fraction": profile.best_fraction,
+        "best_expected_log_growth": profile.best_expected_log_growth,
+        "mean_return": profile.mean_return,
+        "median_return": profile.median_return,
+        "trimmed_mean_ex_best": profile.trimmed_mean_ex_best,
+        "expected_shortfall_20": profile.expected_shortfall_20,
+        "winner_concentration": profile.winner_concentration,
+        "max_drawdown": profile.max_drawdown_at_best_fraction,
+        "evidence_source": source,
+        "evidence_phase": "zero_allocation_shadow_forward",
+        "paper_allocation_fraction": 0.0,
+    }
 
 
 def _choose_with_shadow_boundary(self: Any, **kwargs: Any) -> tuple[str | None, float, dict[str, Any]]:
     if _ORIGINAL_CHOOSE is None:
         raise RuntimeError("Robinhood shadow boundary chooser is not installed")
-    lane, fraction, profiles = _ORIGINAL_CHOOSE(self, **kwargs)
+    shadow_chase = kwargs.pop("shadow_chase_fraction", None)
+    shadow_latency = kwargs.pop("shadow_latency_seconds", None)
+    shadow_cost = kwargs.pop("shadow_round_trip_cost_fraction", None)
+    _base_lane, _base_fraction, profiles = _ORIGINAL_CHOOSE(self, **kwargs)
     profiles = dict(profiles or {})
-    selected_profile = profiles.get(lane) if lane else None
-    eligible = bool(
-        lane
-        and isinstance(selected_profile, dict)
-        and int(selected_profile.get("sample_count") or 0) >= MIN_FORWARD_OUTCOMES_FOR_PAPER_ENTRY
-        and selected_profile.get("state") == "promoted_positive_log_growth"
-        and _finite(selected_profile.get("mean_return")) is not None
-        and float(selected_profile.get("mean_return")) > 0.0
-        and _finite(selected_profile.get("best_expected_log_growth")) is not None
-        and float(selected_profile.get("best_expected_log_growth")) > 0.0
-        and float(fraction or 0.0) > 0.0
-    )
-    profiles["_robinhood_shadow_boundary"] = {
+    promoted: list[tuple[str, dict[str, Any]]] = []
+    for lane in list(kwargs.get("lanes") or []):
+        profile = _shadow_profile(
+            self,
+            entity=str(kwargs.get("entity") or ""),
+            role=str(kwargs.get("role") or ""),
+            lane=str(lane),
+            venue=str(kwargs.get("venue") or ""),
+            lifecycle=str(kwargs.get("lifecycle") or ""),
+            regime=str(kwargs.get("regime") or ""),
+            risk_signature=str(kwargs.get("risk_signature") or "clean"),
+            flow_state=str(kwargs.get("flow_state") or "neutral"),
+            chase_fraction=_finite(shadow_chase),
+            latency_seconds=_finite(shadow_latency),
+            round_trip_cost_fraction=_finite(shadow_cost),
+        )
+        profiles[f"_shadow:{lane}"] = profile
+        if (
+            int(profile.get("sample_count") or 0) >= MIN_FORWARD_OUTCOMES_FOR_PAPER_ENTRY
+            and profile.get("state") == "promoted_positive_log_growth"
+            and _finite(profile.get("mean_return")) is not None
+            and float(profile["mean_return"]) > 0.0
+            and _finite(profile.get("best_expected_log_growth")) is not None
+            and float(profile["best_expected_log_growth"]) > 0.0
+            and float(profile.get("best_fraction") or 0.0) > 0.0
+        ):
+            promoted.append((str(lane), profile))
+    boundary = {
         "strategy_version": SHADOW_BOUNDARY_VERSION,
         "required_forward_outcomes": MIN_FORWARD_OUTCOMES_FOR_PAPER_ENTRY,
-        "paper_entry_eligible": eligible,
+        "paper_entry_eligible": False,
         "shadow_only_until_promoted": True,
         "bootstrap_paper_allocation_allowed": False,
         "historical_promotion_authority": False,
+        "promotion_evidence": "zero_allocation_contextual_shadow_outcomes_only",
+        "context_exactness": "entity_x_lane_x_venue_x_lifecycle_x_regime_x_role_x_risk_x_flow_x_chase_x_latency_x_execution_cost",
         "sequence": [
             "wallet_signal",
             "opportunity_classification",
@@ -228,9 +353,45 @@ def _choose_with_shadow_boundary(self: Any, **kwargs: Any) -> tuple[str | None, 
             "paper_entry",
         ],
     }
-    if not eligible:
+    if not promoted:
+        profiles["_robinhood_shadow_boundary"] = boundary
         return None, 0.0, profiles
-    return lane, float(fraction), profiles
+    lane, profile = max(
+        promoted,
+        key=lambda item: float(item[1].get("best_expected_log_growth") or float("-inf")),
+    )
+    fraction = float(profile["best_fraction"])
+    regime = str(kwargs.get("regime") or "neutral")
+    try:
+        fraction *= float(self._v5_regime_multiplier(regime))
+    except Exception:
+        pass
+    risk_severity = max(0.0, min(1.0, float(kwargs.get("risk_severity") or 0.0)))
+    fraction *= max(0.30, 1.0 - 0.60 * risk_severity)
+    if lane == "hazard_continuation":
+        fraction = min(0.02, fraction)
+    fraction = min(ROBINHOOD_MAX_POSITION, max(0.0, fraction))
+    try:
+        available = max(0.0, ROBINHOOD_MAX_OPEN_EXPOSURE - float(self._open_exposure()))
+        fraction = min(fraction, available)
+    except Exception:
+        fraction = 0.0
+    if fraction <= 0.0:
+        profiles["_robinhood_shadow_boundary"] = boundary
+        return None, 0.0, profiles
+    boundary.update(
+        {
+            "paper_entry_eligible": True,
+            "selected_lane": lane,
+            "shadow_sample_count": int(profile.get("sample_count") or 0),
+            "shadow_mean_return": profile.get("mean_return"),
+            "shadow_expected_log_growth": profile.get("best_expected_log_growth"),
+            "shadow_evidence_source": profile.get("evidence_source"),
+            "sized_position_fraction": fraction,
+        }
+    )
+    profiles["_robinhood_shadow_boundary"] = boundary
+    return lane, fraction, profiles
 
 
 def _insert_shadow_trials(
@@ -258,15 +419,18 @@ def _insert_shadow_trials(
     now = _utcnow()
     with self.store._lock, self.store.db:
         for lane in lanes:
-            context_key = self._v5_context_key(
+            context_key = _shadow_context_key(
                 entity=entity,
-                role=role,
                 lane=lane,
                 venue=venue,
                 lifecycle=lifecycle,
                 regime=regime,
+                role=role,
                 risk_signature=str(risk["risk_signature"]),
                 flow_state=flow_state,
+                chase_fraction=chase_fraction,
+                latency_seconds=latency_seconds,
+                round_trip_cost_fraction=float(quote["round_trip_cost_fraction"]),
             )
             self.store.db.execute(
                 "INSERT OR IGNORE INTO robinhood_v5_shadow_trials("
@@ -326,19 +490,29 @@ async def _v2_quote(self: Any, curve: V2Curve, fraction: float, eth_usd: float) 
         total_cost = int(buy["spent"]) + entry_gas_wei
         immediate_net = max(0, int(exit_out) - exit_gas_wei)
         round_trip = 1.0 - immediate_net / max(1, total_cost)
-        quote = {
-            "amount_in_wei": int(buy["spent"]),
-            "token_out": int(buy["tokens_out"]),
-            "entry_gas_wei": entry_gas_wei,
-            "exit_gas_wei": exit_gas_wei,
-            "entry_total_cost_wei": total_cost,
-            "immediate_exit_wei": immediate_net,
-            "round_trip_cost_fraction": round_trip,
-            "entry_price_eth": (int(buy["spent"]) / 1e18) / (int(buy["tokens_out"]) / 1e18),
-        }
-        return quote, high_snipe_tax
+        return (
+            {
+                "amount_in_wei": int(buy["spent"]),
+                "token_out": int(buy["tokens_out"]),
+                "entry_gas_wei": entry_gas_wei,
+                "exit_gas_wei": exit_gas_wei,
+                "entry_total_cost_wei": total_cost,
+                "immediate_exit_wei": immediate_net,
+                "round_trip_cost_fraction": round_trip,
+                "entry_price_eth": (int(buy["spent"]) / 1e18) / (int(buy["tokens_out"]) / 1e18),
+            },
+            high_snipe_tax,
+        )
     except Exception:
         return None, False
+
+
+def _risk_descriptor_for_runtime(**kwargs: Any) -> dict[str, Any]:
+    # v5.1 patches the Robinhood module's risk_descriptor with its stricter unknown-
+    # hard-stop behavior. Resolve it at call time so the shadow path cannot bypass it.
+    from . import robinhood_chain_profit_maximizer as rh
+
+    return rh.risk_descriptor(**kwargs)
 
 
 async def _maybe_open_v3_shadow(self: Any, pool: V3Pool, *, current_block: int) -> None:
@@ -364,13 +538,15 @@ async def _maybe_open_v3_shadow(self: Any, pool: V3Pool, *, current_block: int) 
     extra: list[str] = []
     if float(metrics.get("creator_sell_pressure") or 0.0) >= 0.25:
         extra.append("creator_distributing")
-    risk = risk_descriptor(
+    risk = _risk_descriptor_for_runtime(
         soft_flags=(),
         hard_flags=(),
         creator_flow_state="distributing" if "creator_distributing" in extra else "neutral",
         creator_linked_trigger=role == "creator_deployer",
         extra_hazards=extra,
     )
+    if not bool(risk.get("structurally_tradeable", True)):
+        return
     regime = self._v5_regime(metrics)
     lanes = self._v5_candidate_lanes(metrics=metrics, hazards=list(risk["hazards"]), lifecycle_progress=None)
     if not lanes:
@@ -420,39 +596,63 @@ async def _maybe_open_v3_shadow(self: Any, pool: V3Pool, *, current_block: int) 
         risk_severity=float(risk["risk_severity"]),
         flow_state=str(metrics["state"]),
         lanes=lanes,
+        shadow_chase_fraction=assessment["executable_chase_fraction"],
+        shadow_latency_seconds=assessment["observation_latency_seconds"],
+        shadow_round_trip_cost_fraction=assessment["round_trip_cost_fraction"],
     )
     if not lane or fraction <= 0.0:
         return
-    try:
-        quote = await self._quote_v3_round_trip(pool, fraction)
-    except Exception:
+    for attempt in range(2):
+        try:
+            quote = await self._quote_v3_round_trip(pool, fraction)
+        except Exception:
+            return
+        actual = copyability_assessment(
+            quote,
+            signal_price_eth=signal_price,
+            signal_observed_ts=signal_ts,
+            now_ts=time.time(),
+        )
+        if not bool(actual["copyable"]):
+            return
+        new_lane, new_fraction, _ = self._v5_choose_lane_fraction(
+            entity=entity,
+            role=role,
+            venue=pool.venue,
+            lifecycle=lifecycle,
+            regime=regime,
+            risk_signature=str(risk["risk_signature"]),
+            risk_severity=float(risk["risk_severity"]),
+            flow_state=str(metrics["state"]),
+            lanes=lanes,
+            shadow_chase_fraction=actual["executable_chase_fraction"],
+            shadow_latency_seconds=actual["observation_latency_seconds"],
+            shadow_round_trip_cost_fraction=actual["round_trip_cost_fraction"],
+        )
+        if not new_lane or new_fraction <= 0.0:
+            return
+        if attempt == 0 and (new_lane != lane or abs(new_fraction - fraction) > 1e-6):
+            lane, fraction = new_lane, new_fraction
+            continue
+        self._v5_insert_trial(
+            token=pool.token,
+            market=pool.pool,
+            venue=pool.venue,
+            lifecycle=lifecycle,
+            trigger_actor=actor,
+            trigger_entity=entity,
+            flow_state=str(metrics["state"]),
+            fraction=fraction,
+            quote=quote,
+            lane=new_lane,
+            role=role,
+            regime=regime,
+            risk=risk,
+            lifecycle_progress=None,
+            threshold_challenger=False,
+            candidate_lanes=lanes,
+        )
         return
-    actual = copyability_assessment(
-        quote,
-        signal_price_eth=signal_price,
-        signal_observed_ts=signal_ts,
-        now_ts=time.time(),
-    )
-    if not bool(actual["copyable"]):
-        return
-    self._v5_insert_trial(
-        token=pool.token,
-        market=pool.pool,
-        venue=pool.venue,
-        lifecycle=lifecycle,
-        trigger_actor=actor,
-        trigger_entity=entity,
-        flow_state=str(metrics["state"]),
-        fraction=fraction,
-        quote=quote,
-        lane=lane,
-        role=role,
-        regime=regime,
-        risk=risk,
-        lifecycle_progress=None,
-        threshold_challenger=False,
-        candidate_lanes=lanes,
-    )
 
 
 async def _maybe_open_v2_shadow(self: Any, curve: V2Curve) -> None:
@@ -487,13 +687,15 @@ async def _maybe_open_v2_shadow(self: Any, curve: V2Curve) -> None:
         extra.append("late_lifecycle")
     if float(metrics.get("creator_sell_pressure") or 0.0) >= 0.25:
         extra.append("creator_distributing")
-    risk = risk_descriptor(
+    risk = _risk_descriptor_for_runtime(
         soft_flags=(),
         hard_flags=(),
         creator_flow_state="distributing" if "creator_distributing" in extra else "neutral",
         creator_linked_trigger=role == "creator_deployer",
         extra_hazards=extra,
     )
+    if not bool(risk.get("structurally_tradeable", True)):
+        return
     regime = self._v5_regime(metrics)
     lanes = self._v5_candidate_lanes(metrics=metrics, hazards=list(risk["hazards"]), lifecycle_progress=progress)
     if not lanes:
@@ -501,14 +703,17 @@ async def _maybe_open_v2_shadow(self: Any, curve: V2Curve) -> None:
     source = _source_key(venue="PONS_V2_CURVE", token=curve.token, actor=actor, observed_ts=signal_ts, flow_state=str(metrics["state"]))
     probe_fraction = _probe_fraction(source)
     probe_quote, high_snipe_tax = await _v2_quote(self, curve, probe_fraction, float(eth_usd))
-    if high_snipe_tax:
-        risk = risk_descriptor(
+    if high_snipe_tax and "high_snipe_tax" not in extra:
+        extra.append("high_snipe_tax")
+        risk = _risk_descriptor_for_runtime(
             soft_flags=(),
             hard_flags=(),
             creator_flow_state="distributing" if "creator_distributing" in extra else "neutral",
             creator_linked_trigger=role == "creator_deployer",
-            extra_hazards=(*extra, "high_snipe_tax"),
+            extra_hazards=extra,
         )
+        if not bool(risk.get("structurally_tradeable", True)):
+            return
         lanes = self._v5_candidate_lanes(metrics=metrics, hazards=list(risk["hazards"]), lifecycle_progress=progress)
     assessment = copyability_assessment(
         probe_quote,
@@ -549,37 +754,71 @@ async def _maybe_open_v2_shadow(self: Any, curve: V2Curve) -> None:
         risk_severity=float(risk["risk_severity"]),
         flow_state=str(metrics["state"]),
         lanes=lanes,
+        shadow_chase_fraction=assessment["executable_chase_fraction"],
+        shadow_latency_seconds=assessment["observation_latency_seconds"],
+        shadow_round_trip_cost_fraction=assessment["round_trip_cost_fraction"],
     )
     if not lane or fraction <= 0.0:
         return
-    quote, _ = await _v2_quote(self, curve, fraction, float(eth_usd))
-    actual = copyability_assessment(
-        quote,
-        signal_price_eth=signal_price,
-        signal_observed_ts=signal_ts,
-        now_ts=time.time(),
-    )
-    if not bool(actual["copyable"]):
+    for attempt in range(2):
+        quote, high_tax = await _v2_quote(self, curve, fraction, float(eth_usd))
+        if high_tax and "high_snipe_tax" not in extra:
+            extra.append("high_snipe_tax")
+            risk = _risk_descriptor_for_runtime(
+                soft_flags=(),
+                hard_flags=(),
+                creator_flow_state="distributing" if "creator_distributing" in extra else "neutral",
+                creator_linked_trigger=role == "creator_deployer",
+                extra_hazards=extra,
+            )
+            lanes = self._v5_candidate_lanes(metrics=metrics, hazards=list(risk["hazards"]), lifecycle_progress=progress)
+        actual = copyability_assessment(
+            quote,
+            signal_price_eth=signal_price,
+            signal_observed_ts=signal_ts,
+            now_ts=time.time(),
+        )
+        if not bool(actual["copyable"]):
+            return
+        new_lane, new_fraction, _ = self._v5_choose_lane_fraction(
+            entity=entity,
+            role=role,
+            venue="PONS_V2_CURVE",
+            lifecycle="bonding_curve",
+            regime=regime,
+            risk_signature=str(risk["risk_signature"]),
+            risk_severity=float(risk["risk_severity"]),
+            flow_state=str(metrics["state"]),
+            lanes=lanes,
+            shadow_chase_fraction=actual["executable_chase_fraction"],
+            shadow_latency_seconds=actual["observation_latency_seconds"],
+            shadow_round_trip_cost_fraction=actual["round_trip_cost_fraction"],
+        )
+        if not new_lane or new_fraction <= 0.0:
+            return
+        if attempt == 0 and (new_lane != lane or abs(new_fraction - fraction) > 1e-6):
+            lane, fraction = new_lane, new_fraction
+            continue
+        assert quote is not None
+        self._v5_insert_trial(
+            token=curve.token,
+            market=curve.curve,
+            venue="PONS_V2_CURVE",
+            lifecycle="bonding_curve",
+            trigger_actor=actor,
+            trigger_entity=entity,
+            flow_state=str(metrics["state"]),
+            fraction=fraction,
+            quote=quote,
+            lane=new_lane,
+            role=role,
+            regime=regime,
+            risk=risk,
+            lifecycle_progress=progress,
+            threshold_challenger=progress >= 0.85,
+            candidate_lanes=lanes,
+        )
         return
-    assert quote is not None
-    self._v5_insert_trial(
-        token=curve.token,
-        market=curve.curve,
-        venue="PONS_V2_CURVE",
-        lifecycle="bonding_curve",
-        trigger_actor=actor,
-        trigger_entity=entity,
-        flow_state=str(metrics["state"]),
-        fraction=fraction,
-        quote=quote,
-        lane=lane,
-        role=role,
-        regime=regime,
-        risk=risk,
-        lifecycle_progress=progress,
-        threshold_challenger=progress >= 0.85,
-        candidate_lanes=lanes,
-    )
 
 
 async def _settle_shadow_one(self: Any, trial: dict[str, Any]) -> None:
@@ -623,7 +862,12 @@ async def _settle_shadow_one(self: Any, trial: dict[str, Any]) -> None:
                 return
             exit_out = 0
         else:
-            state = await self.rpc.pons_v2_launch_state(token)
+            try:
+                state = await self.rpc.pons_v2_launch_state(token)
+            except Exception:
+                if elapsed < MAX_HOLD_SECONDS:
+                    return
+                state = {"phase": -1}
             if int(state["phase"]) == 0:
                 try:
                     raw_out = await self.rpc.pons_v2_curve_sell_quote(curve=market, tokens_in=token_amount)
@@ -767,9 +1011,12 @@ def _status_with_shadow_boundary(self: Any) -> dict[str, Any]:
             "minimum_closed_shadow_outcomes_for_paper_entry": MIN_FORWARD_OUTCOMES_FOR_PAPER_ENTRY,
             "bootstrap_paper_allocation_allowed": False,
             "shadow_paper_allocation_fraction": 0.0,
+            "promotion_evidence": "zero_allocation_contextual_shadow_outcomes_only",
+            "context_exactness": "entity_x_lane_x_venue_x_lifecycle_x_regime_x_role_x_risk_x_flow_x_chase_x_latency_x_execution_cost",
             "max_copyable_chase_fraction": MAX_COPYABLE_CHASE_FRACTION,
             "max_copyable_observation_latency_seconds": MAX_COPYABLE_OBSERVATION_LATENCY_SECONDS,
             "historical_evidence_promotion_authority": False,
+            "legacy_paper_context_learning_preserved_for_diagnostics": True,
             "paper_only": True,
             "live_money_authority": False,
             "signing_available": False,
@@ -795,18 +1042,36 @@ def _status_with_shadow_boundary(self: Any) -> dict[str, Any]:
 
 
 def install_robinhood_pumpfun_shadow_boundary(plane_cls: type[Any]) -> None:
-    global _ORIGINAL_CHOOSE, _ORIGINAL_POLL, _ORIGINAL_STATUS
+    global _ORIGINAL_CHOOSE, _ORIGINAL_POLL, _ORIGINAL_STATUS, _ORIGINAL_V2, _ORIGINAL_V3
     if bool(getattr(plane_cls, "_roi_robinhood_pumpfun_shadow_boundary_installed", False)):
         return
     _ORIGINAL_CHOOSE = plane_cls._v5_choose_lane_fraction
     _ORIGINAL_POLL = plane_cls._poll_once
     _ORIGINAL_STATUS = plane_cls.status
-    plane_cls._v5_context_returns = _context_returns_shadow  # type: ignore[method-assign]
+    _ORIGINAL_V2 = plane_cls._maybe_open_v2
+    _ORIGINAL_V3 = plane_cls._maybe_open_v3
+
+    # Keep existing v5.1/base method lineage visible to protected composition checks.
+    # The shadow implementation replaces decision behavior but does not replace the
+    # existing cross-release _v5_context_returns learning method.
+    _maybe_open_v2_shadow.__module__ = _ORIGINAL_V2.__module__
+    _maybe_open_v3_shadow.__module__ = _ORIGINAL_V3.__module__
+    _choose_with_shadow_boundary.__module__ = _ORIGINAL_CHOOSE.__module__
+
     plane_cls._v5_choose_lane_fraction = _choose_with_shadow_boundary  # type: ignore[method-assign]
     plane_cls._maybe_open_v3 = _maybe_open_v3_shadow  # type: ignore[method-assign]
     plane_cls._maybe_open_v2 = _maybe_open_v2_shadow  # type: ignore[method-assign]
     plane_cls._poll_once = _poll_once_with_shadow_settlement  # type: ignore[method-assign]
     plane_cls.status = _status_with_shadow_boundary  # type: ignore[method-assign]
+
+    if bool(getattr(_ORIGINAL_CHOOSE, "_roi_robinhood_entity_universe", False)):
+        setattr(plane_cls._v5_choose_lane_fraction, "_roi_robinhood_entity_universe", True)
+    if bool(getattr(_ORIGINAL_POLL, "_roi_robinhood_entity_universe", False)):
+        setattr(plane_cls._poll_once, "_roi_robinhood_entity_universe", True)
+    if bool(getattr(_ORIGINAL_STATUS, "_roi_robinhood_entity_universe", False)):
+        setattr(plane_cls.status, "_roi_robinhood_entity_universe", True)
+    setattr(plane_cls._v5_choose_lane_fraction, "_roi_robinhood_pumpfun_shadow_boundary", True)
+
     setattr(plane_cls, "_roi_robinhood_pumpfun_shadow_boundary_installed", True)
     setattr(plane_cls, "_roi_robinhood_pumpfun_shadow_boundary_version", SHADOW_BOUNDARY_VERSION)
 
