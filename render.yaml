@@ -4,14 +4,14 @@ services:
     runtime: python
     plan: 1c-2g
     buildCommand: pip install -e .
-    # Preserve the exact canonical production entrypoint. Robinhood Chain is
-    # installed additively inside solana_roi.production after all existing Solana
-    # continuity/certification composition has been established.
-    startCommand: uvicorn solana_roi.production:app --host 0.0.0.0 --port $PORT
+    # Canonical production entrypoint. The legacy production module remains the
+    # transport/reliability substrate; v51_production installs one final economic
+    # authority boundary after all compatibility internals are composed.
+    startCommand: uvicorn solana_roi.v51_production:app --host 0.0.0.0 --port $PORT
     # Render liveness must remain constant-time and independent of SQLite,
     # certification scans, provider state, or the append-only event-chain audit.
-    # Deep readiness remains available under /v1/ingestion/status and
-    # /v1/robinhood-chain/status.
+    # Deep readiness remains available under /v1/ingestion/status and the
+    # canonical strategy proof surfaces under /v1/strategy/*.
     healthCheckPath: /v1/strategy/baseline
     autoDeployTrigger: checksPass
     numInstances: 1
@@ -23,6 +23,10 @@ services:
     envVars:
       - key: PAPER_ONLY
         value: "true"
+      - key: SOLANA_ROI_ACTIVE_STRATEGY_AUTHORITY
+        value: "roi-convergence-v5.1-consolidated-proof-1"
+      - key: SOLANA_ROI_ECONOMIC_FREEZE_EPOCH
+        value: "v51-consolidated-proof-20260905"
       - key: SOLANA_NETWORK
         value: mainnet-beta
       - key: SOLANA_ROI_DB_PATH
@@ -58,7 +62,7 @@ services:
       - key: SOLANA_ROI_DIRECT_RAW_RETENTION_SECONDS
         value: "900"
       # Research-only adaptive Solana wallet lane. It samples raw full-program
-      # receipts and cannot sign, submit, or mutate the historical v3.1 cohort.
+      # receipts and cannot sign, submit, or create live-money authority.
       - key: SOLANA_ROI_WALLET_DISCOVERY_ENABLED
         value: "true"
       - key: SOLANA_ROI_WALLET_DISCOVERY_SAMPLE_MODULUS
@@ -91,8 +95,9 @@ services:
         value: "1.0"
       - key: SOLANA_ROI_PRICE_TRACKING_HORIZON_SECONDS
         value: "300"
-      # Frozen public scout cohort used by the v3.1 hypothesis. These are public
-      # Solana addresses only; no key material is stored or accepted.
+      # Legacy v3.1 public scout cohort retained only for baseline/audit and
+      # compatibility ingestion. It has no final selection, sizing, exit, or
+      # promotion authority under the canonical v5.1 consolidation.
       - key: SOLANA_ROI_WALLET_PROFILES_JSON
         value: '[{"wallet":"4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk","entity_id":"kol:jijo","tier":"S","first_touch_sample_size":191,"historically_eligible":true},{"wallet":"862TYSvRYoiHAK3F3WwTRYAfuGiQaGdxedN9AGvRGWo2","entity_id":"kol:wugi","tier":"S","first_touch_sample_size":52,"historically_eligible":true},{"wallet":"DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt","entity_id":"kol:the-doc","tier":"S","first_touch_sample_size":121,"historically_eligible":true}]'
       # Jupiter remains the amount-specific quote/simulation provider. Standard
