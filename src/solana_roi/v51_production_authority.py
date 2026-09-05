@@ -73,7 +73,17 @@ def install_v51_production_authority(
     """
     global _INSTALLED
     from . import robinhood_runtime_install as module
+    from .post182_production_proof_wiring_repair import (
+        install_post183_production_proof_wiring_repair,
+    )
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
+
+    # The first production proof after PR #182 showed two observability/evidence
+    # call sites were still one wrapper below the live graph. PR #183 gives us this
+    # explicit final production boundary, so attach the actual economic scout
+    # normalizer and final real-WebSocket durable-frontier verifier here. These are
+    # evidence-only repairs: they cannot select, size, promote or allocate.
+    install_post183_production_proof_wiring_repair()
 
     install_v51_consolidated_strategy()
     install_v51_robinhood_consolidation()
@@ -87,6 +97,7 @@ def install_v51_production_authority(
     app.state.roi_v51_final_economic_authority = True
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
+    app.state.roi_post183_production_proof_wiring = True
     # PR #182 proof/readiness is prepared before Robinhood transport captures its
     # status provider. Mark that proof surface explicitly here without granting it
     # strategy or allocation authority.
@@ -100,6 +111,7 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
         "proof_readiness_prepared_before_robinhood_transport": True,
+        "post183_production_proof_wiring": True,
         "legacy_repair_modules_are_final_economic_authority": False,
         "paper_only": True,
         "live_money_authority": False,
