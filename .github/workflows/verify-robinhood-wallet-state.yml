@@ -1,0 +1,54 @@
+name: Verify Robinhood wallet state audit
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch production ingestion status
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-delay 2 \
+            https://solana-roi-convergence.onrender.com/v1/ingestion/status \
+            -o production-status.json
+      - name: Extract Robinhood authority audit
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path('production-status.json').read_text())
+          matches = []
+
+          def walk(value, path='$'):
+              if isinstance(value, dict):
+                  if 'robinhood_wallet_selection_authority_boundary' in value:
+                      matches.append({
+                          'path': path + '.robinhood_wallet_selection_authority_boundary',
+                          'value': value['robinhood_wallet_selection_authority_boundary'],
+                      })
+                  for key, child in value.items():
+                      walk(child, f'{path}.{key}')
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      walk(child, f'{path}[{index}]')
+
+          walk(data)
+          result = {
+              'release_commit': data.get('release_commit') or data.get('commit') or data.get('release'),
+              'matches': matches,
+          }
+          Path('robinhood-wallet-state-audit.json').write_text(json.dumps(result, indent=2, sort_keys=True))
+          print(json.dumps(result, sort_keys=True))
+          if not matches:
+              raise SystemExit('Robinhood wallet selection authority boundary status not found')
+          PY
+      - name: Upload verification result
+        uses: actions/upload-artifact@v4
+        with:
+          name: robinhood-wallet-state-audit
+          path: robinhood-wallet-state-audit.json
