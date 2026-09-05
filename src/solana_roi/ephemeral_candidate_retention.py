@@ -12,6 +12,7 @@ from .direct_solana import DirectSolanaIngestionPlane
 
 
 ENTRY_WINDOW_SECONDS = float(BASELINE.confirmation_window_seconds)
+SCOUT_HYDRATION_RETENTION_SECONDS = 60.0
 REAPER_INTERVAL_SECONDS = 0.50
 EPHEMERAL_HYDRATION_REASONS = frozenset(
     {
@@ -19,6 +20,12 @@ EPHEMERAL_HYDRATION_REASONS = frozenset(
         "frozen_scout_live_poll_trigger",
         "prospective_launch",
         "deterministic_market_sample",
+    }
+)
+CONTINUATION_HYDRATION_REASONS = frozenset(
+    {
+        "frozen_scout_processed_trigger",
+        "frozen_scout_live_poll_trigger",
     }
 )
 
@@ -36,6 +43,14 @@ def _parse_dt(value: Any) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _hydration_retention_seconds(reason: str) -> float:
+    return (
+        SCOUT_HYDRATION_RETENTION_SECONDS
+        if str(reason) in CONTINUATION_HYDRATION_REASONS
+        else ENTRY_WINDOW_SECONDS
+    )
 
 
 def _ensure_schema(store: Any) -> None:
@@ -75,6 +90,8 @@ def _ensure_schema_conn(db: sqlite3.Connection) -> None:
 
 def _track_candidate(store: Any, *, token_mint: str, first_seen_at: datetime, source: str | None) -> None:
     _ensure_schema(store)
+    # Strategy candidate state keeps the frozen 20-second lifetime even when scout
+    # transaction hydration is allowed to finish later for continuation research.
     expires_at = first_seen_at + timedelta(seconds=ENTRY_WINDOW_SECONDS)
     with store._lock, store.db:
         store.db.execute(
@@ -157,8 +174,13 @@ async def _bounded_ephemeral_hydrate_one(self: DirectSolanaIngestionPlane, row: 
         return
 
     trigger = _parse_dt(row["trigger_received_at"])
-    remaining = ENTRY_WINDOW_SECONDS - max(0.0, (_utcnow() - trigger).total_seconds())
+    retention_seconds = _hydration_retention_seconds(reason)
+    age_seconds = max(0.0, (_utcnow() - trigger).total_seconds())
+    remaining = retention_seconds - age_seconds
     if remaining <= 0.0:
+        # Preserve the existing outcome contract for dashboards and certification
+        # accounting. The changed behavior is the later scout cutoff, not a new
+        # terminal category.
         _discard_hydration_row(self, row, outcome="expired_before_entry")
         return
 
@@ -200,9 +222,49 @@ def _anon_outcome_conn(
     )
 
 
+def _reap_queue_group(
+    db: sqlite3.Connection,
+    *,
+    at: datetime,
+    reasons: tuple[str, ...],
+    cutoff: datetime,
+    outcome: str,
+) -> int:
+    if not reasons:
+        return 0
+    placeholders = ",".join("?" for _ in reasons)
+    groups = db.execute(
+        "SELECT COALESCE(source_hint, 'SCOUT') AS source, reason, COUNT(*) AS n, "
+        "MIN(trigger_received_at) AS oldest FROM direct_solana_hydration_queue "
+        f"WHERE status='pending' AND reason IN ({placeholders}) AND trigger_received_at<? "
+        "GROUP BY COALESCE(source_hint, 'SCOUT'), reason",
+        (*reasons, cutoff.isoformat()),
+    ).fetchall()
+    count = 0
+    for row in groups:
+        oldest = _parse_dt(row["oldest"])
+        _anon_outcome_conn(
+            db,
+            bucket=at.replace(second=0, microsecond=0).isoformat(),
+            source=str(row["source"]),
+            reason=str(row["reason"]),
+            outcome=outcome,
+            count=int(row["n"]),
+            max_age_ms=max(0.0, (at - oldest).total_seconds() * 1000.0),
+        )
+        count += int(row["n"])
+    db.execute(
+        "DELETE FROM direct_solana_hydration_queue WHERE status='pending' "
+        f"AND reason IN ({placeholders}) AND trigger_received_at<?",
+        (*reasons, cutoff.isoformat()),
+    )
+    return count
+
+
 def _reap_sqlite(path: Path, now: datetime | None = None) -> dict[str, Any]:
     at = (now or _utcnow()).astimezone(timezone.utc)
-    cutoff = at - timedelta(seconds=ENTRY_WINDOW_SECONDS)
+    entry_cutoff = at - timedelta(seconds=ENTRY_WINDOW_SECONDS)
+    scout_cutoff = at - timedelta(seconds=SCOUT_HYDRATION_RETENTION_SECONDS)
     result: dict[str, Any] = {"busy": False, "queue_rows": 0, "candidate_mints": []}
     db = _connect_maintenance(path)
     try:
@@ -216,29 +278,21 @@ def _reap_sqlite(path: Path, now: datetime | None = None) -> dict[str, Any]:
 
         _ensure_schema_conn(db)
         if _sqlite_table_exists(db, "direct_solana_hydration_queue"):
-            queue_groups = db.execute(
-                "SELECT COALESCE(source_hint, 'SCOUT') AS source, reason, COUNT(*) AS n, "
-                "MIN(trigger_received_at) AS oldest FROM direct_solana_hydration_queue "
-                "WHERE status='pending' AND reason IN (?,?,?,?) AND trigger_received_at<? "
-                "GROUP BY COALESCE(source_hint, 'SCOUT'), reason",
-                (*sorted(EPHEMERAL_HYDRATION_REASONS), cutoff.isoformat()),
-            ).fetchall()
-            for row in queue_groups:
-                oldest = _parse_dt(row["oldest"])
-                _anon_outcome_conn(
-                    db,
-                    bucket=at.replace(second=0, microsecond=0).isoformat(),
-                    source=str(row["source"]),
-                    reason=str(row["reason"]),
-                    outcome="expired_before_entry",
-                    count=int(row["n"]),
-                    max_age_ms=max(0.0, (at - oldest).total_seconds() * 1000.0),
-                )
-                result["queue_rows"] = int(result["queue_rows"]) + int(row["n"])
-            db.execute(
-                "DELETE FROM direct_solana_hydration_queue WHERE status='pending' "
-                "AND reason IN (?,?,?,?) AND trigger_received_at<?",
-                (*sorted(EPHEMERAL_HYDRATION_REASONS), cutoff.isoformat()),
+            scout_reasons = tuple(sorted(CONTINUATION_HYDRATION_REASONS))
+            immediate_reasons = tuple(sorted(EPHEMERAL_HYDRATION_REASONS - CONTINUATION_HYDRATION_REASONS))
+            result["queue_rows"] = int(result["queue_rows"]) + _reap_queue_group(
+                db,
+                at=at,
+                reasons=scout_reasons,
+                cutoff=scout_cutoff,
+                outcome="expired_before_entry",
+            )
+            result["queue_rows"] = int(result["queue_rows"]) + _reap_queue_group(
+                db,
+                at=at,
+                reasons=immediate_reasons,
+                cutoff=entry_cutoff,
+                outcome="expired_before_entry",
             )
 
         expired = db.execute(
@@ -349,6 +403,9 @@ def _direct_status_with_ephemeral_retention(self: DirectSolanaIngestionPlane) ->
     payload["ephemeral_candidate_retention"] = {
         "installed": True,
         "entry_window_seconds": ENTRY_WINDOW_SECONDS,
+        "scout_hydration_retention_seconds": SCOUT_HYDRATION_RETENTION_SECONDS,
+        "scout_hydration_can_complete_after_entry_window": True,
+        "late_scout_hydration_has_retrospective_entry_authority": False,
         "active_strategy_candidate_state_ephemeral": True,
         "canonical_observation_evidence_retained": True,
         "canonical_observation_tables_pruned": False,
@@ -377,6 +434,8 @@ def _direct_status_with_ephemeral_retention(self: DirectSolanaIngestionPlane) ->
             {
                 "unentered_strategy_candidate_state_is_ephemeral": True,
                 "entry_window_seconds": ENTRY_WINDOW_SECONDS,
+                "scout_hydration_retention_seconds": SCOUT_HYDRATION_RETENTION_SECONDS,
+                "late_scout_hydration_is_continuation_research_only": True,
                 "canonical_observation_evidence_retained": True,
                 "paper_entry_not_required_for_research_evidence": True,
             }
@@ -420,6 +479,8 @@ def install_ephemeral_candidate_retention() -> None:
 
 __all__ = [
     "ENTRY_WINDOW_SECONDS",
+    "SCOUT_HYDRATION_RETENTION_SECONDS",
+    "CONTINUATION_HYDRATION_REASONS",
     "EPHEMERAL_HYDRATION_REASONS",
     "_bounded_ephemeral_hydrate_one",
     "_ensure_schema",

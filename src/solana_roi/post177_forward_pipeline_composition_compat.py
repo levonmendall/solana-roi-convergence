@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from typing import Any, Callable
+
+from . import continuity_standby_rpc_priority_repair as standby
+from . import ephemeral_candidate_retention as ephemeral
+from . import post104_production_architecture_repair as post104
+from . import post177_forward_pipeline_bottleneck_repair as repair
+from . import unified_strategy_status as unified_status
+from .config import BASELINE
+from .direct_solana import DirectSolanaIngestionPlane
+
+
+COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v2"
+_FINAL_DIRECT_STATUS: Callable[..., dict[str, Any]] | None = None
+
+
+def _inherit_markers(target: Any, source: Any) -> None:
+    if target is None or source is None:
+        return
+    try:
+        target.__dict__.update(getattr(source, "__dict__", {}))
+    except Exception:
+        pass
+
+
+def _truthful_direct_status(self: DirectSolanaIngestionPlane) -> dict[str, Any]:
+    if _FINAL_DIRECT_STATUS is None:
+        raise RuntimeError("post-177 composition compatibility is not installed")
+    payload = _FINAL_DIRECT_STATUS(self)
+
+    retention = payload.get("ephemeral_candidate_retention")
+    if isinstance(retention, dict):
+        retention.update(
+            {
+                "entry_window_seconds": float(BASELINE.confirmation_window_seconds),
+                "immediate_copy_window_seconds": float(BASELINE.confirmation_window_seconds),
+                "scout_hydration_retention_seconds": float(ephemeral.SCOUT_HYDRATION_RETENTION_SECONDS),
+                "twenty_seconds_is_strategy_candidate_state_boundary": True,
+                "twenty_seconds_is_universal_hydration_prune_boundary": False,
+                "expired_candidate_hydration_work_pruned": True,
+                "scout_hydration_pruned_after_seconds": float(ephemeral.SCOUT_HYDRATION_RETENTION_SECONDS),
+                "non_scout_ephemeral_hydration_pruned_after_seconds": float(BASELINE.confirmation_window_seconds),
+                "late_scout_hydration_has_retrospective_entry_authority": False,
+                "retention_semantics_version": COMPAT_VERSION,
+            }
+        )
+        retention.pop("operational_hydration_retention_seconds", None)
+        retention.pop("twenty_seconds_is_hydration_prune_boundary", None)
+        retention.pop("hydration_work_pruned_after_operational_timeout", None)
+
+    post = payload.get("post104_architecture_repair")
+    if isinstance(post, dict):
+        post.update(
+            {
+                "candidate_entry_window_seconds_unchanged": float(BASELINE.confirmation_window_seconds),
+                "candidate_state_lifetime_seconds": float(BASELINE.confirmation_window_seconds),
+                "scout_hydration_retention_seconds": float(ephemeral.SCOUT_HYDRATION_RETENTION_SECONDS),
+                "candidate_context_20s_hard_cutoff_active": True,
+                "scout_hydration_can_complete_after_20s": True,
+                "late_scout_hydration_retrospective_entry_authority": False,
+            }
+        )
+        post.pop("candidate_context_operational_timeout_seconds", None)
+        post.pop("continuation_context_collection_after_20s", None)
+
+    policy = payload.get("provider_runtime_policy")
+    if isinstance(policy, dict):
+        policy.update(
+            {
+                "candidate_state_entry_window_seconds": float(BASELINE.confirmation_window_seconds),
+                "scout_hydration_retention_seconds": float(ephemeral.SCOUT_HYDRATION_RETENTION_SECONDS),
+                "scout_hydration_uses_extended_operational_retention": True,
+                "all_candidate_hydration_uses_operational_timeout": False,
+                "candidate_20s_is_immediate_copy_context_only": True,
+                "late_scout_hydration_is_continuation_research_only": True,
+            }
+        )
+        policy.pop("candidate_hydration_retention_uses_operational_timeout", None)
+
+    post177 = payload.get("post177_forward_pipeline_bottleneck_repair")
+    if isinstance(post177, dict):
+        post177.update(
+            {
+                "candidate_state_lifetime_seconds": float(BASELINE.confirmation_window_seconds),
+                "scout_hydration_retention_seconds": float(ephemeral.SCOUT_HYDRATION_RETENTION_SECONDS),
+                "late_scout_hydration_retrospective_entry_authority": False,
+            }
+        )
+        post177.pop("candidate_operational_retention_seconds", None)
+    return payload
+
+
+setattr(_truthful_direct_status, "_roi_post177_forward_pipeline_composition_compat", True)
+
+
+def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) -> None:
+    """Restore established composition identities without undoing the repair.
+
+    PR177's follow-up needs new forward semantics, not new strategy or scheduler
+    authority. Keep the canonical 20-second candidate-state lifetime, restore the
+    final standby-over-background RPC governor, preserve wrapper lineage markers,
+    and leave unified-status composition to the repository's existing readiness
+    installer. Robinhood's legacy `caught_up_for_paper_decisions` field is already a
+    forward-frontier alias, so readiness behavior remains corrected without adding a
+    second wrapper cycle around unified status.
+    """
+
+    global _FINAL_DIRECT_STATUS
+
+    # The candidate-state lifetime is a frozen strategy/certification invariant.
+    # Scout transaction hydration alone is allowed to finish for up to the existing
+    # 60-second operational continuation horizon, without retrospective entry authority.
+    ephemeral.ENTRY_WINDOW_SECONDS = float(BASELINE.confirmation_window_seconds)
+    post104.CANDIDATE_ENTRY_WINDOW_SECONDS = float(BASELINE.confirmation_window_seconds)
+
+    # candidate_rpc's installer writes the lower-level governor function directly.
+    # Reassert the existing final composition where candidate has priority over
+    # standby, and standby has priority over ordinary certification/research.
+    standby.install_continuity_standby_rpc_priority_repair()
+
+    # Do not add a second unified-status wrapper: continuity_e2e owns that composition
+    # and can consume the corrected Robinhood compatibility alias directly.
+    original_unified = repair._ORIGINAL_UNIFIED_STATUS
+    if callable(original_unified):
+        unified_status.build_unified_strategy_status = original_unified
+
+    # Correct the broad first-pass retention labels after the final 20s/60s split is
+    # known. This wrapper is telemetry-only and inherits every existing marker.
+    current_direct_status = DirectSolanaIngestionPlane.status
+    if not bool(getattr(current_direct_status, "_roi_post177_forward_pipeline_composition_compat", False)):
+        _FINAL_DIRECT_STATUS = current_direct_status
+        _inherit_markers(_truthful_direct_status, current_direct_status)
+        setattr(_truthful_direct_status, "_roi_post177_forward_pipeline_composition_compat", True)
+        DirectSolanaIngestionPlane.status = _truthful_direct_status  # type: ignore[method-assign]
+
+    # New wrappers must preserve all prior composition markers because those markers
+    # are repository architecture proofs used by tests and diagnostics.
+    _inherit_markers(plane_cls.run, repair._ORIGINAL_ROBINHOOD_RUN)
+    _inherit_markers(plane_cls.status, repair._ORIGINAL_ROBINHOOD_STATUS)
+    setattr(plane_cls.run, "_roi_post177_forward_pipeline", True)
+    setattr(plane_cls.status, "_roi_post177_forward_pipeline", True)
+    setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_installed", True)
+    setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_version", COMPAT_VERSION)
+
+
+__all__ = ["COMPAT_VERSION", "install_post177_forward_pipeline_composition_compat"]
