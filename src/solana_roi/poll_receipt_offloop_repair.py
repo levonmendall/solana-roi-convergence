@@ -68,11 +68,22 @@ async def _record_poll_rows_scoped_offloop(
 
 def install_poll_receipt_offloop_repair() -> None:
     current = strategy._record_poll_rows_scoped
-    if bool(getattr(current, "_roi_poll_receipt_offloop", False)):
-        return
-    setattr(_record_poll_rows_scoped_offloop, "_roi_poll_receipt_offloop", True)
-    setattr(_record_poll_rows_scoped_offloop, "_roi_poll_receipt_offloop_version", REPAIR_VERSION)
-    strategy._record_poll_rows_scoped = _record_poll_rows_scoped_offloop
+    if not bool(getattr(current, "_roi_poll_receipt_offloop", False)):
+        setattr(_record_poll_rows_scoped_offloop, "_roi_poll_receipt_offloop", True)
+        setattr(_record_poll_rows_scoped_offloop, "_roi_poll_receipt_offloop_version", REPAIR_VERSION)
+        strategy._record_poll_rows_scoped = _record_poll_rows_scoped_offloop
+
+    # This installer is the final direct-Solana composition boundary in __init__.
+    # Exact-release telemetry proved the already-bounded public shard dispatcher was
+    # treating ordinary 32-handler saturation as a fatal transport failure. Replace
+    # only that saturation behavior here, after the shard topology is installed, so
+    # the unchanged bound becomes actual receive backpressure rather than reconnect
+    # churn. No scope, continuity lease, strategy threshold or authority changes.
+    from .notification_dispatch_backpressure_repair import (
+        install_notification_dispatch_backpressure_repair,
+    )
+
+    install_notification_dispatch_backpressure_repair()
 
 
 __all__ = ["REPAIR_VERSION", "install_poll_receipt_offloop_repair"]

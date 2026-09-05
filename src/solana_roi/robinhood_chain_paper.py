@@ -103,6 +103,32 @@ if bool(getattr(_risk_v5, "_INSTALLED", False)):
 
     install_risk_conditioned_alpha_v51()
 
+# Exact-release Robinhood telemetry proved raw ingestion can be healthy while every
+# paper context is suppressed by repeated Blockscout identity failures. Install the
+# repair only after the final v5.1 policy composition so it wraps the actual active
+# methods: entity lookups are deduplicated and negatively cached, unresolved raw
+# addresses never count as independent evidence, only decision-critical trigger and
+# deployer identities fail closed, and aggregate rejection-funnel telemetry becomes
+# visible. The documented Robinhood Stock Token registry also gets bounded retry
+# backoff without ever allowing direct-v3 entry while the registry is unavailable.
+from .robinhood_entity_resolution_repair import (
+    install_robinhood_entity_resolution_repair,
+)
+
+install_robinhood_entity_resolution_repair(RobinhoodChainPaperPlane)
+
+# PR146 installs the continuation-first Robinhood state machine before this concrete
+# production class is created. The entity repair above must remain a substrate repair,
+# not replace that newer strategy authority. Rebind PR146's captured base flow to the
+# repaired entity resolver, then restore its bootstrap/extended-continuation wrapper
+# as the final method. This changes no continuation threshold, position limit, hard
+# exit, signing, submission, or live-money boundary.
+from .robinhood_continuation_entity_composition_repair import (
+    install_robinhood_continuation_entity_composition_repair,
+)
+
+install_robinhood_continuation_entity_composition_repair(RobinhoodChainPaperPlane)
+
 
 __all__ = [
     "RobinhoodChainPaperPlane",
