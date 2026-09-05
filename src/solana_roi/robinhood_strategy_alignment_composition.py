@@ -8,6 +8,7 @@ from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
 from .candidate_fomo_runtime_repair import install_candidate_fomo_runtime_repair
 from .economic_signal_continuation_repair import install_economic_signal_continuation_repair
+from .fomo_worker_liveness_repair import install_fomo_worker_liveness_repair
 from .post161_candidate_attribution_repair import install_post161_candidate_attribution_repair
 from .post164_invocation_source_repair import install_post164_invocation_source_repair
 from .robinhood_rpc_rate_limit_repair import install_robinhood_rpc_rate_limit_repair
@@ -82,6 +83,13 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     # market window from a disconnected scanner. This repair adds no threshold,
     # provider, signing, submission, live-money, or alternate strategy authority.
     install_candidate_fomo_runtime_repair()
+
+    # Exact PR168 production status showed the scanner diagnostics installed but no
+    # completed-cycle heartbeat. Supervise only terminal worker exits and expose the
+    # existing last_scan/error/candidate/opened runtime keys so scanner inactivity,
+    # cycle rejection and initialization failure are distinguishable. The original
+    # FOMO worker remains the sole scan/open/settlement authority.
+    install_fomo_worker_liveness_repair()
 
     # Robinhood's public RPC can return HTTP 429 during exact catch-up. Coordinate
     # Retry-After/cooldown on the same read without skipping block ranges or changing
