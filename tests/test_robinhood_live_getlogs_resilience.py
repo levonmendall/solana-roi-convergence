@@ -1,8 +1,7 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-
-import pytest
 
 from solana_roi import robinhood_catchup_capacity_repair as catchup
 from solana_roi import robinhood_live_frontier_verification_repair as frontier
@@ -53,15 +52,16 @@ class _Plane:
         self.rpc = rpc
 
 
-@pytest.mark.asyncio
-async def test_failed_64_block_live_range_is_split_without_skipping_blocks() -> None:
+def test_failed_64_block_live_range_is_split_without_skipping_blocks() -> None:
     rpc = _RangeLimitedRPC(max_blocks=32)
-    rows = await _resilient_live_logs(
-        _Plane(rpc),
-        from_block=100,
-        to_block=163,
-        addresses=["0xmarket"],
-        topics=["0xtopic"],
+    rows = asyncio.run(
+        _resilient_live_logs(
+            _Plane(rpc),
+            from_block=100,
+            to_block=163,
+            addresses=["0xmarket"],
+            topics=["0xtopic"],
+        )
     )
     blocks = [int(str(row["blockNumber"]), 16) for row in rows]
     assert blocks == list(range(100, 164))
@@ -74,16 +74,17 @@ async def test_failed_64_block_live_range_is_split_without_skipping_blocks() -> 
     assert (132, 163, ("0xmarket",)) in rpc.calls
 
 
-@pytest.mark.asyncio
-async def test_single_block_failure_falls_back_to_disjoint_address_splits() -> None:
+def test_single_block_failure_falls_back_to_disjoint_address_splits() -> None:
     rpc = _AddressLimitedRPC(max_addresses=2)
     addresses = ["0xa", "0xb", "0xc", "0xd"]
-    rows = await _resilient_live_logs(
-        _Plane(rpc),
-        from_block=200,
-        to_block=200,
-        addresses=addresses,
-        topics=None,
+    rows = asyncio.run(
+        _resilient_live_logs(
+            _Plane(rpc),
+            from_block=200,
+            to_block=200,
+            addresses=addresses,
+            topics=None,
+        )
     )
     assert sorted(row["address"] for row in rows) == sorted(addresses)
     assert len(rows) == 4
