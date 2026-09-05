@@ -145,9 +145,7 @@ def health() -> dict[str, object]:
         "liveness_only": True,
         "paper_only": True,
         "live_money_authority": False,
-        "strategy_version": _active_strategy_version(),
-        "baseline_strategy_version": BASELINE.version,
-        "strategy_version_source": "active_runtime_composition",
+        "strategy_version": BASELINE.version,
     }
 
 
@@ -174,11 +172,12 @@ def strategy_baseline() -> dict[str, object]:
 @app.get("/v1/ingestion/status")
 def ingestion_status() -> dict[str, object]:
     runtime = ingestion_runtime()
+    active_strategy_version = _active_strategy_version()
     return {
         "paper_only": True,
         "live_money_authority": False,
-        "strategy_version": _active_strategy_version(),
-        "active_strategy_version": _active_strategy_version(),
+        "strategy_version": active_strategy_version,
+        "active_strategy_version": active_strategy_version,
         "baseline_strategy_version": BASELINE.version,
         "strategy_version_source": "active_runtime_composition",
         "paper_nav_usd": runtime.engine.nav_usd,
