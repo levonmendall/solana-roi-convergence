@@ -71,22 +71,23 @@ def install_v51_final_production_hook() -> None:
     Solana/FOMO/Robinhood compatibility composition exists, so its final installer
     is the last safe place to make v5.1 the economic authority without replacing
     constant-time liveness or startup architecture.
+
+    The hook is deliberately reload-safe. Existing regression harnesses can reload
+    the Robinhood isolation/runtime modules in-process; function markers on the
+    *current* module objects, rather than this module's historical boolean alone,
+    decide whether each attachment still exists.
     """
     global _INSTALLED
-    if _INSTALLED:
-        return
     from . import robinhood_runtime_install as module
+
+    # Re-establish the private-thread proof publisher whenever the isolation module
+    # has been reloaded. This is independently idempotent.
+    _install_isolated_robinhood_proof_cache(module)
 
     original: Callable[[Any, Callable[[], Any]], None] = module.install_robinhood_chain_paper_runtime
     if bool(getattr(original, "_roi_v51_final_authority", False)):
         _INSTALLED = True
         return
-
-    # Called from the end of robinhood_worker_isolation_repair, after that repair
-    # captured the worker-thread status producer but before any lifespan worker can
-    # start. The proof is therefore produced in the isolated thread and consumed
-    # from module._status's existing nonblocking cache reader.
-    _install_isolated_robinhood_proof_cache(module)
 
     def install(app: Any, runtime_provider: Callable[[], Any]) -> None:
         original(app, runtime_provider)
