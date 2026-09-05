@@ -1,8 +1,11 @@
 name: Production Forward Proof
 
+# This verifier is intentionally manual-only. Render is configured with
+# autoDeployTrigger=checksPass, so a push-triggered workflow that waits for the
+# new Render release would create a circular dependency: Render waits for this
+# check while this check waits for Render. Run this only after the exact release
+# is live (or while explicitly diagnosing a deployment).
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -21,7 +24,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Wait for exact Render release and verify paper transports
+      - name: Verify exact Render release and paper transports
         env:
           EXPECTED_RELEASE_COMMIT: ${{ github.sha }}
           SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
