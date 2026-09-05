@@ -6,22 +6,18 @@ from types import SimpleNamespace
 from solana_roi import robinhood_forward_only_runtime_repair as repair
 
 
-class _StopAfterOne:
-    def __init__(self) -> None:
-        self._set = False
-
-    def is_set(self) -> bool:
-        return self._set
-
-    async def wait(self) -> None:
-        self._set = True
-        return None
+def _head(offset: int = 1000) -> int:
+    return repair.runtime.PONS_V1_LEGACY_START_BLOCK + offset
 
 
 def test_bounded_metadata_recovery_never_uses_archival_cursor() -> None:
-    assert repair._bounded_metadata_start(latest=2000, previous_live_cursor=None) == 1937
-    assert repair._bounded_metadata_start(latest=2000, previous_live_cursor=1990) == 1991
-    assert repair._bounded_metadata_start(latest=2000, previous_live_cursor=1000) == 1937
+    latest = _head()
+    assert repair._bounded_metadata_start(latest=latest, previous_live_cursor=None) == latest - 63
+    assert repair._bounded_metadata_start(latest=latest, previous_live_cursor=latest - 10) == latest - 9
+    assert repair._bounded_metadata_start(
+        latest=latest,
+        previous_live_cursor=repair.runtime.PONS_V1_LEGACY_START_BLOCK,
+    ) == latest - 63
 
 
 def test_forward_only_base_poll_never_calls_historical_scanner() -> None:
@@ -53,6 +49,7 @@ def test_forward_only_base_poll_never_calls_historical_scanner() -> None:
 def test_forward_only_epoch_anchors_current_head_without_swap_backfill(monkeypatch) -> None:
     factory_ranges: list[tuple[int, int]] = []
     market_calls: list[tuple[int, int]] = []
+    latest = _head()
 
     async def sync(_self, *, from_block: int, to_block: int) -> int:
         factory_ranges.append((from_block, to_block))
@@ -64,14 +61,15 @@ def test_forward_only_epoch_anchors_current_head_without_swap_backfill(monkeypat
 
     class Rpc:
         async def chain_id(self) -> int:
-            return 46630
+            return repair.runtime.ROBINHOOD_CHAIN_ID
 
         async def block_number(self) -> int:
-            return 2000
+            return latest
 
+    archival_cursor = repair.runtime.PONS_V1_LEGACY_START_BLOCK
     plane = SimpleNamespace(
         rpc=Rpc(),
-        _cursor=1000,
+        _cursor=archival_cursor,
         _latest_block=None,
         _caught_up=False,
         v3_pools={},
@@ -84,11 +82,11 @@ def test_forward_only_epoch_anchors_current_head_without_swap_backfill(monkeypat
 
     asyncio.run(repair._forward_only_advance_live_epoch(plane))
 
-    assert plane._cursor == 1000
-    assert plane._roi_live_epoch_anchor_block == 2000
-    assert plane._roi_live_epoch_cursor == 2000
+    assert plane._cursor == archival_cursor
+    assert plane._roi_live_epoch_anchor_block == latest
+    assert plane._roi_live_epoch_cursor == latest
     assert plane._roi_live_epoch_ready is False
-    assert factory_ranges == [(1937, 2000)]
+    assert factory_ranges == [(latest - 63, latest)]
     assert market_calls == []
     assert plane._roi_forward_only_last_metadata_recovery["swap_backfill_performed"] is False
 
@@ -96,6 +94,8 @@ def test_forward_only_epoch_anchors_current_head_without_swap_backfill(monkeypat
 def test_long_outage_reanchors_with_bounded_factory_metadata_only(monkeypatch) -> None:
     factory_ranges: list[tuple[int, int]] = []
     market_calls: list[tuple[int, int]] = []
+    live_cursor = _head()
+    latest = live_cursor + 100
 
     async def sync(_self, *, from_block: int, to_block: int) -> int:
         factory_ranges.append((from_block, to_block))
@@ -107,16 +107,17 @@ def test_long_outage_reanchors_with_bounded_factory_metadata_only(monkeypatch) -
 
     class Rpc:
         async def block_number(self) -> int:
-            return 2100
+            return latest
 
+    archival_cursor = repair.runtime.PONS_V1_LEGACY_START_BLOCK
     plane = SimpleNamespace(
         rpc=Rpc(),
-        _cursor=1000,
-        _latest_block=2000,
+        _cursor=archival_cursor,
+        _latest_block=live_cursor,
         _caught_up=False,
         _roi_forward_only_chain_id_verified=True,
-        _roi_live_epoch_anchor_block=2000,
-        _roi_live_epoch_cursor=2000,
+        _roi_live_epoch_anchor_block=live_cursor,
+        _roi_live_epoch_cursor=live_cursor,
         _roi_live_epoch_ready=True,
         v3_pools={},
         v2_curves={},
@@ -128,12 +129,12 @@ def test_long_outage_reanchors_with_bounded_factory_metadata_only(monkeypatch) -
 
     asyncio.run(repair._forward_only_advance_live_epoch(plane))
 
-    assert factory_ranges == [(2037, 2100)]
+    assert factory_ranges == [(latest - 63, latest)]
     assert market_calls == []
-    assert plane._roi_live_epoch_anchor_block == 2100
-    assert plane._roi_live_epoch_cursor == 2100
+    assert plane._roi_live_epoch_anchor_block == latest
+    assert plane._roi_live_epoch_cursor == latest
     assert plane._roi_live_epoch_ready is False
-    assert plane._cursor == 1000
+    assert plane._cursor == archival_cursor
 
 
 def test_production_plane_retires_historical_backfill() -> None:
