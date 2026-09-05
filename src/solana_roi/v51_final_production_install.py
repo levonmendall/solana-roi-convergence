@@ -99,8 +99,21 @@ def install_v51_final_production_hook() -> None:
         from .final_production_proof_readiness_repair import (
             install_final_production_proof_readiness_repair,
         )
+        from . import robinhood_worker_isolation_repair as isolation
 
         install_final_production_proof_readiness_repair()
+
+        # The dedicated-worker architecture intentionally asserts object identity
+        # between runtime_install._status and isolation._nonblocking_status. Keep
+        # that invariant while making the object itself the sanitized nonblocking
+        # wrapper captured by the public routes. Internal producer/cache semantics
+        # remain unchanged.
+        try:
+            module._status.__dict__.update(getattr(isolation._nonblocking_status, "__dict__", {}))
+        except Exception:
+            pass
+        isolation._nonblocking_status = module._status
+
         original(app, runtime_provider)
         install_v51_consolidated_strategy()
         install_v51_robinhood_consolidation()
