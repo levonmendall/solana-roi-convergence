@@ -4,10 +4,10 @@ services:
     runtime: python
     plan: 1c-2g
     buildCommand: pip install -e .
-    # Canonical production entrypoint. The legacy production module remains the
-    # transport/reliability substrate; v51_production installs one final economic
-    # authority boundary after all compatibility internals are composed.
-    startCommand: uvicorn solana_roi.v51_production:app --host 0.0.0.0 --port $PORT
+    # Preserve the certified constant-time production ASGI entrypoint. The final
+    # v5.1 economic authority is composed at the end of robinhood_runtime_install,
+    # after every existing Solana/FOMO/Robinhood compatibility layer is installed.
+    startCommand: uvicorn solana_roi.production:app --host 0.0.0.0 --port $PORT
     # Render liveness must remain constant-time and independent of SQLite,
     # certification scans, provider state, or the append-only event-chain audit.
     # Deep readiness remains available under /v1/ingestion/status and the
