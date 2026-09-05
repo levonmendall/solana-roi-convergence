@@ -6,12 +6,14 @@ from . import continuity_standby_rpc_priority_repair as standby
 from . import ephemeral_candidate_retention as ephemeral
 from . import post104_production_architecture_repair as post104
 from . import post177_forward_pipeline_bottleneck_repair as repair
+from . import post178_e2e_residual_repair as post178
+from . import post178_scout_terminal_classification_fix as post178_scout
 from . import unified_strategy_status as unified_status
 from .config import BASELINE
 from .direct_solana import DirectSolanaIngestionPlane
 
 
-COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v2"
+COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v3"
 _FINAL_DIRECT_STATUS: Callable[..., dict[str, Any]] | None = None
 
 
@@ -95,38 +97,27 @@ setattr(_truthful_direct_status, "_roi_post177_forward_pipeline_composition_comp
 
 
 def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) -> None:
-    """Restore established composition identities without undoing the repair.
+    """Restore established composition identities, then install final E2E residuals.
 
     PR177's follow-up needs new forward semantics, not new strategy or scheduler
     authority. Keep the canonical 20-second candidate-state lifetime, restore the
     final standby-over-background RPC governor, preserve wrapper lineage markers,
     and leave unified-status composition to the repository's existing readiness
-    installer. Robinhood's legacy `caught_up_for_paper_decisions` field is already a
-    forward-frontier alias, so readiness behavior remains corrected without adding a
-    second wrapper cycle around unified status.
+    installer before the post-178 residual repair applies its final current-frontier
+    semantics.
     """
 
     global _FINAL_DIRECT_STATUS
 
-    # The candidate-state lifetime is a frozen strategy/certification invariant.
-    # Scout transaction hydration alone is allowed to finish for up to the existing
-    # 60-second operational continuation horizon, without retrospective entry authority.
     ephemeral.ENTRY_WINDOW_SECONDS = float(BASELINE.confirmation_window_seconds)
     post104.CANDIDATE_ENTRY_WINDOW_SECONDS = float(BASELINE.confirmation_window_seconds)
 
-    # candidate_rpc's installer writes the lower-level governor function directly.
-    # Reassert the existing final composition where candidate has priority over
-    # standby, and standby has priority over ordinary certification/research.
     standby.install_continuity_standby_rpc_priority_repair()
 
-    # Do not add a second unified-status wrapper: continuity_e2e owns that composition
-    # and can consume the corrected Robinhood compatibility alias directly.
     original_unified = repair._ORIGINAL_UNIFIED_STATUS
     if callable(original_unified):
         unified_status.build_unified_strategy_status = original_unified
 
-    # Correct the broad first-pass retention labels after the final 20s/60s split is
-    # known. This wrapper is telemetry-only and inherits every existing marker.
     current_direct_status = DirectSolanaIngestionPlane.status
     if not bool(getattr(current_direct_status, "_roi_post177_forward_pipeline_composition_compat", False)):
         _FINAL_DIRECT_STATUS = current_direct_status
@@ -134,12 +125,14 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
         setattr(_truthful_direct_status, "_roi_post177_forward_pipeline_composition_compat", True)
         DirectSolanaIngestionPlane.status = _truthful_direct_status  # type: ignore[method-assign]
 
-    # New wrappers must preserve all prior composition markers because those markers
-    # are repository architecture proofs used by tests and diagnostics.
     _inherit_markers(plane_cls.run, repair._ORIGINAL_ROBINHOOD_RUN)
     _inherit_markers(plane_cls.status, repair._ORIGINAL_ROBINHOOD_STATUS)
     setattr(plane_cls.run, "_roi_post177_forward_pipeline", True)
     setattr(plane_cls.status, "_roi_post177_forward_pipeline", True)
+
+    post178.install_post178_e2e_residual_repair(plane_cls)
+    post178_scout.install_post178_scout_terminal_classification_fix()
+
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_installed", True)
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_version", COMPAT_VERSION)
 
