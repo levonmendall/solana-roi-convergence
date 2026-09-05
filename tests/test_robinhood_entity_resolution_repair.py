@@ -149,3 +149,14 @@ def test_unresolved_deployer_still_fails_closed() -> None:
         assert metrics["independent_entities_60s"] == 0
 
     asyncio.run(scenario())
+
+
+def test_production_composition_keeps_pr146_continuation_flow_authority() -> None:
+    from solana_roi import continuation_market_recalibration as continuation
+    from solana_roi import robinhood_entity_resolution_repair as entity_repair
+    from solana_roi.robinhood_chain_paper import RobinhoodChainPaperPlane
+
+    assert continuation._INSTALLED is True
+    assert continuation._ORIGINAL_RH_FLOW is entity_repair._v5_flow_metrics
+    assert RobinhoodChainPaperPlane._v5_flow_metrics is continuation._rh_flow_without_sniper_cap
+    assert bool(getattr(RobinhoodChainPaperPlane, "_roi_continuation_entity_composition_repair", False))
