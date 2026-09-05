@@ -198,25 +198,33 @@ install_robinhood_live_frontier_verification_repair(RobinhoodChainPaperPlane)
 
 # PR177 retired historical Robinhood catch-up, which exposed several remaining
 # cross-plane composition mismatches: processing lag was still treated as a live data
-# outage, legacy inner wrappers still read `_caught_up`, scout hydration was pruned at
-# the old 20-second sniper boundary, risk prewarm waited until that same boundary, and
-# FOMO delivery timing could shrink its event-time window. Repair those boundaries as
-# one final composition layer. Historical cursors remain archival, true observation
-# gaps still re-anchor fail-closed, and all paper-only/no-signing/no-submission rules
-# remain unchanged.
+# outage, legacy inner wrappers still read `_caught_up`, risk prewarm waited until the
+# old immediate-copy boundary, and FOMO delivery timing could shrink its event-time
+# window. Repair those boundaries as one final composition layer. Historical cursors
+# remain archival, true observation gaps still re-anchor fail-closed, and all
+# paper-only/no-signing/no-submission rules remain unchanged.
 from .post177_forward_pipeline_bottleneck_repair import (
     install_post177_forward_pipeline_bottleneck_repair,
 )
 
 install_post177_forward_pipeline_bottleneck_repair(RobinhoodChainPaperPlane)
 
-# Keep the governed 20-second certification/immediate-copy constant intact. The
-# post-177 repair extends only stale hydration retention to the existing 60-second
-# operational continuation timeout; it does not widen the certification SLA or the
-# targeted immediate-copy context acquisition budget.
+# Keep the governed 20-second certification/immediate-copy constants intact. The
+# bottleneck repair reduces avoidable work instead of enlarging candidate state or
+# targeted immediate-copy acquisition windows.
 from . import post104_production_architecture_repair as _post104_architecture
 
 _post104_architecture.CANDIDATE_ENTRY_WINDOW_SECONDS = 20.0
+
+# Reassert the established final scheduler/wrapper composition after the post-177
+# layer. This preserves the standby-over-background RPC governor, all historical
+# lineage markers used as architecture proofs, and the existing unified-readiness
+# wrapper while retaining the new forward-frontier semantics.
+from .post177_forward_pipeline_composition_compat import (
+    install_post177_forward_pipeline_composition_compat,
+)
+
+install_post177_forward_pipeline_composition_compat(RobinhoodChainPaperPlane)
 
 
 __all__ = [
