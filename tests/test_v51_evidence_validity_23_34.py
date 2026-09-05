@@ -61,10 +61,23 @@ def test_23_current_release_starts_unattested_then_earns_solana_attestation(monk
     release = "1" * 40
     monkeypatch.setenv("GITHUB_SHA", release)
     store = Store()
-    base = measurement.ensure_release_compatibility
 
     import solana_roi.v51_promotion_proof as promotion
 
+    # The broad suite may already have imported production, which installs the
+    # attestation wrapper. Always point this unit test at the immutable pre-wrapper
+    # compatibility registrar instead of ever wiring the wrapper back to itself.
+    base = getattr(
+        measurement,
+        "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY",
+        measurement.ensure_release_compatibility,
+    )
+    if bool(getattr(base, "_roi_v51_release_attestation_gate", False)):
+        from solana_roi.v51_measurement_integrity_hardening import (
+            _ensure_release_compatibility_fail_closed,
+        )
+
+        base = _ensure_release_compatibility_fail_closed
     monkeypatch.setattr(promotion, "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY", base)
     row = _ensure_release_with_attestation(store, release)
     assert row is not None
@@ -320,6 +333,8 @@ def test_34_superseded_import_order_hook_is_deleted_and_explicit_authority_remai
     assert not (ROOT / "src" / "solana_roi" / "v51_final_production_install.py").exists()
     production = (ROOT / "src" / "solana_roi" / "production.py").read_text(encoding="utf-8")
     assert "install_v51_production_authority(app, ingestion_runtime)" in production
+    isolation = (ROOT / "src" / "solana_roi" / "robinhood_worker_isolation_repair.py").read_text(encoding="utf-8")
+    assert "v51_final_production_install" not in isolation
     retirement = (ROOT / "src" / "solana_roi" / "v51_architecture_retirement.py").read_text(encoding="utf-8")
     assert '"state": "deleted"' in retirement
     assert "v51_final_production_install.py" in retirement
