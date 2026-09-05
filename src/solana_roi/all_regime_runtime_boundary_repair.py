@@ -238,13 +238,15 @@ def install_all_regime_runtime_boundary_repair(plane_cls: type[Any]) -> None:
 
     global _ORIGINAL_SOLANA_STATUS
 
-    # Replace only the urgent real-gap fetcher. The exact-durable high-volume wrapper
-    # captures the base interval helper during composition, so refresh its fallback
-    # as well when that module has already installed. Program-firehose authority and
-    # every exact durable boundary remain unchanged.
-    isolation._isolated_gap_fetch_delta = _expanded_gap_fetch_delta  # type: ignore[assignment]
-    if getattr(exact, "_ORIGINAL_INTERVAL_FETCH", None) is not None:
+    # Preserve the exact-durable wrapper when it is already installed. Its fallback
+    # acquisition function is the correct seam to expand for dense scout intervals.
+    # If exact durability has not yet composed, patch the base helper and let the
+    # later exact installer capture this repaired function normally.
+    current_fetch = isolation._isolated_gap_fetch_delta
+    if bool(getattr(current_fetch, "_roi_exact_durable_signature", False)):
         exact._ORIGINAL_INTERVAL_FETCH = _expanded_gap_fetch_delta  # type: ignore[assignment]
+    else:
+        isolation._isolated_gap_fetch_delta = _expanded_gap_fetch_delta  # type: ignore[assignment]
 
     current_solana_status = DirectSolanaIngestionPlane.status
     if not bool(getattr(current_solana_status, "_roi_all_regime_runtime_boundary_repair", False)):
