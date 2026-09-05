@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .robinhood_live_getlogs_resilience import (
+    install_robinhood_live_getlogs_resilience,
+    status as live_getlogs_resilience_status,
+)
 from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
 from .v51_cost_normalization import install_api_cost_normalization, status as cost_normalization_status
@@ -87,6 +91,10 @@ def install_v51_production_authority(
     )
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
+    # Robinhood's bounded live acquisition helper is imported by value into the
+    # final frontier module. Patch both references after the full Robinhood
+    # composition is imported but before its isolated worker starts.
+    install_robinhood_live_getlogs_resilience()
     install_post183_production_proof_wiring_repair()
     install_measurement_integrity()
     install_measurement_integrity_hardening()
@@ -118,6 +126,7 @@ def install_v51_production_authority(
     app.state.roi_v51_measurement_compatibility_filters = True
     app.state.roi_v51_cost_normalization = True
     app.state.roi_v51_forward_certification = True
+    app.state.roi_robinhood_live_getlogs_resilience = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -130,6 +139,7 @@ def status() -> dict[str, Any]:
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
+        "robinhood_live_getlogs_resilience": live_getlogs_resilience_status(),
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
         "live_release_attestation": promotion_proof_status(),
