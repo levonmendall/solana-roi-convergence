@@ -8,6 +8,10 @@ from .v51_measurement_compatibility_filters import (
     status as compatibility_filter_status,
 )
 from .v51_measurement_integrity import install_measurement_integrity, proof_metadata, status as measurement_status
+from .v51_measurement_integrity_hardening import (
+    install_measurement_integrity_hardening,
+    status as measurement_hardening_status,
+)
 from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_coverage
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
@@ -90,6 +94,7 @@ def install_v51_production_authority(
     # append-only stage lineage, v5.1 research observation ceilings, release
     # compatibility epochs and proof freshness before any lazy runtime construction.
     install_measurement_integrity()
+    install_measurement_integrity_hardening()
     install_measurement_compatible_promotion_filters()
 
     install_v51_consolidated_strategy()
@@ -118,6 +123,7 @@ def status() -> dict[str, Any]:
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
         "measurement_integrity_installation": "explicit_same_production_boundary_before_lazy_runtime_construction",
         "measurement_integrity": measurement_status(),
+        "measurement_integrity_hardening": measurement_hardening_status(),
         "measurement_compatibility_filters": compatibility_filter_status(),
         "proof_readiness_prepared_before_robinhood_transport": True,
         "post183_production_proof_wiring": True,
