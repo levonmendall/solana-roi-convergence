@@ -1,52 +1,64 @@
 # Solana ROI Convergence
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/levonmendall/solana-roi-convergence)
+A **paper-only** forward-validation system for a continuation-first, risk-conditioned strategy across Pump.fun, PumpSwap, Raydium, FOMO and Robinhood Chain.
 
-A focused, **paper-only** forward-validation system for **ROI Convergence v3.1** on Solana.
+## Canonical strategy authority
 
-The initial objective is deliberately narrow:
+The current economic authority is **ROI Convergence v5.1 consolidated proof**:
 
-> Determine whether a continuously compounded $500 paper account can profit from historically predictive wallet first-touches, genuinely independent wallet convergence, strict launch/manipulation risk vetoes, fast simulated execution, rapid failure exits, a +50% capital harvest, and an uncapped runner.
+- strategy version: `roi-convergence-v5.1-context-exactness-1`;
+- authority id: `roi-convergence-v5.1-consolidated-proof-1`;
+- frozen economic evidence epoch: `v51-consolidated-proof-20260905`;
+- machine-readable authority: [`strategy_v51_authority.json`](strategy_v51_authority.json);
+- production entrypoint: `solana_roi.v51_production:app`.
 
-## Current status
+Older v3.1/v4/v5 documents, scout cohorts, tables and repair modules remain only where needed for audit, evidence lineage or transport/reliability compatibility. They do **not** override the canonical v5.1 selection, sizing, promotion, exit-learning or allocation authority.
 
-The repository is ready for the live-shadow certification phase:
+## Objective
 
-- frozen v3.1 strategy configuration;
-- deterministic S-tier and A-tier entry state machine;
-- frozen public S-tier scout cohort for Jijo, Wugi, and The Doc;
-- independent-entity confirmation requirement;
-- hard six-dimension risk veto model;
-- 20-second confirmation window and 15% chase ceiling;
-- $500 continuously compounded paper portfolio;
-- 0.75% NAV risk / 2.5% full spot notional sizing;
-- conservative execution-cost model;
-- amount-specific Jupiter pricing;
-- dedicated public-address-only Solana shadow identity;
-- exact unsigned taker transaction construction and mainnet `simulateTransaction` observations;
-- 90/180-second thesis exits and -30% catastrophic stop;
-- 70% harvest at +50% plus 30% runner;
-- 40% runner trailing drawdown;
-- append-only hash-chained SQLite evidence;
-- restart-safe durable paper-engine checkpoints;
-- durable, retrying Helius webhook intake;
-- per-source Pump/Pump AMM/Raydium coverage certification;
-- 300-trade forward profitability certification;
-- deployment preflight and automatic Helius webhook bootstrap.
+Maximize **forward executable percentage ROI and compounded paper growth after costs**. Source-wallet headline ROI is not enough: the system must prove that residual edge remains after observation latency, chase, exact amount-specific entry/exit costs, risk state and lifecycle context.
 
-## Deploy live shadow mode
+## Strategy
 
-The Render Blueprint creates one paid web service with a persistent SQLite disk and auto-deploys disabled. On initial Blueprint creation, Render only needs three user-owned values:
+- **Pump.fun:** residual continuation/information source, not first-slot or millisecond sniping.
+- **PumpSwap / Pump AMM:** first-class graduation and post-graduation continuation across explicit lifecycle windows.
+- **Raydium:** isolated native/post-Pump continuation evidence; no success transfer from other venues.
+- **FOMO:** clean and hazard cohorts, flow acceleration/exhaustion, capped paper sizing.
+- **Robinhood Chain:** independent forward experimental surface with exact chain quote evidence and its own paper outcomes.
 
-1. `HELIUS_API_KEY`
-2. `JUPITER_API_KEY`
-3. `SOLANA_ROI_SHADOW_WALLET_PUBLIC_KEY` — a **public Solana address only**
+Mechanical inability to exit remains a hard stop. Bundling, creator linkage/distribution, sniper concentration, common funding, early-holder distribution, high snipe tax and similar probabilistic hazards are modeled rather than blanket-vetoed. Higher hazard severity requires stronger forward evidence and smaller bootstrap sizing.
 
-Render generates the webhook-authentication and cohort-administration secrets internally. Once the service starts, it uses `RENDER_EXTERNAL_URL` to idempotently create/update its own Helius enhanced webhook for the frozen Pump, Pump AMM, and Raydium program set.
+The 20-second observation boundary is a **maximum operational ceiling**, not economic approval. A candidate below 20 seconds still has to demonstrate residual edge in its actual latency × chase × execution-cost context. Chase above 15% is a challenger context through 40%; above 40% remains observe-only under the frozen authority.
 
-After deployment, check `/v1/deployment/preflight`. The paper cohort remains unarmed while prospective coverage, latency, quote, risk, and unsigned transaction-simulation evidence accumulates.
+## Evidence and promotion
 
-See [`docs/DEPLOYMENT_AUTOMATION_PLAN.md`](docs/DEPLOYMENT_AUTOMATION_PLAN.md).
+The consolidation deliberately starts a new economic freeze epoch because its latency-decay, hazard-burden and hierarchical-evidence rules change economic behavior. Pre-epoch evidence remains durable and auditable but has no promotion authority in this epoch.
+
+Promotion uses hierarchical shrinkage without allowing another wallet/entity to grant promotion authority to a specific entity. Exact and same-entity evidence must satisfy minimum counts, robust expected log growth and leave-best-trade-out profitability. Higher-risk contexts require more evidence. Sufficiently mature contexts with robust negative evidence are killed rather than consuming active paper capital.
+
+The system also measures **incremental wallet alpha** against a matched context model that excludes wallet/entity identity. Wallet identity receives special research priority only if it adds positive forward residual lift.
+
+## Explicit decision pipeline
+
+Canonical evidence follows this auditable path:
+
+`ingestion → candidate → context → execution_evidence → decision → position → settlement → learning`
+
+Candidate coverage reports coverage debt instead of silently treating missing decisions as successful evaluation. Robinhood instruments its existing lane-selection path rather than adding a second polling system.
+
+## Economic certification
+
+The canonical proof endpoints are:
+
+- `/v1/strategy/authority` — machine-readable economic rules and safety boundary;
+- `/v1/strategy/consolidation` — installed authority/freeze epoch;
+- `/v1/strategy/candidate-coverage` — stage-by-stage attribution and coverage debt;
+- `/v1/strategy/economic-certification` — independent N, net ROI, compounded NAV, expected log growth, confidence interval, expected shortfall, drawdown, winner-removal robustness, latency/cost sensitivity and execution stress;
+- `/v1/strategy/incremental-alpha` — wallet/entity residual lift versus identity-free matched context;
+- `/v1/strategy/research-allocation` — family ranking by forward capital efficiency with cash retained when evidence is immature;
+- `/v1/strategy/execution-stress` — modeled deterioration from extra latency, cost, adverse selection and execution failure.
+
+No strategy lane is called profitable because deployment is healthy, a source wallet made money, a backtest looked good, or an individual winner was large. The frozen forward evidence must demonstrate executable after-cost compounded alpha and robustness to winner removal and execution stress.
 
 ## Safety boundary
 
@@ -54,20 +66,17 @@ This repository intentionally has **no live execution authority**:
 
 - no private keys or seed phrases;
 - no signer;
-- no `sendTransaction` integration;
 - no transaction submission;
-- no custody, deposits, or withdrawals;
+- no custody, deposits or withdrawals;
 - no real-money balance authority.
 
-It can construct an **unsigned** proposed transaction for a public taker address solely so Solana RPC can simulate whether that exact transaction would plausibly execute. Missing or stale required evidence fails closed.
+The system may construct unsigned/read-only execution evidence for paper evaluation. Missing critical evidence fails closed.
 
-## Baseline strategy
+## Production
 
-See [`docs/BASELINE_STRATEGY.md`](docs/BASELINE_STRATEGY.md). The initial forward parameters are frozen so later performance cannot be improved by rewriting the rules after outcomes are known.
+The Render Blueprint runs one web service with a persistent SQLite disk. Standard Solana RPC/WebSocket ingestion, Jupiter amount-specific quotes, adaptive wallet research, FOMO and Robinhood Chain are composed under the canonical v5.1 production entrypoint.
 
-## Architecture
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+The legacy Jijo/Wugi/The Doc public cohort remains configured only for baseline/audit and compatibility ingestion. It is not final strategy authority.
 
 ## Development
 
@@ -76,11 +85,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 pytest
-solana-roi baseline
-solana-roi preflight
-uvicorn solana_roi.api:app --reload
+uvicorn solana_roi.v51_production:app --reload
 ```
 
-## Certification target
-
-The system cannot call the strategy profitable until at least 300 independent closed token episodes clear the configured evidence gates, including positive net P&L, positive geometric growth, profit factor above one, a 95% Wilson lower hit-rate bound above the modeled break-even rate, and profitability that survives removal of the best trade and best scout.
+See [`docs/V51_CONSOLIDATED_STRATEGY.md`](docs/V51_CONSOLIDATED_STRATEGY.md) for the design and proof contract.
