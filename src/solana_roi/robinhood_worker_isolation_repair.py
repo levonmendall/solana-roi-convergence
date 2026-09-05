@@ -151,13 +151,7 @@ def _nonblocking_status() -> dict[str, Any]:
 
 
 def _seed_cursor_from_canonical(plane: Any, canonical_store: Any) -> int | None:
-    """Carry forward only the durable processed-block cursor into the private store.
-
-    The cursor is written by the canonical Robinhood implementation only after the
-    entire block range is processed. Copying it therefore cannot skip an unfinished
-    range. Strategy outcomes, launches, and release-bound promotion evidence are not
-    copied; prior canonical rows remain immutable audit history.
-    """
+    """Carry forward only the durable processed-block cursor into the private store."""
 
     if getattr(plane, "_cursor", None) is not None:
         return int(plane._cursor)
@@ -311,14 +305,7 @@ def _start_worker_thread(
 
 
 async def _isolated_runtime_workers(runtime: Any, stop: asyncio.Event) -> None:
-    """Keep Robinhood completely off the Uvicorn loop and canonical SQLite file.
-
-    Production's post-bootstrap runtime always owns a canonical durable store. Some
-    focused regression harnesses intentionally exercise only the canonical worker
-    composition with minimal runtime doubles that omit storage entirely. Those
-    doubles cannot host Robinhood and therefore delegate unchanged to the original
-    workers rather than forcing tests to fabricate production-only state.
-    """
+    """Keep Robinhood completely off the Uvicorn loop and canonical SQLite file."""
 
     module = _runtime_install_module()
     original_workers = getattr(module, "_ORIGINAL_RUNTIME_WORKERS", None)
@@ -366,15 +353,9 @@ def install_robinhood_worker_isolation_repair() -> None:
     _INSTALLED = True
 
 
-# This module is imported at the very end of robinhood_runtime_install, after that
-# module has defined its app-facing installer. Wrap that final production function
-# so the consolidated v5.1 authority is installed only after every existing Solana,
-# FOMO and Robinhood compatibility layer has finished composing. This preserves the
-# certified solana_roi.production:app Render entrypoint and constant-time liveness.
-from .v51_final_production_install import install_v51_final_production_hook
-
-install_v51_final_production_hook()
-
+# Final v5.1 economic/proof authority is now composed explicitly at the end of
+# solana_roi.production after Robinhood transport installation. Worker isolation is
+# transport-only and no longer imports or invokes an economic/proof composition hook.
 
 __all__ = [
     "REPAIR_VERSION",

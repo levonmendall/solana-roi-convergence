@@ -99,13 +99,14 @@ def test_candidate_coverage_merge_fails_closed_when_proof_missing() -> None:
 
 def test_production_worker_status_producer_is_v51_proof_wrapped() -> None:
     # Existing isolation regressions intentionally replace _ORIGINAL_STATUS while
-    # exercising worker internals. Re-run the idempotent final hook to model the
-    # production/reload recovery contract rather than depending on suite order.
+    # exercising worker internals. Re-establish only the explicit proof-cache adapter;
+    # the deleted import-order hook no longer owns production economics.
     from solana_roi import production  # noqa: F401
+    from solana_roi import robinhood_runtime_install as runtime_install
     from solana_roi import robinhood_worker_isolation_repair as isolation
-    from solana_roi.v51_final_production_install import install_v51_final_production_hook
+    from solana_roi.v51_production_authority import install_isolated_robinhood_proof_cache
 
-    install_v51_final_production_hook()
+    install_isolated_robinhood_proof_cache(runtime_install)
 
     assert isolation._ORIGINAL_STATUS is not None
     assert bool(getattr(isolation._ORIGINAL_STATUS, "_roi_v51_isolated_proof", False)) is True

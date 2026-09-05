@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
+from .v51_cost_normalization import install_api_cost_normalization, status as cost_normalization_status
 from .v51_measurement_compatibility_filters import (
     install_measurement_compatible_promotion_filters,
     status as compatibility_filter_status,
@@ -12,23 +14,20 @@ from .v51_measurement_integrity_hardening import (
     install_measurement_integrity_hardening,
     status as measurement_hardening_status,
 )
+from .v51_promotion_proof import install_release_attestation_gate, status as promotion_proof_status
 from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_coverage
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
-# Measurement integrity is a separate compatibility plane; the frozen economic
-# composition identity remains unchanged because entry/sizing/promotion/kill/exit
-# economics are unchanged.
+# Evidence-validity analytics and release attestation are separate proof planes; the
+# frozen economic composition identity remains unchanged because entry/sizing/
+# promotion-threshold/kill/exit economics are unchanged.
 COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
 _INSTALLED = False
 
 
 def install_isolated_robinhood_proof_cache(module: Any) -> None:
-    """Publish Robinhood proof from its private worker/store into status cache.
-
-    This function is observability plumbing only. It does not install strategy
-    economics or wrap the Robinhood production installer.
-    """
+    """Publish Robinhood proof from its private worker/store into status cache."""
     from . import robinhood_worker_isolation_repair as isolation
 
     current = isolation._ORIGINAL_STATUS
@@ -76,9 +75,9 @@ def install_v51_production_authority(
 ) -> None:
     """Install frozen v5.1 economics explicitly at the production boundary.
 
-    Measurement integrity is installed before the runtime object is lazily
-    constructed so upstream legacy evidence filters cannot censor v5.1 research
-    observations. No frozen v5.1 economic rule is changed.
+    A current release begins promotion-ineligible and earns surface-specific proof
+    only from primary production tables. No API poll is required to create attestation,
+    and no frozen v5.1 economic rule changes.
     """
     global _INSTALLED
     from . import robinhood_runtime_install as module
@@ -90,7 +89,10 @@ def install_v51_production_authority(
     install_post183_production_proof_wiring_repair()
     install_measurement_integrity()
     install_measurement_integrity_hardening()
+    install_release_attestation_gate()
+    install_primary_attestation_sources()
     install_measurement_compatible_promotion_filters()
+    install_api_cost_normalization()
 
     install_v51_consolidated_strategy()
     install_v51_robinhood_consolidation()
@@ -105,7 +107,10 @@ def install_v51_production_authority(
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
     app.state.roi_v51_measurement_integrity = True
+    app.state.roi_v51_release_attestation_gate = True
+    app.state.roi_v51_primary_attestation_sources = True
     app.state.roi_v51_measurement_compatibility_filters = True
+    app.state.roi_v51_cost_normalization = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -119,7 +124,10 @@ def status() -> dict[str, Any]:
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
+        "live_release_attestation": promotion_proof_status(),
+        "attestation_sources": attestation_source_status(),
         "measurement_compatibility_filters": compatibility_filter_status(),
+        "execution_cost_normalization": cost_normalization_status(),
         "proof_readiness_prepared_before_robinhood_transport": True,
         "post183_production_proof_wiring": True,
         "legacy_repair_modules_are_final_economic_authority": False,

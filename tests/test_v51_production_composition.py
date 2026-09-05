@@ -21,23 +21,30 @@ def test_production_installs_explicit_final_v51_authority_and_routes() -> None:
     assert "/v1/strategy/consolidation" in paths
     assert "/v1/strategy/candidate-coverage" in paths
     assert "/v1/strategy/economic-certification" in paths
+    assert "/v1/strategy/promotion-certification" in paths
     assert "/v1/strategy/incremental-alpha" in paths
     assert "/v1/strategy/research-allocation" in paths
     assert "/v1/strategy/execution-stress" in paths
+    assert "/v1/strategy/execution-cost-ledger" in paths
+    assert "/v1/strategy/rejected-counterfactuals" in paths
+    assert "/v1/strategy/hazard-calibration" in paths
+    assert "/v1/strategy/correlation-proof" in paths
+    assert "/v1/strategy/allocation-maturity" in paths
+    assert "/v1/strategy/portfolio-reconciliation" in paths
+    assert "/v1/strategy/forward-slo" in paths
     assert "/v1/strategy/economic-dashboard" in paths
 
 
-def test_legacy_import_hook_no_longer_owns_strategy_economics() -> None:
+def test_legacy_import_hook_is_deleted_and_no_longer_owns_strategy_economics() -> None:
     from solana_roi import production  # noqa: F401
     from solana_roi import robinhood_runtime_install as runtime_install
-    from solana_roi.v51_final_production_install import install_v51_final_production_hook
 
     assert bool(
         getattr(runtime_install.install_robinhood_chain_paper_runtime, "_roi_v51_final_authority", False)
     ) is False
-    before = runtime_install.install_robinhood_chain_paper_runtime
-    install_v51_final_production_hook()
-    assert runtime_install.install_robinhood_chain_paper_runtime is before
+    assert not Path("src/solana_roi/v51_final_production_install.py").exists()
+    isolation_source = Path("src/solana_roi/robinhood_worker_isolation_repair.py").read_text()
+    assert "v51_final_production_install" not in isolation_source
 
 
 def test_final_strategy_functions_are_marked_as_consolidated() -> None:
