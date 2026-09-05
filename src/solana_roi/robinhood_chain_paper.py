@@ -152,6 +152,30 @@ from .robinhood_entity_quota_architecture import (
 
 install_robinhood_entity_quota_architecture(RobinhoodChainPaperPlane)
 
+# A deployment SHA is evidence lineage, not a new Robinhood portfolio or learning
+# epoch. Preserve the $500 paper sleeve, unsettled positions, compatible v5 outcome
+# memory and already-discovered market metadata across releases. In parallel, build a
+# research-only Robinhood entity ranking from already-ingested live swaps joined to
+# durable funding-anchor proofs. The discovery lane makes zero additional Blockscout
+# calls and cannot promote a paper context; exact executable quotes plus settled
+# forward paper outcomes remain authoritative.
+from .robinhood_strategy_alignment_repair import (
+    install_robinhood_strategy_alignment_repair,
+)
+
+install_robinhood_strategy_alignment_repair(RobinhoodChainPaperPlane)
+
+# Keep the existing PR146 continuation function as the exact final strategy method.
+# Entity discovery is observational bookkeeping, so attach it after each completed
+# poll instead of wrapping flow classification. This preserves the protected method
+# identity and makes it impossible for the research lane to become alternate paper
+# authority while still evaluating resolved entities continuously.
+from .robinhood_strategy_alignment_composition import (
+    install_robinhood_strategy_alignment_composition,
+)
+
+install_robinhood_strategy_alignment_composition(RobinhoodChainPaperPlane)
+
 
 __all__ = [
     "RobinhoodChainPaperPlane",
