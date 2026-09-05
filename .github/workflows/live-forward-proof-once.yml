@@ -1,0 +1,26 @@
+name: Live Forward Proof Once
+
+on:
+  push:
+    branches: [verify/live-forward-proof-49b1]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-live-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify deployed main forward proof
+        env:
+          EXPECTED_RELEASE_COMMIT: 49b1a1d5eae23ca15d0aa6351eed985c9318adee
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          FORWARD_PROOF_PROBE_ATTEMPTS: '30'
+          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
+          FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '10'
+        run: python tests/production_forward_proof_probe.py
