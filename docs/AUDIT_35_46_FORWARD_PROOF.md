@@ -33,7 +33,9 @@ The active immature-family cap remains the frozen v5.1 cap. The existing maturit
 
 ## Production verification
 
-`Production Forward Proof` runs after every push to `main`. It waits for Render to expose the exact GitHub SHA and then verifies:
+`Production Forward Proof` is an explicit **post-deploy** verifier. It is intentionally not triggered by a push to `main`, because Render uses `autoDeployTrigger=checksPass`; making a workflow wait for Render while Render waits for that same workflow would create a deployment deadlock.
+
+After the exact release is live, the verifier checks:
 
 - `/health` remains paper-only;
 - `/v1/strategy/e2e-status` is bound to the exact release and exposes no signing/submission authority;
@@ -42,4 +44,4 @@ The active immature-family cap remains the frozen v5.1 cap. The existing maturit
 - the one-capital-base reconciliation invariant is intact;
 - the certificate explicitly reports no strategy-authority or economic-threshold mutation.
 
-The production workflow intentionally does **not** require `system_forward_certified=true`, because a freshly deployed, healthy system can legitimately still be collecting real validation/holdout outcomes. That state must remain observable rather than being converted into synthetic evidence.
+The verifier intentionally does **not** require `system_forward_certified=true`, because a freshly deployed, healthy system can legitimately still be collecting real validation/holdout outcomes. That state must remain observable rather than being converted into synthetic evidence.
