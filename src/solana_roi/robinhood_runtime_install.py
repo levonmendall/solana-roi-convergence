@@ -11,6 +11,15 @@ from .risk_conditioned_alpha_v5 import (
     install_risk_conditioned_alpha_v5,
 )
 
+# production.py imports this module only after the canonical semantic candidate
+# architecture has been installed. Compose the venue-native instruction/transfer
+# graph at that exact boundary so sponsored/relayed scout swaps and programIdIndex
+# payloads reach the existing durable candidate/risk plane. The repair adds no entry
+# authority and changes no threshold, scope, signing, submission or live-money rule.
+from .venue_native_candidate_graph_repair import install_venue_native_candidate_graph_repair
+
+install_venue_native_candidate_graph_repair()
+
 # The Robinhood installer is imported by production only after canonical Solana/FOMO
 # modules have been composed and before the ASGI lifespan starts background workers.
 # Install v5 here so existing adapter instances pick up class-method wrappers without
