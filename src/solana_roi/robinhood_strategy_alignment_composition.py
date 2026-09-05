@@ -8,7 +8,7 @@ from . import robinhood_entity_quota_architecture as quota
 from . import robinhood_strategy_alignment_repair as alignment
 
 
-COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v4-pumpfun-intelligence-parity"
+COMPOSITION_VERSION = "robinhood-strategy-alignment-composition-v5-pumpfun-shadow-boundary"
 _ORIGINAL_POLL: Callable[..., Any] | None = None
 
 
@@ -93,6 +93,17 @@ def install_robinhood_strategy_alignment_composition(plane_cls: type[Any]) -> No
     from .robinhood_entity_universe import install_robinhood_entity_universe
 
     install_robinhood_entity_universe(plane_cls)
+
+    # Install the trading boundary LAST so it wraps the final global-universe chooser.
+    # Robinhood therefore follows the same promotion sequence as Pump.fun:
+    # wallet signal -> opportunity classification -> executable/copyable test ->
+    # zero-allocation contextual shadow evidence -> positive geometric edge -> sizing
+    # -> paper entry. Bootstrap paper allocation is prohibited.
+    from .robinhood_pumpfun_shadow_boundary import (
+        install_robinhood_pumpfun_shadow_boundary,
+    )
+
+    install_robinhood_pumpfun_shadow_boundary(plane_cls)
 
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_installed", True)
     setattr(plane_cls, "_roi_robinhood_strategy_alignment_composition_version", COMPOSITION_VERSION)
