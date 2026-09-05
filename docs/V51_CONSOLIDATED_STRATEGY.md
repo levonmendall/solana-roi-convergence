@@ -68,4 +68,4 @@ Execution stress deliberately worsens latency, round-trip costs, adverse selecti
 
 ## Architecture boundary
 
-Legacy `*_repair.py` modules remain compatibility internals where removing them immediately would risk production continuity. They may transport observations or preserve old audit surfaces, but `solana_roi.v51_production` is the single final economic-composition boundary. New economic behavior must be expressed through the canonical authority/economic core rather than by adding another independent strategy wrapper.
+Legacy `*_repair.py` modules remain compatibility internals where removing them immediately would risk production continuity. They may transport observations or preserve old audit surfaces. Render keeps the separately certified `solana_roi.production:app` ASGI entrypoint; `v51_final_production_install.py` wraps the final existing Robinhood production-installer boundary so the consolidated v5.1 strategy is applied after every Solana/FOMO/Robinhood compatibility installer has composed. New economic behavior must be expressed through the canonical authority/economic core rather than by adding another independent strategy wrapper.
