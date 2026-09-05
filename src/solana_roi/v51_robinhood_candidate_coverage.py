@@ -22,6 +22,110 @@ def _ledger_row(self: Any, candidate_id: str) -> Any | None:
         return None
 
 
+def _trial_ids(self: Any, token: str, market: str) -> set[int]:
+    try:
+        with self.store._lock:
+            rows = self.store.db.execute(
+                "SELECT id FROM robinhood_paper_trials WHERE release_commit=? AND token=? AND market=? ORDER BY id",
+                (self.release_commit, token, market),
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
+    except Exception:
+        return set()
+
+
+def _reconcile_durable_entry(
+    self: Any,
+    *,
+    candidate: str,
+    release: str | None,
+    trace: dict[str, Any],
+    new_trial_ids: set[int],
+) -> bool:
+    """Make the final durable paper action authoritative over provisional rejects."""
+    if not new_trial_ids:
+        return False
+    trial_id = max(new_trial_ids)
+    with self.store._lock:
+        trial_row = self.store.db.execute(
+            "SELECT * FROM robinhood_paper_trials WHERE id=? LIMIT 1", (trial_id,)
+        ).fetchone()
+        context_row = self.store.db.execute(
+            "SELECT * FROM robinhood_v5_trial_context WHERE trial_id=? LIMIT 1", (trial_id,)
+        ).fetchone()
+    if trial_row is None:
+        return False
+
+    trial = dict(trial_row)
+    context = dict(context_row) if context_row is not None else {}
+    trace["selected_lane"] = str(context.get("lane") or trial.get("context_state") or "") or None
+    trace["position_fraction"] = float(trial.get("position_fraction") or 0.0)
+    reason = str(trial.get("decision_reason") or "canonical_v51_paper_entry")
+
+    # A lower compatibility layer can legitimately emit a provisional fail-closed
+    # decision while a later composed layer continues gathering its own mature
+    # evidence. The durable paper trial is the final observable action and therefore
+    # must replace any provisional rejection for this candidate.
+    _record_stage(
+        self.store,
+        surface="ROBINHOOD_CHAIN",
+        candidate_id=candidate,
+        release_commit=release,
+        stage="context",
+        status="complete",
+        reason="durable_v51_trial_context_persisted",
+        payload={
+            "trial_id": trial_id,
+            "lane": context.get("lane"),
+            "regime": context.get("regime"),
+            "flow_state": context.get("flow_state"),
+            "risk_signature": context.get("risk_signature"),
+            "risk_severity": context.get("risk_severity"),
+        },
+    )
+    _record_stage(
+        self.store,
+        surface="ROBINHOOD_CHAIN",
+        candidate_id=candidate,
+        release_commit=release,
+        stage="execution_evidence",
+        status="complete",
+        reason="durable_trial_confirms_exact_entry_and_exit_evidence_passed",
+        payload={
+            "trial_id": trial_id,
+            "round_trip_cost_fraction": trial.get("entry_round_trip_cost_fraction"),
+        },
+    )
+    _record_stage(
+        self.store,
+        surface="ROBINHOOD_CHAIN",
+        candidate_id=candidate,
+        release_commit=release,
+        stage="decision",
+        status="complete",
+        reason=reason,
+        payload={
+            "decision": "paper_enter",
+            "trial_id": trial_id,
+            "lane": context.get("lane"),
+            "position_fraction": trial.get("position_fraction"),
+            "durable_action_is_authoritative": True,
+        },
+    )
+    _record_stage(
+        self.store,
+        surface="ROBINHOOD_CHAIN",
+        candidate_id=candidate,
+        release_commit=release,
+        stage="position",
+        status="paper_position_authorized",
+        reason="durable_robinhood_paper_trial_created",
+        payload={"trial_id": trial_id},
+    )
+    _upsert_ledger(self, trace, decision="paper_enter", reason=reason, trial_id=trial_id)
+    return True
+
+
 def _local_preselection_reason(
     self: Any,
     *,
@@ -79,6 +183,7 @@ async def _observe_and_delegate(
         "position_fraction": 0.0,
     }
     release = str(getattr(self, "release_commit", "") or "") or None
+    before_trials = _trial_ids(self, token, market)
 
     _record_stage(
         self.store,
@@ -140,6 +245,19 @@ async def _observe_and_delegate(
         _upsert_ledger(self, trace, decision="paper_reject", reason=reason)
         raise
 
+    after_trials = _trial_ids(self, token, market)
+    if _reconcile_durable_entry(
+        self,
+        candidate=candidate,
+        release=release,
+        trace=trace,
+        new_trial_ids=after_trials - before_trials,
+    ):
+        return
+
+    # If a composed layer already produced a precise rejection and no durable entry
+    # was created, retain it. Otherwise close the formerly silent pre-lane path with
+    # the best no-duplicate-provider attribution available locally.
     if _ledger_row(self, candidate) is not None:
         return
 
