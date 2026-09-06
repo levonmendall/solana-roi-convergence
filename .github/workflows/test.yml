@@ -46,6 +46,10 @@ jobs:
         run: python -m pytest tests/test_v51_forward_proof_35_46.py tests/test_v51_forward_proof_35_46_final.py
       - name: Audit 47-58 prospective alpha-validation regressions
         run: python -m pytest tests/test_v51_alpha_validation_47_58.py tests/test_alpha_live_proof_convergence.py
+      - name: Phase 11 repository truth dependency integrity and authority invariants
+        run: python -m pytest tests/test_phase11_repository_cleanup_75_82.py
+      - name: Phase 11 dead-module audit
+        run: python scripts/audit_dead_modules.py --strict
       - name: Phase 12 final-production import wrapper and black-box E2E
         run: |
           python -m pytest tests/test_v51_phase12_13_83_94.py -k '84 or 85 or 86 or 87 or 88 or 89'
