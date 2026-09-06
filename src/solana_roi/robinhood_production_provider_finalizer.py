@@ -8,6 +8,10 @@ from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_production_ws_transport as production_transport
 from . import robinhood_provider_budget_transport as provider_budget
 from . import robinhood_usage_bounded_transport as bounded_transport
+from .robinhood_event_driven_settlement import (
+    install_robinhood_event_driven_settlement,
+    status as event_driven_settlement_status,
+)
 from .robinhood_provider_budget_transport import (
     install_robinhood_provider_budget_transport,
     status as provider_budget_transport_status,
@@ -18,7 +22,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v3-prospective-budget"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v4-event-driven-settlement"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -65,6 +69,8 @@ def install_robinhood_production_provider_finalizer(
     production transport is installed: all persisted candidates are screened on a
     research-only public plane, known factories stay continuously discoverable, and
     Alchemy is reserved for a small prospective live shortlist plus open positions.
+    Event-driven settlement then removes redundant exact provider quotes while keeping
+    authoritative live-market events and max-hold deadlines as settlement triggers.
     Strategy economics and frozen v5.1 entry authority remain downstream and unchanged.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
@@ -80,6 +86,7 @@ def install_robinhood_production_provider_finalizer(
     bounded_transport._augment_status_wrapper = provider_budget._augment_status_wrapper
     install_robinhood_usage_bounded_transport()
     production_transport.install_robinhood_production_ws_transport(plane_cls)
+    install_robinhood_event_driven_settlement(plane_cls)
 
     current_run = plane_cls.run
     if not bool(getattr(current_run, "_roi_robinhood_production_provider_finalizer", False)):
@@ -98,6 +105,7 @@ def status() -> dict[str, Any]:
         "public_transport_can_authorize_running_worker": False,
         "provider_budget_transport": provider_budget_transport_status(),
         "provider_transport": usage_bounded_transport_status(),
+        "event_driven_settlement": event_driven_settlement_status(),
         "canonical_latency_hard_max_seconds": production_transport.canonical_latency_hard_max_seconds(),
         "legacy_two_block_gate_has_production_authority": False,
         "paper_only": True,
