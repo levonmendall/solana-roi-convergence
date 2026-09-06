@@ -25,6 +25,7 @@ from .v51_consolidated_strategy import install_v51_consolidated_strategy
 from .v51_cost_normalization import install_api_cost_normalization, status as cost_normalization_status
 from .v51_empty_epoch_slo_repair import install_empty_epoch_slo_repair, status as empty_epoch_slo_status
 from .v51_forward_certification import install_forward_certification
+from .v51_latency_challenger_api import install_v51_latency_challenger_api
 from .v51_measurement_compatibility_filters import (
     install_measurement_compatible_promotion_filters,
     status as compatibility_filter_status,
@@ -163,6 +164,11 @@ def install_v51_production_authority(
         runtime_provider,
         robinhood_status_provider=module._status,
     )
+    install_v51_latency_challenger_api(
+        app,
+        runtime_provider,
+        robinhood_status_provider=module._status,
+    )
     install_forward_certification(
         app,
         runtime_provider=runtime_provider,
@@ -182,6 +188,7 @@ def install_v51_production_authority(
     app.state.roi_v51_measurement_compatibility_filters = True
     app.state.roi_v51_cost_normalization = True
     app.state.roi_v51_empty_epoch_slo = True
+    app.state.roi_v51_latency_challenger_research = True
     app.state.roi_v51_forward_certification = True
     app.state.roi_v51_alpha_validation_47_58 = True
     app.state.roi_robinhood_live_getlogs_resilience = True
@@ -201,6 +208,7 @@ def status() -> dict[str, Any]:
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
         "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
+        "latency_challenger_installation": "read_only_rejected_counterfactual_research_over_existing_frozen_v51_evidence",
         "robinhood_live_getlogs_resilience": live_getlogs_resilience_status(),
         "robinhood_decision_tail": decision_tail_status(),
         "robinhood_sequencer_frontier": sequencer_frontier_status(),
@@ -219,6 +227,7 @@ def status() -> dict[str, Any]:
         "legacy_repair_modules_are_final_economic_authority": False,
         "forward_certification_changes_strategy_authority": False,
         "alpha_validation_changes_strategy_authority": False,
+        "latency_challenger_changes_strategy_authority": False,
         "paper_only": True,
         "live_money_authority": False,
     }
