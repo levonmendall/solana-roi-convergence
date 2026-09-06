@@ -20,6 +20,7 @@ from .v51_evidence_analytics import (
     refresh_execution_cost_ledger,
 )
 from .v51_execution_stress_diagnostics import build_execution_mechanism_stress
+from .v51_latency_challenger import build_latency_challenger_research
 from .v51_promotion_proof import refresh_release_attestation
 
 PROOF_CACHE_SECONDS = 30.0
@@ -133,6 +134,7 @@ def build_robinhood_proof(store: Any) -> dict[str, Any]:
         "candidate_coverage": _candidate_coverage(store),
         "execution_cost_ledger": refresh_execution_cost_ledger(store),
         "rejected_counterfactuals": counterfactuals,
+        "latency_challenger": build_latency_challenger_research(store),
         "hazard_calibration": build_hazard_calibration(store),
         "portfolio_reconciliation": build_portfolio_reconciliation(store),
         "forward_proof_slo": build_forward_proof_slo(store),
