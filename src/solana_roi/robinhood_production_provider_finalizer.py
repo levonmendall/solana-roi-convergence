@@ -6,6 +6,8 @@ from typing import Any, Awaitable, Callable
 
 from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_production_ws_transport as production_transport
+from . import robinhood_provider_budget_transport as provider_budget
+from . import robinhood_usage_bounded_transport as bounded_transport
 from .robinhood_provider_budget_transport import (
     install_robinhood_provider_budget_transport,
     status as provider_budget_transport_status,
@@ -71,6 +73,11 @@ def install_robinhood_production_provider_finalizer(
 
     _LEGACY_FRESH_READY = legacy_fresh_ready
     install_robinhood_provider_budget_transport()
+    # The budget installer patches the bounded module before it is installed. Restore
+    # the two-stage wrapper *function* here (not the already-bound wrapper factory), so
+    # bounded installation can compose it around the production status wrapper without
+    # invoking a status method at import time.
+    bounded_transport._augment_status_wrapper = provider_budget._augment_status_wrapper
     install_robinhood_usage_bounded_transport()
     production_transport.install_robinhood_production_ws_transport(plane_cls)
 
