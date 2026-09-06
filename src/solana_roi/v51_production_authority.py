@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .robinhood_decision_tail_repair import (
+    install_robinhood_decision_tail_repair,
+    status as decision_tail_status,
+)
 from .robinhood_live_getlogs_resilience import (
     install_robinhood_live_getlogs_resilience,
     status as live_getlogs_resilience_status,
@@ -10,6 +14,7 @@ from .v51_alpha_validation import install_alpha_validation
 from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
 from .v51_cost_normalization import install_api_cost_normalization, status as cost_normalization_status
+from .v51_empty_epoch_slo_repair import install_empty_epoch_slo_repair, status as empty_epoch_slo_status
 from .v51_forward_certification import install_forward_certification
 from .v51_measurement_compatibility_filters import (
     install_measurement_compatible_promotion_filters,
@@ -87,6 +92,7 @@ def install_v51_production_authority(
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
     install_robinhood_live_getlogs_resilience()
+    install_robinhood_decision_tail_repair()
     install_post183_production_proof_wiring_repair()
     install_measurement_integrity()
     install_measurement_integrity_hardening()
@@ -94,6 +100,7 @@ def install_v51_production_authority(
     install_primary_attestation_sources()
     install_measurement_compatible_promotion_filters()
     install_api_cost_normalization()
+    install_empty_epoch_slo_repair()
 
     install_v51_consolidated_strategy()
     install_v51_robinhood_consolidation()
@@ -122,9 +129,11 @@ def install_v51_production_authority(
     app.state.roi_v51_primary_attestation_sources = True
     app.state.roi_v51_measurement_compatibility_filters = True
     app.state.roi_v51_cost_normalization = True
+    app.state.roi_v51_empty_epoch_slo = True
     app.state.roi_v51_forward_certification = True
     app.state.roi_v51_alpha_validation_47_58 = True
     app.state.roi_robinhood_live_getlogs_resilience = True
+    app.state.roi_robinhood_decision_tail = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -139,6 +148,8 @@ def status() -> dict[str, Any]:
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
         "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
         "robinhood_live_getlogs_resilience": live_getlogs_resilience_status(),
+        "robinhood_decision_tail": decision_tail_status(),
+        "empty_epoch_forward_slo": empty_epoch_slo_status(),
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
         "live_release_attestation": promotion_proof_status(),
