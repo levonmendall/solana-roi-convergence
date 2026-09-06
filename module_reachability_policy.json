@@ -1,10 +1,12 @@
 {
-  "policy_version": "v51-module-reachability-130-v1",
+  "policy_version": "v51-module-reachability-130-v2",
   "production_root": "solana_roi.production",
   "test_only": [
     "solana_roi.v51_seeded_e2e"
   ],
   "migration_only": [
+    "solana_roi.cli",
+    "solana_roi.split_webhooks",
     "solana_roi.v51_architecture_retirement"
   ],
   "archived_fixture_roots": [
@@ -15,6 +17,7 @@
     "migration_only_is_never_production_authority": true,
     "unclassified_unreachable_modules_fail_ci": true,
     "package_import_installer_calls_fail_ci": true,
-    "production_root_installer_registry_fails_ci": true
+    "production_root_installer_registry_fails_ci": true,
+    "production_monkeypatch_migration_in_progress": true
   }
 }
