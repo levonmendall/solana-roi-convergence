@@ -6,6 +6,7 @@ from . import post177_forward_pipeline_bottleneck_repair as post177
 from . import robinhood_forward_only_runtime_repair as forward
 from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_chain_runtime as runtime
+from .v51_counterfactual_extension import refresh_all_rejected_counterfactuals  # compatibility symbol only
 
 REPAIR_VERSION = "robinhood-current-decision-tail-v2-no-proof-work"
 METADATA_WINDOW_BLOCKS = int(frontier.MAX_LIVE_FRONTIER_GAP_BLOCKS)
