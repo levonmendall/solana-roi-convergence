@@ -48,9 +48,17 @@ def install_empty_epoch_slo_repair() -> None:
     from .e2e_production_hardening_followup import (
         install_e2e_production_hardening_followup,
     )
+    from .candidate_pipeline_throughput_repair import (
+        install_candidate_pipeline_throughput_repair,
+    )
 
     install_e2e_production_hardening()
     install_e2e_production_hardening_followup()
+
+    # Install candidate throughput scheduling after the final E2E hardening graph so
+    # it can move only operational timeout/scheduling boundaries while preserving the
+    # already-frozen strategy and certification authority.
+    install_candidate_pipeline_throughput_repair()
     _INSTALLED = True
 
 
