@@ -74,21 +74,8 @@ def install_final_certification_failure_accounting() -> None:
     install_high_volume_standby_checkpoint_architecture()
     install_certification_runtime_architecture_repair()
     install_wallet_forward_pipeline_architecture()
-    # This must remain after PR97/PR98 composition. It closes the two production
-    # races proved by exact-release telemetry: candidate retry churn can consume the
-    # entire scout entry window, and continuous candidate traffic can starve the
-    # high-volume standby lane that keeps the fixed 3x1000 recovery bound useful.
     install_candidate_completion_continuity_repair()
-    # PR99 telemetry then proved the candidate lane was healthy but PUMP_FUN could
-    # generate more than 3,000 signatures between the routine standby cursor and a
-    # real WebSocket loss. Maintain a confirmed same-generation pre-gap lower cursor
-    # at sub-poll cadence while leaving transport memory, the four-second poll, the
-    # fixed recovery bound, and PR99's generation guard unchanged.
     install_high_volume_pre_gap_frontier_repair()
-    # PR100 telemetry proved slot-1 can still require replaying >3,000 already-safe
-    # same-slot Pump signatures. Prefer an independently confirmed exact signature
-    # only after that WebSocket receipt has durably committed; preserve slot-1 as
-    # the fail-closed fallback and keep the 12-second / 3x1000 bounds unchanged.
     install_exact_durable_signature_continuity_repair()
 
     current_discard = retention._discard_hydration_row
@@ -118,27 +105,10 @@ def install_final_certification_failure_accounting() -> None:
         accounting._ORIGINAL_QUOTE_OBSERVE = current_handoff
 
     accounting.install_certification_failure_accounting_repair()
-
-    # Production telemetry proved the high-priority direct frozen-scout candidate
-    # lane could hydrate confirmed transactions while the wallet/V4 lane remained
-    # empty. Wire those planes by shared store, then install one post-hydration,
-    # evidence-only bridge. It may collect risk/quote/simulation/V4 research rows,
-    # but it cannot arm the cohort or authorize paper/live execution.
     install_candidate_v4_runtime_wiring()
     install_candidate_risk_quote_v4_handoff()
-
-    # Keep minimal confirmed transaction hydration and all canonical observation/
-    # continuity evidence, but prevent structurally inaccessible or mature-negative
-    # scout buys from spending launch-context, six-dimension collector RPC, Jupiter
-    # shadow simulation, or final-V4 compute. This is installed last so no earlier
-    # certification/runtime wrapper can bypass the admission decision.
     install_candidate_compute_admission()
 
-    # Bind anonymous scout expiry evidence to the original trigger epoch rather than
-    # the later cleanup time. This preserves old durable rows for audit while making
-    # inherited pre-release queue work unable to poison a new prospective release.
-    # If the exact-scout normalizer has not composed yet, direct_deployment invokes
-    # this idempotent installer again after that wrapper lands.
     from .release_bound_scout_classification_repair import (
         install_release_bound_scout_classification_repair,
     )
@@ -147,20 +117,33 @@ def install_final_certification_failure_accounting() -> None:
     )
 
     install_release_bound_scout_classification_repair()
-    # Never delete a timed-out scout hydration row unless its exact trigger-epoch
-    # failure evidence has committed first. On SQLite contention cleanup yields and
-    # retries, preserving fail-closed certification truth.
     install_release_bound_scout_reaper_atomicity()
 
-    # PR #136 moved the final selective WebSocket receipt write into a worker thread.
-    # Bind explicit real-WebSocket provenance before that thread hop so the existing
-    # exact/scout durable-frontier wrappers can publish their confirmed lower
-    # recovery boundary after SQLite commit. Live-poll/history rows remain excluded.
     from .websocket_frontier_provenance_repair import (
         install_websocket_frontier_provenance_repair,
     )
 
     install_websocket_frontier_provenance_repair()
+
+    # PR #224 proved candidate RPC admission is no longer the dominant delay. The
+    # next exact-release telemetry showed high-volume public websocket shards could
+    # deliver launch receipts well behind a fresh head, while v7 had parked the
+    # independent confirmed-head sampler. Recompose the transport/timing and
+    # multi-scout normalizer at the final worker-creation boundary.
+    from .post224_frontier_candidate_hardening import (
+        install_post224_frontier_candidate_hardening,
+    )
+
+    install_post224_frontier_candidate_hardening()
+
+    # Finalize without changing any economic/certification boundary: retain the
+    # established websocket proof vocabulary and the existing three physical
+    # sockets/provider topology (one scout-only plus two balanced program shards).
+    from .post226_compatibility_finalize import (
+        install_post226_compatibility_finalize,
+    )
+
+    install_post226_compatibility_finalize()
 
 
 __all__ = ["install_final_certification_failure_accounting"]
