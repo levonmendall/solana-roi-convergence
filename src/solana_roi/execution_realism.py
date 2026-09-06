@@ -74,7 +74,7 @@ def enrich_exact_entry_quote(
     """Attach exact unsigned-order economics and revalidate final executability.
 
     The final quote timestamp is the completion of unsigned transaction simulation,
-    not the earlier quote-only response.  The exact input amount is retained all the
+    not the earlier quote-only response. The exact input amount is retained all the
     way to the paper ledger so a quote for one size can never be booked at another.
     """
 
@@ -228,30 +228,33 @@ def apply_exact_entry_if_available(
 ) -> bool:
     """Apply one exact simulated entry through the canonical portfolio ledger.
 
-    Once exact evidence exists for this intent, any amount/capital divergence fails
-    closed.  The caller must not fall back to a theoretical fill using the same quote.
+    Once exact evidence exists for this candidate, any price/amount/capital divergence
+    fails closed. The caller must not fall back to a theoretical fill for that attempt.
     """
 
     evidence = _CURRENT_ENTRY_EXECUTION.get()
-    use_exact = bool(
-        intent.kind in _ENTRY_KINDS
-        and evidence is not None
-        and evidence.simulation_ok
-        and evidence.token_mint == intent.token_mint
+    if intent.kind not in _ENTRY_KINDS or evidence is None or evidence.token_mint != intent.token_mint:
+        return False
+
+    # Exact evidence is consume-once. From this point all integrity failures return
+    # True so PaperPortfolio.apply cannot silently fall through to theoretical execution.
+    _CURRENT_ENTRY_EXECUTION.set(None)
+
+    reference_matches = math.isclose(
+        float(reference_price),
+        evidence.order_effective_price_sol,
+        rel_tol=1e-9,
+        abs_tol=1e-15,
+    )
+    exact_evidence_valid = bool(
+        evidence.simulation_ok
         and evidence.order_effective_price_sol > 0.0
         and evidence.order_out_token_units > 0.0
         and evidence.input_usd > 0.0
-        and math.isclose(
-            float(reference_price),
-            evidence.order_effective_price_sol,
-            rel_tol=1e-9,
-            abs_tol=1e-15,
-        )
+        and reference_matches
     )
-    if not use_exact or evidence is None:
-        return False
-
-    _CURRENT_ENTRY_EXECUTION.set(None)
+    if not exact_evidence_valid:
+        return True
 
     network_fee_usd = max(0.0, float(evidence.network_fee_usd))
     exact_notional = max(0.0, float(evidence.input_usd))
