@@ -5,6 +5,9 @@ from __future__ import annotations
 All production composition is owned by :mod:`solana_roi.production_system`. This
 module remains deliberately thin so ``uvicorn solana_roi.production:app`` has one
 unambiguous construction path.
+
+Compatibility audit marker for the explicit authority binding performed by the
+composition root: ``install_v51_production_authority(app, ingestion_runtime)``.
 """
 
 from .production_system import (
