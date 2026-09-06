@@ -26,7 +26,7 @@ def _get_json(url: str, *, deadline: float) -> dict:
     last_error: BaseException | None = None
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=1.0) as response:
+            with urllib.request.urlopen(url, timeout=2.0) as response:
                 if response.status != 200:
                     raise RuntimeError(f"unexpected HTTP status {response.status} from {url}")
                 payload = json.loads(response.read().decode("utf-8"))
@@ -74,14 +74,11 @@ def main() -> int:
             text=True,
         )
         try:
-            deadline = time.monotonic() + 20.0
+            deadline = time.monotonic() + 30.0
             health = _get_json(f"http://127.0.0.1:{port}/health", deadline=deadline)
-            authority = _get_json(
-                f"http://127.0.0.1:{port}/v1/strategy/authority", deadline=deadline
-            )
-            forward = _get_json(
-                f"http://127.0.0.1:{port}/v1/strategy/forward-certification", deadline=deadline
-            )
+            authority = _get_json(f"http://127.0.0.1:{port}/v1/strategy/authority", deadline=deadline)
+            forward = _get_json(f"http://127.0.0.1:{port}/v1/strategy/forward-certification", deadline=deadline)
+            alpha = _get_json(f"http://127.0.0.1:{port}/v1/strategy/alpha-certificate", deadline=deadline)
 
             assert health["status"] == "ok"
             assert health["paper_only"] is True
@@ -95,21 +92,31 @@ def main() -> int:
             assert authority["transaction_submission_available"] is False
             assert authority["canonical"] is True
 
-            # The smoke intentionally disables transports. The forward endpoint must
-            # still launch through the exact production composition and fail closed
-            # as evidence/transport state, never by exposing execution authority.
-            assert forward["authority_id"] == AUTHORITY_ID
-            assert forward["strategy_version"] == STRATEGY_VERSION
-            assert forward["paper_only"] is True
-            assert forward["live_money_authority"] is False
-            assert forward["signing_available"] is False
-            assert forward["transaction_submission_available"] is False
-            assert forward["changes_strategy_authority"] is False
-            assert forward["changes_economic_thresholds"] is False
+            for payload in (forward, alpha):
+                assert payload["authority_id"] == AUTHORITY_ID
+                assert payload["strategy_version"] == STRATEGY_VERSION
+                assert payload["paper_only"] is True
+                assert payload["live_money_authority"] is False
+                assert payload["signing_available"] is False
+                assert payload["transaction_submission_available"] is False
+                assert payload["changes_strategy_authority"] is False
+                assert payload["changes_economic_thresholds"] is False
+
+            # The smoke disables all transports, so neither proof may manufacture
+            # operational continuity, candidate evidence, settlement, or alpha.
             assert forward["state"] in {
                 "transport_degraded",
                 "measurement_degraded",
                 "collecting_forward_evidence",
+            }
+            assert alpha["after_cost_positive_compounded_alpha_proven"] is False
+            assert alpha["state"] in {
+                "operationally_degraded",
+                "collecting_candidate_evidence",
+                "collecting_settlement_evidence",
+                "resolving_rejected_counterfactuals",
+                "collecting_validation_holdout",
+                "alpha_not_yet_proven",
             }
 
             print(
@@ -119,6 +126,8 @@ def main() -> int:
                         "authority_id": authority["authority_id"],
                         "strategy_version": authority["strategy_version"],
                         "forward_certification_state": forward["state"],
+                        "alpha_certificate_state": alpha["state"],
+                        "alpha_proven": alpha["after_cost_positive_compounded_alpha_proven"],
                         "paper_only": authority["paper_only"],
                         "live_money_authority": authority["live_money_authority"],
                     },

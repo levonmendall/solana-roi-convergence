@@ -9,6 +9,7 @@ from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, PIPELIN
 from .v51_candidate_ledger import ensure_schema as ensure_candidate_stage_schema
 from .v51_cost_normalization import normalize_certification_execution_costs
 from .v51_counterfactual_extension import refresh_all_rejected_counterfactuals
+from .v51_economic_certification import _records as audit_records
 from .v51_economic_certification import build_economic_certification
 from .v51_evidence_analytics import (
     build_forward_proof_slo,
@@ -112,11 +113,9 @@ def _candidate_coverage(store: Any) -> dict[str, Any]:
 def build_robinhood_proof(store: Any) -> dict[str, Any]:
     # Everything below executes inside the isolated Robinhood worker. The main Uvicorn
     # process receives only this cached payload and never reads Robinhood SQLite.
-    # Creating the append-only candidate-stage schema is not evidence synthesis: it
-    # allows an empty forward epoch to report "confirmed, zero recent events" rather
-    # than incorrectly reporting that the measurement plane itself is unavailable.
     ensure_candidate_stage_schema(store)
     attestation = refresh_release_attestation(store, surfaces=("ROBINHOOD_CHAIN",))
+    raw_rows = [dict(row) for row in audit_records(store)]
     raw_certification = build_economic_certification(store)
     certification = normalize_certification_execution_costs(store, raw_certification)
     promotion = build_promotion_certification(store)
@@ -127,6 +126,7 @@ def build_robinhood_proof(store: Any) -> dict[str, Any]:
         "authority_id": AUTHORITY_ID,
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "economic_certification": certification,
+        "audit_records": raw_rows,
         "promotion_certification": promotion,
         "promotion_records": promotion_rows,
         "release_attestation": attestation,

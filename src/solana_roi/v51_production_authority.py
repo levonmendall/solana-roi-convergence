@@ -6,6 +6,7 @@ from .robinhood_live_getlogs_resilience import (
     install_robinhood_live_getlogs_resilience,
     status as live_getlogs_resilience_status,
 )
+from .v51_alpha_validation import install_alpha_validation
 from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
 from .v51_cost_normalization import install_api_cost_normalization, status as cost_normalization_status
@@ -24,9 +25,8 @@ from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_co
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
-# Evidence-validity analytics, release attestation and forward certification are
-# separate proof planes; the frozen economic composition identity remains unchanged
-# because entry/sizing/promotion-threshold/kill/exit economics are unchanged.
+# Evidence-validity analytics, release attestation, forward certification, and alpha
+# validation are separate proof planes; frozen v5.1 economic authority is unchanged.
 COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
 _INSTALLED = False
 
@@ -78,12 +78,7 @@ def install_v51_production_authority(
     app: Any,
     runtime_provider: Callable[[], Any] | Any,
 ) -> None:
-    """Install frozen v5.1 economics explicitly at the production boundary.
-
-    A current release begins promotion-ineligible and earns surface-specific proof
-    only from primary production tables. No API poll is required to create attestation,
-    and no frozen v5.1 economic rule changes.
-    """
+    """Install frozen v5.1 economics explicitly at the production boundary."""
     global _INSTALLED
     from . import robinhood_runtime_install as module
     from .post182_production_proof_wiring_repair import (
@@ -91,9 +86,6 @@ def install_v51_production_authority(
     )
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
-    # Robinhood's bounded live acquisition helper is imported by value into the
-    # final frontier module. Patch both references after the full Robinhood
-    # composition is imported but before its isolated worker starts.
     install_robinhood_live_getlogs_resilience()
     install_post183_production_proof_wiring_repair()
     install_measurement_integrity()
@@ -117,6 +109,11 @@ def install_v51_production_authority(
         runtime_provider=runtime_provider,
         robinhood_status_provider=module._status,
     )
+    install_alpha_validation(
+        app,
+        runtime_provider=runtime_provider,
+        robinhood_status_provider=module._status,
+    )
     app.state.roi_v51_final_economic_authority = True
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
@@ -126,6 +123,7 @@ def install_v51_production_authority(
     app.state.roi_v51_measurement_compatibility_filters = True
     app.state.roi_v51_cost_normalization = True
     app.state.roi_v51_forward_certification = True
+    app.state.roi_v51_alpha_validation_47_58 = True
     app.state.roi_robinhood_live_getlogs_resilience = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
@@ -139,6 +137,7 @@ def status() -> dict[str, Any]:
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
+        "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
         "robinhood_live_getlogs_resilience": live_getlogs_resilience_status(),
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
@@ -150,6 +149,7 @@ def status() -> dict[str, Any]:
         "post183_production_proof_wiring": True,
         "legacy_repair_modules_are_final_economic_authority": False,
         "forward_certification_changes_strategy_authority": False,
+        "alpha_validation_changes_strategy_authority": False,
         "paper_only": True,
         "live_money_authority": False,
     }

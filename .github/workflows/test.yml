@@ -33,6 +33,8 @@ jobs:
         run: python -m pytest tests/test_v51_evidence_validity_23_34.py
       - name: Audit 35-46 live forward-proof regressions
         run: python -m pytest tests/test_v51_forward_proof_35_46.py tests/test_v51_forward_proof_35_46_final.py
+      - name: Audit 47-58 prospective alpha-validation regressions
+        run: python -m pytest tests/test_v51_alpha_validation_47_58.py
       - name: Launched production HTTP smoke
         run: python tests/launched_production_smoke.py
       - name: Canonical architecture and transfer-certification invariants
