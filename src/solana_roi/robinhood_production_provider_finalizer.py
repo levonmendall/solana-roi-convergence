@@ -6,13 +6,17 @@ from typing import Any, Awaitable, Callable
 
 from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_production_ws_transport as production_transport
+from .robinhood_provider_budget_transport import (
+    install_robinhood_provider_budget_transport,
+    status as provider_budget_transport_status,
+)
 from .robinhood_usage_bounded_transport import (
     install_robinhood_usage_bounded_transport,
     status as usage_bounded_transport_status,
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v2-usage-bounded"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v3-prospective-budget"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -55,21 +59,18 @@ def install_robinhood_production_provider_finalizer(
 ) -> None:
     """Install the provider transport after every sequencer/legacy wrapper.
 
-    ``production_transport`` wraps the final sequencer run/status implementation.
-    This finalizer then makes enforcement instance-scoped and restores a composite
-    module-level freshness function so old direct tests keep their historical helper
-    while the actual running production plane cannot use it for authority.
-
-    The usage-bounded patch is deliberately installed immediately before the
-    production transport wrapper. It changes only provider acquisition mechanics:
-    all known Robinhood factory addresses remain discovery-authoritative while
-    Alchemy receives only factory events plus the bounded active market address set.
+    The provider-budget plane patches only acquisition mechanics before the bounded
+    production transport is installed: all persisted candidates are screened on a
+    research-only public plane, known factories stay continuously discoverable, and
+    Alchemy is reserved for a small prospective live shortlist plus open positions.
+    Strategy economics and frozen v5.1 entry authority remain downstream and unchanged.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
         return
 
     _LEGACY_FRESH_READY = legacy_fresh_ready
+    install_robinhood_provider_budget_transport()
     install_robinhood_usage_bounded_transport()
     production_transport.install_robinhood_production_ws_transport(plane_cls)
 
@@ -88,6 +89,7 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "instance_scoped_production_enforcement": True,
         "public_transport_can_authorize_running_worker": False,
+        "provider_budget_transport": provider_budget_transport_status(),
         "provider_transport": usage_bounded_transport_status(),
         "canonical_latency_hard_max_seconds": production_transport.canonical_latency_hard_max_seconds(),
         "legacy_two_block_gate_has_production_authority": False,
