@@ -83,7 +83,16 @@ jobs:
       - name: Final v4 wallet entity universe regressions
         run: python -m pytest tests/test_wallet_entity_universe_v4.py
       - name: Existing regressions
-        run: python -m pytest --ignore=tests/test_forward_activation.py --junitxml=existing-regressions.xml
+        run: |
+          python - <<'PY'
+          import pytest
+          import solana_roi.production  # explicit Phase-18 composition before legacy test collection
+
+          raise SystemExit(pytest.main([
+              "--ignore=tests/test_forward_activation.py",
+              "--junitxml=existing-regressions.xml",
+          ]))
+          PY
       - name: Upload existing regression diagnostics
         if: always()
         uses: actions/upload-artifact@v4
