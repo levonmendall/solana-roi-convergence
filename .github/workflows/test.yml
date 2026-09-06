@@ -53,7 +53,9 @@ jobs:
       - name: Phase 12 prior-state migration regressions
         run: python -m pytest tests/test_v51_phase12_13_83_94.py -k '90'
       - name: Phase 13 work reduction resource backpressure and continuity regressions
-        run: python -m pytest tests/test_v51_phase12_13_83_94.py -k '91 or 92 or 93 or 94'
+        run: |
+          python -m pytest tests/test_v51_phase12_13_83_94.py -k '91 or 92 or 93 or 94'
+          python -m pytest tests/test_v51_phase13_91_completion.py
       - name: No live-money authority regression
         run: python -m pytest tests/test_v51_phase12_13_83_94.py -k 'preserve_frozen_paper_only_authority'
       - name: Launched production HTTP smoke
