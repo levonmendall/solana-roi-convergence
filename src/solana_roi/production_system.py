@@ -202,10 +202,6 @@ def build_production_system() -> ProductionSystem:
     for adapter in _COMPATIBILITY_ADAPTERS:
         adapter.activate()
 
-    from . import runtime as runtime_module
-    from .config import BASELINE
-    runtime_module.BASELINE = BASELINE
-
     from .api import app, ingestion_runtime
     from .robinhood_runtime_install import install_robinhood_chain_paper_runtime
     from .v51_production_authority import install_v51_production_authority
