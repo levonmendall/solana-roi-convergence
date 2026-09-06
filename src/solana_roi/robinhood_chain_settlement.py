@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .robinhood_chain_core import *
+from .v51_atomic_paper_capital import settle_paper_capital
 
 
 class RobinhoodSettlementMixin:
@@ -138,4 +139,13 @@ class RobinhoodSettlementMixin:
                     reason,
                     _utcnow(),
                 ),
+            )
+        reservation_id = str(trial.get("capital_reservation_id") or "")
+        if reservation_id:
+            settle_paper_capital(
+                self.store,
+                release_commit=self.release_commit,
+                reservation_id=reservation_id,
+                settlement_id=f"robinhood-trial:{int(trial['id'])}",
+                net_return=float(net_return),
             )
