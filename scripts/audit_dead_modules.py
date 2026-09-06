@@ -13,12 +13,10 @@ SRC_ROOT = ROOT / "src"
 PACKAGE_ROOT = SRC_ROOT / "solana_roi"
 TEST_ROOT = ROOT / "tests"
 
-# Explicit application entrypoints/public surfaces that need not have an inbound
-# Python import to be live. Everything else must be referenced by source/tests or be
-# deliberately added here with a concrete external-entrypoint reason.
 EXTERNAL_ROOTS = {
     "solana_roi",
     "solana_roi.production",
+    "solana_roi.production_system",
     "solana_roi.api",
     "solana_roi.cli",
 }
@@ -103,6 +101,17 @@ def imports_from(path: Path, module: str, modules: set[str]) -> set[str]:
                 and isinstance(node.args[0].value, str)
             ):
                 dynamic_name = node.args[0].value
+            # ProductionSystem's explicit compatibility registry is a static
+            # composition edge even though activation uses importlib at runtime.
+            elif (
+                module == "solana_roi.production_system"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_adapter"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                dynamic_name = node.args[1].value
             if dynamic_name and (dynamic_name == "solana_roi" or dynamic_name.startswith("solana_roi.")):
                 _add_existing_prefix(dynamic_name, modules, found)
 
@@ -148,14 +157,6 @@ def test_file_references(
     module_paths: dict[str, Path],
     sources: list[tuple[Path, str]],
 ) -> set[str]:
-    """Find source files deliberately consumed as file-level test evidence.
-
-    Some architecture audits inspect a source file's text/absence rather than import
-    it. Those files are repository test fixtures even if they are not runtime modules,
-    so an import-only dead-code scanner must not call them unreferenced. A basename
-    mention is counted only in a test that performs a file-level assertion/read.
-    """
-
     referenced: set[str] = set()
     file_access_markers = ("read_text", "read_bytes", ".exists()", "is_file()")
     for module, path in module_paths.items():
@@ -173,6 +174,39 @@ def has_main_guard(path: Path) -> bool:
     except OSError:
         return False
     return '__name__ == "__main__"' in text or "__name__ == '__main__'" in text
+
+
+def package_import_installer_calls() -> list[str]:
+    path = PACKAGE_ROOT / "__init__.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError):
+        return ["unparseable_package_initializer"]
+    calls: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id.startswith("install_"):
+            calls.append(node.func.id)
+    return sorted(set(calls))
+
+
+def production_registry_modules() -> list[str]:
+    path = PACKAGE_ROOT / "production_system.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError):
+        return []
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_adapter"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            found.add(str(node.args[1].value))
+    return sorted(found)
 
 
 def inventory() -> dict[str, object]:
@@ -223,11 +257,18 @@ def inventory() -> dict[str, object]:
         if path.name != "__init__.py"
         and module not in reachable
     )
+    package_installers = package_import_installer_calls()
+    registry = production_registry_modules()
 
     return {
         "module_count": len(modules),
         "external_roots": sorted(external_roots),
         "test_file_reference_modules": sorted(file_referenced_by_tests),
+        "production_registry_modules": registry,
+        "production_registry_module_count": len(registry),
+        "package_import_installer_calls": package_installers,
+        "package_import_installer_call_count": len(package_installers),
+        "package_import_is_side_effect_free": len(package_installers) == 0,
         "orphan_modules": orphan_modules,
         "orphan_count": len(orphan_modules),
         "source_unreachable_from_application_roots": source_unreachable,
@@ -237,12 +278,15 @@ def inventory() -> dict[str, object]:
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit solana_roi modules for static dead-code candidates")
-    parser.add_argument("--strict", action="store_true", help="fail when an entirely unreferenced module remains")
+    parser.add_argument("--strict", action="store_true", help="fail on unreferenced modules or package import installers")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     report = inventory()
     print(json.dumps(report, indent=2, sort_keys=True))
-    if args.strict and int(report["orphan_count"]) > 0:
+    if args.strict and (
+        int(report["orphan_count"]) > 0
+        or int(report["package_import_installer_call_count"]) > 0
+    ):
         return 1
     return 0
 
