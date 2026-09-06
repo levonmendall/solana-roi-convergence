@@ -1,72 +1,134 @@
-# Architecture
+# Current production architecture — ROI Convergence v5.1
+
+Architecture package release: `0.5.1`
+
+Economic authority and package versioning are intentionally separate. The package release describes repository/runtime architecture; the current economic authority remains:
+
+- authority id: `roi-convergence-v5.1-consolidated-proof-1`;
+- strategy version: `roi-convergence-v5.1-context-exactness-1`;
+- economic freeze epoch: `v51-consolidated-proof-20260905`;
+- machine-readable authority: `strategy_v51_authority.json`.
+
+Historical v3.1/v4 strategy documents are archived and have no current decision authority.
 
 ## Objective
 
-Prospectively prove or disprove Solana ROI strategies under real market conditions using a continuously compounded $500 paper account while preserving strict point-in-time evidence and zero live-money authority.
+Prospectively determine where **executable residual alpha** remains after observation latency, chase, exact amount-specific entry/exit costs, risk state and lifecycle context, while maximizing compounded **paper** growth after costs. Source-wallet headline ROI, deployment health and retrospective backtests are evidence inputs, not profitability authority.
 
-The active v3.1 cohort remains immutable until its governed certification gates are satisfied. The v4 profit-first/entity strategy is research-only and release-bound until final-version forward evidence proves that it is superior under the existing promotion policy.
+The system is intentionally paper-only. It has no signer, no transaction submission, no custody, no deposit/withdrawal path and no live-money balance authority.
 
-## Observation and evaluation funnel
+## Final production composition
 
-The system intentionally separates **broad observation** from **deep economic evaluation**.
+Render launches:
 
-`Full frozen seven-program + three-scout raw observation`
+`uvicorn solana_roi.production:app --host 0.0.0.0 --port $PORT`
 
--> `cheap broad wallet/entity discovery`
+`solana_roi.production` installs transport/reliability boundaries first and then composes the frozen v5.1 economic authority at the explicit final boundary in `v51_production_authority.py`. Compatibility modules may repair transport, persistence, measurement or proof publication, but import order cannot make them the final economic authority.
 
--> `historical profitability screen (discovery only; no promotion authority)`
+The canonical decision/evidence path is:
 
--> `bounded dynamic high-priority wallet/entity set`
+`ingestion → candidate → context → execution_evidence → decision → position → settlement → learning`
 
--> `dedicated realtime logsSubscribe forward tracking`
+Candidate coverage is explicit. Missing downstream stages create coverage debt or fail-closed terminal outcomes; they are not silently counted as successful evaluation.
 
--> `point-in-time copyability + entity/risk evidence`
+## Surface separation
 
--> `release-bound v4 five-lane shadow comparison`
+### Solana
 
--> `forward profitability / robustness selection`
+Direct standard Solana HTTP/WebSocket observation is the canonical production data plane. The normal topology uses two independent public providers and an Alchemy mainnet observer to satisfy the prospective continuity quorum. Legacy Helius endpoints are compatibility-only and the legacy Helius background worker is disabled when direct Solana is canonical.
 
--> `paper-only strategy authority after governed certification`
+The system observes the configured frozen program scope broadly, but expensive context/risk/execution work is bounded and prioritized. Candidate/scout work has reserved capacity ahead of broad research. Raw continuity and candidate evidence remain durable; operational queues are not substitutes for canonical evidence.
 
-The whole observed Solana scope is not deeply hydrated or risk-scored. Broad receipts identify promising economic actors; expensive analysis is reserved for launches, active scouts, and the bounded tracked wallet/entity set. Historical wallet success can nominate a challenger, but it cannot promote one. Strategy influence requires prospective observations first seen after the wallet's live forward boundary.
+Venue/lifecycle evidence remains distinct:
 
-## Continuity architecture
+- `PUMP_FUN`: residual continuation/information, not first-slot millisecond sniping;
+- `PUMP_AMM`: graduation and post-graduation continuation;
+- `RAYDIUM`: independent native/post-Pump continuation; no pooling with PumpSwap;
+- `FOMO`: clean and hazard flow-acceleration cohorts, kept separate for proof and promotion.
 
-Prospective evidence is observed through two independent public Solana WebSocket providers plus a continuously maintained read-only HTTP standby lane for every frozen target.
+Pump.fun → PumpSwap lifecycle research persists explicit transition identity. An exact graduation timestamp is published only when directly observed; otherwise the system records an inferred transition window and does not fabricate exactness.
 
-For high-volume Pump.fun / Pump AMM targets, replaying thousands of signatures that were already observed by healthy WebSockets is not the normal standby-maintenance mechanism. While at least one real target WebSocket remains continuously authoritative, the standby watermark is advanced only from a **confirmed exact target WebSocket receipt**, with the effective cursor kept one slot behind the confirmed receipt so same-slot signatures are replay-safe.
+### Robinhood Chain
 
-If real WebSocket coverage reaches zero, the confirmed target frontier at gap onset becomes the minimum recovery boundary for that generation and the canonical bounded recovery path runs immediately. The certification constraints remain unchanged:
+Robinhood Chain is an independent forward experimental surface. Decision-authoritative paper evaluation requires a production provider HTTP RPC + WebSocket pair. The public Robinhood RPC/sequencer are research-observation-only and cannot become authoritative by catch-up or historical replay.
 
-- recoverability lease: 12 seconds;
-- maximum recovery delta: 3 pages x 1000 signatures;
-- no historical backfill may relabel an irrecoverable interval as prospective evidence;
-- uncertainty fails the release closed.
+Robinhood uses an isolated worker/store boundary. Candidate identity is recorded before venue/lane preselection; concrete forward opportunities receive terminal paper-enter or explicit paper-reject outcomes. Historical/catch-up state has no readiness or retrospective entry authority. Proof publication is consumed through cached/isolated status rather than putting Robinhood SQLite work onto the main Uvicorn event loop.
 
-The standby checkpoint itself is never persisted as a Solana receipt and has no hydration, candidate, strategy, paper-trading, signing, or submission authority.
+## Economic authority
 
-## Research / certification resource boundary
+The frozen v5.1 authority keeps a hard **20-second maximum observation boundary**, but being inside 20 seconds is not economic approval. Residual edge in the actual latency × chase × execution-cost context still governs.
 
-Continuity recovery has the critical RPC reservation. Candidate acquisition has reserved noncritical capacity ahead of research. High-volume standby maintenance has its own noncritical priority below candidates and cannot consume the critical reserve. Wallet research uses a separate RPC pool object and is governed process-wide so broad discovery cannot starve certification or live wallet tracking.
+Chase policy remains:
 
-This keeps the certification evidence-producing path independent from broad market research while preserving the full raw observation scope.
+- baseline context through 15%;
+- challenger research 15–25% and 25–40%;
+- above 40% observe-only.
 
-## Wallet/entity forward-learning boundary
+Missing exact entry/exit execution evidence, unavailable sell route, transfer restrictions, unexitable liquidity, authority capable of blocking transfer/exit, or a linked entity able to remove required exit liquidity remain mechanical fail-closed conditions.
 
-Realtime wallet observations are the canonical prospective input to the v4 profit-first/entity evaluator. The final production composition installs point-in-time wallet evidence semantics first and the release-bound v4 adapter last, so a later wrapper cannot silently bypass v4 shadow sampling.
+Probabilistic hazards such as bundling, creator linkage/distribution, sniper concentration, common funding, early-holder distribution and high snipe tax are modeled with higher evidence burdens rather than automatically vetoed.
 
-A new release starts a clean v4 evidence epoch. Older historical or forward rows remain available for audit/research but are not replayed into the new release as executable forward evidence. Challengers may replace weaker wallets for future influence only after satisfying the current forward promotion requirements.
+## Forward proof and promotion
 
-## Authority boundary
+Economic proof is prospective and release/epoch-aware. Known defective or incompatible measurement releases remain auditable but cannot silently contribute current promotion evidence.
 
-The repository is paper-only. Provider adapters and research evaluators are observation-only. There is intentionally no transaction builder, signer, private-key loader, live balance, `sendTransaction` path, custody layer, or withdrawal path.
+Promotion proof includes, as applicable:
 
-No continuity or research repair is permitted to change strategy thresholds, the frozen market scope, signing/submission capability, or the live-money prohibition.
+- raw and independent outcome counts;
+- holdout evidence;
+- net ROI and compounded paper NAV;
+- expected log growth and lower confidence bound;
+- expected shortfall and max drawdown;
+- winner concentration;
+- top-1/top-3 removal robustness;
+- latency and cost sensitivity;
+- execution stress;
+- promotion/kill state.
 
-## Point-in-time rule
+Hierarchical pooling can improve estimation but cannot let another wallet/entity or venue grant promotion authority to an exact context that lacks its own required evidence. Venue success is not transferred across PumpSwap, Raydium, FOMO or Robinhood without forward proof.
 
-Every wallet tier, entity relationship, risk flag, confirmation, price, and cost value used to make a decision must have an observation timestamp no later than that decision. Future follower counts, future peak prices, future wallet performance, later-discovered risk relationships, and retroactive risk completion cannot alter an earlier decision.
+## Canonical proof and readiness plane
 
-## Storage
+`/v1/system-proof` is the canonical release-bound proof snapshot. It composes release identity, authority, runtime state, candidate coverage, execution evidence, strategy evidence, paper portfolio, settlement, learning and resource health from one shared proof snapshot.
 
-Canonical state uses persistent SQLite WAL plus a hash-chained append-only event ledger. Raw/normalized prospective evidence is retained according to its governed evidence contract; bounded operational queues and terminal work-state retention are not substitutes for canonical evidence.
+Operational endpoints are deliberately separated:
+
+- `/health` — constant-time process liveness;
+- `/v1/liveness` — explicit liveness identity, no SQLite/runtime readiness requirement;
+- `/readiness` — deep trading-research readiness;
+- `/v1/system-proof` — canonical machine-readable proof;
+- `/v1/system-proof/dashboard` — presentation of the same canonical proof.
+
+Render uses liveness. External certification should monitor readiness. A healthy process does not imply economic readiness or profitability.
+
+Canonical proof is precomputed off the Uvicorn event loop and shared by proof/readiness/dashboard requests. Static SQLite schema metadata used by the proof plane is cached and automatically invalidated on schema-version changes.
+
+## Resource and continuity proof
+
+Resource/backpressure proof reports, where available, cycle duration/work counters plus queue depth, oldest pending age, producer/consumer rates, lag, dropped work and retries for Solana ingestion, wallet discovery, risk enrichment, FOMO, Robinhood, proof publication and HTTP.
+
+Persistent producer-over-consumer imbalance, aged backlog or dropped work degrades readiness; it does not make process liveness false.
+
+Restart/continuity proof persists per-subsystem process/worker start identity, restart count/reason, current/previous release, cursor-restore status and the stable continuity epoch. A process restart does **not** create a new economic epoch.
+
+## Storage and point-in-time evidence
+
+Canonical state uses persistent SQLite WAL plus append-only/hash-chained evidence where defined by the subsystem. Historical evidence remains available for audit and compatibility analysis, but current decisions may use only evidence observable at the relevant decision time and compatible with the active release/measurement/execution epoch.
+
+Future wallet performance, later-discovered risk, future prices or retrospective replay cannot rewrite an earlier decision.
+
+## Dependency and release integrity
+
+Production dependencies are installed from exact `requirements.lock`. `/v1/deployment/preflight` publishes the lock SHA-256 and verifies that it matches `dependency_compatibility.json`.
+
+Dependency changes are pull-request-only maintenance. They must regenerate the lock deliberately, update the compatibility review manifest and pass full production-composition/forward-proof CI. A dependency bump cannot silently change economic authority or reuse incompatible measurement evidence.
+
+## Safety invariant
+
+Every architecture/reliability/research change must preserve:
+
+- `paper_only = true`;
+- `live_money_authority = false`;
+- signing unavailable;
+- transaction submission unavailable;
+- frozen v5.1 economics unless a separately governed future economic epoch is explicitly created.
