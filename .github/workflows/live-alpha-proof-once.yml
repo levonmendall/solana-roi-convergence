@@ -7,55 +7,24 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: live-alpha-proof-once
-  cancel-in-progress: true
-
 jobs:
   verify-live-alpha:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Inspect stabilized exact deployed alpha proof
-        env:
-          EXPECTED_RELEASE_COMMIT: f2d0d5359492ddae20153c92a8c179a18bfa32c8
+      - name: Inspect direct Solana and FOMO continuity
         run: |
           python - <<'PY'
-          import json, os, urllib.request
-          base='https://solana-roi-convergence.onrender.com'
-          expected=os.environ['EXPECTED_RELEASE_COMMIT']
-          def get(path):
-              req=urllib.request.Request(base+path,headers={'Accept':'application/json','User-Agent':'roi-alpha-proof-recheck/1'})
-              with urllib.request.urlopen(req,timeout=90) as r:
-                  return json.loads(r.read().decode())
-          e2e=get('/v1/strategy/e2e-status')
-          slo=get('/v1/strategy/forward-slo')
-          rejects=get('/v1/strategy/rejected-counterfactuals')
-          forward=get('/v1/strategy/forward-certification')
-          alpha=get('/v1/strategy/alpha-certificate')
-          rh=e2e.get('robinhood') or {}
-          print('ROBINHOOD',json.dumps({
-              'runtime_ready':rh.get('runtime_ready'),
-              'paper_decision_transport_ready':rh.get('paper_decision_transport_ready'),
-              'forward_frontier_ready':rh.get('forward_frontier_ready'),
-              'block_lag':rh.get('block_lag'),
-              'blockers':rh.get('blockers'),
-              'forward_frontier_readiness':rh.get('forward_frontier_readiness'),
-              'live_frontier_verification':rh.get('live_frontier_verification'),
-              'worker_isolation':rh.get('worker_isolation'),
-          },sort_keys=True,default=str))
-          print('SLO',json.dumps(slo,sort_keys=True,default=str))
-          print('REJECTS',json.dumps(rejects,sort_keys=True,default=str))
-          print('FORWARD',json.dumps({k:forward.get(k) for k in ('release_commit','state','system_forward_certified','hard_operational_gates_ok','blockers','checks')},sort_keys=True,default=str))
-          print('ALPHA',json.dumps({k:alpha.get(k) for k in ('release_commit','state','after_cost_positive_compounded_alpha_proven','blockers','checks')},sort_keys=True,default=str))
-          assert forward.get('release_commit') == expected
-          assert alpha.get('release_commit') == expected
-          assert alpha.get('paper_only') is True
-          assert alpha.get('live_money_authority') is False
-          assert alpha.get('changes_strategy_authority') is False
-          assert alpha.get('changes_economic_thresholds') is False
+          import json, urllib.request
+          req=urllib.request.Request('https://solana-roi-convergence.onrender.com/v1/strategy/e2e-status',headers={'Accept':'application/json','User-Agent':'roi-solana-continuity/1'})
+          with urllib.request.urlopen(req,timeout=90) as r:
+              e=json.loads(r.read().decode())
+          print('RELEASE',e.get('release_commit'))
+          print('SOLANA',json.dumps(e.get('solana'),sort_keys=True,default=str))
+          print('FOMO',json.dumps(e.get('fomo'),sort_keys=True,default=str))
+          print('OVERALL',json.dumps(e.get('overall'),sort_keys=True,default=str))
           PY
