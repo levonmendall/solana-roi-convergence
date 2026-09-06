@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from . import robinhood_live_frontier_verification_repair as robinhood_frontier
+from .candidate_execution_evidence_plane import install_candidate_execution_evidence_plane
 from .fomo_runtime_install import install_fomo_runtime
 from .robinhood_decision_tail_repair import (
     install_robinhood_decision_tail_repair,
@@ -51,10 +52,9 @@ from .v51_robinhood_phase9_65_69 import (
 from .v51_strategy_api import install_v51_strategy_api
 from .v51_system_proof import install_system_proof
 
-# Capture the already-proven final entry guard before the sequencer transport installs.
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v4-native-fomo-composition"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v5-candidate-fomo-explicit"
 _INSTALLED = False
 
 
@@ -136,10 +136,15 @@ def install_v51_production_authority(
     install_robinhood_decision_tail_repair()
     install_post183_production_proof_wiring_repair()
 
-    # FOMO is a first-class paper research/economic surface, not an incidental side
-    # effect of wallet-router precision installation. Compose its observation layer
-    # explicitly before Phase 16 installs the one active terminal/FOMO exact-exit
-    # engine. This changes no frozen entry economics and adds no live authority.
+    # Candidate execution isolation is a real production dependency. Compose it
+    # explicitly before measurement integrity so canonical candidate lineage wraps
+    # the plane's true base delegate rather than relying on an accidental predecessor
+    # created by the retired 47-adapter registry.
+    install_candidate_execution_evidence_plane()
+
+    # FOMO is likewise a first-class paper surface, not an incidental side effect of
+    # wallet-router precision installation. Its observation layer must exist before
+    # Phase 16 installs the single terminal/FOMO exact-exit engine.
     install_fomo_runtime()
 
     install_measurement_integrity()
@@ -218,6 +223,7 @@ def install_v51_production_authority(
     app.state.roi_robinhood_phase9_65_69 = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
+    app.state.roi_candidate_execution_evidence_plane_explicit = True
     app.state.roi_fomo_runtime_explicit = True
     _INSTALLED = True
 
@@ -227,6 +233,7 @@ def status() -> dict[str, Any]:
         "composition_version": COMPOSITION_VERSION,
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
+        "candidate_execution_plane_installation": "explicit_before_measurement_integrity",
         "fomo_runtime_installation": "explicit_first_class_paper_surface_before_terminal_exact_exit",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
