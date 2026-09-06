@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import copy
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from .api import legacy_webhook_worker_enabled
 from .strategy_v51_authority import authority, authority_fingerprint
 from .v51_candidate_ledger import refresh_candidate_pipeline
 from .v51_dashboard import render_economic_dashboard
@@ -18,6 +22,7 @@ from .v51_evidence_analytics import (
 )
 from .v51_forward_certification import _e2e_status, build_forward_certification
 from .v51_phase10_proof import PHASE10_VERSION, dashboard_funnel, family_proof_confidence
+from .v51_phase12_13_operations import OPERATIONS_VERSION, build_operations_proof
 from .v51_strategy_api import (
     _isolated_robinhood_proof_state,
     _merged_certification,
@@ -26,7 +31,7 @@ from .v51_strategy_api import (
     _merged_promotion_certification,
 )
 
-SYSTEM_PROOF_VERSION = "v51-canonical-system-proof-v1-phase10-70-74"
+SYSTEM_PROOF_VERSION = "v51-canonical-system-proof-v2-phase12-13-83-94"
 SYSTEM_STATES = (
     "READY_FOR_FORWARD_PROOF",
     "DEGRADED",
@@ -69,9 +74,12 @@ def system_state(
     coverage: dict[str, Any],
     certification: dict[str, Any],
     promotion: dict[str, Any],
+    operations_healthy: bool = True,
 ) -> str:
     if _invalid_epoch_state(forward_certification, coverage, certification, promotion):
         return "INVALID_MEASUREMENT_EPOCH"
+    if not operations_healthy:
+        return "DEGRADED"
     if bool(forward_certification.get("system_forward_certified")):
         return "READY_FOR_FORWARD_PROOF"
     if bool(forward_certification.get("hard_operational_gates_ok")):
@@ -100,34 +108,6 @@ def _settlement_section(
         "robinhood_pending_settlement_count": int(rh_slo.get("pending_settlement_count") or 0),
         "settlement_is_paper_only": True,
         "live_money_authority": False,
-    }
-
-
-def _resource_health(runtime: Any, unified: dict[str, Any], robinhood_status: dict[str, Any]) -> dict[str, Any]:
-    direct: dict[str, Any]
-    wallet: dict[str, Any]
-    collectors: dict[str, Any]
-    try:
-        direct = dict(runtime.direct_ingestion.status())
-    except Exception as exc:
-        direct = {"runtime_ready": False, "error_type": type(exc).__name__}
-    try:
-        wallet = dict(runtime.wallet_discovery.status())
-    except Exception as exc:
-        wallet = {"runtime_ready": False, "error_type": type(exc).__name__}
-    try:
-        collectors = dict(runtime.collectors.status())
-    except Exception as exc:
-        collectors = {"runtime_ready": False, "error_type": type(exc).__name__}
-    return {
-        "unified_runtime": unified,
-        "direct_solana": direct,
-        "wallet_discovery": wallet,
-        "collectors": collectors,
-        "robinhood_cached_status": robinhood_status,
-        "robinhood_main_uvicorn_sqlite_reads": False,
-        "liveness_endpoint_requires_runtime_or_sqlite": False,
-        "readiness_endpoint_is_deep": True,
     }
 
 
@@ -174,11 +154,19 @@ def build_system_proof(
         local_counterfactuals=local_counterfactuals,
         robinhood_proof=proof,
     )
+    operations = build_operations_proof(
+        runtime,
+        unified_status=unified,
+        robinhood_status=robinhood_status,
+        legacy_webhook_worker_enabled=legacy_webhook_worker_enabled(),
+    )
+    operations_healthy = bool(_dict(operations.get("backpressure")).get("healthy", False))
     state = system_state(
         forward_certification=forward,
         coverage=coverage,
         certification=certification,
         promotion=promotion,
+        operations_healthy=operations_healthy,
     )
     spec = authority()
     overall = _dict(unified.get("overall"))
@@ -187,6 +175,7 @@ def build_system_proof(
     return {
         "system_proof_version": SYSTEM_PROOF_VERSION,
         "phase10_version": PHASE10_VERSION,
+        "phase12_13_operations_version": OPERATIONS_VERSION,
         "generated_at": _utcnow(),
         "state": state,
         "ready_for_forward_proof": state == "READY_FOR_FORWARD_PROOF",
@@ -211,7 +200,8 @@ def build_system_proof(
             "surfaces": {name: unified.get(name) for name in ("solana", "fomo", "robinhood")},
             "forward_certification_state": forward.get("state"),
             "hard_operational_gates_ok": bool(forward.get("hard_operational_gates_ok")),
-            "blockers": forward.get("blockers") or [],
+            "backpressure_healthy": operations_healthy,
+            "blockers": list(forward.get("blockers") or []) + ([] if operations_healthy else ["persistent_backpressure_or_dropped_work"]),
         },
         "candidate_coverage": coverage,
         "execution_evidence": {
@@ -242,7 +232,13 @@ def build_system_proof(
             "hazard_calibration": hazard,
             "retrospective_entry_authority": False,
         },
-        "resource_health": _resource_health(runtime, unified, robinhood_status),
+        "resource_health": {
+            "operations": operations,
+            "robinhood_main_uvicorn_sqlite_reads": False,
+            "liveness_endpoint_requires_runtime_or_sqlite": False,
+            "readiness_endpoint_is_deep": True,
+        },
+        "operations_proof": operations,
         "dashboard_funnel": funnel,
         "proof_confidence_by_family": confidence,
         "readiness_contract": {
@@ -265,6 +261,7 @@ def _failed_closed_system_proof(error: Exception) -> dict[str, Any]:
     return {
         "system_proof_version": SYSTEM_PROOF_VERSION,
         "phase10_version": PHASE10_VERSION,
+        "phase12_13_operations_version": OPERATIONS_VERSION,
         "generated_at": _utcnow(),
         "state": "DEGRADED",
         "ready_for_forward_proof": False,
@@ -284,6 +281,7 @@ def _failed_closed_system_proof(error: Exception) -> dict[str, Any]:
         "settlement": {},
         "learning": {},
         "resource_health": {"system_proof_error_type": type(error).__name__},
+        "operations_proof": {},
         "dashboard_funnel": {},
         "proof_confidence_by_family": {},
         "paper_only": True,
@@ -302,16 +300,46 @@ def install_system_proof(
     if bool(getattr(app.state, "roi_v51_system_proof_70_74", False)):
         return
 
+    cache_lock = threading.RLock()
+    cache: dict[str, Any] = {"payload": None, "built_monotonic": 0.0}
+    try:
+        cache_seconds = max(1.0, float(os.getenv("SOLANA_ROI_SYSTEM_PROOF_CACHE_SECONDS", "15")))
+    except ValueError:
+        cache_seconds = 15.0
+
     def current_proof() -> dict[str, Any]:
+        now = time.monotonic()
+        with cache_lock:
+            payload = cache.get("payload")
+            age = now - float(cache.get("built_monotonic") or 0.0)
+            if isinstance(payload, dict) and age <= cache_seconds:
+                result = copy.deepcopy(payload)
+                result["system_proof_cache"] = {
+                    "hit": True,
+                    "age_seconds": max(0.0, age),
+                    "max_age_seconds": cache_seconds,
+                    "shared_by_system_proof_readiness_and_dashboard": True,
+                }
+                return result
         try:
             runtime = runtime_provider() if callable(runtime_provider) else runtime_provider
-            return build_system_proof(
+            result = build_system_proof(
                 app,
                 runtime,
                 robinhood_status_provider=robinhood_status_provider,
             )
         except Exception as exc:
-            return _failed_closed_system_proof(exc)
+            result = _failed_closed_system_proof(exc)
+        with cache_lock:
+            cache["payload"] = copy.deepcopy(result)
+            cache["built_monotonic"] = time.monotonic()
+        result["system_proof_cache"] = {
+            "hit": False,
+            "age_seconds": 0.0,
+            "max_age_seconds": cache_seconds,
+            "shared_by_system_proof_readiness_and_dashboard": True,
+        }
+        return result
 
     existing = {getattr(route, "path", None) for route in app.routes}
     if "/v1/liveness" not in existing:
@@ -349,6 +377,8 @@ def install_system_proof(
                     "proof_state": _dict(payload.get("candidate_coverage")).get("proof_state"),
                 },
                 "forward_certification": _dict(_dict(payload.get("strategy_evidence")).get("forward_certification")),
+                "operations_proof": payload.get("operations_proof"),
+                "system_proof_cache": payload.get("system_proof_cache"),
                 "system_proof_path": "/v1/system-proof",
                 "paper_only": True,
                 "live_money_authority": False,
@@ -372,6 +402,8 @@ def install_system_proof(
             )
 
     app.state.roi_v51_system_proof_70_74 = True
+    app.state.roi_v51_phase12_13_83_94 = True
+    app.state.roi_v51_system_proof_cache_seconds = cache_seconds
 
 
 __all__ = [

@@ -6,6 +6,10 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
+# The black-box regression must compose the same final production graph before
+# importing the Robinhood plane. Running this test in isolation previously imported
+# the compatibility plane first and therefore depended on unrelated test ordering.
+from solana_roi import production as production_runtime
 from solana_roi.observation_store import ObservationEventStore
 from solana_roi.robinhood_chain_core import MAX_HOLD_SECONDS, V3Pool, WETH
 from solana_roi.robinhood_chain_paper import RobinhoodChainPaperPlane
@@ -15,11 +19,8 @@ from solana_roi.v51_robinhood_consolidation import refresh_robinhood_candidate_l
 
 
 def _plane(tmp_path, monkeypatch) -> RobinhoodChainPaperPlane:
-    # Importing production exercises the exact explicit composition used by Render.
-    from solana_roi import production
-
-    assert production.app.state.roi_v51_final_economic_authority is True
-    assert production.app.state.roi_v51_economic_composition_explicit is True
+    assert production_runtime.app.state.roi_v51_final_economic_authority is True
+    assert production_runtime.app.state.roi_v51_economic_composition_explicit is True
     monkeypatch.setenv("ROBINHOOD_ENTITY_RESOLUTION_REQUIRED", "true")
     monkeypatch.setenv("ROBINHOOD_RWA_FILTER_REQUIRED", "true")
     return RobinhoodChainPaperPlane(

@@ -18,6 +18,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Main history policy backstop
+        if: github.event_name == 'push'
+        run: |
+          test "${{ github.event.forced }}" != "true"
+          parents="$(git show -s --format=%P HEAD)"
+          test "$(printf '%s\n' "$parents" | wc -w)" -ge 2
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -35,6 +41,16 @@ jobs:
         run: python -m pytest tests/test_v51_forward_proof_35_46.py tests/test_v51_forward_proof_35_46_final.py
       - name: Audit 47-58 prospective alpha-validation regressions
         run: python -m pytest tests/test_v51_alpha_validation_47_58.py tests/test_alpha_live_proof_convergence.py
+      - name: Phase 12 final-production import wrapper and black-box E2E
+        run: |
+          python -m pytest tests/test_v51_phase12_13_83_94.py -k '84 or 85 or 86 or 87 or 88 or 89'
+          python -m pytest tests/test_v51_production_path_e2e.py
+      - name: Phase 12 prior-state migration regressions
+        run: python -m pytest tests/test_v51_phase12_13_83_94.py -k '90'
+      - name: Phase 13 work reduction resource backpressure and continuity regressions
+        run: python -m pytest tests/test_v51_phase12_13_83_94.py -k '91 or 92 or 93 or 94'
+      - name: No live-money authority regression
+        run: python -m pytest tests/test_v51_phase12_13_83_94.py -k 'preserve_frozen_paper_only_authority'
       - name: Launched production HTTP smoke
         run: python tests/launched_production_smoke.py
       - name: Canonical architecture and transfer-certification invariants
