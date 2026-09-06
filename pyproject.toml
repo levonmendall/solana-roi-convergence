@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "solana-roi-convergence"
-version = "0.4.0"
-description = "Paper-only forward validation engine for ROI Convergence v5.1 across Solana, FOMO, and Robinhood Chain"
+version = "0.5.1"
+description = "Paper-only forward-validation and economic-certification engine for Solana, FOMO, and Robinhood Chain v5.1 strategies"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

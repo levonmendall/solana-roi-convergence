@@ -1,3 +1,9 @@
+# ARCHIVED — ROI Convergence v3.1 baseline
+
+> Historical prospective-cohort record only. This document has **no current selection, sizing, promotion, exit, allocation, readiness, or live-money authority**. Current production authority is `roi-convergence-v5.1-consolidated-proof-1`; see `README.md`, `docs/V51_CONSOLIDATED_STRATEGY.md`, and `strategy_v51_authority.json`.
+
+---
+
 # Frozen Forward Baseline — ROI Convergence v3.1
 
 This file defines the first prospective strategy cohort. Parameters must not be changed retroactively after forward evidence begins.

@@ -1,3 +1,9 @@
+# ARCHIVED — Solana ROI Convergence v4
+
+> Historical strategy record only. This document has **no current selection, sizing, promotion, exit, allocation, readiness, or live-money authority**. Current production authority is `roi-convergence-v5.1-consolidated-proof-1`; see `README.md`, `docs/V51_CONSOLIDATED_STRATEGY.md`, and `strategy_v51_authority.json`.
+
+---
+
 # Solana ROI Convergence v4 — Profit-First Entity-Aware Research Strategy
 
 Strategy version: `roi-convergence-v4.0-profit-first-entity-research-1`
