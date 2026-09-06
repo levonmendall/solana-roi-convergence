@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from .execution_realism import clear_observed_entry_execution, enrich_exact_entry_quote
 from .observation import WSOL_MINT
 from .observation_store import ObservationEventStore
 from .quote import (
@@ -421,6 +422,7 @@ class ShadowWalletExecutableQuoteHandoff:
         scout_reference_price_sol: float,
         trigger_observed_at: datetime,
     ) -> ExecutableQuote | None:
+        clear_observed_entry_execution()
         if self.client is None or self.simulator is None:
             self.store.append(
                 "execution_quote_unavailable",
@@ -473,5 +475,7 @@ class ShadowWalletExecutableQuoteHandoff:
                 {"token_mint": token_mint, "stage": stage, "error_type": type(exc).__name__, "error": str(exc)[:500]},
             )
             return None
+        # Preserve the legacy quote-ledger observation exactly, then derive the
+        # amount-specific paper fill context as a normal dependency for the caller.
         self.ledger.record(final_quote)
-        return final_quote
+        return enrich_exact_entry_quote(store=self.store, quote=final_quote, shadow=shadow)
