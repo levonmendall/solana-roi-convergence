@@ -67,6 +67,7 @@ def _base_case(lane_name: str, *, qualifying: bool) -> dict[str, Any]:
         "candidate_id": f"batch3-{lane_name}-{suffix}",
         "token": f"synthetic-token-{lane_name}",
         "surface": SYNTHETIC_SURFACE,
+        "strict_synthetic_isolation": True,
         "economic_surface": descriptor["economic_surface"],
         "venue": descriptor["venue"],
         "lifecycle": descriptor["lifecycle"],
