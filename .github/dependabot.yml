@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 3
+    versioning-strategy: "increase"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+    # Dependabot may propose a version bump, but required CI deliberately rejects a
+    # changed dependency set until requirements.lock and dependency_compatibility.json
+    # are regenerated/reviewed together. Auto-merge is intentionally not configured.
