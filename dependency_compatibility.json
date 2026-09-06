@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "architecture_release": "0.5.1",
+  "review_epoch": "phase11-dependency-baseline-20260905",
+  "requirements_lock_sha256": "29b487505cee13789ef8423b0d6c2ae56f199ca24b08b9e28294085907b88916",
+  "execution_compatibility_review": "confirmed_no_change",
+  "measurement_compatibility_review": "confirmed_no_change",
+  "strategy_economic_authority_changed": false,
+  "paper_only": true,
+  "live_money_authority": false
+}
