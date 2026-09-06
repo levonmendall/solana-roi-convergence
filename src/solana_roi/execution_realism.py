@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Any, Callable
 
 from .models import IntentKind, PaperPosition, SimulatedFill
-from .portfolio import PaperPortfolio
 from .quote import ExecutableQuote, LAMPORTS_PER_SOL
 from .shadow_execution import ShadowWalletExecutableQuoteHandoff
 
@@ -47,12 +46,7 @@ def _matching_shadow_row(
     handoff: ShadowWalletExecutableQuoteHandoff,
     quote: ExecutableQuote,
 ) -> dict[str, Any] | None:
-    """Find the exact shadow observation that produced this returned quote.
-
-    The original handoff stamps the final quote's ``received_at`` with the shadow
-    observation's ``completed_at``. Matching all three fields avoids accidentally
-    borrowing fees from a concurrent candidate.
-    """
+    """Find the exact shadow observation that produced this returned quote."""
 
     completed = quote.received_at.isoformat()
     for row in handoff.shadow_ledger.recent(64):
@@ -104,10 +98,6 @@ def _observed_handoff(
         simulation_ok = bool(shadow.get("simulation_ok"))
         exact_order_available = bool(order_price > 0.0 and order_units > 0.0)
 
-        # Jupiter's assembled taker order ``outAmount`` is already net of route
-        # execution effects. Its effective price therefore replaces the earlier
-        # quote-only price for paper accounting rather than receiving another
-        # fixed 2.5% entry haircut on top.
         exact_quote = replace(
             quote,
             effective_price_sol=order_price if exact_order_available else quote.effective_price_sol,
@@ -115,11 +105,7 @@ def _observed_handoff(
             drift_fraction=order_drift if exact_order_available else quote.drift_fraction,
             router=str(shadow.get("router") or quote.router),
             usable=bool(quote.usable and simulation_ok and exact_order_available),
-            reason=(
-                quote.reason
-                if quote.usable and simulation_ok and exact_order_available
-                else quote.reason
-            ),
+            reason=quote.reason,
         )
 
         payload = {
@@ -177,99 +163,90 @@ def _observed_handoff(
     return observe
 
 
-def _exact_entry_apply(
-    original: Callable[..., None],
-) -> Callable[..., None]:
-    def apply(
-        self: PaperPortfolio,
-        intent: Any,
-        *,
-        scout_wallet: str,
-        reference_price: float,
-        family: str = "legacy_runtime",
-        context: str = "unclassified",
-    ) -> None:
-        evidence = _CURRENT_ENTRY_EXECUTION.get()
-        use_exact = bool(
-            intent.kind in _ENTRY_KINDS
-            and evidence is not None
-            and evidence.simulation_ok
-            and evidence.token_mint == intent.token_mint
-            and evidence.order_effective_price_sol > 0.0
-            and math.isclose(
-                float(reference_price),
-                evidence.order_effective_price_sol,
-                rel_tol=1e-9,
-                abs_tol=1e-15,
-            )
+def apply_exact_entry_if_available(
+    portfolio: Any,
+    intent: Any,
+    *,
+    scout_wallet: str,
+    reference_price: float,
+    family: str = "legacy_runtime",
+    context: str = "unclassified",
+) -> bool:
+    """Apply one exact simulated entry through the canonical portfolio ledger.
+
+    This is a normal dependency invoked by ``PaperPortfolio.apply``. It replaces
+    the former runtime replacement of ``PaperPortfolio.apply`` while preserving
+    the exact Jupiter-order price, explicit network-fee basis, and consume-once
+    execution evidence semantics.
+    """
+
+    evidence = _CURRENT_ENTRY_EXECUTION.get()
+    use_exact = bool(
+        intent.kind in _ENTRY_KINDS
+        and evidence is not None
+        and evidence.simulation_ok
+        and evidence.token_mint == intent.token_mint
+        and evidence.order_effective_price_sol > 0.0
+        and math.isclose(
+            float(reference_price),
+            evidence.order_effective_price_sol,
+            rel_tol=1e-9,
+            abs_tol=1e-15,
         )
-        if not use_exact or evidence is None:
-            return original(
-                self,
-                intent,
-                scout_wallet=scout_wallet,
-                reference_price=reference_price,
-                family=family,
-                context=context,
-            )
+    )
+    if not use_exact or evidence is None:
+        return False
 
-        # Consume exactly once. A confirmation add receives its own independently
-        # built and simulated Jupiter order and therefore its own context.
-        _CURRENT_ENTRY_EXECUTION.set(None)
+    _CURRENT_ENTRY_EXECUTION.set(None)
 
-        position = self.positions.get(intent.token_mint)
-        if position is None:
-            position = PaperPosition(intent.token_mint, scout_wallet, intent.observed_at)
-            self.ledger.register_position(position, family=family, context=context)
+    position = portfolio.positions.get(intent.token_mint)
+    if position is None:
+        position = PaperPosition(intent.token_mint, scout_wallet, intent.observed_at)
+        portfolio.ledger.register_position(position, family=family, context=context)
 
-        network_fee_usd = max(0.0, float(evidence.network_fee_usd))
-        full = self.full_position_notional({intent.token_mint: evidence.order_effective_price_sol})
-        available_for_swap = max(0.0, self.cash_usd - network_fee_usd)
-        notional = min(available_for_swap, full * intent.fraction_of_full_position)
-        if notional <= 0.0:
-            return
+    network_fee_usd = max(0.0, float(evidence.network_fee_usd))
+    full = portfolio.full_position_notional({intent.token_mint: evidence.order_effective_price_sol})
+    available_for_swap = max(0.0, portfolio.cash_usd - network_fee_usd)
+    notional = min(available_for_swap, full * intent.fraction_of_full_position)
+    if notional <= 0.0:
+        return True
 
-        units = notional / evidence.order_effective_price_sol
-        fill = SimulatedFill(
-            token_mint=intent.token_mint,
-            side="buy",
-            observed_at=intent.observed_at,
-            reference_price=evidence.order_effective_price_sol,
-            fill_price=evidence.order_effective_price_sol,
-            notional_usd=notional,
-            units=units,
-            # For exact observed entries this field is the explicit cash friction
-            # not already embedded in the net Jupiter order price. Existing
-            # checkpoint/event schemas therefore remain backward compatible.
-            execution_drag_usd=network_fee_usd,
-            intent=intent.kind,
-        )
-        total_cash_cost = notional + network_fee_usd
-        self.cash_usd -= total_cash_cost
-        position.units += units
-        # Fee-inclusive basis makes later paper P&L and break-even accounting
-        # reflect the actual observed entry cash requirement.
-        position.cost_basis_usd += total_cash_cost
-        position.entry_capital_usd += total_cash_cost
-        position.fills.append(fill)
-        self.ledger.record_equity({intent.token_mint: evidence.order_effective_price_sol})
-
-    try:
-        apply.__dict__.update(getattr(original, "__dict__", {}))
-    except Exception:
-        pass
-    setattr(apply, "_roi_execution_realism", True)
-    return apply
+    units = notional / evidence.order_effective_price_sol
+    fill = SimulatedFill(
+        token_mint=intent.token_mint,
+        side="buy",
+        observed_at=intent.observed_at,
+        reference_price=evidence.order_effective_price_sol,
+        fill_price=evidence.order_effective_price_sol,
+        notional_usd=notional,
+        units=units,
+        execution_drag_usd=network_fee_usd,
+        intent=intent.kind,
+    )
+    total_cash_cost = notional + network_fee_usd
+    portfolio.cash_usd -= total_cash_cost
+    position.units += units
+    position.cost_basis_usd += total_cash_cost
+    position.entry_capital_usd += total_cash_cost
+    position.fills.append(fill)
+    portfolio.ledger.record_equity({intent.token_mint: evidence.order_effective_price_sol})
+    return True
 
 
 def install_execution_realism() -> None:
+    """Legacy migration shim for the remaining shadow-handoff wrapper only.
+
+    Paper portfolio accounting is no longer monkeypatched; it consumes execution
+    realism through ``apply_exact_entry_if_available`` as an ordinary dependency.
+    """
+
     handoff_observe = ShadowWalletExecutableQuoteHandoff.observe
     if not bool(getattr(handoff_observe, "_roi_execution_realism", False)):
         ShadowWalletExecutableQuoteHandoff.observe = _observed_handoff(handoff_observe)  # type: ignore[method-assign]
 
-    portfolio_apply = PaperPortfolio.apply
-    if not bool(getattr(portfolio_apply, "_roi_execution_realism", False)):
-        PaperPortfolio.apply = _exact_entry_apply(portfolio_apply)  # type: ignore[method-assign]
 
-
-__all__ = ["ObservedEntryExecution", "install_execution_realism"]
+__all__ = [
+    "ObservedEntryExecution",
+    "apply_exact_entry_if_available",
+    "install_execution_realism",
+]
