@@ -16,60 +16,51 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Benchmark recent sequencer range log acquisition
+      - name: Verify final production Robinhood provider authority
         run: |
-          python -m pip install -q websockets==15.0.1
           python - <<'PY'
-          import asyncio, json, time, urllib.request, urllib.error
-          import websockets
+          import json, urllib.request
 
-          FEED='wss://feed.mainnet.chain.robinhood.com'
-          RPC='https://rpc.mainnet.chain.robinhood.com'
-          TOPICS=[
-            '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118',
-            '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67',
-            '0xdb51ea9ad51ab453a65a4cb7e60c3cb378c9501bb002609f8f97778fb6c4235a',
-            '0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607',
-            '0xec36bf571f136799e8dc0b0b8bea4b04d8bd3d43de838aab0d5fc21d4cbfc455',
-            '0x8113d738abdcb6b38357e9d53a54a7157861a09031b453651f0fe7fe151f59df',
-          ]
-
-          def rpc(method,params,timeout=20):
-              body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
-              req=urllib.request.Request(RPC,data=body,headers={'Content-Type':'application/json','User-Agent':'roi-range-bench/1'})
-              t=time.perf_counter()
-              try:
-                  with urllib.request.urlopen(req,timeout=timeout) as r:
-                      obj=json.loads(r.read().decode())
-                  return obj,time.perf_counter()-t,None
-              except Exception as exc:
-                  return None,time.perf_counter()-t,f'{type(exc).__name__}: {exc}'
-
-          async def feed_head():
-              http,_,_=await asyncio.to_thread(rpc,'eth_blockNumber',[])
-              target=int(http['result'],16)
-              async with websockets.connect(FEED,open_timeout=10,close_timeout=3,ping_interval=20,max_size=8*1024*1024) as ws:
-                  latest=None
-                  while latest is None or latest < target:
-                      raw=await asyncio.wait_for(ws.recv(),timeout=30)
-                      seqs=[int(m['sequenceNumber']) for m in (json.loads(raw).get('messages') or []) if isinstance(m,dict) and m.get('sequenceNumber') is not None]
-                      if seqs: latest=max(seqs)
-                  # Drain an additional 100 feed messages so this is near the feed's current frontier.
-                  for _ in range(100):
-                      raw=await asyncio.wait_for(ws.recv(),timeout=30)
-                      seqs=[int(m['sequenceNumber']) for m in (json.loads(raw).get('messages') or []) if isinstance(m,dict) and m.get('sequenceNumber') is not None]
-                      if seqs: latest=max(seqs)
-                  return latest
-
-          async def main():
-              latest=await feed_head()
-              print('FEED_HEAD',latest)
-              for width in (1,64,256,1024,4096,8192):
-                  start=max(0,latest-width+1)
-                  filt={'fromBlock':hex(start),'toBlock':hex(latest),'topics':[TOPICS]}
-                  obj,elapsed,error=await asyncio.to_thread(rpc,'eth_getLogs',[filt],20)
-                  result=(obj or {}).get('result') if isinstance(obj,dict) else None
-                  rpc_error=(obj or {}).get('error') if isinstance(obj,dict) else None
-                  print('RANGE','width',width,'start',start,'end',latest,'seconds',round(elapsed,4),'logs',None if result is None else len(result),'rpc_error',rpc_error,'transport_error',error)
-          asyncio.run(main())
+          URL='https://solana-roi-convergence.onrender.com/v1/strategy/e2e-status'
+          EXPECTED='404c435b22082ca9404a9420bfde3d54fb3e16b4'
+          req=urllib.request.Request(URL,headers={'Accept':'application/json','User-Agent':'roi-final-provider-proof/1'})
+          with urllib.request.urlopen(req,timeout=60) as r:
+              payload=json.loads(r.read().decode())
+          rh=payload.get('robinhood') or {}
+          provider=rh.get('production_transport_authority') or {}
+          summary={
+              'release_commit': payload.get('release_commit'),
+              'paper_only': (payload.get('overall') or {}).get('paper_only'),
+              'live_money_authority': (payload.get('overall') or {}).get('live_money_authority'),
+              'robinhood_runtime_ready': rh.get('runtime_ready'),
+              'robinhood_failed_closed': rh.get('failed_closed'),
+              'robinhood_error': rh.get('error'),
+              'provider_configured': provider.get('provider_configured'),
+              'decision_authoritative': provider.get('decision_authoritative'),
+              'provider_blocker': provider.get('blocker'),
+              'canonical_latency_hard_max_seconds': provider.get('canonical_latency_hard_max_seconds'),
+              'legacy_two_block_gate_has_production_authority': provider.get('legacy_two_block_gate_has_production_authority'),
+              'public_rpc_is_research_observation_only': provider.get('public_rpc_is_research_observation_only'),
+              'public_sequencer_is_research_observation_only': provider.get('public_sequencer_is_research_observation_only'),
+              'signing_available': provider.get('signing_available'),
+              'transaction_submission_available': provider.get('transaction_submission_available'),
+          }
+          print('FINAL_PRODUCTION',json.dumps(summary,sort_keys=True))
+          if summary['release_commit'] != EXPECTED:
+              raise SystemExit('wrong production release')
+          if summary['paper_only'] is not True or summary['live_money_authority'] is not False:
+              raise SystemExit('paper-only boundary changed')
+          if summary['canonical_latency_hard_max_seconds'] != 20.0:
+              raise SystemExit('canonical v5.1 latency authority changed')
+          if summary['legacy_two_block_gate_has_production_authority'] is not False:
+              raise SystemExit('legacy two-block gate still has production authority')
+          if summary['signing_available'] is not False or summary['transaction_submission_available'] is not False:
+              raise SystemExit('execution authority unexpectedly available')
+          # Credential handoff is external. Until Render has a non-public RPC/WSS pair,
+          # production must fail closed explicitly rather than use the public transport.
+          if summary['provider_configured'] is False:
+              if summary['decision_authoritative'] is not False:
+                  raise SystemExit('public transport incorrectly decision-authoritative')
+              if summary['provider_blocker'] != 'robinhood_production_rpc_websocket_required':
+                  raise SystemExit('missing provider did not fail closed precisely')
           PY
