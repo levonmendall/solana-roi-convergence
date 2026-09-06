@@ -13,7 +13,7 @@ from .config import BASELINE
 from .direct_solana import DirectSolanaIngestionPlane
 
 
-COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v3"
+COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v4-production-provider"
 _FINAL_DIRECT_STATUS: Callable[..., dict[str, Any]] | None = None
 
 
@@ -97,14 +97,13 @@ setattr(_truthful_direct_status, "_roi_post177_forward_pipeline_composition_comp
 
 
 def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) -> None:
-    """Restore established composition identities, then install final E2E residuals.
+    """Restore compatibility, then install the final production transport authority.
 
-    PR177's follow-up needs new forward semantics, not new strategy or scheduler
-    authority. Keep the canonical 20-second candidate-state lifetime, restore the
-    final standby-over-background RPC governor, preserve wrapper lineage markers,
-    and leave unified-status composition to the repository's existing readiness
-    installer before the post-178 residual repair applies its final current-frontier
-    semantics.
+    The v5.1 economic latency ceiling remains 20 seconds. Robinhood's old two-block
+    polling heuristic is retained only for compatibility/audit beneath this layer;
+    it cannot authorize production paper entries. The final authority is a dedicated
+    production WebSocket/RPC transport with a separate reader thread, prospective
+    event-time gating and no retrospective, signing, submission or live-money path.
     """
 
     global _FINAL_DIRECT_STATUS
@@ -132,6 +131,13 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
 
     post178.install_post178_e2e_residual_repair(plane_cls)
     post178_scout.install_post178_scout_terminal_classification_fix()
+
+    # This must be the final Robinhood runtime/status/entry transport composition.
+    # Lower wrappers preserve lineage and research observation only; production
+    # decision authority requires an explicitly configured non-public RPC + WSS pair.
+    from .robinhood_production_ws_transport import install_robinhood_production_ws_transport
+
+    install_robinhood_production_ws_transport(plane_cls)
 
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_installed", True)
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_version", COMPAT_VERSION)
