@@ -101,9 +101,13 @@ def _trial_metadata(store: Any) -> dict[tuple[str, str], dict[str, Any]]:
         )
         if column in cols
     ]
-    order = " ORDER BY rowid"
     with store._lock:
-        rows = [dict(row) for row in store.db.execute(f"SELECT {','.join(wanted)} FROM {table}{order}").fetchall()]
+        rows = [
+            dict(row)
+            for row in store.db.execute(
+                f"SELECT {','.join(wanted)} FROM {table} ORDER BY rowid"
+            ).fetchall()
+        ]
     result: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
         signature = str(row.get("source_signature") or "")
@@ -143,20 +147,52 @@ def _trial_metadata(store: Any) -> dict[tuple[str, str], dict[str, Any]]:
 
 def _candidate_metadata(store: Any) -> dict[tuple[str, str], dict[str, Any]]:
     result: dict[tuple[str, str], dict[str, Any]] = {}
-    if not _table_exists(store, "v51_candidates"):
-        return result
-    cols = _columns(store, "v51_candidates")
-    wanted = [
-        column
-        for column in ("surface", "candidate_id", "release_commit", "venue", "lifecycle", "raw_chase_fraction")
-        if column in cols
-    ]
-    if not {"surface", "candidate_id"}.issubset(wanted):
-        return result
-    with store._lock:
-        rows = [dict(row) for row in store.db.execute(f"SELECT {','.join(wanted)} FROM v51_candidates").fetchall()]
-    for row in rows:
-        result[(str(row.get("surface") or ""), str(row.get("candidate_id") or ""))] = row
+    if _table_exists(store, "v51_candidates"):
+        cols = _columns(store, "v51_candidates")
+        wanted = [
+            column
+            for column in (
+                "surface",
+                "candidate_id",
+                "release_commit",
+                "venue",
+                "lifecycle",
+                "raw_chase_fraction",
+            )
+            if column in cols
+        ]
+        if {"surface", "candidate_id"}.issubset(wanted):
+            with store._lock:
+                rows = [
+                    dict(row)
+                    for row in store.db.execute(
+                        f"SELECT {','.join(wanted)} FROM v51_candidates"
+                    ).fetchall()
+                ]
+            for row in rows:
+                result[(str(row.get("surface") or ""), str(row.get("candidate_id") or ""))] = row
+    if _table_exists(store, "v51_robinhood_candidate_ledger"):
+        cols = _columns(store, "v51_robinhood_candidate_ledger")
+        wanted = [
+            column
+            for column in (
+                "candidate_id",
+                "release_commit",
+                "venue",
+                "lifecycle",
+            )
+            if column in cols
+        ]
+        if "candidate_id" in wanted:
+            with store._lock:
+                rows = [
+                    dict(row)
+                    for row in store.db.execute(
+                        f"SELECT {','.join(wanted)} FROM v51_robinhood_candidate_ledger"
+                    ).fetchall()
+                ]
+            for row in rows:
+                result[("ROBINHOOD_CHAIN", str(row.get("candidate_id") or ""))] = row
     return result
 
 
@@ -184,18 +220,24 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
     hard_max = float(authority()["execution"]["latency_hard_max_seconds"])
     trial_meta = _trial_metadata(store)
     candidate_meta = _candidate_metadata(store)
+    counterfactual_cols = _columns(store, "v51_rejected_counterfactuals")
+    optional_gross = ",forward_gross_return" if "forward_gross_return" in counterfactual_cols else ""
 
     with store._lock:
-        rejected_rows = [dict(row) for row in store.db.execute(
-            "SELECT surface,candidate_id,release_commit,decision_reason,forward_net_return,counterfactual_state "
-            "FROM v51_rejected_counterfactuals ORDER BY updated_at"
-        ).fetchall()]
+        rejected_rows = [
+            dict(row)
+            for row in store.db.execute(
+                "SELECT surface,candidate_id,release_commit,decision_reason,forward_net_return,counterfactual_state"
+                + optional_gross
+                + " FROM v51_rejected_counterfactuals ORDER BY updated_at"
+            ).fetchall()
+        ]
 
     grouped: dict[tuple[str, str, str, str], list[float]] = defaultdict(list)
     counts: dict[tuple[str, str, str, str], dict[str, int]] = defaultdict(
         lambda: {"candidate_count": 0, "resolved_count": 0, "positive_count": 0}
     )
-    missing_numeric_latency = 0
+    missing_by_surface: dict[str, int] = defaultdict(int)
     above_authority_count = 0
     resolved_above_authority = 0
 
@@ -207,13 +249,15 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
         candidate_row = candidate_meta.get((surface, candidate), {})
         latency = _safe(meta.get("signal_to_entry_seconds"))
         if latency is None:
-            missing_numeric_latency += 1
+            missing_by_surface[surface] += 1
         band = latency_research_band(latency)
         venue = str(meta.get("venue") or candidate_row.get("venue") or "UNKNOWN")
         lifecycle = str(meta.get("lifecycle") or candidate_row.get("lifecycle") or "unknown")
         key = (surface, venue, lifecycle, band)
         counts[key]["candidate_count"] += 1
         value = _safe(row.get("forward_net_return"))
+        if value is None and surface == "ROBINHOOD_CHAIN":
+            value = _safe(row.get("forward_gross_return"))
         if value is not None:
             counts[key]["resolved_count"] += 1
             counts[key]["positive_count"] += int(value > 0.0)
@@ -227,25 +271,31 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
         surface, venue, lifecycle, band = key
         label = "|".join(key)
         values = grouped.get(key, [])
-        summary = _return_summary(values)
         cohorts[label] = {
             "surface": surface,
             "venue": venue,
             "lifecycle": lifecycle,
             "latency_band": band,
             **counts[key],
+            "return_semantics": (
+                "gross_observed_market_return_research_only_not_executable_pnl"
+                if surface == "ROBINHOOD_CHAIN"
+                else "resolved_shadow_net_return_after_recorded_execution_model"
+            ),
             "positive_rate": (
                 counts[key]["positive_count"] / counts[key]["resolved_count"]
-                if counts[key]["resolved_count"] else None
+                if counts[key]["resolved_count"]
+                else None
             ),
-            "return_profile": summary,
+            "return_profile": _return_summary(values),
         }
 
     by_band_values: dict[str, list[float]] = defaultdict(list)
     by_band_counts: dict[str, int] = defaultdict(int)
-    for (_surface, _venue, _lifecycle, band), counter in counts.items():
+    for key, counter in counts.items():
+        band = key[3]
         by_band_counts[band] += int(counter["candidate_count"])
-        by_band_values[band].extend(grouped.get((_surface, _venue, _lifecycle, band), []))
+        by_band_values[band].extend(grouped.get(key, []))
     bands = {
         band: {
             "candidate_count": by_band_counts.get(band, 0),
@@ -253,10 +303,11 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
         }
         for band, _low, _high in RESEARCH_BANDS
     }
+    missing_numeric_latency = sum(missing_by_surface.values())
     if missing_numeric_latency:
         bands["unknown"] = {
             "candidate_count": missing_numeric_latency,
-            **_return_summary([]),
+            **_return_summary(by_band_values.get("unknown", [])),
         }
 
     return {
@@ -266,7 +317,11 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
         "current_authorized_hard_max_seconds": hard_max,
         "current_authority_changed": False,
         "research_bands": [
-            {"name": name, "lower_exclusive_seconds": low if low and low > 0.0 else None, "upper_inclusive_seconds": high}
+            {
+                "name": name,
+                "lower_exclusive_seconds": low if low and low > 0.0 else None,
+                "upper_inclusive_seconds": high,
+            }
             for name, low, high in RESEARCH_BANDS
         ],
         "bands": bands,
@@ -275,6 +330,13 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
         "above_current_authority_candidate_count": above_authority_count,
         "resolved_above_current_authority_count": resolved_above_authority,
         "missing_numeric_signal_to_entry_count": missing_numeric_latency,
+        "missing_numeric_signal_to_entry_by_surface": dict(sorted(missing_by_surface.items())),
+        "measurement_debt": (
+            "Robinhood currently resolves rejected forward market returns but does not persist a numeric amount-specific "
+            "signal_to_entry_seconds for rejected candidates; those rows remain in the explicit unknown latency cohort"
+            if missing_by_surface.get("ROBINHOOD_CHAIN", 0)
+            else None
+        ),
         "selection_policy": (
             "research-only counterfactual evidence; no challenger cohort can create a paper position or satisfy current promotion authority"
         ),
