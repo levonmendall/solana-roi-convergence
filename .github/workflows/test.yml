@@ -18,6 +18,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Main history policy backstop
+        if: github.event_name == 'push'
+        run: |
+          test "${{ github.event.forced }}" != "true"
+          parents="$(git show -s --format=%P HEAD)"
+          test "$(printf '%s\n' "$parents" | wc -w)" -ge 2
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
