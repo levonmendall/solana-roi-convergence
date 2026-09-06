@@ -2,7 +2,9 @@
   "policy_version": "v51-module-reachability-130-v4-explicit-compatibility",
   "production_root": "solana_roi.production",
   "test_only": [
-    "solana_roi.v51_seeded_e2e"
+    "solana_roi.v51_lane_capability_e2e",
+    "solana_roi.v51_seeded_e2e",
+    "solana_roi.v51_synthetic_provenance"
   ],
   "migration_only": [
     "solana_roi.cli",
