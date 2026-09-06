@@ -16,30 +16,31 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Probe public WSS JSON-RPC
+      - name: Probe public sequencer feed
         run: |
           python -m pip install -q websockets==15.0.1
           python - <<'PY'
           import asyncio, json
           import websockets
-          URL='wss://rpc.mainnet.chain.robinhood.com'
+          URL='wss://feed.mainnet.chain.robinhood.com'
           async def main():
-              try:
-                  async with websockets.connect(URL,open_timeout=10,close_timeout=3,ping_interval=20) as ws:
-                      await ws.send(json.dumps({'jsonrpc':'2.0','id':1,'method':'eth_chainId','params':[]}))
-                      print('CHAIN',await asyncio.wait_for(ws.recv(),timeout=10))
-                      await ws.send(json.dumps({'jsonrpc':'2.0','id':2,'method':'eth_subscribe','params':['newHeads']}))
-                      reply=json.loads(await asyncio.wait_for(ws.recv(),timeout=10))
-                      print('SUB',json.dumps(reply,sort_keys=True))
-                      if 'result' not in reply:
-                          raise SystemExit(2)
-                      for i in range(3):
-                          msg=json.loads(await asyncio.wait_for(ws.recv(),timeout=10))
-                          params=msg.get('params') or {}
-                          result=params.get('result') or {}
-                          print('HEAD',i+1,result.get('number'),result.get('hash'))
-              except Exception as exc:
-                  print('WSS_ERROR',type(exc).__name__,str(exc))
-                  raise
+              async with websockets.connect(URL,open_timeout=10,close_timeout=3,ping_interval=20,max_size=8*1024*1024) as ws:
+                  raw=await asyncio.wait_for(ws.recv(),timeout=10)
+                  print('BYTES',len(raw))
+                  obj=json.loads(raw)
+                  print('TOP_KEYS',sorted(obj.keys()))
+                  msgs=obj.get('messages') or obj.get('Messages') or []
+                  print('MSG_COUNT',len(msgs))
+                  if msgs:
+                      m=msgs[0]
+                      print('MSG_KEYS',sorted(m.keys()))
+                      print('SEQUENCE',m.get('sequenceNumber'),m.get('sequence_number'),m.get('sequence'))
+                      print('BLOCKHASH',m.get('blockHash'),m.get('block_hash'))
+                      inner=m.get('message') or m.get('Message') or {}
+                      if isinstance(inner,dict):
+                          print('INNER_KEYS',sorted(inner.keys()))
+                          header=inner.get('message') or inner.get('Message') or inner
+                          if isinstance(header,dict):
+                              print('INNER2_KEYS',sorted(header.keys())[:30])
           asyncio.run(main())
           PY
