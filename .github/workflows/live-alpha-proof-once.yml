@@ -10,21 +10,92 @@ permissions:
 jobs:
   verify-live-alpha:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Inspect direct Solana and FOMO continuity
+      - name: Verify exact PR194 production convergence
+        env:
+          EXPECTED_RELEASE_COMMIT: b58627e2d0c16e98986e5de4238c3d4a9f1dc4f3
         run: |
           python - <<'PY'
-          import json, urllib.request
-          req=urllib.request.Request('https://solana-roi-convergence.onrender.com/v1/strategy/e2e-status',headers={'Accept':'application/json','User-Agent':'roi-solana-continuity/1'})
-          with urllib.request.urlopen(req,timeout=90) as r:
-              e=json.loads(r.read().decode())
-          print('RELEASE',e.get('release_commit'))
-          print('SOLANA',json.dumps(e.get('solana'),sort_keys=True,default=str))
-          print('FOMO',json.dumps(e.get('fomo'),sort_keys=True,default=str))
-          print('OVERALL',json.dumps(e.get('overall'),sort_keys=True,default=str))
+          import json, os, time, urllib.request
+          base='https://solana-roi-convergence.onrender.com'
+          expected=os.environ['EXPECTED_RELEASE_COMMIT']
+          def get(path):
+              req=urllib.request.Request(base+path,headers={'Accept':'application/json','User-Agent':'roi-final-convergence/1'})
+              with urllib.request.urlopen(req,timeout=90) as r:
+                  return json.loads(r.read().decode())
+          e2e=slo=None
+          for attempt in range(4):
+              e2e=get('/v1/strategy/e2e-status')
+              slo=get('/v1/strategy/forward-slo')
+              rh=e2e.get('robinhood') or {}
+              live=rh.get('live_frontier_verification') or {}
+              last=live.get('last_range') or {}
+              sol=e2e.get('solana') or {}
+              fomo=e2e.get('fomo') or {}
+              local=(slo.get('local_solana_fomo') or {})
+              print('ATTEMPT',attempt+1,json.dumps({
+                  'release':e2e.get('release_commit'),
+                  'solana_ready':sol.get('runtime_ready'),
+                  'solana_blockers':sol.get('blockers'),
+                  'fomo_ready':fomo.get('runtime_ready'),
+                  'fomo_blockers':fomo.get('blockers'),
+                  'robinhood_ready':rh.get('paper_decision_transport_ready'),
+                  'robinhood_blockers':rh.get('blockers'),
+                  'robinhood_lag':rh.get('block_lag'),
+                  'decision_tail_blocks':last.get('decision_tail_blocks'),
+                  'metadata_window_blocks':last.get('metadata_window_blocks'),
+                  'stale_trade_authority':last.get('stale_trade_blocks_have_retrospective_entry_authority'),
+                  'local_slo_state':local.get('proof_state'),
+                  'local_stage_events_60m':local.get('stage_events_last_60m'),
+              },sort_keys=True,default=str))
+              convergence=(
+                  e2e.get('release_commit')==expected
+                  and local.get('proof_state')!='unavailable'
+                  and last.get('decision_tail_blocks')==2
+                  and last.get('metadata_window_blocks')==64
+                  and last.get('stale_trade_blocks_have_retrospective_entry_authority') is False
+                  and rh.get('paper_decision_transport_ready') is True
+              )
+              if convergence:
+                  break
+              if attempt < 3:
+                  time.sleep(20)
+          rejects=get('/v1/strategy/rejected-counterfactuals')
+          forward=get('/v1/strategy/forward-certification')
+          alpha=get('/v1/strategy/alpha-certificate')
+          print('REJECTS',json.dumps({
+              'release_commit':rejects.get('release_commit'),
+              'local':rejects.get('local_solana_fomo'),
+              'robinhood':rejects.get('isolated_robinhood'),
+              'paper_only':rejects.get('paper_only'),
+              'live_money_authority':rejects.get('live_money_authority'),
+          },sort_keys=True,default=str))
+          print('FORWARD',json.dumps({k:forward.get(k) for k in ('release_commit','state','system_forward_certified','hard_operational_gates_ok','blockers')},sort_keys=True,default=str))
+          print('ALPHA',json.dumps({
+              'release_commit':alpha.get('release_commit'),
+              'state':alpha.get('state'),
+              'after_cost_positive_compounded_alpha_proven':alpha.get('after_cost_positive_compounded_alpha_proven'),
+              'blockers':alpha.get('blockers'),
+              'promoted_families':alpha.get('promoted_families'),
+              'checks':alpha.get('checks'),
+              'paper_only':alpha.get('paper_only'),
+              'live_money_authority':alpha.get('live_money_authority'),
+              'signing_available':alpha.get('signing_available'),
+              'transaction_submission_available':alpha.get('transaction_submission_available'),
+          },sort_keys=True,default=str))
+          assert e2e.get('release_commit') == expected
+          assert forward.get('release_commit') == expected
+          assert alpha.get('release_commit') == expected
+          assert (slo.get('local_solana_fomo') or {}).get('proof_state') != 'unavailable'
+          assert alpha.get('paper_only') is True
+          assert alpha.get('live_money_authority') is False
+          assert alpha.get('signing_available') is False
+          assert alpha.get('transaction_submission_available') is False
+          assert alpha.get('changes_strategy_authority') is False
+          assert alpha.get('changes_economic_thresholds') is False
           PY
