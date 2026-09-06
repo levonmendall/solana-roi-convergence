@@ -23,17 +23,20 @@ from solana_roi.strategy_v51_authority import authority
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_125_package_import_is_passive_and_has_no_installer_calls() -> None:
-    source = (ROOT / "src/solana_roi/__init__.py").read_text(encoding="utf-8")
+def _installer_calls(source: str) -> list[str]:
     tree = ast.parse(source)
-    install_calls = [
+    return [
         node.func.id
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id.startswith("install_")
     ]
-    assert install_calls == []
+
+
+def test_125_package_import_is_passive_and_has_no_installer_calls() -> None:
+    source = (ROOT / "src/solana_roi/__init__.py").read_text(encoding="utf-8")
+    assert _installer_calls(source) == []
 
     script = (
         "import sys; import solana_roi; "
@@ -47,8 +50,7 @@ def test_125_package_import_is_passive_and_has_no_installer_calls() -> None:
 def test_125_126_production_entrypoint_has_one_explicit_root() -> None:
     production_source = (ROOT / "src/solana_roi/production.py").read_text(encoding="utf-8")
     assert "from .production_system import" in production_source
-    assert "install_runtime_guards" not in production_source
-    assert "install_v51_production_authority" not in production_source
+    assert _installer_calls(production_source) == []
 
     from solana_roi.production import production_system
 
@@ -130,11 +132,8 @@ def test_130_cold_start_routes_components_release_and_safety() -> None:
     assert status["required_component_count"] == 10
     assert status["production_entrypoint"] == "solana_roi.production:app"
 
-    # Repair 130 is architectural only. The v5.1 ENTRY ceiling remains exactly 20s.
     assert float(authority()["execution"]["latency_hard_max_seconds"]) == 20.0
 
-    # Release identity remains environment-bound and is never synthesized by the
-    # architecture layer. Use a deterministic cold-start subprocess to prove it.
     release = "a" * 40
     env = dict(os.environ)
     env["GITHUB_SHA"] = release
