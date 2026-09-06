@@ -16,39 +16,85 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Benchmark exact-block log acquisition
+      - name: Sample final production sequencer frontier
         run: |
-          python -m pip install -q websockets==15.0.1
           python - <<'PY'
-          import asyncio, json, time, urllib.request
-          import websockets
-          FEED='wss://feed.mainnet.chain.robinhood.com'
-          RPC='https://rpc.mainnet.chain.robinhood.com'
-          topics=[
-            '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118',
-            '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67',
-            '0xdb51ea9ad51ab453a65a4cb7e60c3cb378c9501bb002609f8f97778fb6c4235a',
-            '0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607',
-            '0xec36bf571f136799e8dc0b0b8bea4b04d8bd3d43de838aab0d5fc21d4cbfc455',
-            '0x8113d738abdcb6b38357e9d53a54a7157861a09031b453651f0fe7fe151f59df',
-          ]
-          def rpc(method,params):
-              body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
-              req=urllib.request.Request(RPC,data=body,headers={'Content-Type':'application/json','User-Agent':'roi-exact-block-bench/1'})
-              t=time.perf_counter()
-              with urllib.request.urlopen(req,timeout=10) as r:
-                  obj=json.loads(r.read().decode())
-              return obj,time.perf_counter()-t
-          async def main():
-              async with websockets.connect(FEED,open_timeout=10,close_timeout=3,ping_interval=20,max_size=8*1024*1024) as ws:
-                  for i in range(5):
-                      raw=await asyncio.wait_for(ws.recv(),timeout=10)
-                      m=(json.loads(raw).get('messages') or [])[0]
-                      block=int(m['sequenceNumber'])
-                      filt={'fromBlock':hex(block),'toBlock':hex(block),'topics':[topics]}
-                      result,elapsed=await asyncio.to_thread(rpc,'eth_getLogs',[filt])
-                      latest,head_elapsed=await asyncio.to_thread(rpc,'eth_blockNumber',[])
-                      head=int(latest.get('result') or '0x0',16)
-                      print('SAMPLE',i+1,'block',block,'head',head,'lag',max(0,head-block),'log_seconds',round(elapsed,4),'head_seconds',round(head_elapsed,4),'logs',len(result.get('result') or []),'error',result.get('error'))
-          asyncio.run(main())
+          import json, time, urllib.request
+
+          BASE='https://solana-roi-convergence.onrender.com'
+          EXPECTED='81e77eeae04c43ff3d9d2f7e597e77348829ab32'
+
+          def get(path):
+              req=urllib.request.Request(BASE+path,headers={'Accept':'application/json','User-Agent':'roi-final-sequencer-proof/1'})
+              with urllib.request.urlopen(req,timeout=45) as r:
+                  return json.loads(r.read().decode())
+
+          samples=[]
+          for i in range(12):
+              e=get('/v1/strategy/e2e-status')
+              rh=e.get('robinhood') or {}
+              seq=rh.get('sequencer_frontier') or {}
+              live=rh.get('live_frontier_verification') or {}
+              iso=rh.get('worker_isolation') or {}
+              proof=rh.get('v51_proof') or {}
+              s={
+                  'i':i+1,
+                  'release':e.get('release_commit'),
+                  'runtime_ready':rh.get('runtime_ready'),
+                  'failed_closed':rh.get('failed_closed'),
+                  'transport_ready':rh.get('paper_decision_transport_ready'),
+                  'caught_up':rh.get('caught_up_for_paper_decisions'),
+                  'blockers':rh.get('blockers'),
+                  'seq_connected':seq.get('connected'),
+                  'seq_sync':seq.get('synchronized'),
+                  'seq_fresh':seq.get('fresh'),
+                  'seq_head':seq.get('head_block'),
+                  'seq_cursor':seq.get('processing_cursor_block'),
+                  'seq_lag':seq.get('processing_lag_blocks'),
+                  'seq_generation':seq.get('generation'),
+                  'seq_disconnects':seq.get('disconnects'),
+                  'live_ready':live.get('live_epoch_ready'),
+                  'live_lag':live.get('live_epoch_lag_blocks'),
+                  'range':live.get('last_range'),
+                  'status_cache_stale':iso.get('status_cache_stale'),
+                  'status_cache_age':iso.get('status_cache_age_seconds'),
+                  'proof_available':proof.get('available'),
+                  'proof_topology':proof.get('proof_refresh_topology'),
+              }
+              samples.append(s)
+              print('SAMPLE',json.dumps(s,sort_keys=True,default=str))
+              if i < 11:
+                  time.sleep(2)
+
+          releases={s['release'] for s in samples}
+          ready=sum(1 for s in samples if s['runtime_ready'] is True and s['failed_closed'] is not True and s['transport_ready'] is True)
+          seq_ready=sum(1 for s in samples if s['seq_connected'] is True and s['seq_sync'] is True and s['seq_fresh'] is True and isinstance(s['seq_lag'],int) and s['seq_lag'] <= 2)
+          stale=sum(1 for s in samples if s['status_cache_stale'] is True)
+          generations={s['seq_generation'] for s in samples}
+          disconnects=[s['seq_disconnects'] for s in samples if isinstance(s['seq_disconnects'],int)]
+          proof_seen=any(s['proof_available'] is True for s in samples)
+          summary={
+              'expected_release':EXPECTED,
+              'releases':sorted(str(x) for x in releases),
+              'samples':len(samples),
+              'ready_samples':ready,
+              'sequencer_ready_samples':seq_ready,
+              'status_cache_stale_samples':stale,
+              'sequencer_generations':sorted(str(x) for x in generations),
+              'max_disconnects':max(disconnects) if disconnects else None,
+              'proof_available_seen':proof_seen,
+          }
+          print('SUMMARY',json.dumps(summary,sort_keys=True))
+          if releases != {EXPECTED}:
+              raise SystemExit('wrong production release')
+          if ready < 9:
+              raise SystemExit('Robinhood transport not stably ready')
+          if seq_ready < 9:
+              raise SystemExit('sequencer frontier not stably within two blocks')
+          if stale:
+              raise SystemExit('Robinhood status cache became stale')
+          if len(generations) != 1:
+              raise SystemExit('sequencer feed reconnected during proof window')
+          if not proof_seen:
+              raise SystemExit('offloaded Robinhood proof never became available')
           PY
