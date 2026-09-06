@@ -70,6 +70,8 @@ jobs:
         run: python -m pytest tests/test_v51_repair_114_exit_survivability.py
       - name: Phase 17 scoped context certification 115-120
         run: python -m pytest tests/test_v51_phase17_115_120.py
+      - name: Phase 18 monkeypatch migration inventory
+        run: python scripts/audit_monkeypatch_debt.py
       - name: Phase 18 production architecture consolidation 125-130
         run: python -m pytest tests/test_v51_phase18_125_130_architecture.py
       - name: No live-money authority regression
