@@ -2,14 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from .v51_phase14_profitability_certification import (
-    PHASE14_VERSION,
-    build_phase14_profitability_certification,
+from .v51_phase14_profitability_certification import PHASE14_VERSION
+from .v51_phase17_context_certification import (
+    PHASE17_VERSION,
+    build_phase17_profitability_certification,
 )
 from .v51_strategy_api import _isolated_robinhood_proof_state
 
 
-API_VERSION = "v51-phase14-final-certification-api-v1"
+API_VERSION = "v51-phase17-context-certification-api-v2"
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -35,10 +36,12 @@ def install_phase14_profitability_certification(
             if not callable(proof_provider):
                 return {
                     "phase14_version": PHASE14_VERSION,
+                    "phase17_version": PHASE17_VERSION,
                     "api_version": API_VERSION,
                     "classification": "INSUFFICIENT_EVIDENCE",
                     "economically_promising": False,
                     "production_proven": False,
+                    "system_certification_pass": False,
                     "blockers": ["canonical_system_proof_cache_unavailable"],
                     "changes_strategy_authority": False,
                     "changes_economic_thresholds": False,
@@ -57,7 +60,7 @@ def install_phase14_profitability_certification(
             robinhood_proof, robinhood_proof_state = _isolated_robinhood_proof_state(
                 robinhood_status_provider
             )
-            certificate = build_phase14_profitability_certification(
+            certificate = build_phase17_profitability_certification(
                 runtime.store,
                 promotion_certification=promotion,
                 candidate_coverage=coverage,
@@ -81,6 +84,7 @@ def install_phase14_profitability_certification(
     app.state.roi_v51_phase14_95_102 = True
     app.state.roi_v51_phase14_final_certification_path = "/v1/strategy/final-certification"
     app.state.roi_v51_phase14_version = PHASE14_VERSION
+    app.state.roi_v51_phase17_version = PHASE17_VERSION
 
 
 __all__ = ["API_VERSION", "install_phase14_profitability_certification"]
