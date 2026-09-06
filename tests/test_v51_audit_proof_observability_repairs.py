@@ -3,12 +3,12 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from solana_roi import v51_phase17_context_certification as phase17
+from solana_roi import v51_resource_pressure as resource_pressure
 from solana_roi.v51_phase14_api import install_phase14_profitability_certification
 from solana_roi.v51_phase17_attestation_hardening import (
     install_phase17_surface_attestation_hardening,
     strict_surface_attestations,
 )
-from solana_roi import v51_resource_pressure as resource_pressure
 
 
 def _aggregate_only_forward() -> dict:
@@ -69,12 +69,16 @@ def test_resource_pressure_trend_reports_growth_and_throttling() -> None:
 def test_canonical_production_proof_route_fails_closed_without_system_proof() -> None:
     app = FastAPI()
     install_phase14_profitability_certification(app, object())
-    route = next(route for route in app.routes if getattr(route, "path", None) == "/v1/strategy/production-proof")
+    route = next(
+        route for route in app.routes
+        if getattr(route, "path", None) == "/v1/strategy/production-proof"
+    )
     payload = route.endpoint()
     assert payload["state"] == "DEGRADED"
     assert payload["ready_for_forward_proof"] is False
     assert payload["final_certification"]["classification"] == "INSUFFICIENT_EVIDENCE"
-    assert payload["surface_attestation_policy"] if "surface_attestation_policy" in payload else True
+    assert payload["surface_attestation_policy"]["surface_scoped_attestation_required"] is True
+    assert payload["surface_attestation_policy"]["aggregate_attestation_fallback_allowed"] is False
     assert payload["read_only_observability"] is True
     assert payload["changes_strategy_authority"] is False
     assert payload["changes_economic_thresholds"] is False
