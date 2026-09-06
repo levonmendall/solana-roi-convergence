@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 from solana_roi import robinhood_chain_runtime as runtime
 from solana_roi import robinhood_production_provider_finalizer as finalizer
@@ -9,29 +8,21 @@ from solana_roi import robinhood_production_ws_transport as transport
 from solana_roi import robinhood_usage_bounded_transport as bounded
 
 
-def _subject(launch_block: int) -> SimpleNamespace:
-    return SimpleNamespace(launch_block=launch_block)
-
-
-def test_subscription_filter_keeps_all_factories_and_only_active_markets() -> None:
-    v3 = "0x1111111111111111111111111111111111111111"
-    v2 = "0x2222222222222222222222222222222222222222"
-    plane = SimpleNamespace(
-        v3_pools={v3: _subject(100)},
-        v2_curves={v2: _subject(101)},
-    )
-
-    event_filter, targets = bounded._subscription_filter(plane)
-
+def test_factory_discovery_contracts_remain_complete_under_provider_budgeting() -> None:
+    # Market subscription membership is now research-promoted and is covered by the
+    # provider-budget regressions. The permanent discovery set itself must remain
+    # complete regardless of that live shortlist.
     assert set(bounded.DISCOVERY_ADDRESSES) == {
         runtime.UNISWAP_V3_FACTORY,
         runtime.PONS_V1_ACTIVE_FACTORY,
         runtime.PONS_V1_LEGACY_FACTORY,
         runtime.PONS_V2_FACTORY,
     }
-    assert set(event_filter["address"]) == set(bounded.DISCOVERY_ADDRESSES) | {v3, v2}
-    assert targets == {v3: 100, v2: 101}
-    assert set(event_filter["topics"][0]) == set(bounded.DISCOVERY_TOPICS) | set(bounded.MARKET_TOPICS)
+    assert set(bounded.DISCOVERY_TOPICS) == {
+        runtime.V3_POOL_CREATED_TOPIC.lower(),
+        runtime.PONS_V1_TOKEN_LAUNCHED_TOPIC.lower(),
+        runtime.PONS_V2_TOKEN_LAUNCHED_TOPIC.lower(),
+    }
 
 
 def test_bounded_transport_replaces_global_reader_before_final_install() -> None:
