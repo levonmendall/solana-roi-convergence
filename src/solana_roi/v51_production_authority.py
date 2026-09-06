@@ -44,7 +44,7 @@ from .v51_strategy_api import install_v51_strategy_api
 # is switched to provider/v5.1 event-time authority by the finalizer below.
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v2-provider-finalized"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
 _INSTALLED = False
 
 
