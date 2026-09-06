@@ -7,7 +7,7 @@ name = "solana-roi-convergence"
 version = "0.5.1"
 description = "Paper-only forward-validation and economic-certification engine for Solana, FOMO, and Robinhood Chain v5.1 strategies"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 dependencies = [
   "fastapi==0.141.1",
   "httpx==0.28.1",
