@@ -5,7 +5,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v6-execution-realism-retired"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v7-two-native-slices"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -137,7 +137,6 @@ _COMPATIBILITY_ADAPTERS: tuple[CompatibilityAdapter, ...] = (
     _adapter("web_liveness_isolation", "solana_roi.web_liveness_isolation_repair", "install_web_liveness_isolation", "ingestion"),
     _adapter("continuity_storage_capacity", "solana_roi.continuity_storage_capacity_repair", "install_continuity_storage_capacity_repair", "ingestion"),
     _adapter("render_runtime_bootstrap", "solana_roi.render_runtime_bootstrap_repair", "install_render_runtime_bootstrap_handoff", "ingestion"),
-    _adapter("candidate_risk_window", "solana_roi.candidate_risk_window_repair", "install_candidate_risk_window_repair", "candidate"),
     _adapter("wallet_venue_lifecycle_research", "solana_roi.wallet_venue_lifecycle_research", "install_wallet_venue_lifecycle_research", "learning"),
     _adapter("wallet_context_router", "solana_roi.wallet_context_router", "install_wallet_context_router", "strategy"),
     _adapter("wallet_context_router_precision", "solana_roi.wallet_context_router_precision_repair", "install_wallet_context_router_precision_repair", "strategy"),
