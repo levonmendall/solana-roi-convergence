@@ -8,7 +8,7 @@ from .config import BASELINE, StrategyConfig
 from .execution import ExecutionSimulator
 from .models import IntentKind, PaperPosition, SimulatedFill, TradeIntent, TradeOutcome
 
-PORTFOLIO_CORE_VERSION = "v51-canonical-paper-capital-ledger-127-v2"
+PORTFOLIO_CORE_VERSION = "v51-canonical-paper-capital-ledger-127-v3-native-execution-realism"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 
@@ -127,7 +127,7 @@ class CanonicalPaperCapitalLedger:
     """Single in-memory owner for paper capital and position accounting.
 
     Economic outcomes are attributed to the capital actually committed to the
-    position.  Whole-portfolio NAV is never used as a trade-return denominator.
+    position. Whole-portfolio NAV is never used as a trade-return denominator.
     This object is deliberately paper-only and contains no signing or submission
     capability.
     """
@@ -233,7 +233,6 @@ class PaperPortfolio:
         self.execution = execution or ExecutionSimulator(config)
         self.ledger = CanonicalPaperCapitalLedger(float(config.initial_capital_usd))
         self.initial_capital_usd = self.ledger.initial_capital_usd
-        # Preserve legacy object references while keeping one accounting owner.
         self.positions = self.ledger.positions
         self.closed = self.ledger.closed
 
@@ -262,6 +261,19 @@ class PaperPortfolio:
     ) -> None:
         position = self.positions.get(intent.token_mint)
         if intent.kind in {IntentKind.OPEN_STARTER, IntentKind.OPEN_FULL, IntentKind.ADD_CONFIRMATION}:
+            # Repair 126 migration: exact entry realism is an ordinary dependency,
+            # not a runtime replacement of this method.
+            from .execution_realism import apply_exact_entry_if_available
+
+            if apply_exact_entry_if_available(
+                self,
+                intent,
+                scout_wallet=scout_wallet,
+                reference_price=reference_price,
+                family=family,
+                context=context,
+            ):
+                return
             if position is None:
                 position = PaperPosition(intent.token_mint, scout_wallet, intent.observed_at)
                 self.ledger.register_position(position, family=family, context=context)
