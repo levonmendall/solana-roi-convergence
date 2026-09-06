@@ -11,6 +11,10 @@ from .robinhood_live_getlogs_resilience import (
     install_robinhood_live_getlogs_resilience,
     status as live_getlogs_resilience_status,
 )
+from .robinhood_production_provider_finalizer import (
+    install_robinhood_production_provider_finalizer,
+    status as production_provider_status,
+)
 from .robinhood_sequencer_frontier_repair import (
     install_robinhood_sequencer_frontier,
     status as sequencer_frontier_status,
@@ -36,12 +40,11 @@ from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
 # Capture the already-proven final entry guard before the sequencer transport installs.
-# The sequencer performs its own feed-freshness check before candidate evaluation; the
-# established fresh-head RPC guard remains as a second independent fail-closed check at
-# actual paper entry and preserves all pre-existing tests/semantics.
+# Direct regression calls retain this helper. The actual running production instance
+# is switched to provider/v5.1 event-time authority by the finalizer below.
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v2-provider-finalized"
 _INSTALLED = False
 
 
@@ -138,13 +141,20 @@ def install_v51_production_authority(
     install_v51_robinhood_consolidation()
     install_v51_robinhood_candidate_coverage(RobinhoodChainPaperPlane)
 
-    # Final transport layer: stream the official public sequencer head continuously
-    # and acquire only exact-current-block relevant logs. The feed freshness check is
-    # additive; restore the established RPC fresh-head guard as the entry-time check.
+    # PR195 sequencer remains a research/compatibility substrate. It is installed
+    # first so the provider finalizer wraps the true final run/status graph. Direct
+    # tests keep the established fresh-head helper; only a real running instance is
+    # switched to provider/v5.1 event-time authority.
     install_robinhood_sequencer_frontier(RobinhoodChainPaperPlane)
     robinhood_frontier._fresh_head_ready = _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY  # type: ignore[assignment]
-    # The sequencer run loop remains forward-only by construction. Preserve the prior
-    # semantic marker relied on by compatibility/architecture tests and telemetry.
+    install_robinhood_production_provider_finalizer(
+        RobinhoodChainPaperPlane,
+        legacy_fresh_ready=_ORIGINAL_ROBINHOOD_FRESH_HEAD_READY,
+    )
+
+    # Preserve historical architecture markers while making the provider wrapper the
+    # final runtime implementation. No signer, transaction submission, or live-money
+    # authority is introduced.
     setattr(RobinhoodChainPaperPlane.run, "_roi_robinhood_forward_only_run", True)
 
     install_isolated_robinhood_proof_cache(module)
@@ -177,6 +187,7 @@ def install_v51_production_authority(
     app.state.roi_robinhood_live_getlogs_resilience = True
     app.state.roi_robinhood_decision_tail = True
     app.state.roi_robinhood_sequencer_frontier = True
+    app.state.roi_robinhood_production_provider_finalizer = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -193,7 +204,8 @@ def status() -> dict[str, Any]:
         "robinhood_live_getlogs_resilience": live_getlogs_resilience_status(),
         "robinhood_decision_tail": decision_tail_status(),
         "robinhood_sequencer_frontier": sequencer_frontier_status(),
-        "robinhood_entry_freshness_checks": "sequencer_feed_then_existing_rpc_fresh_head_guard",
+        "robinhood_production_provider": production_provider_status(),
+        "robinhood_entry_freshness_checks": "running_worker_provider_v51_event_time; direct_test_calls_legacy_helper",
         "robinhood_proof_refresh": "separate_sqlite_connection_threadpool_not_live_frontier",
         "empty_epoch_forward_slo": empty_epoch_slo_status(),
         "measurement_integrity": measurement_status(),
