@@ -14,26 +14,30 @@ from .observation_store import ObservationEventStore
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
 
-REPAIR_VERSION = "robinhood-dedicated-worker-isolation-v1"
+REPAIR_VERSION = "robinhood-dedicated-worker-isolation-v2-proof-offload"
 STATUS_PUBLISH_SECONDS = 1.0
 STATUS_STALE_SECONDS = 5.0
+PROOF_PUBLISH_SECONDS = 5.0
 THREAD_JOIN_TIMEOUT_SECONDS = 3.0
 THREAD_NAME = "robinhood-chain-paper-isolated"
 
 _STATUS_LOCK = threading.Lock()
 _STATUS_SNAPSHOT: dict[str, Any] | None = None
 _STATUS_PUBLISHED_MONOTONIC: float | None = None
+_PROOF_LOCK = threading.Lock()
+_PROOF_SNAPSHOT: dict[str, Any] | None = None
+_PROOF_PUBLISHED_MONOTONIC: float | None = None
 _WORKER_THREAD: threading.Thread | None = None
 _WORKER_STOP: threading.Event | None = None
+_BASE_STATUS: Callable[[], dict[str, Any]] | None = None
+# Kept for compatibility with the later v5.1 installer. It may wrap this reference,
+# but the latency-critical publisher intentionally never calls it after installation.
 _ORIGINAL_STATUS: Callable[[], dict[str, Any]] | None = None
 _INSTALLED = False
 
 
 def _runtime_install_module() -> Any:
-    # Imported lazily because this repair is intentionally installed only after
-    # robinhood_runtime_install has finished defining its worker and status hooks.
     from . import robinhood_runtime_install as module
-
     return module
 
 
@@ -55,6 +59,9 @@ def _dedicated_store_path(canonical_store: Any) -> Path:
 
 def _worker_isolation_metadata(*, store_path: str | None = None) -> dict[str, Any]:
     thread = _WORKER_THREAD
+    with _PROOF_LOCK:
+        proof_at = _PROOF_PUBLISHED_MONOTONIC
+    proof_age = max(0.0, time.monotonic() - proof_at) if proof_at is not None else None
     return {
         "repair_version": REPAIR_VERSION,
         "worker_topology": "dedicated_os_thread_with_private_asyncio_loop",
@@ -65,9 +72,13 @@ def _worker_isolation_metadata(*, store_path: str | None = None) -> dict[str, An
         "canonical_store_shared_for_robinhood_writes": False,
         "canonical_store_used_only_for_one_time_cursor_seed": True,
         "status_served_from_nonblocking_cache": True,
+        "fast_status_uses_base_status_only": True,
+        "proof_refresh_uses_separate_sqlite_connection": True,
+        "proof_refresh_runs_in_worker_threadpool": True,
+        "proof_publish_seconds": PROOF_PUBLISH_SECONDS,
+        "proof_cache_age_seconds": proof_age,
+        "proof_blocks_live_frontier": False,
         "uvicorn_event_loop_runs_robinhood_chain_worker": False,
-        "catchup_batch_limit_changed": False,
-        "catchup_poll_cadence_changed": False,
         "paper_decision_gate_changed": False,
         "strategy_thresholds_changed": False,
         "paper_only": True,
@@ -77,9 +88,24 @@ def _worker_isolation_metadata(*, store_path: str | None = None) -> dict[str, An
     }
 
 
+def _current_proof_snapshot() -> dict[str, Any] | None:
+    with _PROOF_LOCK:
+        return copy.deepcopy(_PROOF_SNAPSHOT)
+
+
+def _publish_proof_snapshot(payload: dict[str, Any]) -> None:
+    global _PROOF_SNAPSHOT, _PROOF_PUBLISHED_MONOTONIC
+    with _PROOF_LOCK:
+        _PROOF_SNAPSHOT = copy.deepcopy(payload)
+        _PROOF_PUBLISHED_MONOTONIC = time.monotonic()
+
+
 def _publish_snapshot(payload: dict[str, Any], *, store_path: str | None) -> None:
     global _STATUS_SNAPSHOT, _STATUS_PUBLISHED_MONOTONIC
     published = copy.deepcopy(payload)
+    proof = _current_proof_snapshot()
+    if proof is not None:
+        published["v51_proof"] = proof
     published["worker_isolation"] = _worker_isolation_metadata(store_path=store_path)
     with _STATUS_LOCK:
         _STATUS_SNAPSHOT = published
@@ -110,8 +136,7 @@ def _failed_closed_payload(error: str, *, store_path: str | None = None) -> dict
 
 
 def _nonblocking_status() -> dict[str, Any]:
-    """Return Robinhood telemetry without ever waiting on its SQLite/thread locks."""
-
+    """Return Robinhood telemetry without ever waiting on its live SQLite connection."""
     module = _runtime_install_module()
     with _STATUS_LOCK:
         snapshot = copy.deepcopy(_STATUS_SNAPSHOT)
@@ -122,6 +147,9 @@ def _nonblocking_status() -> dict[str, Any]:
             getattr(module, "_STARTUP_ERROR", None) or "isolated_robinhood_worker_not_ready"
         )
 
+    proof = _current_proof_snapshot()
+    if proof is not None:
+        snapshot["v51_proof"] = proof
     age = max(0.0, time.monotonic() - published_at) if published_at is not None else None
     isolation = snapshot.setdefault("worker_isolation", {})
     if isinstance(isolation, dict):
@@ -151,8 +179,6 @@ def _nonblocking_status() -> dict[str, Any]:
 
 
 def _seed_cursor_from_canonical(plane: Any, canonical_store: Any) -> int | None:
-    """Carry forward only the durable processed-block cursor into the private store."""
-
     if getattr(plane, "_cursor", None) is not None:
         return int(plane._cursor)
     try:
@@ -169,16 +195,65 @@ def _seed_cursor_from_canonical(plane: Any, canonical_store: Any) -> int | None:
     return value
 
 
+def _refresh_proof_on_separate_connection(
+    store_path: str,
+    *,
+    store_factory: Callable[..., Any] = ObservationEventStore,
+) -> dict[str, Any]:
+    """Build v5.1 proof on a separate WAL reader/writer connection, never the live lock."""
+    proof_store: Any | None = None
+    try:
+        from .v51_consolidated_strategy import install_v51_consolidated_strategy
+        from .v51_robinhood_consolidation import refresh_robinhood_candidate_learning
+        from .v51_robinhood_proof import cached_robinhood_proof
+
+        proof_store = store_factory(store_path)
+        release = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GITHUB_SHA") or "local"
+        install_v51_consolidated_strategy(store=proof_store, release_commit=release)
+        refresh_robinhood_candidate_learning(proof_store)
+        proof = cached_robinhood_proof(proof_store, max_age_seconds=0.0)
+        proof["available"] = True
+        proof["proof_refresh_topology"] = "separate_sqlite_connection_in_threadpool"
+        proof["live_frontier_blocked_by_proof_refresh"] = False
+        return proof
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": "isolated_robinhood_proof_failed_closed",
+            "error_type": type(exc).__name__,
+            "proof_refresh_topology": "separate_sqlite_connection_in_threadpool",
+            "live_frontier_blocked_by_proof_refresh": False,
+            "paper_only": True,
+            "live_money_authority": False,
+        }
+    finally:
+        if proof_store is not None:
+            with suppress(Exception):
+                proof_store.close()
+
+
 async def _status_publisher(local_stop: asyncio.Event, *, store_path: str) -> None:
+    """Publish only cheap live status on the latency-critical Robinhood event loop."""
     while not local_stop.is_set():
         try:
-            if _ORIGINAL_STATUS is not None:
-                _publish_snapshot(_ORIGINAL_STATUS(), store_path=store_path)
+            if _BASE_STATUS is not None:
+                _publish_snapshot(_BASE_STATUS(), store_path=store_path)
         except Exception as exc:
             module = _runtime_install_module()
             module._STARTUP_ERROR = f"{type(exc).__name__}: Robinhood status snapshot failed"
         try:
             await asyncio.wait_for(local_stop.wait(), timeout=STATUS_PUBLISH_SECONDS)
+        except TimeoutError:
+            pass
+
+
+async def _proof_publisher(local_stop: asyncio.Event, *, store_path: str) -> None:
+    """Refresh economic/counterfactual proof without occupying the live event loop."""
+    while not local_stop.is_set():
+        proof = await asyncio.to_thread(_refresh_proof_on_separate_connection, store_path)
+        _publish_proof_snapshot(proof)
+        try:
+            await asyncio.wait_for(local_stop.wait(), timeout=PROOF_PUBLISH_SECONDS)
         except TimeoutError:
             pass
 
@@ -200,8 +275,7 @@ async def _worker_async(
     dedicated_store: Any | None = None
     plane: Any | None = None
     local_stop = asyncio.Event()
-    bridge_task: asyncio.Task[None] | None = None
-    publisher_task: asyncio.Task[None] | None = None
+    tasks: list[asyncio.Task[Any]] = []
     store_path: Path | None = None
     try:
         store_path = _dedicated_store_path(canonical_store)
@@ -216,32 +290,38 @@ async def _worker_async(
                 "worker_isolation": "dedicated_os_thread_with_private_asyncio_loop",
                 "dedicated_store": str(store_path),
                 "cursor_seeded_from_canonical": seeded_cursor,
+                "proof_refresh_topology": "separate_sqlite_connection_in_threadpool",
             }
         )
-        if _ORIGINAL_STATUS is not None:
-            _publish_snapshot(_ORIGINAL_STATUS(), store_path=str(store_path))
+        if _BASE_STATUS is not None:
+            _publish_snapshot(_BASE_STATUS(), store_path=str(store_path))
         if not plane.enabled:
             return
 
-        bridge_task = asyncio.create_task(
-            _thread_stop_bridge(thread_stop, local_stop), name="robinhood-thread-stop-bridge"
-        )
-        publisher_task = asyncio.create_task(
-            _status_publisher(local_stop, store_path=str(store_path)),
-            name="robinhood-thread-status-publisher",
-        )
+        tasks = [
+            asyncio.create_task(
+                _thread_stop_bridge(thread_stop, local_stop), name="robinhood-thread-stop-bridge"
+            ),
+            asyncio.create_task(
+                _status_publisher(local_stop, store_path=str(store_path)),
+                name="robinhood-thread-status-publisher",
+            ),
+            asyncio.create_task(
+                _proof_publisher(local_stop, store_path=str(store_path)),
+                name="robinhood-thread-proof-publisher",
+            ),
+        ]
         await plane.run(local_stop)
         if not local_stop.is_set() and not thread_stop.is_set():
             raise RuntimeError("Robinhood isolated worker returned unexpectedly")
     finally:
         local_stop.set()
-        for task in (bridge_task, publisher_task):
-            if task is not None and not task.done():
+        for task in tasks:
+            if not task.done():
                 task.cancel()
-        for task in (bridge_task, publisher_task):
-            if task is not None:
-                with suppress(asyncio.CancelledError, Exception):
-                    await task
+        for task in tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await task
         if plane is not None:
             with suppress(Exception):
                 await plane.close()
@@ -305,8 +385,6 @@ def _start_worker_thread(
 
 
 async def _isolated_runtime_workers(runtime: Any, stop: asyncio.Event) -> None:
-    """Keep Robinhood completely off the Uvicorn loop and canonical SQLite file."""
-
     module = _runtime_install_module()
     original_workers = getattr(module, "_ORIGINAL_RUNTIME_WORKERS", None)
     if original_workers is None:
@@ -337,10 +415,11 @@ setattr(_nonblocking_status, "_roi_robinhood_dedicated_worker_isolation", True)
 
 
 def install_robinhood_worker_isolation_repair() -> None:
-    global _ORIGINAL_STATUS, _INSTALLED
+    global _BASE_STATUS, _ORIGINAL_STATUS, _INSTALLED
     if _INSTALLED:
         return
     module = _runtime_install_module()
+    _BASE_STATUS = module._status
     _ORIGINAL_STATUS = module._status
     module._runtime_workers_with_robinhood = _isolated_runtime_workers
     module._status = _nonblocking_status
@@ -348,21 +427,20 @@ def install_robinhood_worker_isolation_repair() -> None:
         {
             "worker_isolation_repair": REPAIR_VERSION,
             "worker_isolation": "dedicated_os_thread_with_private_asyncio_loop",
+            "proof_refresh_offloaded": True,
         }
     )
     _INSTALLED = True
 
 
-# Final v5.1 economic/proof authority is now composed explicitly at the end of
-# solana_roi.production after Robinhood transport installation. Worker isolation is
-# transport-only and no longer imports or invokes an economic/proof composition hook.
-
 __all__ = [
+    "PROOF_PUBLISH_SECONDS",
     "REPAIR_VERSION",
     "STATUS_STALE_SECONDS",
     "THREAD_JOIN_TIMEOUT_SECONDS",
     "_dedicated_store_path",
     "_nonblocking_status",
+    "_refresh_proof_on_separate_connection",
     "_seed_cursor_from_canonical",
     "_start_worker_thread",
     "install_robinhood_worker_isolation_repair",
