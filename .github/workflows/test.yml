@@ -84,20 +84,26 @@ jobs:
         run: python -m pytest tests/test_wallet_entity_universe_v4.py
       - name: Existing regressions
         run: |
-          # These modules validate native/component contracts and must run before
-          # production composition replaces compatibility surfaces. They are not
-          # skipped; they run as a separate native regression partition.
-          python -m pytest \
-            tests/test_candidate_risk_window_repair.py \
-            tests/test_continuity_storage_capacity_repair.py \
-            tests/test_fomo_continuation_shadow.py \
-            tests/test_fomo_feature_boundaries.py \
-            tests/test_fomo_risk_conditioned_v5.py \
-            tests/test_live_poll_redundancy.py \
-            tests/test_observation.py \
-            tests/test_poll_watermark_repair.py \
-            tests/test_prospective_observation.py \
-            --junitxml=existing-regressions-native.xml
+          # Component compatibility modules are mutation-heavy by historical design.
+          # Run each native contract in its own interpreter so collection of one
+          # module cannot replace another module's functions before its tests run.
+          python - <<'PY'
+          import pytest
+          from solana_roi import candidate_risk_window_repair as compatibility
+          compatibility.install_candidate_risk_window_repair()
+          raise SystemExit(pytest.main([
+              "tests/test_candidate_risk_window_repair.py",
+              "--junitxml=existing-regressions-native-candidate-risk.xml",
+          ]))
+          PY
+          python -m pytest tests/test_continuity_storage_capacity_repair.py --junitxml=existing-regressions-native-continuity-storage.xml
+          python -m pytest tests/test_fomo_continuation_shadow.py --junitxml=existing-regressions-native-fomo-shadow.xml
+          python -m pytest tests/test_fomo_feature_boundaries.py --junitxml=existing-regressions-native-fomo-boundaries.xml
+          python -m pytest tests/test_fomo_risk_conditioned_v5.py --junitxml=existing-regressions-native-fomo-v5.xml
+          python -m pytest tests/test_live_poll_redundancy.py --junitxml=existing-regressions-native-live-poll.xml
+          python -m pytest tests/test_observation.py --junitxml=existing-regressions-native-observation.xml
+          python -m pytest tests/test_poll_watermark_repair.py --junitxml=existing-regressions-native-poll-watermark.xml
+          python -m pytest tests/test_prospective_observation.py --junitxml=existing-regressions-native-prospective.xml
           python - <<'PY'
           import pytest
           import solana_roi.production  # explicit Phase-18 production composition
