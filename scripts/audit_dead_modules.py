@@ -110,14 +110,24 @@ def imports_from(path: Path, module: str, modules: set[str]) -> set[str]:
     return found
 
 
-def test_imports(modules: set[str]) -> set[str]:
-    found: set[str] = set()
+def _test_sources() -> list[tuple[Path, str]]:
+    sources: list[tuple[Path, str]] = []
     if not TEST_ROOT.exists():
-        return found
+        return sources
     for path in TEST_ROOT.rglob("*.py"):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (OSError, SyntaxError):
+            sources.append((path, path.read_text(encoding="utf-8")))
+        except OSError:
+            continue
+    return sources
+
+
+def test_imports(modules: set[str], sources: list[tuple[Path, str]]) -> set[str]:
+    found: set[str] = set()
+    for path, text in sources:
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError:
             continue
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -132,6 +142,29 @@ def test_imports(modules: set[str]) -> set[str]:
                         if alias.name != "*":
                             _add_existing_prefix(f"{base}.{alias.name}", modules, found)
     return found
+
+
+def test_file_references(
+    module_paths: dict[str, Path],
+    sources: list[tuple[Path, str]],
+) -> set[str]:
+    """Find source files deliberately consumed as file-level test evidence.
+
+    Some architecture audits inspect a source file's text/absence rather than import
+    it. Those files are repository test fixtures even if they are not runtime modules,
+    so an import-only dead-code scanner must not call them unreferenced. A basename
+    mention is counted only in a test that performs a file-level assertion/read.
+    """
+
+    referenced: set[str] = set()
+    file_access_markers = ("read_text", "read_bytes", ".exists()", "is_file()")
+    for module, path in module_paths.items():
+        basename = path.name
+        for _test_path, text in sources:
+            if basename in text and any(marker in text for marker in file_access_markers):
+                referenced.add(module)
+                break
+    return referenced
 
 
 def has_main_guard(path: Path) -> bool:
@@ -154,9 +187,14 @@ def inventory() -> dict[str, object]:
         for target in targets:
             inbound[target].add(module)
 
-    tests = test_imports(modules)
-    for target in tests:
-        inbound[target].add("<tests>")
+    sources = _test_sources()
+    imported_by_tests = test_imports(modules, sources)
+    for target in imported_by_tests:
+        inbound[target].add("<tests:import>")
+
+    file_referenced_by_tests = test_file_references(module_paths, sources)
+    for target in file_referenced_by_tests:
+        inbound[target].add("<tests:file-reference>")
 
     external_roots = set(EXTERNAL_ROOTS)
     external_roots.update(module for module, path in module_paths.items() if has_main_guard(path))
@@ -189,6 +227,7 @@ def inventory() -> dict[str, object]:
     return {
         "module_count": len(modules),
         "external_roots": sorted(external_roots),
+        "test_file_reference_modules": sorted(file_referenced_by_tests),
         "orphan_modules": orphan_modules,
         "orphan_count": len(orphan_modules),
         "source_unreachable_from_application_roots": source_unreachable,
