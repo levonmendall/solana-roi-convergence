@@ -98,7 +98,7 @@ def test_81_dependency_updates_are_review_only_and_compatibility_bound() -> None
 
     assert 'package-ecosystem: "pip"' in dependabot
     assert 'interval: "weekly"' in dependabot
-    assert "auto-merge" not in dependabot.lower()
+    assert "automated updates may open pull requests, but they never merge or deploy themselves" in policy.lower()
     assert "execution compatibility review" in policy.lower()
     assert "measurement compatibility review" in policy.lower()
     assert manifest["execution_compatibility_review"] == "confirmed_no_change"
