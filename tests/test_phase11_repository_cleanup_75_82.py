@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
+import tomllib
 from pathlib import Path
 
 from solana_roi.dependency_integrity import dependency_integrity_status
@@ -89,6 +91,33 @@ def test_80_lock_hash_is_recorded_and_deployment_preflight_reports_it() -> None:
     assert preflight["dependency_integrity"]["requirements_lock_sha256"] == lock_hash
     lock_check = next(row for row in preflight["checks"] if row["name"] == "deterministic_dependency_lock")
     assert lock_check["ok"] is True
+
+
+def test_80_declared_runtime_dependencies_equal_lock_and_installed_versions() -> None:
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = pyproject["project"]["dependencies"]
+    declared_pins: dict[str, str] = {}
+    for requirement in declared:
+        assert "==" in requirement, f"runtime dependency must be exact-pinned: {requirement}"
+        name, version = requirement.split("==", 1)
+        declared_pins[name.strip().lower()] = version.strip()
+
+    lock_pins: dict[str, str] = {}
+    for line in (ROOT / "requirements.lock").read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "==" not in line:
+            continue
+        name, version = line.split("==", 1)
+        lock_pins[name.strip().lower()] = version.strip()
+
+    for name, version in declared_pins.items():
+        assert lock_pins.get(name) == version, f"{name}: pyproject={version}, lock={lock_pins.get(name)}"
+        assert importlib.metadata.version(name) == version, (
+            f"{name}: CI installed {importlib.metadata.version(name)}, expected locked {version}"
+        )
+
+    assert declared_pins["websockets"] == "17.1"
+    assert importlib.metadata.version("websockets") == "17.1"
 
 
 def test_81_dependency_updates_are_review_only_and_compatibility_bound() -> None:
