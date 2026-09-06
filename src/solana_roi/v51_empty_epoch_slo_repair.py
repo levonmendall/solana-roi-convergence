@@ -45,8 +45,12 @@ def install_empty_epoch_slo_repair() -> None:
     # economics, the 20-second hard maximum, certification gates, or paper-only
     # authority.
     from .e2e_production_hardening_repair import install_e2e_production_hardening
+    from .e2e_production_hardening_followup import (
+        install_e2e_production_hardening_followup,
+    )
 
     install_e2e_production_hardening()
+    install_e2e_production_hardening_followup()
     _INSTALLED = True
 
 
