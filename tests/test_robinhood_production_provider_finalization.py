@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from solana_roi import robinhood_chain_runtime as runtime
+from solana_roi import robinhood_getlogs_provider_guard as getlogs_guard
 from solana_roi import robinhood_production_provider_finalizer as finalizer
 from solana_roi import robinhood_production_ws_transport as transport
 from solana_roi import v51_production_authority
@@ -49,6 +50,19 @@ def test_provider_finalizer_is_installed_after_sequencer_in_v51_authority() -> N
     assert sequencer < provider
     assert "legacy_fresh_ready=_ORIGINAL_ROBINHOOD_FRESH_HEAD_READY" in source
     assert "roi_robinhood_production_provider_finalizer" in source
+
+
+def test_provider_finalizer_installs_getlogs_guard_before_provider_transports() -> None:
+    source = Path(finalizer.__file__).read_text(encoding="utf-8")
+    guard_install = source.index("install_robinhood_getlogs_provider_guard()")
+    budget_install = source.index("install_robinhood_provider_budget_transport()")
+    assert guard_install < budget_install
+    proof = getlogs_guard.status()
+    assert proof["alchemy_detected_max_blocks"] == 10
+    assert proof["prevents_oversized_provider_requests"] is True
+    assert proof["changes_strategy_thresholds"] is False
+    assert proof["paper_only"] is True
+    assert proof["live_money_authority"] is False
 
 
 def test_running_worker_enforcement_is_instance_scoped() -> None:
