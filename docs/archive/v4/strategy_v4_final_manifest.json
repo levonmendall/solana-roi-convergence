@@ -22,6 +22,16 @@
   "wallet_entity_universe": {
     "model": "large_observation_universe_to_token_specific_economic_entities_to_role_specific_alpha_to_dynamic_high_priority_set",
     "named_seeds_are_hypotheses_not_whitelist": true,
+    "seed_addresses": {
+      "Jijo": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+      "trunoest": "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT",
+      "decu": "4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9",
+      "Wugi": "862TYSvRYoiHAK3F3WwTRYAfuGiQaGdxedN9AGvRGWo2",
+      "The Doc": "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt",
+      "Theo": "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt",
+      "Schoen": "5hAgYC8TJCcEZV7LTXAzkTrm7YL29YXyQQJPCNrG84zM",
+      "Cented": "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o"
+    },
     "role_scores": [
       "scout_alpha",
       "creator_alpha",
