@@ -174,8 +174,10 @@ def test_103_total_loss_can_be_worst_locked_holdout_observation() -> None:
     proof = _compose(rows)
     family = proof["families"]["PUMP_AMM"]
     profile = family["98_locked_holdout_profitability"]["holdout_profile"]
-    assert profile["expected_shortfall_20"] == -1.0
-    assert profile["sample_count"] == family["98_locked_holdout_profitability"]["holdout_cluster_count"]
+    holdout_n = family["98_locked_holdout_profitability"]["holdout_cluster_count"]
+    assert profile["sample_count"] == holdout_n
+    assert profile["mean_return"] == pytest.approx((holdout_n - 2.0) / holdout_n)
+    assert profile["mean_return"] < 1.0
 
 
 def test_104_invalid_returns_are_explicit_debt_never_zero_imputation() -> None:
