@@ -62,6 +62,8 @@ jobs:
           python -m pytest tests/test_v51_phase13_91_completion.py
       - name: Phase 14 final profitability proof 95-102
         run: python -m pytest tests/test_v51_phase14_95_102.py
+      - name: Phase 15 statistical correctness 103-108
+        run: python -m pytest tests/test_v51_repairs_103_108.py tests/test_v51_repairs_103_108_compatibility.py
       - name: No live-money authority regression
         run: python -m pytest tests/test_v51_phase12_13_83_94.py -k 'preserve_frozen_paper_only_authority'
       - name: Launched production HTTP smoke
