@@ -1,4 +1,4 @@
-# Exact Python 3.11 dependency set proven by the canonical GitHub Actions runner on 2026-09-05.
+# Exact Python 3.11 dependency set proven by the canonical GitHub Actions runner on 2026-09-06.
 # Regenerate deliberately; do not silently widen versions in production CI.
 annotated-doc==0.0.5
 annotated-types==0.8.0
@@ -21,4 +21,4 @@ starlette==1.6.0
 typing-extensions==4.16.0
 typing-inspection==0.4.4
 uvicorn==0.52.4
-websockets==15.0.1
+websockets==17.1
