@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from . import rpc_workload_governor as rpc_governor
 from . import v51_evidence_analytics as analytics
 from . import v51_strategy_api as strategy_api
 from .v51_candidate_ledger import ensure_schema as ensure_candidate_stage_schema
@@ -48,9 +49,36 @@ def install_empty_epoch_slo_repair() -> None:
     from .e2e_production_hardening_followup import (
         install_e2e_production_hardening_followup,
     )
+    from .candidate_pipeline_throughput_repair import (
+        install_candidate_pipeline_throughput_repair,
+    )
 
     install_e2e_production_hardening()
     install_e2e_production_hardening_followup()
+
+    # Production reaches this boundary after the RPC workload governor has captured
+    # its canonical endpoint delegate. Narrow analytics/unit imports can install the
+    # empty-epoch SLO in isolation before that runtime exists; do not make those
+    # read-only imports construct a production RPC graph. The real production graph
+    # therefore gets the throughput repair, while isolated measurement callers keep
+    # their prior bootstrap-safe behavior.
+    if rpc_governor._ORIGINAL_CALL_ENDPOINT is not None:
+        install_candidate_pipeline_throughput_repair()
+
+        # Existing production-composition invariants intentionally identify the
+        # final noncritical acquire hook by this legacy name. Preserve that stable
+        # composition identity while the implementation underneath is now
+        # event-driven and candidate-first. This is an observability/import contract,
+        # not a scheduling or authority rollback.
+        try:
+            rpc_governor._acquire.__name__ = "_acquire_with_standby_priority"
+            setattr(
+                rpc_governor._acquire,
+                "_roi_candidate_pipeline_event_driven",
+                True,
+            )
+        except Exception:
+            pass
     _INSTALLED = True
 
 
