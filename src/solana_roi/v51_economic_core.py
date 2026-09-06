@@ -67,6 +67,8 @@ def robust_profile(values: Iterable[float], *, max_fraction: float = 0.20) -> di
             "mean_return_ci95_upper": None,
             "best_fraction": 0.0,
             "best_expected_log_growth": None,
+            "expected_log_growth_ci95_lower": None,
+            "expected_log_growth_ci95_upper": None,
             "max_drawdown_at_best_fraction": None,
             "compounded_nav_at_best_fraction": 1.0,
         }
@@ -81,6 +83,8 @@ def robust_profile(values: Iterable[float], *, max_fraction: float = 0.20) -> di
         fractions = [max_fraction]
     scored = [(fraction, _expected_log_growth(series, fraction)) for fraction in fractions]
     best_fraction, best_growth = max(scored, key=lambda pair: pair[1] if pair[1] is not None else float("-inf"))
+    log_series = [math.log1p(max(-0.999999, best_fraction * value)) for value in series]
+    growth_ci_lower, growth_ci_upper = _confidence(log_series)
     nav = 1.0
     for value in series:
         nav *= max(1e-9, 1.0 + best_fraction * value)
@@ -102,6 +106,8 @@ def robust_profile(values: Iterable[float], *, max_fraction: float = 0.20) -> di
         "mean_return_ci95_upper": ci_upper,
         "best_fraction": best_fraction,
         "best_expected_log_growth": best_growth,
+        "expected_log_growth_ci95_lower": growth_ci_lower,
+        "expected_log_growth_ci95_upper": growth_ci_upper,
         "max_drawdown_at_best_fraction": _drawdown(series, best_fraction),
         "compounded_nav_at_best_fraction": nav,
     }

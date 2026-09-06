@@ -33,8 +33,9 @@ def test_production_fairness_install_is_idempotent():
     assert second is first
 
 
-def test_render_liveness_uses_constant_time_strategy_route():
+def test_render_liveness_uses_explicit_constant_time_health_route():
     blueprint = Path("render.yaml").read_text()
     assert "startCommand: uvicorn solana_roi.production:app" in blueprint
-    assert "healthCheckPath: /v1/strategy/baseline" in blueprint
-    assert "healthCheckPath: /health" not in blueprint
+    assert "healthCheckPath: /health" in blueprint
+    assert "healthCheckPath: /v1/strategy/baseline" not in blueprint
+    assert "deep readiness is /readiness" in blueprint

@@ -8,11 +8,10 @@ services:
     # v5.1 economic authority is composed at the end of robinhood_runtime_install,
     # after every existing Solana/FOMO/Robinhood compatibility layer is installed.
     startCommand: uvicorn solana_roi.production:app --host 0.0.0.0 --port $PORT
-    # Render liveness must remain constant-time and independent of SQLite,
-    # certification scans, provider state, or the append-only event-chain audit.
-    # Deep readiness remains available under /v1/ingestion/status and the
-    # canonical strategy proof surfaces under /v1/strategy/*.
-    healthCheckPath: /v1/strategy/baseline
+    # Render checks process liveness only. It must never infer trading-research
+    # readiness from provider/SQLite/certification state; deep readiness is /readiness
+    # and the canonical composed evidence surface is /v1/system-proof.
+    healthCheckPath: /health
     autoDeployTrigger: checksPass
     numInstances: 1
     disk:
