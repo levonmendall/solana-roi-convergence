@@ -18,6 +18,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The main-history guard must be able to inspect both parents of a merge
+          # commit. Depth 1 marks HEAD shallow and hides its parents from revision
+          # inspection even though the commit itself is a valid PR merge.
+          fetch-depth: 2
       - name: Main history policy backstop
         if: github.event_name == 'push'
         run: |
