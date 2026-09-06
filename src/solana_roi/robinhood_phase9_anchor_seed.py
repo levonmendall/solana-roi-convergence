@@ -6,6 +6,10 @@ from typing import Any, Awaitable, Callable
 
 from . import robinhood_forward_only_runtime_repair as forward_only
 from . import robinhood_production_ws_transport as production_transport
+# Import the narrow compatibility composer before v51_production_authority imports
+# the Phase-9 installer by name. This preserves the existing dedicated-worker status
+# identity and v1 economic-composition marker while still installing 65-69.
+from . import robinhood_phase9_compatibility as _phase9_compatibility  # noqa: F401
 
 
 ANCHOR_VERSION = "robinhood-phase9-latest-seed-reorg-insurance-v1"
