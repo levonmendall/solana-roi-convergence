@@ -10,6 +10,10 @@ from .robinhood_live_getlogs_resilience import (
     install_robinhood_live_getlogs_resilience,
     status as live_getlogs_resilience_status,
 )
+from .robinhood_sequencer_frontier_repair import (
+    install_robinhood_sequencer_frontier,
+    status as sequencer_frontier_status,
+)
 from .v51_alpha_validation import install_alpha_validation
 from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
@@ -30,15 +34,19 @@ from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_co
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
-# Evidence-validity analytics, release attestation, forward certification, and alpha
-# validation are separate proof planes; frozen v5.1 economic authority is unchanged.
 COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
 _INSTALLED = False
 
 
 def install_isolated_robinhood_proof_cache(module: Any) -> None:
-    """Publish Robinhood proof from its private worker/store into status cache."""
+    """Compatibility hook for proof publication from the isolated Robinhood store."""
     from . import robinhood_worker_isolation_repair as isolation
+
+    # v2 worker isolation publishes proof on a separate SQLite connection/thread.
+    # Do not wrap the fast live-status function with proof SQL again.
+    if getattr(isolation, "PROOF_PUBLISH_SECONDS", None) is not None and getattr(isolation, "_BASE_STATUS", None) is not None:
+        module._STATE["v51_proof_publication"] = "separate_sqlite_connection_threadpool"
+        return
 
     current = isolation._ORIGINAL_STATUS
     if current is None or bool(getattr(current, "_roi_v51_isolated_proof", False)):
@@ -105,6 +113,9 @@ def install_v51_production_authority(
     install_v51_consolidated_strategy()
     install_v51_robinhood_consolidation()
     install_v51_robinhood_candidate_coverage(RobinhoodChainPaperPlane)
+    # Final transport layer: stream the official public sequencer head continuously
+    # and acquire only exact-current-block relevant logs. It changes no economic gate.
+    install_robinhood_sequencer_frontier(RobinhoodChainPaperPlane)
     install_isolated_robinhood_proof_cache(module)
     install_v51_strategy_api(
         app,
@@ -134,6 +145,7 @@ def install_v51_production_authority(
     app.state.roi_v51_alpha_validation_47_58 = True
     app.state.roi_robinhood_live_getlogs_resilience = True
     app.state.roi_robinhood_decision_tail = True
+    app.state.roi_robinhood_sequencer_frontier = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -149,6 +161,8 @@ def status() -> dict[str, Any]:
         "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
         "robinhood_live_getlogs_resilience": live_getlogs_resilience_status(),
         "robinhood_decision_tail": decision_tail_status(),
+        "robinhood_sequencer_frontier": sequencer_frontier_status(),
+        "robinhood_proof_refresh": "separate_sqlite_connection_threadpool_not_live_frontier",
         "empty_epoch_forward_slo": empty_epoch_slo_status(),
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),
