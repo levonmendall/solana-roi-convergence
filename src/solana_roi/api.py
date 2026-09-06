@@ -62,6 +62,33 @@ def _active_strategy_version() -> str:
     return str(BASELINE.version)
 
 
+async def _proof_precompute_loop(app: FastAPI, stop: asyncio.Event) -> None:
+    """Keep the canonical proof cache warm without blocking the Uvicorn loop."""
+    while not stop.is_set():
+        callback = getattr(app.state, "roi_v51_system_proof_precompute", None)
+        if not callable(callback):
+            app.state.roi_v51_system_proof_precompute_state = "not_installed"
+            return
+        try:
+            await asyncio.to_thread(callback)
+            app.state.roi_v51_system_proof_precompute_state = "healthy"
+            app.state.roi_v51_system_proof_precompute_last_completed_at = datetime.now(timezone.utc).isoformat()
+            app.state.roi_v51_system_proof_precompute_last_error_type = None
+        except Exception as exc:
+            # Proof remains fail-closed at the request boundary; a precompute error
+            # must not take down process liveness or the ingestion event loop.
+            app.state.roi_v51_system_proof_precompute_state = "degraded"
+            app.state.roi_v51_system_proof_precompute_last_error_type = type(exc).__name__
+        try:
+            interval = max(1.0, float(getattr(app.state, "roi_v51_system_proof_precompute_seconds", 15.0)))
+        except (TypeError, ValueError):
+            interval = 15.0
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     runtime = ingestion_runtime()
@@ -69,6 +96,8 @@ async def lifespan(app: FastAPI):
     clock_task: asyncio.Task[None] | None = None
     webhook_stop: asyncio.Event | None = None
     webhook_task: asyncio.Task[None] | None = None
+    proof_stop: asyncio.Event | None = None
+    proof_task: asyncio.Task[None] | None = None
     direct_stop = asyncio.Event()
     wallet_stop = asyncio.Event()
     if legacy_webhook_worker_enabled():
@@ -80,7 +109,11 @@ async def lifespan(app: FastAPI):
     if enabled:
         clock_stop = asyncio.Event()
         clock_task = asyncio.create_task(runtime.price_clock.run(clock_stop), name="shadow-price-clock")
+    if callable(getattr(app.state, "roi_v51_system_proof_precompute", None)):
+        proof_stop = asyncio.Event()
+        proof_task = asyncio.create_task(_proof_precompute_loop(app, proof_stop), name="v51-system-proof-precompute")
     app.state.roi_legacy_helius_webhook_worker_enabled = webhook_task is not None
+    app.state.roi_v51_system_proof_precompute_worker_enabled = proof_task is not None
     try:
         yield
     finally:
@@ -90,9 +123,14 @@ async def lifespan(app: FastAPI):
             webhook_stop.set()
         if clock_stop is not None:
             clock_stop.set()
+        if proof_stop is not None:
+            proof_stop.set()
         if clock_task is not None:
             with suppress(asyncio.CancelledError):
                 await clock_task
+        if proof_task is not None:
+            with suppress(asyncio.CancelledError):
+                await proof_task
         with suppress(asyncio.CancelledError):
             await wallet_task
         with suppress(asyncio.CancelledError):
