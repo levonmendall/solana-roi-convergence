@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import httpx
 
+from .candidate_risk_window import refresh_until_entry_ceiling, status as candidate_risk_window_status
 from .engine import PaperTradingEngine
 from .observation_store import ObservationEventStore
 from .risk import TokenRiskIntelligence
@@ -48,12 +49,10 @@ class LatencyCertificationPolicy:
 class TimedRiskCollectors:
     """Collect broad coverage while timing only the frozen scout decision path.
 
-    Program-wide traffic is useful for launch/funding coverage, but it is not a
-    candidate. Recording expensive background collection as candidate latency
-    makes the latency gate measure the wrong path. Production collectors expose
-    refresh_coverage/refresh_candidate, so only historically eligible S/A scout
-    buys are timed. Generic/offline collectors retain their historical full
-    refresh behavior for deterministic regression and replay compatibility.
+    The v5.1 candidate timing contract is owned directly here: five seconds remains
+    the certification/processing target, while complete prospective risk evidence
+    may mature until the unchanged twenty-second executable-entry ceiling. Generic
+    and non-candidate collection retains the historical one-pass behavior.
     """
 
     def __init__(
@@ -83,6 +82,9 @@ class TimedRiskCollectors:
         return bool(profile["historically_eligible"]) and str(profile["tier"]).upper() in {"S", "A"}
 
     async def refresh(self, mint: str, at: datetime, *, current_swap: Any = None) -> None:
+        if await refresh_until_entry_ceiling(self, mint, at, current_swap=current_swap):
+            return
+
         started_at = self.now_fn()
         started_perf = self.perf_fn()
 
@@ -123,7 +125,10 @@ class TimedRiskCollectors:
         )
 
     def status(self) -> dict[str, object]:
-        return self.inner.status()
+        raw = self.inner.status()
+        payload = dict(raw) if isinstance(raw, dict) else {}
+        payload["candidate_risk_window"] = candidate_risk_window_status(self)
+        return payload
 
 
 class LatencyCertificationGate:
