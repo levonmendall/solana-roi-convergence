@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v4"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v5"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -123,7 +123,6 @@ _COMPATIBILITY_ADAPTERS: tuple[CompatibilityAdapter, ...] = (
     _adapter("launch_ws_frontier_timing", "solana_roi.launch_ws_frontier_timing_repair", "install_launch_ws_frontier_timing_repair", "evidence"),
     _adapter("production_boundary_compatibility", "solana_roi.production_boundary_compatibility", "install_production_boundary_compatibility", "evidence"),
     _adapter("funding_provenance", "solana_roi.funding_provenance_repair", "install_funding_provenance_repair", "evidence"),
-    _adapter("execution_realism", "solana_roi.execution_realism", "install_execution_realism", "execution"),
     _adapter("poll_receipt_offloop", "solana_roi.poll_receipt_offloop_repair", "install_poll_receipt_offloop_repair", "ingestion"),
     _adapter("production_capacity", "solana_roi.production_capacity_repair", "install_production_capacity_repair", "ingestion"),
     _adapter("certification_hotpath", "solana_roi.certification_hotpath_repair", "install_certification_hotpath_repair", "certification"),
