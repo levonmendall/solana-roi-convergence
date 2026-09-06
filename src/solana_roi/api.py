@@ -26,6 +26,28 @@ def ingestion_runtime() -> IngestionRuntime:
     return build_runtime()
 
 
+def _env_true(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def legacy_webhook_worker_enabled() -> bool:
+    """Run the Helius compatibility consumer only when it is actually needed.
+
+    Direct Solana is the canonical production data plane. Keeping the legacy
+    webhook worker alive with no configured webhook feed adds polling/write work
+    without adding canonical coverage. An explicit override remains available for
+    compatibility deployments; when direct Solana is disabled we retain the old
+    worker by default.
+    """
+    explicit = os.getenv("SOLANA_ROI_LEGACY_WEBHOOK_WORKER_ENABLED")
+    if explicit is not None:
+        return _env_true("SOLANA_ROI_LEGACY_WEBHOOK_WORKER_ENABLED")
+    return not _env_true("SOLANA_ROI_DIRECT_SOLANA_ENABLED", default=True)
+
+
 def _active_strategy_version() -> str:
     """Return the strategy actually composed into the live decision path.
 
@@ -45,22 +67,27 @@ async def lifespan(app: FastAPI):
     runtime = ingestion_runtime()
     clock_stop: asyncio.Event | None = None
     clock_task: asyncio.Task[None] | None = None
-    webhook_stop = asyncio.Event()
+    webhook_stop: asyncio.Event | None = None
+    webhook_task: asyncio.Task[None] | None = None
     direct_stop = asyncio.Event()
     wallet_stop = asyncio.Event()
-    webhook_task = asyncio.create_task(runtime.webhook_worker.run(webhook_stop), name="legacy-helius-webhook-worker")
+    if legacy_webhook_worker_enabled():
+        webhook_stop = asyncio.Event()
+        webhook_task = asyncio.create_task(runtime.webhook_worker.run(webhook_stop), name="legacy-helius-webhook-worker")
     direct_task = asyncio.create_task(runtime.direct_ingestion.run(direct_stop), name="direct-solana-ingestion")
     wallet_task = asyncio.create_task(runtime.wallet_discovery.run(wallet_stop), name="continuous-wallet-discovery")
-    enabled = os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+    enabled = _env_true("SOLANA_ROI_SHADOW_CLOCK_ENABLED")
     if enabled:
         clock_stop = asyncio.Event()
         clock_task = asyncio.create_task(runtime.price_clock.run(clock_stop), name="shadow-price-clock")
+    app.state.roi_legacy_helius_webhook_worker_enabled = webhook_task is not None
     try:
         yield
     finally:
         wallet_stop.set()
         direct_stop.set()
-        webhook_stop.set()
+        if webhook_stop is not None:
+            webhook_stop.set()
         if clock_stop is not None:
             clock_stop.set()
         if clock_task is not None:
@@ -70,8 +97,9 @@ async def lifespan(app: FastAPI):
             await wallet_task
         with suppress(asyncio.CancelledError):
             await direct_task
-        with suppress(asyncio.CancelledError):
-            await webhook_task
+        if webhook_task is not None:
+            with suppress(asyncio.CancelledError):
+                await webhook_task
 
 
 app = FastAPI(title="Solana ROI Convergence", version="0.14.0", lifespan=lifespan)
@@ -188,6 +216,7 @@ def ingestion_status() -> dict[str, object]:
         "data_plane": "direct-solana",
         "direct_solana": runtime.direct_ingestion.status(),
         "webhook_queue": runtime.webhook_queue.status(),
+        "legacy_helius_webhook_worker_enabled": legacy_webhook_worker_enabled(),
         "helius_webhook_bootstrap": _latest_helius_bootstrap(runtime),
         "collectors": runtime.collectors.status(),
         "program_coverage": runtime.coverage_gate.status(),
@@ -198,7 +227,7 @@ def ingestion_status() -> dict[str, object]:
         "wallet_discovery": runtime.wallet_discovery.status(),
         "deployment_preflight": deployment_preflight(),
         "certification_epoch": runtime.certification_epoch.isoformat(),
-        "shadow_price_clock_enabled": os.getenv("SOLANA_ROI_SHADOW_CLOCK_ENABLED", "").strip().lower() in {"1", "true", "yes"},
+        "shadow_price_clock_enabled": _env_true("SOLANA_ROI_SHADOW_CLOCK_ENABLED"),
         "price_clock_drives_paper_engine": runtime.price_clock.drive_paper_engine,
         "evidence_counts": runtime.store.evidence_counts(),
         "event_chain_valid": runtime.store.verify(),
