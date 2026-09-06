@@ -4,7 +4,7 @@ from typing import Any, Callable
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority_fingerprint
 
-HARDENING_VERSION = "v51-measurement-integrity-hardening-v5-single-exit-engine"
+HARDENING_VERSION = "v51-measurement-integrity-hardening-v6-exit-survivability"
 _ORIGINAL_WALLET_RECORD: Callable[..., Any] | None = None
 _INSTALLED = False
 
@@ -138,6 +138,7 @@ def install_measurement_integrity_hardening() -> None:
 
 def status() -> dict[str, Any]:
     from . import v51_exit_execution_integrity as previous_v2
+    from . import v51_exit_survivability_analytics as survivability
     from .v51_exit_execution_terminal_fomo_followup import (
         ACTIVE_EXECUTION_MODEL_EPOCH,
         status as terminal_fomo_exit_status,
@@ -156,6 +157,7 @@ def status() -> dict[str, Any]:
         "previous_v2_exit_engine_installed": bool(previous_v2._INSTALLED),
         "previous_v2_retained_for_audit_only": True,
         "active_terminal_fomo_exit_execution": terminal_fomo_exit_status(),
+        "exit_survivability_analytics": survivability.status(),
         "paper_only": True,
         "live_money_authority": False,
     }
