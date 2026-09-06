@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v10-native-cutover"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v11-explicit-compatibility"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -53,6 +53,11 @@ class ProductionSystem:
             ],
             "compatibility_adapters": [],
             "compatibility_adapter_registry_retired": True,
+            "compatibility_runtime_migration_active": True,
+            "compatibility_runtime_roots": [
+                "solana_roi.legacy_package_runtime_composition",
+                "solana_roi.legacy_production_composition",
+            ],
             "single_production_composition_root": True,
             "package_import_has_runtime_install_side_effects": False,
             "production_entrypoint": "solana_roi.production:app",
@@ -117,14 +122,16 @@ def build_production_system() -> ProductionSystem:
     if _BUILT is not None:
         return _BUILT
 
-    # Import the canonical app/runtime only after package import has remained passive.
-    # Repair 126 deliberately does not activate the retired compatibility registry.
-    from .api import app, ingestion_runtime
-    from .robinhood_runtime_install import install_robinhood_chain_paper_runtime
-    from .v51_production_authority import install_v51_production_authority
+    # Package import stays passive. The exact previously green repair composition is
+    # activated only from this one production root while the remaining installers are
+    # migrated natively into their owner modules. This preserves the proven runtime
+    # behavior without restoring hidden package-import authority.
+    from . import legacy_package_runtime_composition as _legacy_package_runtime_composition
+    from . import legacy_production_composition as _legacy_production_composition
 
-    install_robinhood_chain_paper_runtime(app, ingestion_runtime)
-    install_v51_production_authority(app, ingestion_runtime)
+    _ = _legacy_package_runtime_composition
+    app = _legacy_production_composition.app
+    ingestion_runtime = _legacy_production_composition.ingestion_runtime
 
     components = _required_components()
     missing = [component.name for component in components if component.required and not component.available]
