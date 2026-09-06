@@ -12,16 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 PACKAGE_ROOT = SRC_ROOT / "solana_roi"
 TEST_ROOT = ROOT / "tests"
-
-# Explicit application entrypoints/public surfaces that need not have an inbound
-# Python import to be live. Everything else must be referenced by source/tests or be
-# deliberately added here with a concrete external-entrypoint reason.
-EXTERNAL_ROOTS = {
-    "solana_roi",
-    "solana_roi.production",
-    "solana_roi.api",
-    "solana_roi.cli",
-}
+POLICY_PATH = ROOT / "module_reachability_policy.json"
 
 
 def module_for(path: Path) -> str:
@@ -38,6 +29,13 @@ def source_modules() -> dict[str, Path]:
         for path in PACKAGE_ROOT.rglob("*.py")
         if "__pycache__" not in path.parts
     }
+
+
+def load_policy() -> dict[str, object]:
+    payload = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("module reachability policy must be a JSON object")
+    return payload
 
 
 def _current_package(module: str, path: Path) -> list[str]:
@@ -103,6 +101,15 @@ def imports_from(path: Path, module: str, modules: set[str]) -> set[str]:
                 and isinstance(node.args[0].value, str)
             ):
                 dynamic_name = node.args[0].value
+            elif (
+                module == "solana_roi.production_system"
+                and isinstance(node.func, ast.Name)
+                and node.func.id in {"_adapter", "_component"}
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                dynamic_name = node.args[1].value
             if dynamic_name and (dynamic_name == "solana_roi" or dynamic_name.startswith("solana_roi.")):
                 _add_existing_prefix(dynamic_name, modules, found)
 
@@ -144,18 +151,7 @@ def test_imports(modules: set[str], sources: list[tuple[Path, str]]) -> set[str]
     return found
 
 
-def test_file_references(
-    module_paths: dict[str, Path],
-    sources: list[tuple[Path, str]],
-) -> set[str]:
-    """Find source files deliberately consumed as file-level test evidence.
-
-    Some architecture audits inspect a source file's text/absence rather than import
-    it. Those files are repository test fixtures even if they are not runtime modules,
-    so an import-only dead-code scanner must not call them unreferenced. A basename
-    mention is counted only in a test that performs a file-level assertion/read.
-    """
-
+def test_file_references(module_paths: dict[str, Path], sources: list[tuple[Path, str]]) -> set[str]:
     referenced: set[str] = set()
     file_access_markers = ("read_text", "read_bytes", ".exists()", "is_file()")
     for module, path in module_paths.items():
@@ -175,32 +171,49 @@ def has_main_guard(path: Path) -> bool:
     return '__name__ == "__main__"' in text or "__name__ == '__main__'" in text
 
 
-def inventory() -> dict[str, object]:
-    module_paths = source_modules()
-    modules = set(module_paths)
-    edges: dict[str, set[str]] = {}
-    inbound: dict[str, set[str]] = defaultdict(set)
+def package_import_installer_calls() -> list[str]:
+    path = PACKAGE_ROOT / "__init__.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError):
+        return ["unparseable_package_initializer"]
+    calls: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id.startswith("install_"):
+            calls.append(node.func.id)
+    return sorted(set(calls))
 
-    for module, path in module_paths.items():
-        targets = imports_from(path, module, modules)
-        edges[module] = targets
-        for target in targets:
-            inbound[target].add(module)
 
-    sources = _test_sources()
-    imported_by_tests = test_imports(modules, sources)
-    for target in imported_by_tests:
-        inbound[target].add("<tests:import>")
+def production_root_installer_debt() -> dict[str, list[str]]:
+    """Detect installer activation in the two canonical composition source files."""
+    result: dict[str, list[str]] = {}
+    for module, path in (
+        ("solana_roi.production", PACKAGE_ROOT / "production.py"),
+        ("solana_roi.production_system", PACKAGE_ROOT / "production_system.py"),
+    ):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError):
+            result[module] = ["unparseable"]
+            continue
+        debt: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id.startswith("install_"):
+                debt.add(node.func.id)
+            if isinstance(node.func, ast.Name) and node.func.id == "_adapter":
+                debt.add("compatibility_adapter_registry")
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "activate":
+                debt.add("compatibility_adapter_activation")
+        if debt:
+            result[module] = sorted(debt)
+    return result
 
-    file_referenced_by_tests = test_file_references(module_paths, sources)
-    for target in file_referenced_by_tests:
-        inbound[target].add("<tests:file-reference>")
 
-    external_roots = set(EXTERNAL_ROOTS)
-    external_roots.update(module for module, path in module_paths.items() if has_main_guard(path))
-
+def _reachable_from(root: str, modules: set[str], edges: dict[str, set[str]]) -> set[str]:
     reachable: set[str] = set()
-    queue = deque(sorted(root for root in external_roots if root in modules))
+    queue = deque([root] if root in modules else [])
     while queue:
         current = queue.popleft()
         if current in reachable:
@@ -209,40 +222,114 @@ def inventory() -> dict[str, object]:
         for target in sorted(edges.get(current, ())):
             if target not in reachable:
                 queue.append(target)
+    return reachable
+
+
+def inventory() -> dict[str, object]:
+    policy = load_policy()
+    rules = policy.get("rules") if isinstance(policy.get("rules"), dict) else {}
+    migration_in_progress = bool(rules.get("production_monkeypatch_migration_in_progress", False))
+    module_paths = source_modules()
+    modules = set(module_paths)
+    edges: dict[str, set[str]] = {}
+    inbound_source: dict[str, set[str]] = defaultdict(set)
+
+    for module, path in module_paths.items():
+        targets = imports_from(path, module, modules)
+        edges[module] = targets
+        for target in targets:
+            inbound_source[target].add(module)
+
+    sources = _test_sources()
+    imported_by_tests = test_imports(modules, sources)
+    file_referenced_by_tests = test_file_references(module_paths, sources)
+    test_referenced = imported_by_tests | file_referenced_by_tests
+
+    production_root = str(policy.get("production_root") or "solana_roi.production")
+    production_reachable = _reachable_from(production_root, modules, edges)
+
+    declared_test_only = {str(item) for item in policy.get("test_only", [])}
+    declared_migration_only = {str(item) for item in policy.get("migration_only", [])}
+    unknown_policy_modules = sorted((declared_test_only | declared_migration_only) - modules)
+    classification_overlap = sorted(declared_test_only & declared_migration_only)
+    production_policy_conflicts = sorted(production_reachable & (declared_test_only | declared_migration_only))
+
+    main_guard_modules = sorted(module for module, path in module_paths.items() if has_main_guard(path))
+    test_only_observed = sorted((test_referenced - production_reachable) & declared_test_only)
+    migration_only_observed = sorted(declared_migration_only - production_reachable)
+
+    classified = production_reachable | declared_test_only | declared_migration_only
+    classified.add("solana_roi")
+    unclassified_unreachable = sorted(
+        module
+        for module, path in module_paths.items()
+        if path.name != "__init__.py" and module not in classified
+    )
+    test_referenced_unclassified = sorted((test_referenced - production_reachable) - declared_test_only - declared_migration_only)
 
     orphan_modules = sorted(
         module
         for module, path in module_paths.items()
         if path.name != "__init__.py"
-        and module not in external_roots
-        and not inbound.get(module)
-    )
-    source_unreachable = sorted(
-        module
-        for module, path in module_paths.items()
-        if path.name != "__init__.py"
-        and module not in reachable
+        and module not in production_reachable
+        and not inbound_source.get(module)
+        and module not in declared_test_only
+        and module not in declared_migration_only
     )
 
+    package_installers = package_import_installer_calls()
+    production_installer_debt = production_root_installer_debt()
+
     return {
+        "policy_version": policy.get("policy_version"),
         "module_count": len(modules),
-        "external_roots": sorted(external_roots),
-        "test_file_reference_modules": sorted(file_referenced_by_tests),
+        "production_root": production_root,
+        "production_reachable_modules": sorted(production_reachable),
+        "production_reachable_count": len(production_reachable),
+        "test_only_declared": sorted(declared_test_only),
+        "test_only_observed": test_only_observed,
+        "migration_only_declared": sorted(declared_migration_only),
+        "migration_only_observed": migration_only_observed,
+        "main_guard_modules_without_implicit_production_authority": main_guard_modules,
+        "test_referenced_but_not_production_reachable": sorted(test_referenced - production_reachable),
+        "test_referenced_unclassified": test_referenced_unclassified,
+        "unclassified_unreachable_modules": unclassified_unreachable,
+        "unclassified_unreachable_count": len(unclassified_unreachable),
+        "unknown_policy_modules": unknown_policy_modules,
+        "classification_overlap": classification_overlap,
+        "production_policy_conflicts": production_policy_conflicts,
         "orphan_modules": orphan_modules,
         "orphan_count": len(orphan_modules),
-        "source_unreachable_from_application_roots": source_unreachable,
-        "source_unreachable_count": len(source_unreachable),
+        "package_import_installer_calls": package_installers,
+        "package_import_installer_call_count": len(package_installers),
+        "package_import_is_side_effect_free": len(package_installers) == 0,
+        "production_root_installer_debt": production_installer_debt,
+        "production_root_has_installer_debt": bool(production_installer_debt),
+        "production_monkeypatch_migration_in_progress": migration_in_progress,
+        "tests_grant_production_reachability": False,
+        "unreachable_modules_fail_ci": True,
     }
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Audit solana_roi modules for static dead-code candidates")
-    parser.add_argument("--strict", action="store_true", help="fail when an entirely unreferenced module remains")
+    parser = argparse.ArgumentParser(description="Audit solana_roi production reachability and explicit non-production classifications")
+    parser.add_argument("--strict", action="store_true", help="fail on architecture/reachability ambiguity")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     report = inventory()
     print(json.dumps(report, indent=2, sort_keys=True))
-    if args.strict and int(report["orphan_count"]) > 0:
+    installer_debt_is_blocking = bool(report["production_root_has_installer_debt"]) and not bool(
+        report["production_monkeypatch_migration_in_progress"]
+    )
+    if args.strict and (
+        int(report["unclassified_unreachable_count"]) > 0
+        or int(report["package_import_installer_call_count"]) > 0
+        or installer_debt_is_blocking
+        or bool(report["unknown_policy_modules"])
+        or bool(report["classification_overlap"])
+        or bool(report["production_policy_conflicts"])
+        or bool(report["test_referenced_unclassified"])
+    ):
         return 1
     return 0
 

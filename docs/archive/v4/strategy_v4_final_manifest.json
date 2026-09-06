@@ -1,4 +1,5 @@
 {
+  "_archive_notice": "ARCHIVED: superseded v4 final manifest; no current strategy or production authority.",
   "strategy_version": "roi-convergence-v4.0-profit-first-entity-1",
   "parent_research_version": "roi-convergence-v4.0-profit-first-entity-research-1",
   "objective": "maximize_out_of_sample_compounded_net_return_for_500_usd_paper_portfolio",

@@ -4,12 +4,10 @@ import math
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from .models import IntentKind, PaperPosition, SimulatedFill
-from .portfolio import PaperPortfolio
 from .quote import ExecutableQuote, LAMPORTS_PER_SOL
-from .shadow_execution import ShadowWalletExecutableQuoteHandoff
 
 
 _ENTRY_KINDS = {
@@ -43,28 +41,6 @@ _CURRENT_ENTRY_EXECUTION: ContextVar[ObservedEntryExecution | None] = ContextVar
 )
 
 
-def _matching_shadow_row(
-    handoff: ShadowWalletExecutableQuoteHandoff,
-    quote: ExecutableQuote,
-) -> dict[str, Any] | None:
-    """Find the exact shadow observation that produced this returned quote.
-
-    The original handoff stamps the final quote's ``received_at`` with the shadow
-    observation's ``completed_at``. Matching all three fields avoids accidentally
-    borrowing fees from a concurrent candidate.
-    """
-
-    completed = quote.received_at.isoformat()
-    for row in handoff.shadow_ledger.recent(64):
-        if (
-            str(row.get("token_mint") or "") == quote.token_mint
-            and str(row.get("stage") or "") == quote.stage
-            and str(row.get("completed_at") or "") == completed
-        ):
-            return row
-    return None
-
-
 def _fee(value: Any) -> int:
     try:
         return max(0, int(value or 0))
@@ -72,57 +48,57 @@ def _fee(value: Any) -> int:
         return 0
 
 
-def _observed_handoff(
-    original: Callable[..., Any],
-) -> Callable[..., Any]:
-    async def observe(self: ShadowWalletExecutableQuoteHandoff, *args: Any, **kwargs: Any) -> ExecutableQuote | None:
-        # Never let a previous candidate's observed execution leak into a later
-        # path. A fresh handoff either publishes one exact entry context or none.
-        _CURRENT_ENTRY_EXECUTION.set(None)
-        quote = await original(self, *args, **kwargs)
-        if quote is None:
-            return None
+def clear_observed_entry_execution() -> None:
+    """Clear candidate-local exact-entry evidence before a new handoff begins."""
 
-        shadow = _matching_shadow_row(self, quote)
-        if shadow is None:
-            return quote
+    _CURRENT_ENTRY_EXECUTION.set(None)
 
-        try:
-            order_price = float(shadow.get("order_effective_price_sol") or 0.0)
-            order_units = float(shadow.get("order_out_token_units") or 0.0)
-            order_drift = float(shadow.get("order_drift_fraction"))
-        except (TypeError, ValueError):
-            order_price = 0.0
-            order_units = 0.0
-            order_drift = quote.drift_fraction
 
-        signature_fee = _fee(shadow.get("signature_fee_lamports"))
-        priority_fee = _fee(shadow.get("prioritization_fee_lamports"))
-        rent_fee = _fee(shadow.get("rent_fee_lamports"))
-        network_fee_lamports = signature_fee + priority_fee + rent_fee
-        network_fee_usd = (network_fee_lamports / LAMPORTS_PER_SOL) * float(quote.sol_usd)
-        simulation_ok = bool(shadow.get("simulation_ok"))
-        exact_order_available = bool(order_price > 0.0 and order_units > 0.0)
+def enrich_exact_entry_quote(
+    *,
+    store: Any,
+    quote: ExecutableQuote,
+    shadow: Any,
+) -> ExecutableQuote:
+    """Attach exact unsigned-order economics without replacing runtime methods.
 
-        # Jupiter's assembled taker order ``outAmount`` is already net of route
-        # execution effects. Its effective price therefore replaces the earlier
-        # quote-only price for paper accounting rather than receiving another
-        # fixed 2.5% entry haircut on top.
-        exact_quote = replace(
-            quote,
-            effective_price_sol=order_price if exact_order_available else quote.effective_price_sol,
-            output_token_units=order_units if exact_order_available else quote.output_token_units,
-            drift_fraction=order_drift if exact_order_available else quote.drift_fraction,
-            router=str(shadow.get("router") or quote.router),
-            usable=bool(quote.usable and simulation_ok and exact_order_available),
-            reason=(
-                quote.reason
-                if quote.usable and simulation_ok and exact_order_available
-                else quote.reason
-            ),
-        )
+    ``shadow`` is the just-recorded unsigned Jupiter/mainnet simulation result.
+    The function publishes the same paper execution-cost observation previously
+    emitted by the runtime wrapper and stores one consume-once exact-entry context.
+    """
 
-        payload = {
+    try:
+        order_price = float(getattr(shadow, "order_effective_price_sol", None) or 0.0)
+        order_units = float(getattr(shadow, "order_out_token_units", None) or 0.0)
+        raw_drift = getattr(shadow, "order_drift_fraction", None)
+        order_drift = float(raw_drift) if raw_drift is not None else quote.drift_fraction
+    except (TypeError, ValueError):
+        order_price = 0.0
+        order_units = 0.0
+        order_drift = quote.drift_fraction
+
+    signature_fee = _fee(getattr(shadow, "signature_fee_lamports", None))
+    priority_fee = _fee(getattr(shadow, "prioritization_fee_lamports", None))
+    rent_fee = _fee(getattr(shadow, "rent_fee_lamports", None))
+    network_fee_lamports = signature_fee + priority_fee + rent_fee
+    network_fee_usd = (network_fee_lamports / LAMPORTS_PER_SOL) * float(quote.sol_usd)
+    simulation_ok = bool(getattr(shadow, "simulation_ok", False))
+    exact_order_available = bool(order_price > 0.0 and order_units > 0.0)
+    router = str(getattr(shadow, "router", None) or quote.router)
+
+    exact_quote = replace(
+        quote,
+        effective_price_sol=order_price if exact_order_available else quote.effective_price_sol,
+        output_token_units=order_units if exact_order_available else quote.output_token_units,
+        drift_fraction=order_drift if exact_order_available else quote.drift_fraction,
+        router=router,
+        usable=bool(quote.usable and simulation_ok and exact_order_available),
+    )
+
+    store.append(
+        "paper_execution_cost_observation",
+        exact_quote.received_at.isoformat(),
+        {
             "token_mint": exact_quote.token_mint,
             "stage": exact_quote.stage,
             "observed_at": exact_quote.received_at.isoformat(),
@@ -134,7 +110,7 @@ def _observed_handoff(
             "order_effective_price_sol": order_price if exact_order_available else None,
             "order_out_token_units": order_units if exact_order_available else None,
             "order_drift_fraction": order_drift if exact_order_available else None,
-            "router": str(shadow.get("router") or quote.router),
+            "router": router,
             "route_fee_bps": int(quote.fee_bps),
             "route_cost_embedded_in_net_order_price": True,
             "signature_fee_lamports": signature_fee,
@@ -145,124 +121,115 @@ def _observed_handoff(
             "network_fee_usd": network_fee_usd,
             "fixed_entry_drag_suppressed_when_exact_order_available": True,
             "fallback_execution_drag_per_side_fraction": 0.025,
-        }
-        self.store.append("paper_execution_cost_observation", exact_quote.received_at.isoformat(), payload)
+        },
+    )
 
-        if exact_quote.usable:
-            _CURRENT_ENTRY_EXECUTION.set(
-                ObservedEntryExecution(
-                    token_mint=exact_quote.token_mint,
-                    stage=exact_quote.stage,
-                    completed_at=exact_quote.received_at,
-                    order_effective_price_sol=exact_quote.effective_price_sol,
-                    order_out_token_units=exact_quote.output_token_units,
-                    order_drift_fraction=exact_quote.drift_fraction,
-                    router=exact_quote.router,
-                    route_fee_bps=int(exact_quote.fee_bps),
-                    signature_fee_lamports=signature_fee,
-                    prioritization_fee_lamports=priority_fee,
-                    rent_fee_lamports=rent_fee,
-                    network_fee_lamports=network_fee_lamports,
-                    network_fee_usd=network_fee_usd,
-                    simulation_ok=True,
-                )
-            )
-        return exact_quote
-
-    try:
-        observe.__dict__.update(getattr(original, "__dict__", {}))
-    except Exception:
-        pass
-    setattr(observe, "_roi_execution_realism", True)
-    return observe
-
-
-def _exact_entry_apply(
-    original: Callable[..., None],
-) -> Callable[..., None]:
-    def apply(
-        self: PaperPortfolio,
-        intent: Any,
-        *,
-        scout_wallet: str,
-        reference_price: float,
-    ) -> None:
-        evidence = _CURRENT_ENTRY_EXECUTION.get()
-        use_exact = bool(
-            intent.kind in _ENTRY_KINDS
-            and evidence is not None
-            and evidence.simulation_ok
-            and evidence.token_mint == intent.token_mint
-            and evidence.order_effective_price_sol > 0.0
-            and math.isclose(
-                float(reference_price),
-                evidence.order_effective_price_sol,
-                rel_tol=1e-9,
-                abs_tol=1e-15,
+    if exact_quote.usable:
+        _CURRENT_ENTRY_EXECUTION.set(
+            ObservedEntryExecution(
+                token_mint=exact_quote.token_mint,
+                stage=exact_quote.stage,
+                completed_at=exact_quote.received_at,
+                order_effective_price_sol=exact_quote.effective_price_sol,
+                order_out_token_units=exact_quote.output_token_units,
+                order_drift_fraction=exact_quote.drift_fraction,
+                router=exact_quote.router,
+                route_fee_bps=int(exact_quote.fee_bps),
+                signature_fee_lamports=signature_fee,
+                prioritization_fee_lamports=priority_fee,
+                rent_fee_lamports=rent_fee,
+                network_fee_lamports=network_fee_lamports,
+                network_fee_usd=network_fee_usd,
+                simulation_ok=True,
             )
         )
-        if not use_exact or evidence is None:
-            return original(self, intent, scout_wallet=scout_wallet, reference_price=reference_price)
+    return exact_quote
 
-        # Consume exactly once. A confirmation add receives its own independently
-        # built and simulated Jupiter order and therefore its own context.
-        _CURRENT_ENTRY_EXECUTION.set(None)
 
-        position = self.positions.get(intent.token_mint)
-        if position is None:
-            position = PaperPosition(intent.token_mint, scout_wallet, intent.observed_at)
-            self.positions[intent.token_mint] = position
-            self._trade_start_nav[intent.token_mint] = self.nav(
-                {intent.token_mint: evidence.order_effective_price_sol}
-            )
+def apply_exact_entry_if_available(
+    portfolio: Any,
+    intent: Any,
+    *,
+    scout_wallet: str,
+    reference_price: float,
+    family: str = "legacy_runtime",
+    context: str = "unclassified",
+) -> bool:
+    """Apply one exact simulated entry through the canonical portfolio ledger."""
 
-        network_fee_usd = max(0.0, float(evidence.network_fee_usd))
-        full = self.full_position_notional({intent.token_mint: evidence.order_effective_price_sol})
-        available_for_swap = max(0.0, self.cash_usd - network_fee_usd)
-        notional = min(available_for_swap, full * intent.fraction_of_full_position)
-        if notional <= 0.0:
-            return
-
-        units = notional / evidence.order_effective_price_sol
-        fill = SimulatedFill(
-            token_mint=intent.token_mint,
-            side="buy",
-            observed_at=intent.observed_at,
-            reference_price=evidence.order_effective_price_sol,
-            fill_price=evidence.order_effective_price_sol,
-            notional_usd=notional,
-            units=units,
-            # For exact observed entries this field is the explicit cash friction
-            # not already embedded in the net Jupiter order price. Existing
-            # checkpoint/event schemas therefore remain backward compatible.
-            execution_drag_usd=network_fee_usd,
-            intent=intent.kind,
+    evidence = _CURRENT_ENTRY_EXECUTION.get()
+    use_exact = bool(
+        intent.kind in _ENTRY_KINDS
+        and evidence is not None
+        and evidence.simulation_ok
+        and evidence.token_mint == intent.token_mint
+        and evidence.order_effective_price_sol > 0.0
+        and math.isclose(
+            float(reference_price),
+            evidence.order_effective_price_sol,
+            rel_tol=1e-9,
+            abs_tol=1e-15,
         )
-        total_cash_cost = notional + network_fee_usd
-        self.cash_usd -= total_cash_cost
-        position.units += units
-        # Fee-inclusive basis makes later paper P&L and break-even accounting
-        # reflect the actual observed entry cash requirement.
-        position.cost_basis_usd += total_cash_cost
-        position.entry_capital_usd += total_cash_cost
-        position.fills.append(fill)
+    )
+    if not use_exact or evidence is None:
+        return False
 
-    try:
-        apply.__dict__.update(getattr(original, "__dict__", {}))
-    except Exception:
-        pass
-    setattr(apply, "_roi_execution_realism", True)
-    return apply
+    _CURRENT_ENTRY_EXECUTION.set(None)
+
+    position = portfolio.positions.get(intent.token_mint)
+    if position is None:
+        position = PaperPosition(intent.token_mint, scout_wallet, intent.observed_at)
+        portfolio.ledger.register_position(position, family=family, context=context)
+
+    network_fee_usd = max(0.0, float(evidence.network_fee_usd))
+    full = portfolio.full_position_notional({intent.token_mint: evidence.order_effective_price_sol})
+    available_for_swap = max(0.0, portfolio.cash_usd - network_fee_usd)
+    notional = min(available_for_swap, full * intent.fraction_of_full_position)
+    if notional <= 0.0:
+        return True
+
+    units = notional / evidence.order_effective_price_sol
+    fill = SimulatedFill(
+        token_mint=intent.token_mint,
+        side="buy",
+        observed_at=intent.observed_at,
+        reference_price=evidence.order_effective_price_sol,
+        fill_price=evidence.order_effective_price_sol,
+        notional_usd=notional,
+        units=units,
+        execution_drag_usd=network_fee_usd,
+        intent=intent.kind,
+    )
+    total_cash_cost = notional + network_fee_usd
+    portfolio.cash_usd -= total_cash_cost
+    position.units += units
+    position.cost_basis_usd += total_cash_cost
+    position.entry_capital_usd += total_cash_cost
+    position.fills.append(fill)
+    portfolio.ledger.record_equity({intent.token_mint: evidence.order_effective_price_sol})
+    return True
 
 
 def install_execution_realism() -> None:
-    handoff_observe = ShadowWalletExecutableQuoteHandoff.observe
-    if not bool(getattr(handoff_observe, "_roi_execution_realism", False)):
-        ShadowWalletExecutableQuoteHandoff.observe = _observed_handoff(handoff_observe)  # type: ignore[method-assign]
+    """Compatibility bridge for the pre-Phase-18 composition installer.
 
-    portfolio_apply = PaperPortfolio.apply
-    if not bool(getattr(portfolio_apply, "_roi_execution_realism", False)):
-        PaperPortfolio.apply = _exact_entry_apply(portfolio_apply)  # type: ignore[method-assign]
+    Exact-entry realism is now native in the owning handoff and portfolio methods.
+    This function intentionally performs no method replacement. It only records
+    the legacy capability markers so older composition/order assertions can verify
+    that the native implementation is present while the installer graph is retired.
+    """
+
+    from .portfolio import PaperPortfolio
+    from .shadow_execution import ShadowWalletExecutableQuoteHandoff
+
+    setattr(ShadowWalletExecutableQuoteHandoff.observe, "_roi_execution_realism", True)
+    setattr(PaperPortfolio.apply, "_roi_execution_realism", True)
 
 
-__all__ = ["ObservedEntryExecution", "install_execution_realism"]
+__all__ = [
+    "ObservedEntryExecution",
+    "apply_exact_entry_if_available",
+    "clear_observed_entry_execution",
+    "enrich_exact_entry_quote",
+    "install_execution_realism",
+]

@@ -10,6 +10,7 @@ from typing import Any
 from .activation import CandidateActivationGate, ForwardCohortController
 from .certification_epoch import ensure_release_certification_epoch
 from .collecting_ingestion import CollectingLiveEvidenceIngestionService
+from .config import BASELINE
 from .direct_funding import SolanaRpcFundingCollector
 from .direct_quote import DirectRpcJupiterQuoteClient
 from .direct_risk_collectors import SolanaAuthorityCollector, SolanaDeployerCollector

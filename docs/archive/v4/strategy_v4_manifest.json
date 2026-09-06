@@ -1,4 +1,5 @@
 {
+  "_archive_notice": "ARCHIVED: superseded v4 research manifest; no current strategy or production authority.",
   "strategy_version": "roi-convergence-v4.0-profit-first-entity-research-1",
   "objective": "maximize_expected_compounded_paper_return_after_costs",
   "activation_mode": "new_governed_forward_cohort",

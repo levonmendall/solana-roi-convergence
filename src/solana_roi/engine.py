@@ -17,6 +17,11 @@ class PaperTradingEngine:
         self.config = config
         self.strategy = strategy or RoiConvergenceStrategy(config)
         self.portfolio = portfolio or PaperPortfolio(config)
+        # Checkpoint v1 persists this field.  The canonical capital ledger no longer
+        # uses whole-NAV trade attribution, but retaining the map keeps old durable
+        # checkpoints readable without giving it economic authority.
+        if not hasattr(self.portfolio, "_trade_start_nav"):
+            self.portfolio._trade_start_nav = {}
         self.store = store
         self.marks: dict[str, float] = {}
 

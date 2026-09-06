@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -12,7 +13,7 @@ from . import scout_candidate_continuity_repair as scout
 from .direct_solana import DirectSolanaIngestionPlane
 
 
-REPAIR_VERSION = "post183-production-proof-wiring-v1"
+REPAIR_VERSION = "post183-production-proof-wiring-v2-cooperative-yield"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -38,18 +39,8 @@ def _normalizer_with_current_context_probe(
     wallet: str,
     source_hint: str | None = None,
 ) -> Any:
-    """Schedule proof from the actual economic scout-normalizer boundary.
-
-    The first proof release attached this behavior at the generic transaction
-    normalizer. Production proved the live scout path had already moved one layer
-    higher: the economic-signal wrapper persists an unpriced movement and returns
-    ``economic_movement_price_unresolved`` from ``scout._normalize_tracked_wallet``.
-    Bind here so the persisted movement can launch evidence-only current-context
-    evaluation without creating retrospective entry authority.
-    """
     if _ORIGINAL_SCOUT_NORMALIZER is None:
         raise RuntimeError("post-183 scout normalizer wiring is not installed")
-
     normalized = _ORIGINAL_SCOUT_NORMALIZER(
         result,
         signature=signature,
@@ -61,20 +52,14 @@ def _normalizer_with_current_context_probe(
         swap, error = normalized
     except (TypeError, ValueError):
         return normalized
-
     if swap is not None or source_hint is not None:
         return normalized
     plane = scout._SCOUT_HYDRATION_PLANE.get()
     if plane is None:
         return normalized
-
-    # The row must already exist in canonical durable economic evidence. Ordinary
-    # parse/attribution failures never gain a probe simply because normalization
-    # returned None.
     row = proof._economic_unpriced_buy(plane, signature)
     if row is None:
         return normalized
-
     _inc(plane, "unpriced_probe_candidates_seen")
     proof._schedule_probe(plane, signature)
     _inc(plane, "probe_schedule_calls")
@@ -91,7 +76,6 @@ def _mapped_real_pump_receipt(
     subscription_targets: dict[int, Any],
     message: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Resolve one exact PUMP receipt only from a mapped real WebSocket message."""
     if str(provider) == str(live_poll.POLL_PROVIDER_NAME):
         return None
     if not isinstance(message, dict) or message.get("method") != "logsNotification":
@@ -122,12 +106,10 @@ def _publish_verified_ws_frontier(
     *,
     received_at: datetime,
 ) -> bool:
-    """Pair real WebSocket provenance with already-durable exact SQLite identity."""
     try:
         with plane.store._lock:
             durable = plane.store.db.execute(
-                "SELECT slot FROM direct_solana_recent_receipts "
-                "WHERE signature=? AND source_key=? LIMIT 1",
+                "SELECT slot FROM direct_solana_recent_receipts WHERE signature=? AND source_key=? LIMIT 1",
                 (str(receipt["signature"]), str(receipt["source_key"])),
             ).fetchone()
     except Exception:
@@ -143,7 +125,6 @@ def _publish_verified_ws_frontier(
     if durable_slot != int(receipt["slot"]):
         _inc(plane, "ws_durable_slot_mismatch")
         return False
-
     journal = getattr(plane, "journal", None)
     if journal is None:
         _inc(plane, "ws_journal_missing")
@@ -187,6 +168,7 @@ async def _final_handler_with_verified_ws_frontier(
     subscription_targets: dict[int, Any],
     message: dict[str, Any],
 ) -> None:
+    """Final durable WebSocket frontier boundary and cooperative fairness owner."""
     if _ORIGINAL_HANDLER is None:
         raise RuntimeError("post-183 final WebSocket handler wiring is not installed")
 
@@ -210,9 +192,14 @@ async def _final_handler_with_verified_ws_frontier(
     finally:
         if token is not None:
             raw_dispatch._RECEIPT_WALL_TIME.reset(token)
+        # This is the actual outermost production notification boundary. Yield only
+        # after every inner durable/frontier action so dense traffic cannot starve
+        # Uvicorn health or control work.
+        await asyncio.sleep(0)
 
 
 setattr(_final_handler_with_verified_ws_frontier, "_roi_post183_production_proof_wiring", True)
+setattr(_final_handler_with_verified_ws_frontier, "_roi_cooperative_yield", True)
 
 
 def _status_with_wiring(self: Any) -> dict[str, Any]:
@@ -228,6 +215,9 @@ def _status_with_wiring(self: Any) -> dict[str, Any]:
             ),
             "final_websocket_handler_attached": bool(
                 getattr(DirectSolanaIngestionPlane._handle_notification, "_roi_post183_production_proof_wiring", False)
+            ),
+            "final_websocket_handler_cooperative_yield": bool(
+                getattr(DirectSolanaIngestionPlane._handle_notification, "_roi_cooperative_yield", False)
             ),
             "unpriced_probe_candidates_seen_session": int(
                 getattr(self, "_roi_post183_wiring_unpriced_probe_candidates_seen", 0) or 0
@@ -255,7 +245,6 @@ setattr(_status_with_wiring, "_roi_post183_production_proof_wiring", True)
 
 
 def install_post183_production_proof_wiring_repair() -> None:
-    """Attach proof/frontier behavior after the final explicit production graph."""
     global _INSTALLED, _ORIGINAL_SCOUT_NORMALIZER, _ORIGINAL_HANDLER, _ORIGINAL_STATUS
     if _INSTALLED:
         return
@@ -278,6 +267,7 @@ def install_post183_production_proof_wiring_repair() -> None:
         except Exception:
             pass
         setattr(_final_handler_with_verified_ws_frontier, "_roi_post183_production_proof_wiring", True)
+        setattr(_final_handler_with_verified_ws_frontier, "_roi_cooperative_yield", True)
         DirectSolanaIngestionPlane._handle_notification = _final_handler_with_verified_ws_frontier  # type: ignore[method-assign]
 
     current_status = DirectSolanaIngestionPlane.status

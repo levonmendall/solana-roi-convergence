@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .strategy_v51_authority import authority
+from .portfolio import allocate_family_capital
 
 
 def merge_economic_certifications(primary: dict[str, Any], secondary: dict[str, Any] | None) -> dict[str, Any]:
@@ -33,24 +33,12 @@ def merge_economic_certifications(primary: dict[str, Any], secondary: dict[str, 
 
     families = dict(result.get("families") or {})
     scores = {name: float(value.get("capital_efficiency_score") or 0.0) for name, value in families.items()}
-    priority = list(authority()["research_family_priority"])
-    ordered = sorted(
-        set(priority) | set(families),
-        key=lambda family: (-scores.get(family, 0.0), priority.index(family) if family in priority else len(priority), family),
-    )
-    positive = [family for family in ordered if scores.get(family, 0.0) > 0.0]
-    total = sum(scores[family] for family in positive)
-    weights: dict[str, float] = {}
-    remaining = 1.0
-    for family in positive:
-        raw = scores[family] / total if total > 0.0 else 0.0
-        weight = min(0.25, raw, remaining)
-        weights[family] = weight
-        remaining -= weight
+    allocation = allocate_family_capital(scores)
     result["closed_outcome_count"] = sum(int(value.get("closed_outcome_count") or 0) for value in families.values())
-    result["research_family_ranking"] = ordered
-    result["paper_allocation_weights"] = weights
-    result["paper_cash_weight"] = max(0.0, remaining)
+    result["research_family_ranking"] = allocation["research_family_ranking"]
+    result["paper_allocation_weights"] = allocation["paper_allocation_weights"]
+    result["paper_cash_weight"] = allocation["paper_cash_weight"]
+    result["canonical_portfolio_core_version"] = allocation["portfolio_core_version"]
     result["robinhood_proof_available"] = True
     result["robinhood_proof_transport"] = "nonblocking_worker_status_cache"
     return result

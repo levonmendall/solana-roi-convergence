@@ -70,6 +70,10 @@ jobs:
         run: python -m pytest tests/test_v51_repair_114_exit_survivability.py
       - name: Phase 17 scoped context certification 115-120
         run: python -m pytest tests/test_v51_phase17_115_120.py
+      - name: Phase 18 monkeypatch migration inventory
+        run: python scripts/audit_monkeypatch_debt.py
+      - name: Phase 18 production architecture consolidation 125-130
+        run: python -m pytest tests/test_v51_phase18_125_130_architecture.py
       - name: No live-money authority regression
         run: python -m pytest tests/test_v51_phase12_13_83_94.py -k 'preserve_frozen_paper_only_authority'
       - name: Launched production HTTP smoke
@@ -79,7 +83,78 @@ jobs:
       - name: Final v4 wallet entity universe regressions
         run: python -m pytest tests/test_wallet_entity_universe_v4.py
       - name: Existing regressions
-        run: python -m pytest --ignore=tests/test_forward_activation.py
+        run: |
+          # Component compatibility modules are mutation-heavy by historical design.
+          # Run each native contract in its own interpreter so collection of one
+          # module cannot replace another module's functions before its tests run.
+          python - <<'PY'
+          import pytest
+          from solana_roi import candidate_risk_window_repair as compatibility
+          compatibility.install_candidate_risk_window_repair()
+          raise SystemExit(pytest.main([
+              "tests/test_candidate_risk_window_repair.py",
+              "--junitxml=existing-regressions-native-candidate-risk.xml",
+          ]))
+          PY
+          python -m pytest tests/test_continuity_storage_capacity_repair.py --junitxml=existing-regressions-native-continuity-storage.xml
+          python -m pytest tests/test_fomo_continuation_shadow.py --junitxml=existing-regressions-native-fomo-shadow.xml
+          python -m pytest tests/test_fomo_feature_boundaries.py --junitxml=existing-regressions-native-fomo-boundaries.xml
+          python -m pytest tests/test_fomo_risk_conditioned_v5.py --junitxml=existing-regressions-native-fomo-v5.xml
+          python - <<'PY'
+          import pytest
+          from solana_roi.target_quorum import install_target_quorum
+          from solana_roi.live_poll_redundancy import install_live_poll_redundancy
+          from solana_roi.poll_watermark_repair import install_poll_watermark_repair
+          install_target_quorum()
+          install_live_poll_redundancy()
+          install_poll_watermark_repair()
+          raise SystemExit(pytest.main([
+              "tests/test_live_poll_redundancy.py",
+              "--junitxml=existing-regressions-native-live-poll.xml",
+          ]))
+          PY
+          python -m pytest tests/test_observation.py --junitxml=existing-regressions-native-observation.xml
+          python - <<'PY'
+          import pytest
+          from solana_roi.live_poll_redundancy import install_live_poll_redundancy
+          from solana_roi.poll_watermark_repair import install_poll_watermark_repair
+          from solana_roi.poll_pagination_context import install_poll_pagination_context
+          install_live_poll_redundancy()
+          install_poll_watermark_repair()
+          install_poll_pagination_context()
+          from solana_roi.poll_exception_rearm import install_poll_exception_rearm
+          install_poll_exception_rearm()
+          raise SystemExit(pytest.main([
+              "tests/test_poll_watermark_repair.py",
+              "--junitxml=existing-regressions-native-poll-watermark.xml",
+          ]))
+          PY
+          python -m pytest tests/test_prospective_observation.py --junitxml=existing-regressions-native-prospective.xml
+          python - <<'PY'
+          import pytest
+          import solana_roi.production  # explicit Phase-18 production composition
+
+          raise SystemExit(pytest.main([
+              "--ignore=tests/test_forward_activation.py",
+              "--ignore=tests/test_candidate_risk_window_repair.py",
+              "--ignore=tests/test_continuity_storage_capacity_repair.py",
+              "--ignore=tests/test_fomo_continuation_shadow.py",
+              "--ignore=tests/test_fomo_feature_boundaries.py",
+              "--ignore=tests/test_fomo_risk_conditioned_v5.py",
+              "--ignore=tests/test_live_poll_redundancy.py",
+              "--ignore=tests/test_observation.py",
+              "--ignore=tests/test_poll_watermark_repair.py",
+              "--ignore=tests/test_prospective_observation.py",
+              "--junitxml=existing-regressions-composed.xml",
+          ]))
+          PY
+      - name: Upload existing regression diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: existing-regressions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: existing-regressions-*.xml
+          if-no-files-found: error
       - name: Forward cohort certification regressions
         run: python -m pytest tests/test_forward_activation.py
       - name: Compile production package
