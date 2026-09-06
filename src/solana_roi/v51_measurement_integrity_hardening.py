@@ -4,7 +4,7 @@ from typing import Any, Callable
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority_fingerprint
 
-HARDENING_VERSION = "v51-measurement-integrity-hardening-v2"
+HARDENING_VERSION = "v51-measurement-integrity-hardening-v3-exact-exit-epoch"
 _ORIGINAL_WALLET_RECORD: Callable[..., Any] | None = None
 _INSTALLED = False
 
@@ -22,7 +22,34 @@ def _ensure_release_compatibility_fail_closed(store: Any, release_commit: str | 
             (release,),
         ).fetchone()
     if existing is not None:
-        return dict(existing)
+        row = dict(existing)
+        # Repair 113 changes execution measurement semantics but not economic
+        # authority. A current release row may have been created moments earlier by
+        # the base measurement installer, before Phase 16's exact-exit installer ran.
+        # Upgrade only that same current release to the new execution epoch and fail
+        # promotion closed until the ordinary live attestation refreshes it. Historical
+        # release rows retain their original epoch permanently for audit/non-pooling.
+        if (
+            release == measurement.current_release_commit()
+            and str(row.get("execution_model_epoch") or "") != measurement.EXECUTION_MODEL_EPOCH
+        ):
+            with store._lock, store.db:
+                store.db.execute(
+                    "UPDATE v51_release_compatibility SET execution_model_epoch=?,execution_model_fingerprint=?,"
+                    "promotion_eligible=0,reason=? WHERE release_commit=?",
+                    (
+                        measurement.EXECUTION_MODEL_EPOCH,
+                        measurement.execution_model_fingerprint(),
+                        "current_release_exact_exit_execution_model_pending_live_attestation",
+                        release,
+                    ),
+                )
+                upgraded = store.db.execute(
+                    "SELECT * FROM v51_release_compatibility WHERE release_commit=?",
+                    (release,),
+                ).fetchone()
+            return dict(upgraded) if upgraded is not None else row
+        return row
 
     if release == measurement.current_release_commit():
         original = getattr(measurement, "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY", None)
@@ -45,8 +72,8 @@ def _ensure_release_compatibility_fail_closed(store: Any, release_commit: str | 
                 authority_fingerprint(),
                 "unclassified-historical-release",
                 "unclassified-historical-release",
-                measurement.EXECUTION_MODEL_EPOCH,
-                measurement.execution_model_fingerprint(),
+                "unclassified-historical-execution-model",
+                "unclassified-historical-execution-model",
                 "historical_release_not_explicitly_registered_while_running; promotion fails closed",
                 measurement._utcnow(),
             ),
@@ -77,7 +104,12 @@ def install_measurement_integrity_hardening() -> None:
     from . import runtime
     from . import v51_measurement_compatibility_filters as filters
     from . import v51_measurement_integrity as measurement
+    from .v51_exit_execution_integrity import install_exact_exit_execution_integrity
     from .wallet_discovery import ContinuousWalletDiscovery
+
+    # Install the Phase 16 execution model before wrapping compatibility so all
+    # subsequent registration and proof calls see the same current execution epoch.
+    install_exact_exit_execution_integrity()
 
     if not hasattr(measurement, "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY"):
         measurement._ORIGINAL_ENSURE_RELEASE_COMPATIBILITY = measurement.ensure_release_compatibility  # type: ignore[attr-defined]
@@ -106,6 +138,8 @@ def install_measurement_integrity_hardening() -> None:
 
 
 def status() -> dict[str, Any]:
+    from .v51_exit_execution_integrity import EXECUTION_MODEL_EPOCH, status as exit_execution_status
+
     return {
         "version": HARDENING_VERSION,
         "installed": _INSTALLED,
@@ -114,6 +148,8 @@ def status() -> dict[str, Any]:
         "legacy_wallet_policy_factory_preserved": True,
         "v51_wallet_research_reclassification_ceiling_fraction": 0.40,
         "wallet_lineage_candidate_schema_precreated": True,
+        "execution_model_epoch": EXECUTION_MODEL_EPOCH,
+        "exact_exit_execution_integrity": exit_execution_status(),
         "paper_only": True,
         "live_money_authority": False,
     }
