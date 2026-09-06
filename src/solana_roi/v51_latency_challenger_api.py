@@ -4,9 +4,10 @@ from typing import Any, Callable
 
 from .v51_latency_challenger import build_latency_challenger_research
 from .v51_measurement_integrity import cached_proof_state, decorate_proof
+from .v51_roadmap_59_64_research import build_roadmap_59_64_research
 
 
-API_VERSION = "v51-latency-challenger-api-v1"
+API_VERSION = "v51-latency-challenger-api-v2-roadmap-59-64"
 _INSTALLED = False
 
 
@@ -49,16 +50,19 @@ def install_v51_latency_challenger_api(
     def v51_latency_challengers() -> dict[str, Any]:
         runtime = _runtime(runtime_provider)
         local = build_latency_challenger_research(runtime.store)
+        roadmap = build_roadmap_59_64_research(runtime.store)
         robinhood, rh_state = _isolated_robinhood_latency(robinhood_status_provider)
         payload = {
             "api_version": API_VERSION,
             "local_solana_fomo": local,
+            "roadmap_59_64_research": roadmap,
             "isolated_robinhood": robinhood,
             "robinhood_proof_state": rh_state,
             "current_authority_changed": False,
             "retrospective_entry_authority": False,
             "purpose": (
-                "measure whether venue/lifecycle-specific forward edge survives beyond the frozen 20-second v5.1 boundary"
+                "measure venue/lifecycle-specific forward edge, FOMO sub-20 signal half-life, "
+                "Pump.fun-to-PumpSwap lifecycle transitions, and latency/chase/cost decay without changing frozen v5.1 economics"
             ),
             "paper_only": True,
             "live_money_authority": False,
