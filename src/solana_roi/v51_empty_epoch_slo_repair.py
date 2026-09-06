@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from . import rpc_workload_governor as rpc_governor
 from . import v51_evidence_analytics as analytics
 from . import v51_strategy_api as strategy_api
 from .v51_candidate_ledger import ensure_schema as ensure_candidate_stage_schema
@@ -55,10 +56,14 @@ def install_empty_epoch_slo_repair() -> None:
     install_e2e_production_hardening()
     install_e2e_production_hardening_followup()
 
-    # Install candidate throughput scheduling after the final E2E hardening graph so
-    # it can move only operational timeout/scheduling boundaries while preserving the
-    # already-frozen strategy and certification authority.
-    install_candidate_pipeline_throughput_repair()
+    # Production reaches this boundary after the RPC workload governor has captured
+    # its canonical endpoint delegate. Narrow analytics/unit imports can install the
+    # empty-epoch SLO in isolation before that runtime exists; do not make those
+    # read-only imports construct a production RPC graph. The real production graph
+    # therefore gets the throughput repair, while isolated measurement callers keep
+    # their prior bootstrap-safe behavior.
+    if rpc_governor._ORIGINAL_CALL_ENDPOINT is not None:
+        install_candidate_pipeline_throughput_repair()
     _INSTALLED = True
 
 
