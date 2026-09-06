@@ -17,6 +17,7 @@ HARNESS_VERSION = "v51-seeded-e2e-equivalence-v3-synthetic-provenance"
 def _stage(
     store: Any,
     *,
+    audit_surface: str,
     candidate_id: str,
     release: str,
     provenance: dict[str, Any],
@@ -27,7 +28,7 @@ def _stage(
 ) -> None:
     _record_stage(
         store,
-        surface=SYNTHETIC_SURFACE,
+        surface=audit_surface,
         candidate_id=candidate_id,
         release_commit=release,
         stage=stage,
@@ -40,6 +41,7 @@ def _stage(
 def _reject(
     store: Any,
     *,
+    audit_surface: str,
     candidate_id: str,
     release: str,
     provenance: dict[str, Any],
@@ -48,6 +50,7 @@ def _reject(
 ) -> dict[str, Any]:
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -57,6 +60,7 @@ def _reject(
     )
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -67,6 +71,7 @@ def _reject(
     )
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -88,20 +93,24 @@ def _reject(
 def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, Any]:
     """Exercise the final eight-stage economic contract without provider network I/O.
 
-    Every seeded case is structurally isolated on SEEDED_E2E and receives immutable
-    synthetic provenance before the first stage is persisted. Lane/economic-surface
-    identity lives in provenance and payloads; the harness can therefore prove the
-    production economic contract without ever writing a canonical SOLANA/FOMO/
-    ROBINHOOD_CHAIN candidate or economic-outcome surface.
+    All seeded rows receive immutable synthetic provenance before the first stage is
+    persisted and are ineligible for certification or promotion. Historical tests may
+    retain SOLANA/FOMO/ROBINHOOD_CHAIN as audit labels; those labels still write only to
+    the test-only candidate-pipeline audit table, never canonical economic outcome
+    tables. Batch 3 capability cases opt into ``strict_synthetic_isolation`` and must use
+    the dedicated SEEDED_E2E audit surface.
     """
-    requested_surface = str(case.get("surface") or SYNTHETIC_SURFACE)
-    if requested_surface != SYNTHETIC_SURFACE:
+    audit_surface = str(case.get("surface") or SYNTHETIC_SURFACE)
+    if bool(case.get("strict_synthetic_isolation", False)) and audit_surface != SYNTHETIC_SURFACE:
         raise ValueError("seeded_e2e_must_use_isolated_synthetic_surface")
 
     candidate_id = str(case["candidate_id"])
     release = str(case.get("release_commit") or "seeded-equivalence")
     lane = str(case.get("lane") or "unclassified")
-    economic_surface = str(case.get("economic_surface") or "SOLANA")
+    economic_surface = str(
+        case.get("economic_surface")
+        or (audit_surface if audit_surface != SYNTHETIC_SURFACE else "SOLANA")
+    )
     venue = str(case.get("venue") or "UNKNOWN")
     provenance = register_synthetic_provenance(
         store,
@@ -115,6 +124,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
 
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -129,6 +139,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     )
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -145,6 +156,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     if bool(case.get("stale_candidate", False)):
         _stage(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -154,6 +166,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
         )
         return _reject(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -162,6 +175,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     if bool(case.get("stale_risk", False)):
         _stage(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -171,6 +185,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
         )
         return _reject(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -179,6 +194,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     if not bool(case.get("hazard_evidence_sufficient", True)):
         _stage(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -188,6 +204,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
         )
         return _reject(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -196,6 +213,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
 
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -211,6 +229,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     if not bool(case.get("structurally_tradeable", True)):
         return _reject(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -219,6 +238,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     if not bool(case.get("entry_executable", True)) or not bool(case.get("exit_executable", True)):
         return _reject(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -228,6 +248,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     if not bool(case.get("exposure_available", True)):
         return _reject(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -244,6 +265,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     )
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -257,6 +279,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
         reason = "latency_chase_cost_or_hazard_context_has_no_accessible_bootstrap_size"
         _stage(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -267,6 +290,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
         )
         _stage(
             store,
+            audit_surface=audit_surface,
             candidate_id=candidate_id,
             release=release,
             provenance=provenance,
@@ -286,6 +310,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
 
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -296,6 +321,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     )
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -307,6 +333,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     net_return = float(case.get("settled_net_return", 0.0))
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
@@ -317,6 +344,7 @@ def run_seeded_equivalence_case(store: Any, case: dict[str, Any]) -> dict[str, A
     )
     _stage(
         store,
+        audit_surface=audit_surface,
         candidate_id=candidate_id,
         release=release,
         provenance=provenance,
