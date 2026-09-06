@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v9-native-cutover-probe"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v10-native-cutover"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -118,19 +118,10 @@ def build_production_system() -> ProductionSystem:
         return _BUILT
 
     # Import the canonical app/runtime only after package import has remained passive.
-    # Repair 126 deliberately does not activate the legacy compatibility registry.
+    # Repair 126 deliberately does not activate the retired compatibility registry.
     from .api import app, ingestion_runtime
-    from . import candidate_execution_evidence_plane as candidate_plane
-    from .collecting_ingestion import CollectingLiveEvidenceIngestionService
     from .robinhood_runtime_install import install_robinhood_chain_paper_runtime
     from .v51_production_authority import install_v51_production_authority
-
-    # Temporary cutover probe: measurement integrity historically captured this
-    # delegate as a side effect of the retired candidate-plane installer. Bind only
-    # the canonical predecessor function so CI can expose the next missing native
-    # behavior. This assignment is removed before Repair 126 is finalized.
-    if candidate_plane._ORIGINAL_SERVICE_INGEST is None:
-        candidate_plane._ORIGINAL_SERVICE_INGEST = CollectingLiveEvidenceIngestionService.ingest_swap
 
     install_robinhood_chain_paper_runtime(app, ingestion_runtime)
     install_v51_production_authority(app, ingestion_runtime)
