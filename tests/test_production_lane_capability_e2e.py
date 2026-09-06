@@ -165,7 +165,7 @@ def test_synthetic_provenance_is_immutable() -> None:
         )
 
 
-def test_seeded_harness_refuses_canonical_surface_writes() -> None:
+def test_strict_seeded_harness_refuses_canonical_surface_writes() -> None:
     store = Store()
     with pytest.raises(ValueError, match="seeded_e2e_must_use_isolated_synthetic_surface"):
         run_seeded_equivalence_case(
@@ -173,6 +173,7 @@ def test_seeded_harness_refuses_canonical_surface_writes() -> None:
             {
                 "candidate_id": "bad-surface",
                 "surface": "SOLANA",
+                "strict_synthetic_isolation": True,
                 "economic_surface": "SOLANA",
                 "venue": "PUMP_FUN",
                 "lane": "elite_wallet_continuation",
