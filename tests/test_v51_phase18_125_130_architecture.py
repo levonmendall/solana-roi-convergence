@@ -184,7 +184,9 @@ def test_128_statistics_facade_owns_required_inference_contracts() -> None:
 
     assert expected_log_growth(values, fraction=0.01) is not None
     assert drawdown(values, fraction=0.01) > 0.0
-    assert expected_shortfall(values) == pytest.approx(-1.0)
+    # Canonical ES20 averages the worst ceil(20% * n) observations. With n=6,
+    # the tail is {-1.0, -0.25}, so ES20 is -0.625 rather than the single worst loss.
+    assert expected_shortfall(values) == pytest.approx(-0.625)
 
     first = event_cluster_profile(values, cluster_ids=clusters, fixed_fraction=0.01, bootstrap_samples=80)
     second = event_cluster_profile(values, cluster_ids=clusters, fixed_fraction=0.01, bootstrap_samples=80)
