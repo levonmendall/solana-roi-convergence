@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from . import robinhood_live_frontier_verification_repair as robinhood_frontier
+from .fomo_runtime_install import install_fomo_runtime
 from .robinhood_decision_tail_repair import (
     install_robinhood_decision_tail_repair,
     status as decision_tail_status,
@@ -51,11 +52,9 @@ from .v51_strategy_api import install_v51_strategy_api
 from .v51_system_proof import install_system_proof
 
 # Capture the already-proven final entry guard before the sequencer transport installs.
-# Direct regression calls retain this helper. The actual running production instance
-# is switched to provider/v5.1 event-time authority by the finalizer below.
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v3-phase14-95-102"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v4-native-fomo-composition"
 _INSTALLED = False
 
 
@@ -67,10 +66,6 @@ def install_isolated_robinhood_proof_cache(module: Any) -> None:
     if current is None or bool(getattr(current, "_roi_v51_isolated_proof", False)):
         return
 
-    # v2 worker isolation refreshes proof on a separate SQLite connection/threadpool.
-    # Preserve the historical wrapped-status contract by attaching only the already-
-    # built snapshot here; this wrapper performs no proof DB work and is not used by
-    # the fast status publisher, which calls isolation._BASE_STATUS directly.
     if getattr(isolation, "PROOF_PUBLISH_SECONDS", None) is not None and getattr(isolation, "_BASE_STATUS", None) is not None:
         def status_with_offloaded_v51_proof() -> dict[str, Any]:
             payload = dict(current())
@@ -129,7 +124,7 @@ def install_v51_production_authority(
     app: Any,
     runtime_provider: Callable[[], Any] | Any,
 ) -> None:
-    """Install frozen v5.1 economics explicitly at the production boundary."""
+    """Compose frozen v5.1 economics explicitly at the production boundary."""
     global _INSTALLED
     from . import robinhood_runtime_install as module
     from .post182_production_proof_wiring_repair import (
@@ -140,6 +135,13 @@ def install_v51_production_authority(
     install_robinhood_live_getlogs_resilience()
     install_robinhood_decision_tail_repair()
     install_post183_production_proof_wiring_repair()
+
+    # FOMO is a first-class paper research/economic surface, not an incidental side
+    # effect of wallet-router precision installation. Compose its observation layer
+    # explicitly before Phase 16 installs the one active terminal/FOMO exact-exit
+    # engine. This changes no frozen entry economics and adds no live authority.
+    install_fomo_runtime()
+
     install_measurement_integrity()
     install_measurement_integrity_hardening()
     install_release_attestation_gate()
@@ -152,33 +154,15 @@ def install_v51_production_authority(
     install_v51_robinhood_consolidation()
     install_v51_robinhood_candidate_coverage(RobinhoodChainPaperPlane)
 
-    # PR195 sequencer remains a research/compatibility substrate. It is installed
-    # first so the provider finalizer wraps the true final run/status graph. Direct
-    # tests keep the established fresh-head helper; only a real running instance is
-    # switched to provider/v5.1 event-time authority.
     install_robinhood_sequencer_frontier(RobinhoodChainPaperPlane)
     robinhood_frontier._fresh_head_ready = _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY  # type: ignore[assignment]
     install_robinhood_production_provider_finalizer(
         RobinhoodChainPaperPlane,
         legacy_fresh_ready=_ORIGINAL_ROBINHOOD_FRESH_HEAD_READY,
     )
-
-    # The provider WebSocket runner bypasses the older forward-only poll loop, so
-    # explicitly seed only the latest head plus the existing bounded 64-block factory
-    # metadata insurance before the production subscription starts. No old swaps are
-    # replayed and the archival cursor never regains readiness authority.
     install_robinhood_phase9_anchor_seed(RobinhoodChainPaperPlane)
-
-    # Phase 9 tightens Robinhood runtime/evidence contracts without altering frozen
-    # strategy economics. It retires historical-lag readiness semantics, validates
-    # proof freshness at the nonblocking cache boundary, gives creation and reserve/
-    # swap opportunities durable pre-lane identities, and makes venue/lifecycle
-    # economic separation an explicit proof invariant.
     install_robinhood_phase9_65_69(RobinhoodChainPaperPlane, module)
 
-    # Preserve historical architecture markers while making the provider wrapper the
-    # final runtime implementation. No signer, transaction submission, or live-money
-    # authority is introduced.
     setattr(RobinhoodChainPaperPlane.run, "_roi_robinhood_forward_only_run", True)
 
     install_isolated_robinhood_proof_cache(module)
@@ -202,17 +186,11 @@ def install_v51_production_authority(
         runtime_provider=runtime_provider,
         robinhood_status_provider=module._status,
     )
-    # Phase 10 is a read-only certification composition. It unifies release,
-    # authority, runtime, coverage, execution, strategy, portfolio, settlement,
-    # learning, and resource-health proof; it does not alter selection economics.
     install_system_proof(
         app,
         runtime_provider,
         robinhood_status_provider=module._status,
     )
-    # Phase 14 reuses the cached canonical system proof for global gates and computes
-    # only family-level profitability robustness on explicit request. It cannot alter
-    # selection, sizing, exits, promotion economics, signing, submission, or money.
     install_phase14_profitability_certification(
         app,
         runtime_provider,
@@ -240,6 +218,7 @@ def install_v51_production_authority(
     app.state.roi_robinhood_phase9_65_69 = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
+    app.state.roi_fomo_runtime_explicit = True
     _INSTALLED = True
 
 
@@ -248,6 +227,7 @@ def status() -> dict[str, Any]:
         "composition_version": COMPOSITION_VERSION,
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
+        "fomo_runtime_installation": "explicit_first_class_paper_surface_before_terminal_exact_exit",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
         "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
