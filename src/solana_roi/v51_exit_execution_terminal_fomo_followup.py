@@ -5,7 +5,7 @@ import json
 from typing import Any, Callable
 
 
-FOLLOWUP_VERSION = "v51-exact-exit-terminal-fomo-followup-v1"
+FOLLOWUP_VERSION = "v51-exact-exit-terminal-fomo-followup-v2-single-engine"
 ACTIVE_EXECUTION_MODEL_EPOCH = "v51-execution-model-exact-exit-v3-terminal-fomo"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
@@ -13,9 +13,7 @@ SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
 
 _INSTALLED = False
-_ORIGINAL_RECORD_OUTCOME_MODEL: Callable[..., Any] | None = None
-_ORIGINAL_SETTLE_FOMO: Callable[..., Any] | None = None
-_ORIGINAL_SYNC_V5: Callable[..., Any] | None = None
+_ORIGINAL_PROMOTION_RECORDS: Callable[..., Any] | None = None
 
 
 def _json(value: Any) -> str:
@@ -25,8 +23,8 @@ def _json(value: Any) -> str:
 def execution_model_fingerprint() -> str:
     payload = {
         "execution_model_epoch": ACTIVE_EXECUTION_MODEL_EPOCH,
-        "base_exact_exit_integrity": "v51-exact-exit-execution-integrity-109-113-v1",
-        "settlement_engine": "nonblocking_durable_liquidation",
+        "settlement_engine": "single_active_nonblocking_durable_exact_exit_liquidation",
+        "previous_v2_runtime_engine_active": False,
         "retry_elapsed_seconds": [0, 10, 30, 60, 120, 300],
         "terminal_unsellable_measurement": "net_return_minus_1_after_300s",
         "failed_exit_disappears_from_forward_evidence": False,
@@ -50,100 +48,38 @@ def _table_exists(store: Any, table: str) -> bool:
         return False
 
 
-def _ensure_epoch_column(store: Any, table: str) -> None:
-    if not _table_exists(store, table):
-        return
-    with store._lock, store.db:
-        columns = {str(row["name"]) for row in store.db.execute(f"PRAGMA table_info({table})").fetchall()}
-        if "execution_model_epoch" not in columns:
-            store.db.execute(f"ALTER TABLE {table} ADD COLUMN execution_model_epoch TEXT")
+def _preserve_wrapped_markers(settlement: Any) -> None:
+    """Preserve composition metadata while keeping one behavioral exit engine.
 
+    The exact-exit implementation replaces observe/sell/status/manifest deliberately.
+    Earlier research wrappers attach idempotence/architecture markers to those callables.
+    Copying those marker dictionaries onto the replacement preserves composition truth
+    without adding another behavioral wrapper or changing any settlement decision.
+    """
 
-def _record_outcome_model_bridge(
-    adapter: Any,
-    *,
-    source_signature: str,
-    lane: str,
-    attempt_id: int,
-    scope: str,
-) -> None:
-    if _ORIGINAL_RECORD_OUTCOME_MODEL is None:
-        raise RuntimeError("Phase 16 outcome-model bridge not installed")
-    _ORIGINAL_RECORD_OUTCOME_MODEL(
-        adapter,
-        source_signature=source_signature,
-        lane=lane,
-        attempt_id=attempt_id,
-        scope=scope,
+    pairs = (
+        ("_observe_with_exact_exit", "_ORIGINAL_OBSERVE"),
+        ("_sell_exact", "_ORIGINAL_SELL"),
+        ("_status_with_exact_exit", "_ORIGINAL_STATUS"),
+        ("_manifest_with_exact_exit", "_ORIGINAL_MANIFEST"),
     )
-    _ensure_epoch_column(adapter.store, "profit_first_final_outcomes")
-    if _table_exists(adapter.store, "profit_first_final_outcomes"):
-        with adapter.store._lock, adapter.store.db:
-            adapter.store.db.execute(
-                "UPDATE profit_first_final_outcomes SET execution_model_epoch=? "
-                "WHERE epoch_id=? AND source_signature=? AND lane=?",
-                (ACTIVE_EXECUTION_MODEL_EPOCH, adapter.epoch_id, source_signature, lane),
-            )
-
-
-def _settle_fomo_bridge(
-    adapter: Any,
-    liquidation: dict[str, Any],
-    *,
-    attempt_id: int,
-    exit_net_sol: float,
-    terminal: bool,
-) -> None:
-    if _ORIGINAL_SETTLE_FOMO is None:
-        raise RuntimeError("Phase 16 FOMO settlement bridge not installed")
-    _ORIGINAL_SETTLE_FOMO(
-        adapter,
-        liquidation,
-        attempt_id=attempt_id,
-        exit_net_sol=exit_net_sol,
-        terminal=terminal,
-    )
-    _ensure_epoch_column(adapter.store, "fomo_paper_outcomes")
-    if _table_exists(adapter.store, "fomo_paper_outcomes"):
-        with adapter.store._lock, adapter.store.db:
-            adapter.store.db.execute(
-                "UPDATE fomo_paper_outcomes SET execution_model_epoch=? "
-                "WHERE release_commit=? AND source_signature=?",
-                (
-                    ACTIVE_EXECUTION_MODEL_EPOCH,
-                    adapter.release_commit,
-                    str(liquidation["source_signature"]),
-                ),
-            )
-
-
-def _sync_v5_bridge(
-    adapter: Any,
-    source_signature: str,
-    exit_signature: str,
-    net_return: float,
-    exit_reason: str,
-) -> None:
-    if _ORIGINAL_SYNC_V5 is None:
-        raise RuntimeError("Phase 16 v5 outcome bridge not installed")
-    _ORIGINAL_SYNC_V5(adapter, source_signature, exit_signature, net_return, exit_reason)
-    _ensure_epoch_column(adapter.store, "risk_conditioned_alpha_v5_outcomes")
-    if _table_exists(adapter.store, "risk_conditioned_alpha_v5_outcomes"):
-        with adapter.store._lock, adapter.store.db:
-            adapter.store.db.execute(
-                "UPDATE risk_conditioned_alpha_v5_outcomes SET execution_model_epoch=? "
-                "WHERE release_commit=? AND source_signature=?",
-                (ACTIVE_EXECUTION_MODEL_EPOCH, adapter.release_commit, source_signature),
-            )
+    for wrapper_name, original_name in pairs:
+        wrapper = getattr(settlement, wrapper_name, None)
+        original = getattr(settlement, original_name, None)
+        if not callable(wrapper) or not callable(original):
+            continue
+        try:
+            wrapper.__dict__.update(getattr(original, "__dict__", {}))
+        except Exception:
+            pass
+        setattr(wrapper, "_roi_exact_exit_execution_v2", True)
+        setattr(wrapper, "_roi_exact_exit_execution_v3_terminal_fomo", True)
 
 
 def _active_promotion_records(store: Any) -> list[dict[str, Any]]:
-    from . import v51_exit_execution_integrity as base
-
-    original = base._ORIGINAL_ANALYTICS_PROMOTION_RECORDS
-    if original is None:
-        raise RuntimeError("base exact-exit analytics promotion source unavailable")
-    rows = list(original(store))
+    if _ORIGINAL_PROMOTION_RECORDS is None:
+        raise RuntimeError("active exact-exit analytics promotion source unavailable")
+    rows = list(_ORIGINAL_PROMOTION_RECORDS(store))
     epochs: dict[str, str] = {}
     if _table_exists(store, "v51_release_compatibility"):
         with store._lock:
@@ -338,6 +274,8 @@ def status(store: Any | None = None) -> dict[str, Any]:
         "installed": _INSTALLED,
         "execution_model_epoch": ACTIVE_EXECUTION_MODEL_EPOCH,
         "execution_model_fingerprint": execution_model_fingerprint(),
+        "single_active_exit_engine": True,
+        "internal_settlement_monkeypatches": False,
         "retry_elapsed_seconds": [0, 10, 30, 60, 120, 300],
         "terminal_liquidation_assumption": "total_loss_after_300s_without_executable_exact_exit",
         "terminal_unsellable_net_return": -1.0,
@@ -377,7 +315,7 @@ def status(store: Any | None = None) -> dict[str, Any]:
 
 
 def install_terminal_fomo_followup() -> None:
-    global _INSTALLED, _ORIGINAL_RECORD_OUTCOME_MODEL, _ORIGINAL_SETTLE_FOMO, _ORIGINAL_SYNC_V5
+    global _INSTALLED, _ORIGINAL_PROMOTION_RECORDS
     if _INSTALLED:
         return
 
@@ -385,26 +323,21 @@ def install_terminal_fomo_followup() -> None:
     from . import v51_cross_surface_proof as cross_surface
     from . import v51_evidence_analytics as analytics
     from . import v51_exact_exit_execution as settlement
-    from . import v51_exit_execution_integrity as base
     from . import v51_measurement_compatibility_filters as filters
     from . import v51_measurement_integrity as measurement
 
-    # The merged #215 engine remains the compatibility/filter base. The active
-    # settlement path is replaced before any forward observation can occur so no
-    # current-release rows are produced under mixed terminal semantics.
+    # The v3 durable liquidation implementation is the sole active Phase 16 exit
+    # engine. PR #215's v2 module remains in the repository for audit/regression
+    # lineage but is not installed in production.
     settlement.EXACT_EXIT_EXECUTION_MODEL_EPOCH = ACTIVE_EXECUTION_MODEL_EPOCH
     settlement.install_exact_exit_execution_model()
-
-    _ORIGINAL_RECORD_OUTCOME_MODEL = settlement._record_outcome_model
-    settlement._record_outcome_model = _record_outcome_model_bridge
-    _ORIGINAL_SETTLE_FOMO = settlement._settle_fomo
-    settlement._settle_fomo = _settle_fomo_bridge
-    _ORIGINAL_SYNC_V5 = settlement._sync_v5_exact_outcomes
-    settlement._sync_v5_exact_outcomes = _sync_v5_bridge
+    _preserve_wrapped_markers(settlement)
 
     measurement.EXECUTION_MODEL_EPOCH = ACTIVE_EXECUTION_MODEL_EPOCH
     measurement.execution_model_fingerprint = execution_model_fingerprint  # type: ignore[assignment]
 
+    if _ORIGINAL_PROMOTION_RECORDS is None:
+        _ORIGINAL_PROMOTION_RECORDS = analytics.promotion_records
     analytics.promotion_records = _active_promotion_records  # type: ignore[assignment]
     cross_surface.promotion_records = _active_promotion_records  # type: ignore[assignment]
     filters._solana_evidence_compatible = _solana_evidence_active_epoch  # type: ignore[assignment]
