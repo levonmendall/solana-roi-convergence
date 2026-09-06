@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 
@@ -46,10 +47,14 @@ def test_seeded_qualifying_event_reaches_learning() -> None:
         },
     )
     assert result["decision"] == "paper_enter"
+    assert result["synthetic"] is True
+    assert result["certification_eligible"] is False
+    assert result["promotion_eligible"] is False
     rows = _stages(store, "qualified-1")
     assert [row["stage"] for row in rows] == authority()["pipeline_stages"]
     assert rows[-1]["stage"] == "learning"
     assert rows[-1]["status"] == "complete"
+    assert all(json.loads(str(row["payload_json"]))["synthetic"] is True for row in rows)
 
 
 def test_seeded_nonqualification_has_explicit_fail_closed_reason() -> None:
@@ -75,6 +80,9 @@ def test_seeded_nonqualification_has_explicit_fail_closed_reason() -> None:
         "reason": "exact_entry_or_exit_execution_evidence_unavailable",
         "authority_id": "roi-convergence-v5.1-consolidated-proof-1",
         "economic_freeze_epoch": "v51-consolidated-proof-20260905",
+        "synthetic": True,
+        "certification_eligible": False,
+        "promotion_eligible": False,
     }
     rows = _stages(store, "rejected-1")
     assert [row["stage"] for row in rows] == [
@@ -82,3 +90,4 @@ def test_seeded_nonqualification_has_explicit_fail_closed_reason() -> None:
     ]
     assert rows[-1]["status"] == "not_opened"
     assert rows[-1]["reason"] == "exact_entry_or_exit_execution_evidence_unavailable"
+    assert all(json.loads(str(row["payload_json"]))["synthetic"] is True for row in rows)
