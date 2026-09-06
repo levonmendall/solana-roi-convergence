@@ -4,10 +4,11 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from .strategy_v51_authority import authority, authority_fingerprint
 from .v51_candidate_ledger import refresh_candidate_pipeline
+from .v51_dashboard import render_economic_dashboard
 from .v51_evidence_analytics import (
     build_forward_proof_slo,
     build_hazard_calibration,
@@ -248,6 +249,7 @@ def build_system_proof(
             "liveness_paths": ["/health", "/v1/liveness"],
             "deep_readiness_path": "/readiness",
             "canonical_system_proof_path": "/v1/system-proof",
+            "canonical_dashboard_path": "/v1/system-proof/dashboard",
             "render_health_uses_deep_readiness": False,
             "external_verification_should_monitor": "/readiness",
         },
@@ -312,6 +314,20 @@ def install_system_proof(
             return _failed_closed_system_proof(exc)
 
     existing = {getattr(route, "path", None) for route in app.routes}
+    if "/v1/liveness" not in existing:
+        @app.get("/v1/liveness")
+        def liveness_endpoint() -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "liveness_only": True,
+                "runtime_or_sqlite_checked": False,
+                "trading_research_readiness_implied": False,
+                "readiness_path": "/readiness",
+                "system_proof_path": "/v1/system-proof",
+                "paper_only": True,
+                "live_money_authority": False,
+            }
+
     if "/v1/system-proof" not in existing:
         @app.get("/v1/system-proof")
         def system_proof_endpoint() -> dict[str, Any]:
@@ -338,6 +354,22 @@ def install_system_proof(
                 "live_money_authority": False,
             }
             return JSONResponse(content=body, status_code=200 if ready else 503)
+
+    if "/v1/system-proof/dashboard" not in existing:
+        @app.get("/v1/system-proof/dashboard", response_class=HTMLResponse)
+        def system_proof_dashboard_endpoint() -> HTMLResponse:
+            payload = current_proof()
+            strategy = _dict(payload.get("strategy_evidence"))
+            execution = _dict(payload.get("execution_evidence"))
+            return HTMLResponse(
+                render_economic_dashboard(
+                    _dict(strategy.get("economic_certification")),
+                    _dict(payload.get("candidate_coverage")),
+                    _dict(execution.get("mechanism_stress")),
+                    funnel=_dict(payload.get("dashboard_funnel")),
+                    proof_confidence=_dict(payload.get("proof_confidence_by_family")),
+                )
+            )
 
     app.state.roi_v51_system_proof_70_74 = True
 
