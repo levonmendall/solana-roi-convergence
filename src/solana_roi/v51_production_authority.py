@@ -39,6 +39,7 @@ from .v51_measurement_integrity_hardening import (
     install_measurement_integrity_hardening,
     status as measurement_hardening_status,
 )
+from .v51_phase14_api import install_phase14_profitability_certification
 from .v51_promotion_proof import install_release_attestation_gate, status as promotion_proof_status
 from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_coverage
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
@@ -54,7 +55,7 @@ from .v51_system_proof import install_system_proof
 # is switched to provider/v5.1 event-time authority by the finalizer below.
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v2-robinhood-phase9-65-69"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v3-phase14-95-102"
 _INSTALLED = False
 
 
@@ -209,6 +210,14 @@ def install_v51_production_authority(
         runtime_provider,
         robinhood_status_provider=module._status,
     )
+    # Phase 14 reuses the cached canonical system proof for global gates and computes
+    # only family-level profitability robustness on explicit request. It cannot alter
+    # selection, sizing, exits, promotion economics, signing, submission, or money.
+    install_phase14_profitability_certification(
+        app,
+        runtime_provider,
+        robinhood_status_provider=module._status,
+    )
     app.state.roi_v51_final_economic_authority = True
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
@@ -222,6 +231,7 @@ def install_v51_production_authority(
     app.state.roi_v51_forward_certification = True
     app.state.roi_v51_alpha_validation_47_58 = True
     app.state.roi_v51_system_proof_70_74 = True
+    app.state.roi_v51_phase14_95_102 = True
     app.state.roi_robinhood_live_getlogs_resilience = True
     app.state.roi_robinhood_decision_tail = True
     app.state.roi_robinhood_sequencer_frontier = True
@@ -242,6 +252,7 @@ def status() -> dict[str, Any]:
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
         "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
         "system_proof_70_74_installation": "read_only_canonical_certification_and_dashboard_composition",
+        "phase14_95_102_installation": "read_only_final_profitability_certificate_over_cached_system_proof_and_attested_family_records",
         "latency_challenger_installation": "read_only_rejected_counterfactual_research_over_existing_frozen_v51_evidence",
         "robinhood_live_getlogs_resilience": live_getlogs_resilience_status(),
         "robinhood_decision_tail": decision_tail_status(),
@@ -264,6 +275,8 @@ def status() -> dict[str, Any]:
         "forward_certification_changes_strategy_authority": False,
         "alpha_validation_changes_strategy_authority": False,
         "system_proof_changes_strategy_authority": False,
+        "phase14_changes_strategy_authority": False,
+        "phase14_changes_economic_thresholds": False,
         "latency_challenger_changes_strategy_authority": False,
         "phase9_65_69_changes_strategy_authority": False,
         "paper_only": True,
