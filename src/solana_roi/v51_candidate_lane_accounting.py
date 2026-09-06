@@ -109,7 +109,7 @@ def _local_lane_accounting(
             continue
         candidate_lane[("SOLANA", candidate_id)] = lane
 
-    # FOMO candidates are born in the shadow-observation pipeline rather than
+    # FOMO candidates originate in the shadow-observation pipeline rather than
     # v51_candidates. Its canonical identity is therefore the candidate-stage row.
     for row in stage_rows:
         if str(row.get("surface") or "") != "FOMO" or str(row.get("stage") or "") != "candidate":
@@ -129,7 +129,8 @@ def _local_lane_accounting(
         stage = str(row.get("stage") or "unknown")
         status = str(row.get("status") or "unknown")
         lane_summary = lanes[lane]["stage_summary"]
-        lane_summary.setdefault(stage, {})[status] = int(lane_summary.setdefault(stage, {}).get(status, 0)) + 1
+        statuses = lane_summary.setdefault(stage, {})
+        statuses[status] = int(statuses.get(status, 0)) + 1
 
     for key, lane in candidate_lane.items():
         lane_state = lanes[lane]
@@ -256,7 +257,15 @@ def build_five_lane_candidate_accounting(
     anomalies.update(robinhood_anomalies)
 
     unverified_lanes = [lane for lane in FIVE_LANES if not bool(lanes[lane].get("verified"))]
-    all_verified = not unverified_lanes
+    all_lane_sources_verified = not unverified_lanes
+    local_readable = bool(anomalies.get("local_candidate_store_readable"))
+    anomaly_free = (
+        int(anomalies.get("unclassified_solana_candidate_count") or 0) == 0
+        and int(anomalies.get("orphan_stage_state_count") or 0) == 0
+        and not bool(anomalies.get("robinhood_count_inconsistency"))
+    )
+    population_verifiable = bool(all_lane_sources_verified and local_readable and anomaly_free)
+
     local_totals = {
         "observed_candidate_count": sum(int(lanes[lane].get("observed_candidate_count") or 0) for lane in LOCAL_LANES),
         "terminal_candidate_count": sum(int(lanes[lane].get("terminal_candidate_count") or 0) for lane in LOCAL_LANES),
@@ -265,7 +274,7 @@ def build_five_lane_candidate_accounting(
         "unexplained_candidate_count": sum(int(lanes[lane].get("unexplained_candidate_count") or 0) for lane in LOCAL_LANES),
     }
 
-    if all_verified:
+    if population_verifiable:
         observed = sum(int(lanes[lane]["observed_candidate_count"]) for lane in FIVE_LANES)
         terminal = sum(int(lanes[lane]["terminal_candidate_count"]) for lane in FIVE_LANES)
         pending = sum(int(lanes[lane]["valid_pending_candidate_count"]) for lane in FIVE_LANES)
@@ -275,17 +284,25 @@ def build_five_lane_candidate_accounting(
     else:
         observed = terminal = pending = debt = unexplained = delta = None
 
-    local_readable = bool(anomalies.get("local_candidate_store_readable"))
-    anomaly_free = (
-        int(anomalies.get("unclassified_solana_candidate_count") or 0) == 0
-        and int(anomalies.get("orphan_stage_state_count") or 0) == 0
-        and not bool(anomalies.get("robinhood_count_inconsistency"))
+    blockers: list[str] = []
+    if unverified_lanes:
+        blockers.append("unverified_lane_candidate_population")
+    if not local_readable:
+        blockers.append("local_candidate_store_unreadable")
+    if int(anomalies.get("unclassified_solana_candidate_count") or 0) > 0:
+        blockers.append("unclassified_solana_candidates")
+    if int(anomalies.get("orphan_stage_state_count") or 0) > 0:
+        blockers.append("orphan_candidate_stage_states")
+    if bool(anomalies.get("robinhood_count_inconsistency")):
+        blockers.append("robinhood_candidate_count_inconsistency")
+
+    conserved = bool(
+        population_verifiable
+        and delta == 0
+        and all(bool(lanes[lane].get("conserved")) for lane in FIVE_LANES)
     )
-    conserved = bool(all_verified and delta == 0 and all(bool(lanes[lane].get("conserved")) for lane in FIVE_LANES))
     reconciled = bool(
         conserved
-        and local_readable
-        and anomaly_free
         and all(bool(lanes[lane].get("reconciled")) for lane in FIVE_LANES)
         and int(debt or 0) == 0
         and int(unexplained or 0) == 0
@@ -299,8 +316,10 @@ def build_five_lane_candidate_accounting(
         "measurement_epoch": measurement_epoch or None,
         "lanes": lanes,
         "candidate_conservation": {
-            "candidate_population_verifiable": all_verified,
+            "candidate_population_verifiable": population_verifiable,
+            "all_lane_sources_verified": all_lane_sources_verified,
             "unverified_lanes": unverified_lanes,
+            "verification_blockers": blockers,
             "observed_candidate_count": observed,
             "terminal_candidate_count": terminal,
             "valid_pending_candidate_count": pending,
