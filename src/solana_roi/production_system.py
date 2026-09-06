@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v5"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v6-execution-realism-retired"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -148,6 +149,42 @@ _COMPATIBILITY_ADAPTERS: tuple[CompatibilityAdapter, ...] = (
 _BUILT: ProductionSystem | None = None
 
 
+def _install_direct_stream_resource_guards() -> None:
+    """Temporary final-layer equivalence guard while Repair 126 migrates ingestion."""
+    from . import direct_solana as direct_solana_module
+    from .direct_solana import DirectSolanaIngestionPlane
+
+    if not bool(getattr(DirectSolanaIngestionPlane._handle_notification, "_roi_cooperative_yield", False)):
+        original = DirectSolanaIngestionPlane._handle_notification
+
+        async def handle(self: Any, provider: str, subscription_targets: dict[int, Any], message: dict[str, Any]) -> None:
+            await original(self, provider, subscription_targets, message)
+            await asyncio.sleep(0)
+
+        try:
+            handle.__dict__.update(getattr(original, "__dict__", {}))
+        except Exception:
+            pass
+        setattr(handle, "_roi_cooperative_yield", True)
+        DirectSolanaIngestionPlane._handle_notification = handle  # type: ignore[method-assign]
+
+    current_connect = direct_solana_module.websockets.connect
+    if not bool(getattr(current_connect, "_roi_memory_bounded", False)):
+        def connect(*args: Any, **kwargs: Any) -> Any:
+            requested_queue = kwargs.get("max_queue")
+            requested_size = kwargs.get("max_size")
+            kwargs["max_queue"] = 64 if requested_queue is None else min(int(requested_queue), 64)
+            kwargs["max_size"] = 256 * 1024 if requested_size is None else min(int(requested_size), 256 * 1024)
+            return current_connect(*args, **kwargs)
+
+        try:
+            connect.__dict__.update(getattr(current_connect, "__dict__", {}))
+        except Exception:
+            pass
+        setattr(connect, "_roi_memory_bounded", True)
+        direct_solana_module.websockets.connect = connect  # type: ignore[assignment]
+
+
 def _component(name: str, module: str, attribute: str, *, required: bool = True) -> ComponentHealth:
     try:
         imported = importlib.import_module(module)
@@ -200,6 +237,7 @@ def build_production_system() -> ProductionSystem:
 
     for adapter in _COMPATIBILITY_ADAPTERS:
         adapter.activate()
+    _install_direct_stream_resource_guards()
 
     from .api import app, ingestion_runtime
     from .robinhood_runtime_install import install_robinhood_chain_paper_runtime
