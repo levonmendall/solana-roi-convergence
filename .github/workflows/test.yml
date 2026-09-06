@@ -84,13 +84,36 @@ jobs:
         run: python -m pytest tests/test_wallet_entity_universe_v4.py
       - name: Existing regressions
         run: |
+          # These modules validate native/component contracts and must run before
+          # production composition replaces compatibility surfaces. They are not
+          # skipped; they run as a separate native regression partition.
+          python -m pytest \
+            tests/test_candidate_risk_window_repair.py \
+            tests/test_continuity_storage_capacity_repair.py \
+            tests/test_fomo_continuation_shadow.py \
+            tests/test_fomo_feature_boundaries.py \
+            tests/test_fomo_risk_conditioned_v5.py \
+            tests/test_live_poll_redundancy.py \
+            tests/test_observation.py \
+            tests/test_poll_watermark_repair.py \
+            tests/test_prospective_observation.py \
+            --junitxml=existing-regressions-native.xml
           python - <<'PY'
           import pytest
-          import solana_roi.production  # explicit Phase-18 composition before legacy test collection
+          import solana_roi.production  # explicit Phase-18 production composition
 
           raise SystemExit(pytest.main([
               "--ignore=tests/test_forward_activation.py",
-              "--junitxml=existing-regressions.xml",
+              "--ignore=tests/test_candidate_risk_window_repair.py",
+              "--ignore=tests/test_continuity_storage_capacity_repair.py",
+              "--ignore=tests/test_fomo_continuation_shadow.py",
+              "--ignore=tests/test_fomo_feature_boundaries.py",
+              "--ignore=tests/test_fomo_risk_conditioned_v5.py",
+              "--ignore=tests/test_live_poll_redundancy.py",
+              "--ignore=tests/test_observation.py",
+              "--ignore=tests/test_poll_watermark_repair.py",
+              "--ignore=tests/test_prospective_observation.py",
+              "--junitxml=existing-regressions-composed.xml",
           ]))
           PY
       - name: Upload existing regression diagnostics
@@ -98,7 +121,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: existing-regressions-${{ github.run_id }}-${{ github.run_attempt }}
-          path: existing-regressions.xml
+          path: existing-regressions-*.xml
           if-no-files-found: error
       - name: Forward cohort certification regressions
         run: python -m pytest tests/test_forward_activation.py
