@@ -6,6 +6,7 @@ from dataclasses import asdict
 from typing import Any
 
 from .risk_conditioned_alpha_v5 import robust_return_profile
+from .v51_return_validation import STATISTICS_VERSION, validate_return
 
 
 ALLOCATOR_VERSION = "cross-regime-paper-allocator-v2-context-isolated"
@@ -71,22 +72,10 @@ def _segment_key(
     regime: str,
     risk_signature: str,
 ) -> str:
-    return "|".join(
-        (
-            surface,
-            lane,
-            venue,
-            lifecycle,
-            regime,
-            risk_signature,
-        )
-    )
+    return "|".join((surface, lane, venue, lifecycle, regime, risk_signature))
 
 
 def _family_key(*, surface: str, venue: str) -> str:
-    # Solana active-alpha and FOMO overlays can express the same underlying venue
-    # exposure. Keep them in the same correlation family until aligned forward
-    # evidence proves the overlap is diversifying rather than duplicative.
     if surface in {"SOLANA_ALPHA", "FOMO"}:
         return f"SOLANA_UNDERLYING:{venue}"
     return "ROBINHOOD_CHAIN"
@@ -95,6 +84,7 @@ def _family_key(*, surface: str, venue: str) -> str:
 def _append(
     grouped: dict[str, list[float]],
     metadata: dict[str, dict[str, str]],
+    measurement_debt: dict[str, int],
     *,
     surface: str,
     lane: str,
@@ -102,7 +92,8 @@ def _append(
     lifecycle: str,
     regime: str,
     risk_signature: str,
-    net_return: float,
+    net_return: Any,
+    source_signature: str = "",
 ) -> None:
     key = _segment_key(
         surface=surface,
@@ -112,7 +103,6 @@ def _append(
         regime=regime,
         risk_signature=risk_signature,
     )
-    grouped.setdefault(key, []).append(float(net_return))
     metadata[key] = {
         "surface": surface,
         "lane": lane,
@@ -122,19 +112,29 @@ def _append(
         "risk_signature": risk_signature,
         "correlation_family": _family_key(surface=surface, venue=venue),
     }
+    validated = validate_return(
+        net_return,
+        source_surface=surface,
+        source_signature=source_signature,
+    )
+    if not validated.validity or validated.normalized_fraction is None:
+        measurement_debt[key] = measurement_debt.get(key, 0) + 1
+        return
+    grouped.setdefault(key, []).append(validated.normalized_fraction)
 
 
 def _segment_returns(
     store: Any,
     release_commit: str,
-) -> tuple[dict[str, list[float]], dict[str, dict[str, str]]]:
+) -> tuple[dict[str, list[float]], dict[str, dict[str, str]], dict[str, int]]:
     grouped: dict[str, list[float]] = {}
     metadata: dict[str, dict[str, str]] = {}
+    measurement_debt: dict[str, int] = {}
 
     if _table_exists(store, "risk_conditioned_alpha_v5_outcomes"):
         with store._lock:
             rows = store.db.execute(
-                "SELECT lane,venue,lifecycle,regime,risk_signature,net_return "
+                "SELECT id,lane,venue,lifecycle,regime,risk_signature,net_return "
                 "FROM risk_conditioned_alpha_v5_outcomes WHERE release_commit=? ORDER BY id",
                 (release_commit,),
             ).fetchall()
@@ -142,13 +142,15 @@ def _segment_returns(
             _append(
                 grouped,
                 metadata,
+                measurement_debt,
                 surface="SOLANA_ALPHA",
                 lane=str(row["lane"] or "unknown"),
                 venue=str(row["venue"] or "UNKNOWN"),
                 lifecycle=str(row["lifecycle"] or "unknown"),
                 regime=str(row["regime"] or "unknown"),
                 risk_signature=str(row["risk_signature"] or "clean"),
-                net_return=float(row["net_return"]),
+                net_return=row["net_return"],
+                source_signature=str(row["id"]),
             )
 
     if _table_exists(store, "fomo_paper_outcomes"):
@@ -156,7 +158,7 @@ def _segment_returns(
         with store._lock:
             if shadow_exists:
                 rows = store.db.execute(
-                    "SELECT o.venue,o.lifecycle,o.regime,o.net_return,s.state_json "
+                    "SELECT o.id,o.venue,o.lifecycle,o.regime,o.net_return,s.state_json "
                     "FROM fomo_paper_outcomes o "
                     "LEFT JOIN fomo_shadow_observations s "
                     "ON s.release_commit=o.release_commit AND s.source_signature=o.source_signature "
@@ -165,7 +167,7 @@ def _segment_returns(
                 ).fetchall()
             else:
                 rows = store.db.execute(
-                    "SELECT venue,lifecycle,regime,net_return,NULL AS state_json "
+                    "SELECT id,venue,lifecycle,regime,net_return,NULL AS state_json "
                     "FROM fomo_paper_outcomes WHERE release_commit=? ORDER BY id",
                     (release_commit,),
                 ).fetchall()
@@ -173,19 +175,21 @@ def _segment_returns(
             _append(
                 grouped,
                 metadata,
+                measurement_debt,
                 surface="FOMO",
                 lane="fomo_continuation",
                 venue=str(row["venue"] or "UNKNOWN"),
                 lifecycle=str(row["lifecycle"] or "unknown"),
                 regime=str(row["regime"] or "unknown"),
                 risk_signature=_fomo_risk_signature(row["state_json"]),
-                net_return=float(row["net_return"]),
+                net_return=row["net_return"],
+                source_signature=str(row["id"]),
             )
 
     if _table_exists(store, "robinhood_paper_outcomes") and _table_exists(store, "robinhood_v5_trial_context"):
         with store._lock:
             rows = store.db.execute(
-                "SELECT c.lane,t.venue,t.lifecycle,c.regime,c.risk_signature,o.net_return "
+                "SELECT o.id,c.lane,t.venue,t.lifecycle,c.regime,c.risk_signature,o.net_return "
                 "FROM robinhood_paper_outcomes o "
                 "JOIN robinhood_v5_trial_context c ON c.trial_id=o.trial_id "
                 "JOIN robinhood_paper_trials t ON t.id=o.trial_id "
@@ -196,16 +200,18 @@ def _segment_returns(
             _append(
                 grouped,
                 metadata,
+                measurement_debt,
                 surface="ROBINHOOD_CHAIN",
                 lane=str(row["lane"] or "unknown"),
                 venue=str(row["venue"] or "UNKNOWN"),
                 lifecycle=str(row["lifecycle"] or "unknown"),
                 regime=str(row["regime"] or "unknown"),
                 risk_signature=str(row["risk_signature"] or "clean"),
-                net_return=float(row["net_return"]),
+                net_return=row["net_return"],
+                source_signature=str(row["id"]),
             )
 
-    return grouped, metadata
+    return grouped, metadata, measurement_debt
 
 
 def _score(profile: Any) -> float:
@@ -253,17 +259,16 @@ def _capped_normalize(scores: dict[str, float], caps: dict[str, float]) -> dict[
 def build_cross_regime_allocation(store: Any, release_commit: str) -> dict[str, Any]:
     """Allocate paper capital by exact lifecycle/regime/risk segments.
 
-    A weak lifecycle or hazard cohort cannot dilute or subsidize a different
-    lifecycle/regime/risk signature. Correlation remains fail-closed: Solana alpha
-    and FOMO exposures on the same underlying venue share one family cap until
-    aligned forward evidence can support a correlation estimate.
+    Invalid economic measurements remain audit evidence but cannot mature or score
+    the affected segment. Exact -100% returns remain valid economic observations.
     """
-    grouped, metadata = _segment_returns(store, release_commit)
+    grouped, metadata, measurement_debt = _segment_returns(store, release_commit)
     profiles: dict[str, dict[str, Any]] = {}
     segment_scores: dict[str, float] = {}
     family_scores: dict[str, float] = {}
 
-    for segment, values in grouped.items():
+    for segment in sorted(set(grouped) | set(metadata)):
+        values = grouped.get(segment, [])
         profile = robust_return_profile(
             values,
             grid=ALLOCATOR_EVIDENCE_POSITION_GRID,
@@ -272,7 +277,8 @@ def build_cross_regime_allocation(store: Any, release_commit: str) -> dict[str, 
         profiles[segment] = asdict(profile)
         mature = profile.sample_count >= MIN_SEGMENT_SAMPLES
         promoted = profile.state == "promoted_positive_log_growth"
-        score = _score(profile) if mature and promoted else 0.0
+        integrity_pass = measurement_debt.get(segment, 0) == 0
+        score = _score(profile) if mature and promoted and integrity_pass else 0.0
         segment_scores[segment] = score
         if score > 0.0:
             family = metadata[segment]["correlation_family"]
@@ -300,10 +306,14 @@ def build_cross_regime_allocation(store: Any, release_commit: str) -> dict[str, 
     allocated = min(1.0, sum(segment_weights.values()))
     return {
         "allocator_version": ALLOCATOR_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "release_commit": release_commit,
-        "authority": "paper_only_if_exact_forward_segment_is_mature_and_robust_positive",
+        "authority": "paper_only_if_exact_forward_segment_is_mature_robust_positive_and_measurement_valid",
         "segmentation": "surface_x_lane_x_venue_x_lifecycle_x_regime_x_full_risk_signature",
         "minimum_segment_samples": MIN_SEGMENT_SAMPLES,
+        "invalid_economic_measurement_debt_by_segment": measurement_debt,
+        "invalid_economic_measurement_count": sum(measurement_debt.values()),
+        "invalid_measurements_are_not_imputed": True,
         "correlation_policy": (
             "unknown_correlation_is_not_zero; Solana alpha and FOMO on the same "
             "underlying venue share one capped family until aligned forward evidence"
