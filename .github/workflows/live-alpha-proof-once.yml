@@ -1,0 +1,59 @@
+name: Live Alpha Proof Once
+
+on:
+  push:
+    branches: [verify/alpha-f2d0]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-live-alpha:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Inspect exact deployed alpha certificate
+        env:
+          EXPECTED_RELEASE_COMMIT: f2d0d5359492ddae20153c92a8c179a18bfa32c8
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          base='https://solana-roi-convergence.onrender.com'
+          expected=os.environ['EXPECTED_RELEASE_COMMIT']
+          def get(path):
+              req=urllib.request.Request(base+path,headers={'Accept':'application/json','User-Agent':'roi-alpha-proof/1'})
+              with urllib.request.urlopen(req,timeout=90) as r:
+                  return json.loads(r.read().decode())
+          health=get('/health')
+          forward=get('/v1/strategy/forward-certification')
+          alpha=get('/v1/strategy/alpha-certificate')
+          print('HEALTH',json.dumps({k:health.get(k) for k in ('status','paper_only','live_money_authority','release_commit')},sort_keys=True))
+          print('FORWARD',json.dumps({k:forward.get(k) for k in ('release_commit','state','system_forward_certified','hard_operational_gates_ok','blockers','promotion_eligible_families_under_existing_v51_claims')},sort_keys=True))
+          print('ALPHA',json.dumps({
+              'release_commit':alpha.get('release_commit'),
+              'state':alpha.get('state'),
+              'after_cost_positive_compounded_alpha_proven':alpha.get('after_cost_positive_compounded_alpha_proven'),
+              'blockers':alpha.get('blockers'),
+              'promoted_families':alpha.get('promoted_families'),
+              'degrading_families':alpha.get('degrading_families'),
+              'killed_families':alpha.get('killed_families'),
+              'future_mature_scaling_eligible_families':alpha.get('future_mature_scaling_eligible_families'),
+              'checks':alpha.get('checks'),
+              'paper_only':alpha.get('paper_only'),
+              'live_money_authority':alpha.get('live_money_authority'),
+              'signing_available':alpha.get('signing_available'),
+              'transaction_submission_available':alpha.get('transaction_submission_available'),
+          },sort_keys=True,default=str))
+          assert forward.get('release_commit') == expected
+          assert alpha.get('release_commit') == expected
+          assert alpha.get('paper_only') is True
+          assert alpha.get('live_money_authority') is False
+          assert alpha.get('signing_available') is False
+          assert alpha.get('transaction_submission_available') is False
+          assert alpha.get('changes_strategy_authority') is False
+          assert alpha.get('changes_economic_thresholds') is False
+          PY
