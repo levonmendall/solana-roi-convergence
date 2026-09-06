@@ -11,6 +11,10 @@ from .robinhood_live_getlogs_resilience import (
     install_robinhood_live_getlogs_resilience,
     status as live_getlogs_resilience_status,
 )
+from .robinhood_phase9_anchor_seed import (
+    install_robinhood_phase9_anchor_seed,
+    status as robinhood_phase9_anchor_status,
+)
 from .robinhood_production_provider_finalizer import (
     install_robinhood_production_provider_finalizer,
     status as production_provider_status,
@@ -38,6 +42,10 @@ from .v51_measurement_integrity_hardening import (
 from .v51_promotion_proof import install_release_attestation_gate, status as promotion_proof_status
 from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_coverage
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
+from .v51_robinhood_phase9_65_69 import (
+    install_robinhood_phase9_65_69,
+    status as robinhood_phase9_status,
+)
 from .v51_strategy_api import install_v51_strategy_api
 
 # Capture the already-proven final entry guard before the sequencer transport installs.
@@ -45,7 +53,7 @@ from .v51_strategy_api import install_v51_strategy_api
 # is switched to provider/v5.1 event-time authority by the finalizer below.
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v2-robinhood-phase9-65-69"
 _INSTALLED = False
 
 
@@ -153,6 +161,19 @@ def install_v51_production_authority(
         legacy_fresh_ready=_ORIGINAL_ROBINHOOD_FRESH_HEAD_READY,
     )
 
+    # The provider WebSocket runner bypasses the older forward-only poll loop, so
+    # explicitly seed only the latest head plus the existing bounded 64-block factory
+    # metadata insurance before the production subscription starts. No old swaps are
+    # replayed and the archival cursor never regains readiness authority.
+    install_robinhood_phase9_anchor_seed(RobinhoodChainPaperPlane)
+
+    # Phase 9 tightens Robinhood runtime/evidence contracts without altering frozen
+    # strategy economics. It retires historical-lag readiness semantics, validates
+    # proof freshness at the nonblocking cache boundary, gives creation and reserve/
+    # swap opportunities durable pre-lane identities, and makes venue/lifecycle
+    # economic separation an explicit proof invariant.
+    install_robinhood_phase9_65_69(RobinhoodChainPaperPlane, module)
+
     # Preserve historical architecture markers while making the provider wrapper the
     # final runtime implementation. No signer, transaction submission, or live-money
     # authority is introduced.
@@ -195,6 +216,8 @@ def install_v51_production_authority(
     app.state.roi_robinhood_decision_tail = True
     app.state.roi_robinhood_sequencer_frontier = True
     app.state.roi_robinhood_production_provider_finalizer = True
+    app.state.roi_robinhood_phase9_anchor_seed = True
+    app.state.roi_robinhood_phase9_65_69 = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -213,6 +236,8 @@ def status() -> dict[str, Any]:
         "robinhood_decision_tail": decision_tail_status(),
         "robinhood_sequencer_frontier": sequencer_frontier_status(),
         "robinhood_production_provider": production_provider_status(),
+        "robinhood_phase9_anchor_seed": robinhood_phase9_anchor_status(),
+        "robinhood_phase9_65_69": robinhood_phase9_status(),
         "robinhood_entry_freshness_checks": "running_worker_provider_v51_event_time; direct_test_calls_legacy_helper",
         "robinhood_proof_refresh": "separate_sqlite_connection_threadpool_not_live_frontier",
         "empty_epoch_forward_slo": empty_epoch_slo_status(),
@@ -228,6 +253,7 @@ def status() -> dict[str, Any]:
         "forward_certification_changes_strategy_authority": False,
         "alpha_validation_changes_strategy_authority": False,
         "latency_challenger_changes_strategy_authority": False,
+        "phase9_65_69_changes_strategy_authority": False,
         "paper_only": True,
         "live_money_authority": False,
     }
