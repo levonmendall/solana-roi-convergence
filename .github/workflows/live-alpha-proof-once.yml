@@ -16,21 +16,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Inspect Robinhood transport kind
+      - name: Probe public WSS JSON-RPC
         run: |
+          python -m pip install -q websockets==15.0.1
           python - <<'PY'
-          import json, urllib.request
-          req=urllib.request.Request('https://solana-roi-convergence.onrender.com/v1/strategy/e2e-status',headers={'Accept':'application/json','User-Agent':'roi-rh-provider-inspect/1'})
-          with urllib.request.urlopen(req,timeout=90) as r:
-              e=json.loads(r.read().decode())
-          rh=e.get('robinhood') or {}
-          print(json.dumps({
-              'release_commit':e.get('release_commit'),
-              'rpc_endpoint_kind':rh.get('rpc_endpoint_kind'),
-              'runtime_ready':rh.get('runtime_ready'),
-              'paper_decision_transport_ready':rh.get('paper_decision_transport_ready'),
-              'blockers':rh.get('blockers'),
-              'forward_frontier_readiness':rh.get('forward_frontier_readiness'),
-              'live_frontier_verification':rh.get('live_frontier_verification'),
-          },sort_keys=True,default=str))
+          import asyncio, json
+          import websockets
+          URL='wss://rpc.mainnet.chain.robinhood.com'
+          async def main():
+              try:
+                  async with websockets.connect(URL,open_timeout=10,close_timeout=3,ping_interval=20) as ws:
+                      await ws.send(json.dumps({'jsonrpc':'2.0','id':1,'method':'eth_chainId','params':[]}))
+                      print('CHAIN',await asyncio.wait_for(ws.recv(),timeout=10))
+                      await ws.send(json.dumps({'jsonrpc':'2.0','id':2,'method':'eth_subscribe','params':['newHeads']}))
+                      reply=json.loads(await asyncio.wait_for(ws.recv(),timeout=10))
+                      print('SUB',json.dumps(reply,sort_keys=True))
+                      if 'result' not in reply:
+                          raise SystemExit(2)
+                      for i in range(3):
+                          msg=json.loads(await asyncio.wait_for(ws.recv(),timeout=10))
+                          params=msg.get('params') or {}
+                          result=params.get('result') or {}
+                          print('HEAD',i+1,result.get('number'),result.get('hash'))
+              except Exception as exc:
+                  print('WSS_ERROR',type(exc).__name__,str(exc))
+                  raise
+          asyncio.run(main())
           PY
