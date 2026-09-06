@@ -4,7 +4,7 @@ from typing import Any, Callable
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority_fingerprint
 
-HARDENING_VERSION = "v51-measurement-integrity-hardening-v3-exact-exit-epoch"
+HARDENING_VERSION = "v51-measurement-integrity-hardening-v4-terminal-fomo-exit"
 _ORIGINAL_WALLET_RECORD: Callable[..., Any] | None = None
 _INSTALLED = False
 
@@ -23,12 +23,12 @@ def _ensure_release_compatibility_fail_closed(store: Any, release_commit: str | 
         ).fetchone()
     if existing is not None:
         row = dict(existing)
-        # Repair 113 changes execution measurement semantics but not economic
+        # Repairs 109-113 change execution measurement semantics but not economic
         # authority. A current release row may have been created moments earlier by
-        # the base measurement installer, before Phase 16's exact-exit installer ran.
-        # Upgrade only that same current release to the new execution epoch and fail
-        # promotion closed until the ordinary live attestation refreshes it. Historical
-        # release rows retain their original epoch permanently for audit/non-pooling.
+        # the base measurement installer, before the active exact-exit settlement
+        # follow-up ran. Upgrade only that same current release to the active
+        # execution epoch and fail promotion closed until ordinary live attestation
+        # refreshes it. Historical release rows retain their original epoch forever.
         if (
             release == measurement.current_release_commit()
             and str(row.get("execution_model_epoch") or "") != measurement.EXECUTION_MODEL_EPOCH
@@ -40,7 +40,7 @@ def _ensure_release_compatibility_fail_closed(store: Any, release_commit: str | 
                     (
                         measurement.EXECUTION_MODEL_EPOCH,
                         measurement.execution_model_fingerprint(),
-                        "current_release_exact_exit_execution_model_pending_live_attestation",
+                        "current_release_terminal_fomo_exact_exit_model_pending_live_attestation",
                         release,
                     ),
                 )
@@ -105,11 +105,14 @@ def install_measurement_integrity_hardening() -> None:
     from . import v51_measurement_compatibility_filters as filters
     from . import v51_measurement_integrity as measurement
     from .v51_exit_execution_integrity import install_exact_exit_execution_integrity
+    from .v51_exit_execution_terminal_fomo_followup import install_terminal_fomo_followup
     from .wallet_discovery import ContinuousWalletDiscovery
 
-    # Install the Phase 16 execution model before wrapping compatibility so all
-    # subsequent registration and proof calls see the same current execution epoch.
+    # Install the merged Phase 16 exact-order/epoch base first, then activate the
+    # nonblocking terminal/FOMO settlement semantics before compatibility
+    # registration and before any forward observation can be admitted.
     install_exact_exit_execution_integrity()
+    install_terminal_fomo_followup()
 
     if not hasattr(measurement, "_ORIGINAL_ENSURE_RELEASE_COMPATIBILITY"):
         measurement._ORIGINAL_ENSURE_RELEASE_COMPATIBILITY = measurement.ensure_release_compatibility  # type: ignore[attr-defined]
@@ -138,7 +141,11 @@ def install_measurement_integrity_hardening() -> None:
 
 
 def status() -> dict[str, Any]:
-    from .v51_exit_execution_integrity import EXECUTION_MODEL_EPOCH, status as exit_execution_status
+    from .v51_exit_execution_integrity import status as base_exit_execution_status
+    from .v51_exit_execution_terminal_fomo_followup import (
+        ACTIVE_EXECUTION_MODEL_EPOCH,
+        status as terminal_fomo_exit_status,
+    )
 
     return {
         "version": HARDENING_VERSION,
@@ -148,8 +155,9 @@ def status() -> dict[str, Any]:
         "legacy_wallet_policy_factory_preserved": True,
         "v51_wallet_research_reclassification_ceiling_fraction": 0.40,
         "wallet_lineage_candidate_schema_precreated": True,
-        "execution_model_epoch": EXECUTION_MODEL_EPOCH,
-        "exact_exit_execution_integrity": exit_execution_status(),
+        "execution_model_epoch": ACTIVE_EXECUTION_MODEL_EPOCH,
+        "exact_exit_execution_integrity_base": base_exit_execution_status(),
+        "active_terminal_fomo_exit_execution": terminal_fomo_exit_status(),
         "paper_only": True,
         "live_money_authority": False,
     }
