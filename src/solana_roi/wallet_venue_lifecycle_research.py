@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterable
 
 from .profit_first_entity_final import FINAL_STRATEGY_VERSION, UNIFIED_LANE
 from .profit_first_entity_final_research import FinalProfitFirstResearchAdapter
+from .v51_return_validation import STATISTICS_VERSION, validate_return
 from .wallet_entity_universe_v4 import MIN_MATURE_FORWARD_SAMPLES, WalletEntityUniverseV4
 
 
@@ -64,7 +65,6 @@ def _column_exists(store: Any, table: str, column: str) -> bool:
 
 
 def venue_from_source(source: str | None) -> str | None:
-    """Extract the canonical venue family without inventing a finer Raydium subtype."""
     raw = str(source or "").upper()
     parts = {part for part in raw.replace("/", ":").split(":") if part}
     for venue in VENUES:
@@ -74,7 +74,6 @@ def venue_from_source(source: str | None) -> str | None:
 
 
 def lifecycle_stage(venue: str | None, *, prior_pump_evidence: bool = False) -> str:
-    """Classify only what current-release point-in-time observations actually prove."""
     if venue == "PUMP_FUN":
         return PUMP_BONDING_CURVE
     if venue == "PUMP_AMM":
@@ -87,7 +86,7 @@ def lifecycle_stage(venue: str | None, *, prior_pump_evidence: bool = False) -> 
 def _safe_float(value: Any) -> float | None:
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return result if math.isfinite(result) else None
 
@@ -124,12 +123,22 @@ def _settled_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     gross_loss = 0.0
     scaled_returns: list[float] = []
     wins = 0
+    invalid_returns = 0
     for row in ordered:
-        value = _safe_float(row.get("net_return"))
+        validated = validate_return(
+            row.get("net_return"),
+            source_surface="WALLET_ALPHA",
+            source_signature=str(row.get("source_signature") or ""),
+            measurement_epoch=str(row.get("measurement_epoch") or ""),
+            execution_model_epoch=str(row.get("execution_model_epoch") or ""),
+        )
         fraction = _safe_float(row.get("position_fraction"))
-        if value is None or fraction is None or fraction <= 0.0:
+        if not validated.validity or validated.normalized_fraction is None:
+            invalid_returns += 1
             continue
-        contribution = fraction * value
+        if fraction is None or fraction <= 0.0:
+            continue
+        contribution = fraction * validated.normalized_fraction
         deployed += fraction
         weighted_pnl += contribution
         scaled_returns.append(contribution)
@@ -155,7 +164,10 @@ def _settled_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         max_drawdown = min(1.0, max(0.0, drawdown))
 
     return {
+        "statistics_version": STATISTICS_VERSION,
         "closed_outcomes": len(scaled_returns),
+        "invalid_economic_measurement_count": invalid_returns,
+        "invalid_economic_measurements_are_not_imputed": True,
         "deployed_fraction_sum": deployed,
         "copyable_return_on_deployed_fraction": weighted_pnl / deployed if deployed > 0.0 else None,
         "geometric_growth_on_fraction_scaled_returns": geometric_growth,
@@ -166,18 +178,12 @@ def _settled_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "max_drawdown_on_fraction_scaled_returns": max_drawdown,
         "median_signal_to_entry_seconds": _median(row.get("signal_to_entry_seconds") for row in ordered),
         "median_realized_chase_fraction": _median(row.get("chase_fraction") for row in ordered),
-        "mature_forward_segment": len(scaled_returns) >= SEGMENT_OUTCOME_MATURITY,
+        "mature_forward_segment": len(scaled_returns) >= SEGMENT_OUTCOME_MATURITY and invalid_returns == 0,
     }
 
 
 class VenueLifecycleResearch:
-    """Release-bound research view of copyable wallet/entity alpha by venue and lifecycle.
-
-    This component is deliberately read-only. It cannot mutate tracking cohorts,
-    strategy rules, paper positions, or any live-money authority. Raydium is called
-    post-Pump only when an earlier current-release Pump.fun/Pump-AMM wallet observation
-    for the same token exists before that Raydium observation.
-    """
+    """Release-bound research view of copyable wallet/entity alpha by venue and lifecycle."""
 
     def __init__(self, universe: WalletEntityUniverseV4):
         self.universe = universe
@@ -248,7 +254,6 @@ class VenueLifecycleResearch:
             row = dict(raw)
             observation = by_signature.get(str(row.get("source_signature") or ""))
             if observation is None:
-                # Old-release or pre-epoch observations cannot gain current segment authority.
                 continue
             row["venue"] = observation["venue"]
             row["lifecycle_stage"] = observation["lifecycle_stage"]
@@ -298,9 +303,6 @@ class VenueLifecycleResearch:
     def _entity_segments(
         observations: list[dict[str, Any]], outcomes: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        # Entity identity for settled performance is read from the point-in-time trial.
-        # Observation-only rows have no safe immutable entity snapshot here, so they
-        # intentionally do not fabricate an entity segment before an outcome exists.
         groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
         for row in outcomes:
             key = (str(row.get("trigger_entity") or ""), str(row["venue"]), str(row["lifecycle_stage"]))
@@ -352,8 +354,10 @@ class VenueLifecycleResearch:
                 * float(row.get("deployed_fraction_sum") or 0.0)
                 for row in rows
             )
+            invalid = sum(int(row.get("invalid_economic_measurement_count") or 0) for row in rows)
             return {
                 "closed_outcomes": closed,
+                "invalid_economic_measurement_count": invalid,
                 "deployed_fraction_sum": deployed,
                 "copyable_return_on_deployed_fraction": weighted / deployed if deployed > 0.0 else None,
             }
@@ -361,7 +365,12 @@ class VenueLifecycleResearch:
         raydium = combine(raydium_rows)
         pump = combine(pump_rows)
         conclusion = "insufficient_forward_evidence"
-        if raydium["closed_outcomes"] >= SEGMENT_OUTCOME_MATURITY and pump["closed_outcomes"] >= SEGMENT_OUTCOME_MATURITY:
+        if (
+            raydium["closed_outcomes"] >= SEGMENT_OUTCOME_MATURITY
+            and pump["closed_outcomes"] >= SEGMENT_OUTCOME_MATURITY
+            and raydium["invalid_economic_measurement_count"] == 0
+            and pump["invalid_economic_measurement_count"] == 0
+        ):
             left = raydium["copyable_return_on_deployed_fraction"]
             right = pump["copyable_return_on_deployed_fraction"]
             if left is not None and right is not None:
@@ -411,6 +420,7 @@ class VenueLifecycleResearch:
         return {
             "installed": True,
             "strategy_version": FINAL_STRATEGY_VERSION,
+            "statistics_version": STATISTICS_VERSION,
             "research_only": True,
             "release_commit": _release_commit(),
             "evidence_epoch_id": epoch_id,
