@@ -100,9 +100,33 @@ jobs:
           python -m pytest tests/test_fomo_continuation_shadow.py --junitxml=existing-regressions-native-fomo-shadow.xml
           python -m pytest tests/test_fomo_feature_boundaries.py --junitxml=existing-regressions-native-fomo-boundaries.xml
           python -m pytest tests/test_fomo_risk_conditioned_v5.py --junitxml=existing-regressions-native-fomo-v5.xml
-          python -m pytest tests/test_live_poll_redundancy.py --junitxml=existing-regressions-native-live-poll.xml
+          python - <<'PY'
+          import pytest
+          from solana_roi.live_poll_redundancy import install_live_poll_redundancy
+          from solana_roi.poll_watermark_repair import install_poll_watermark_repair
+          install_live_poll_redundancy()
+          install_poll_watermark_repair()
+          raise SystemExit(pytest.main([
+              "tests/test_live_poll_redundancy.py",
+              "--junitxml=existing-regressions-native-live-poll.xml",
+          ]))
+          PY
           python -m pytest tests/test_observation.py --junitxml=existing-regressions-native-observation.xml
-          python -m pytest tests/test_poll_watermark_repair.py --junitxml=existing-regressions-native-poll-watermark.xml
+          python - <<'PY'
+          import pytest
+          from solana_roi.live_poll_redundancy import install_live_poll_redundancy
+          from solana_roi.poll_watermark_repair import install_poll_watermark_repair
+          from solana_roi.poll_pagination_context import install_poll_pagination_context
+          install_live_poll_redundancy()
+          install_poll_watermark_repair()
+          install_poll_pagination_context()
+          from solana_roi.poll_exception_rearm import install_poll_exception_rearm
+          install_poll_exception_rearm()
+          raise SystemExit(pytest.main([
+              "tests/test_poll_watermark_repair.py",
+              "--junitxml=existing-regressions-native-poll-watermark.xml",
+          ]))
+          PY
           python -m pytest tests/test_prospective_observation.py --junitxml=existing-regressions-native-prospective.xml
           python - <<'PY'
           import pytest
