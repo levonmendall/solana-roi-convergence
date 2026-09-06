@@ -28,6 +28,14 @@ def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _attestation_policy() -> dict[str, Any]:
+    return {
+        "version": ATTESTATION_HARDENING_VERSION,
+        "surface_scoped_attestation_required": True,
+        "aggregate_attestation_fallback_allowed": False,
+    }
+
+
 def _insufficient_certificate() -> dict[str, Any]:
     return {
         "phase14_version": PHASE14_VERSION,
@@ -38,6 +46,9 @@ def _insufficient_certificate() -> dict[str, Any]:
         "production_proven": False,
         "system_certification_pass": False,
         "blockers": ["canonical_system_proof_cache_unavailable"],
+        "surface_attestation_hardening_version": ATTESTATION_HARDENING_VERSION,
+        "surface_scoped_attestation_required": True,
+        "aggregate_attestation_fallback_allowed": False,
         "changes_strategy_authority": False,
         "changes_economic_thresholds": False,
         "paper_only": True,
@@ -139,6 +150,8 @@ def install_phase14_profitability_certification(
                     "final_certification": certificate,
                     "worker_readiness": {},
                     "resource_pressure": resource_pressure_snapshot(),
+                    "surface_attestation_policy": _attestation_policy(),
+                    "resource_pressure_version": RESOURCE_PRESSURE_VERSION,
                     "blockers": ["canonical_system_proof_cache_unavailable"],
                     "read_only_observability": True,
                     "changes_strategy_authority": False,
@@ -195,11 +208,7 @@ def install_phase14_profitability_certification(
                     "resource_attribution": operations.get("resource_attribution"),
                 },
                 "resource_pressure": resource_pressure,
-                "surface_attestation_policy": {
-                    "version": ATTESTATION_HARDENING_VERSION,
-                    "surface_scoped_attestation_required": True,
-                    "aggregate_attestation_fallback_allowed": False,
-                },
+                "surface_attestation_policy": _attestation_policy(),
                 "resource_pressure_version": RESOURCE_PRESSURE_VERSION,
                 "blockers": blockers,
                 "read_only_observability": True,
