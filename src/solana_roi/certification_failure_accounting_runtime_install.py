@@ -162,5 +162,18 @@ def install_final_certification_failure_accounting() -> None:
 
     install_websocket_frontier_provenance_repair()
 
+    # PR #224 proved candidate RPC admission is no longer the dominant delay. The
+    # next exact-release telemetry showed high-volume public websocket shards could
+    # deliver launch receipts 13-27 seconds behind a fresh head, while v7 had parked
+    # the independent confirmed-head sampler. Recompose the transport/timing and
+    # multi-scout normalizer at the final worker-creation boundary. This does not
+    # alter strategy economics, certification thresholds, provider scope, signing,
+    # submission, or paper-only authority.
+    from .post224_frontier_candidate_hardening import (
+        install_post224_frontier_candidate_hardening,
+    )
+
+    install_post224_frontier_candidate_hardening()
+
 
 __all__ = ["install_final_certification_failure_accounting"]
