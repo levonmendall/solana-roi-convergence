@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .robinhood_chain_core import *
+from .v51_atomic_paper_capital import ensure_atomic_capital_schema, settle_paper_capital
 
 
 class RobinhoodStateMixin:
@@ -74,7 +75,20 @@ class RobinhoodStateMixin:
                 "position_fraction REAL NOT NULL, entry_quote_in_wei TEXT NOT NULL, entry_token_raw TEXT NOT NULL, "
                 "entry_gas_wei TEXT NOT NULL, entry_total_cost_wei TEXT NOT NULL, entry_price_eth REAL NOT NULL, "
                 "entry_round_trip_cost_fraction REAL NOT NULL, opened_at TEXT NOT NULL, decision_reason TEXT NOT NULL, "
-                "paper_only INTEGER NOT NULL, live_money_authority INTEGER NOT NULL)"
+                "capital_reservation_id TEXT, paper_only INTEGER NOT NULL, live_money_authority INTEGER NOT NULL)"
+            )
+            trial_columns = {
+                str(row["name"])
+                for row in self.store.db.execute("PRAGMA table_info(robinhood_paper_trials)").fetchall()
+            }
+            if "capital_reservation_id" not in trial_columns:
+                self.store.db.execute(
+                    "ALTER TABLE robinhood_paper_trials ADD COLUMN capital_reservation_id TEXT"
+                )
+            self.store.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_robinhood_trial_capital_reservation "
+                "ON robinhood_paper_trials(release_commit,capital_reservation_id) "
+                "WHERE capital_reservation_id IS NOT NULL"
             )
             self.store.db.execute(
                 "CREATE TABLE IF NOT EXISTS robinhood_paper_outcomes ("
@@ -85,6 +99,7 @@ class RobinhoodStateMixin:
                 "exit_gas_wei TEXT NOT NULL, exit_reason TEXT NOT NULL, settled_at TEXT NOT NULL, "
                 "paper_only INTEGER NOT NULL, live_money_authority INTEGER NOT NULL)"
             )
+        ensure_atomic_capital_schema(self.store)
 
     def _restore(self) -> None:
         with self.store._lock:
@@ -94,6 +109,12 @@ class RobinhoodStateMixin:
             self._cursor = int(row["value"]) if row is not None else None
             launches = self.store.db.execute(
                 "SELECT * FROM robinhood_launches WHERE release_commit=? ORDER BY id DESC LIMIT 256",
+                (self.release_commit,),
+            ).fetchall()
+            settled_capital = self.store.db.execute(
+                "SELECT t.id AS trial_id,t.capital_reservation_id,o.net_return "
+                "FROM robinhood_paper_trials t JOIN robinhood_paper_outcomes o ON o.trial_id=t.id "
+                "WHERE t.release_commit=? AND t.capital_reservation_id IS NOT NULL ORDER BY t.id",
                 (self.release_commit,),
             ).fetchall()
         for raw in reversed(launches):
@@ -125,6 +146,21 @@ class RobinhoodStateMixin:
                     graduation_threshold=int(row.get("graduation_threshold") or 0),
                     launch_block=int(row.get("launch_block") or 0),
                 )
+        for raw in settled_capital:
+            item = dict(raw)
+            try:
+                settle_paper_capital(
+                    self.store,
+                    release_commit=self.release_commit,
+                    reservation_id=str(item["capital_reservation_id"]),
+                    settlement_id=f"robinhood-trial:{int(item['trial_id'])}",
+                    net_return=float(item["net_return"]),
+                )
+            except (KeyError, RuntimeError):
+                # Pre-Batch-4 rows have no reservation to reconcile. New rows are
+                # repaired idempotently here after a crash between outcome write and
+                # capital settlement.
+                pass
         self._trim_tracking()
 
     def _set_cursor(self, value: int) -> None:

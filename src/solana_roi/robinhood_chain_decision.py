@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .robinhood_chain_core import *
+from .v51_atomic_paper_capital import cancel_paper_capital, reserve_paper_capital
 
 
 class RobinhoodDecisionMixin:
@@ -191,33 +192,59 @@ class RobinhoodDecisionMixin:
         fraction: float,
         quote: dict[str, Any],
         decision_reason: str,
-    ) -> None:
-        with self.store._lock, self.store.db:
-            self.store.db.execute(
-                "INSERT INTO robinhood_paper_trials("
-                "release_commit,strategy_version,token,market,venue,lifecycle,trigger_actor,trigger_entity,fomo_state,context_state,"
-                "position_fraction,entry_quote_in_wei,entry_token_raw,entry_gas_wei,entry_total_cost_wei,"
-                "entry_price_eth,entry_round_trip_cost_fraction,opened_at,decision_reason,paper_only,live_money_authority"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)",
-                (
-                    self.release_commit,
-                    ROBINHOOD_CHAIN_PAPER_VERSION,
-                    token,
-                    market,
-                    venue,
-                    lifecycle,
-                    trigger_actor,
-                    trigger_entity,
-                    fomo_state,
-                    context_state,
-                    float(fraction),
-                    str(int(quote["amount_in_wei"])),
-                    str(int(quote["token_out"])),
-                    str(int(quote["entry_gas_wei"])),
-                    str(int(quote["entry_total_cost_wei"])),
-                    float(quote["entry_price_eth"]),
-                    float(quote["round_trip_cost_fraction"]),
-                    _utcnow(),
-                    decision_reason,
-                ),
+    ) -> bool:
+        reservation_id = f"robinhood:{_clean_address(token)}:{_clean_address(market)}"
+        reservation = reserve_paper_capital(
+            self.store,
+            release_commit=self.release_commit,
+            reservation_id=reservation_id,
+            lane="robinhood",
+            candidate_id=f"{_clean_address(token)}:{_clean_address(market)}",
+            requested_fraction=float(fraction),
+            capacity_fraction=MAX_OPEN_EXPOSURE_FRACTION,
+            allow_downsize=False,
+            minimum_fraction=float(fraction),
+        )
+        if str(reservation.get("status")) != "active" or float(reservation.get("reserved_fraction") or 0.0) + 1e-12 < float(fraction):
+            return False
+        try:
+            with self.store._lock, self.store.db:
+                cursor = self.store.db.execute(
+                    "INSERT OR IGNORE INTO robinhood_paper_trials("
+                    "release_commit,strategy_version,token,market,venue,lifecycle,trigger_actor,trigger_entity,fomo_state,context_state,"
+                    "position_fraction,entry_quote_in_wei,entry_token_raw,entry_gas_wei,entry_total_cost_wei,"
+                    "entry_price_eth,entry_round_trip_cost_fraction,opened_at,decision_reason,capital_reservation_id,"
+                    "paper_only,live_money_authority"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)",
+                    (
+                        self.release_commit,
+                        ROBINHOOD_CHAIN_PAPER_VERSION,
+                        token,
+                        market,
+                        venue,
+                        lifecycle,
+                        trigger_actor,
+                        trigger_entity,
+                        fomo_state,
+                        context_state,
+                        float(fraction),
+                        str(int(quote["amount_in_wei"])),
+                        str(int(quote["token_out"])),
+                        str(int(quote["entry_gas_wei"])),
+                        str(int(quote["entry_total_cost_wei"])),
+                        float(quote["entry_price_eth"]),
+                        float(quote["round_trip_cost_fraction"]),
+                        _utcnow(),
+                        decision_reason,
+                        reservation_id,
+                    ),
+                )
+            return int(cursor.rowcount or 0) == 1
+        except Exception:
+            cancel_paper_capital(
+                self.store,
+                release_commit=self.release_commit,
+                reservation_id=reservation_id,
+                reason="robinhood_trial_insert_failed",
             )
+            raise
