@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority
 from .v51_cross_surface_proof import combined_promotion_records
+from .v51_economic_clustering import cluster_economic_rows, cluster_economic_rows_legacy_pre103
 from .v51_economic_core import execution_stress_profiles, robust_profile
 from .v51_evidence_analytics import _family_minimum
 from .v51_measurement_integrity import MEASUREMENT_EPOCH
-from .v51_promotion_proof import cluster_rows
+from .v51_return_validation import STATISTICS_VERSION, return_integrity_summary, validate_row_return
 
 
-PHASE14_VERSION = "v51-phase14-profitability-proof-95-102-v1"
+PHASE14_VERSION = "v51-phase14-profitability-proof-103-108-v2"
 MIN_CONTINUOUS_PRODUCTION_SECONDS = 24.0 * 60.0 * 60.0
 CLASS_ECONOMICALLY_PROMISING = "ECONOMICALLY_PROMISING"
 CLASS_PRODUCTION_PROVEN = "PRODUCTION-PROVEN"
@@ -25,9 +27,10 @@ def _dict(value: Any) -> dict[str, Any]:
 
 def _safe(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
         return default
+    return result if math.isfinite(result) else default
 
 
 def _dt(value: Any) -> datetime | None:
@@ -50,8 +53,8 @@ def _now(value: datetime | None = None) -> datetime:
 
 
 def _growth_positive(profile: dict[str, Any], *, hurdle: float = 0.0) -> bool:
-    growth = profile.get("best_expected_log_growth")
-    return growth is not None and _safe(growth) > hurdle
+    growth = profile.get("lower_confidence_expected_log_growth")
+    return growth is not None and _safe(growth, float("-inf")) > hurdle
 
 
 def _leave_best_positive(profile: dict[str, Any]) -> bool:
@@ -59,25 +62,36 @@ def _leave_best_positive(profile: dict[str, Any]) -> bool:
     return value is not None and _safe(value) > 0.0
 
 
+def _cluster_values(clusters: Iterable[dict[str, Any]]) -> list[float]:
+    values: list[float] = []
+    for row in clusters:
+        validated = validate_row_return(row)
+        if validated.validity and validated.normalized_fraction is not None:
+            values.append(validated.normalized_fraction)
+    return values
+
+
 def _remove_top(values: Iterable[float], count: int) -> list[float]:
-    series = sorted((_safe(value) for value in values), reverse=True)
+    series = sorted((float(value) for value in values), reverse=True)
     if len(series) <= count:
         return []
     return series[count:]
 
 
-def _top_winner_proof(values: list[float], *, hurdle: float) -> dict[str, Any]:
-    full = robust_profile(values)
-    remove_one = robust_profile(_remove_top(values, 1))
-    remove_three = robust_profile(_remove_top(values, 3))
-    remove_five = robust_profile(_remove_top(values, 5))
+def _top_winner_proof(values: list[float], *, hurdle: float, fixed_fraction: float) -> dict[str, Any]:
+    full = robust_profile(values, fixed_fraction=fixed_fraction)
+    remove_one = robust_profile(_remove_top(values, 1), fixed_fraction=fixed_fraction)
+    remove_three = robust_profile(_remove_top(values, 3), fixed_fraction=fixed_fraction)
+    remove_five = robust_profile(_remove_top(values, 5), fixed_fraction=fixed_fraction)
     full_pass = _growth_positive(full, hurdle=hurdle) and _leave_best_positive(full)
     top_one_pass = _growth_positive(remove_one, hurdle=hurdle)
     top_three_pass = _growth_positive(remove_three, hurdle=hurdle)
     return {
         "pass": bool(full_pass and top_one_pass and top_three_pass),
-        "profitability_definition": "best_expected_log_growth_above_existing_family_hurdle",
+        "profitability_definition": "bootstrap_lower_expected_log_growth_above_existing_family_hurdle",
         "existing_family_hurdle": hurdle,
+        "selected_fraction": fixed_fraction,
+        "selected_fraction_source": "validation",
         "full_sample_pass": full_pass,
         "remove_top_1_pass": top_one_pass,
         "remove_top_3_pass": top_three_pass,
@@ -89,31 +103,82 @@ def _top_winner_proof(values: list[float], *, hurdle: float) -> dict[str, Any]:
     }
 
 
-def _stress_proof(values: list[float]) -> dict[str, Any]:
-    profiles = execution_stress_profiles(values)
+def _stress_proof(values: list[float], *, fixed_fraction: float) -> dict[str, Any]:
+    profiles = execution_stress_profiles(values, fixed_fraction=fixed_fraction)
     scenarios: dict[str, Any] = {}
     for name, profile in profiles.items():
         passed = _growth_positive(profile) and _leave_best_positive(profile)
         scenarios[name] = {
             "pass": passed,
-            "required_positive_expected_log_growth": True,
+            "required_positive_bootstrap_lower_expected_log_growth": True,
             "required_positive_leave_best_trade_out_mean": True,
+            "selected_fraction": fixed_fraction,
             "profile": profile,
         }
     return {
         "pass": bool(scenarios) and all(bool(row.get("pass")) for row in scenarios.values()),
         "all_frozen_execution_stress_scenarios_required": True,
+        "selected_fraction_source": "validation",
         "scenarios": scenarios,
     }
 
 
-def _partition_profile(clusters: list[dict[str, Any]], partition: str) -> tuple[list[float], dict[str, Any]]:
-    values = [
-        _safe(row.get("net_return"))
-        for row in clusters
-        if str(row.get("evidence_partition") or "") == partition
-    ]
-    return values, robust_profile(values)
+def _partition_values(clusters: list[dict[str, Any]], partition: str) -> list[float]:
+    return _cluster_values(
+        row for row in clusters if str(row.get("evidence_partition") or "") == partition
+    )
+
+
+def _locked_partition_profiles(clusters: list[dict[str, Any]]) -> tuple[list[float], dict[str, Any], list[float], dict[str, Any], float]:
+    validation_values = _partition_values(clusters, "validation")
+    validation_profile = robust_profile(validation_values)
+    selected_fraction = float(validation_profile.get("best_fraction") or 0.0)
+    holdout_values = _partition_values(clusters, "holdout")
+    holdout_profile = robust_profile(holdout_values, fixed_fraction=selected_fraction)
+    return validation_values, validation_profile, holdout_values, holdout_profile, selected_fraction
+
+
+def _legacy_raw_accepted_count(rows: Iterable[dict[str, Any]]) -> int:
+    count = 0
+    for row in rows:
+        try:
+            value = float(row.get("net_return"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        count += int(math.isfinite(value) and value > -1.0)
+    return count
+
+
+def _family_economic_evaluation(
+    clusters: list[dict[str, Any]],
+    *,
+    hurdle: float,
+    minimum_n: int,
+    integrity_pass: bool,
+) -> dict[str, Any]:
+    values = _cluster_values(clusters)
+    validation_values, validation_profile, holdout_values, holdout_profile, selected_fraction = _locked_partition_profiles(clusters)
+    maturity_pass = len(clusters) >= minimum_n and integrity_pass
+    top_winner = _top_winner_proof(values, hurdle=hurdle, fixed_fraction=selected_fraction)
+    stress = _stress_proof(values, fixed_fraction=selected_fraction)
+    holdout_pass = bool(
+        holdout_values
+        and _growth_positive(holdout_profile)
+        and _leave_best_positive(holdout_profile)
+    )
+    return {
+        "values": values,
+        "validation_values": validation_values,
+        "validation_profile": validation_profile,
+        "holdout_values": holdout_values,
+        "holdout_profile": holdout_profile,
+        "selected_fraction": selected_fraction,
+        "maturity_pass": maturity_pass,
+        "top_winner": top_winner,
+        "stress": stress,
+        "holdout_pass": holdout_pass,
+        "economic_gates_pass": bool(maturity_pass and top_winner.get("pass") and stress.get("pass") and holdout_pass),
+    }
 
 
 def _family_certification(
@@ -123,41 +188,32 @@ def _family_certification(
     *,
     global_production_gates_pass: bool,
 ) -> dict[str, Any]:
-    clusters = cluster_rows(family_rows, family=family, promotion_only=True)
-    values = [_safe(row.get("net_return")) for row in clusters]
-    validation_values, validation_profile = _partition_profile(clusters, "validation")
-    holdout_values, holdout_profile = _partition_profile(clusters, "holdout")
+    integrity = return_integrity_summary(family_rows)
+    clusters = cluster_economic_rows(family_rows, family=family, promotion_only=True)
+    legacy_clusters = cluster_economic_rows_legacy_pre103(family_rows, family=family, promotion_only=True)
     minimum_n, exact_min, hurdle = _family_minimum(family, family_rows)
 
-    # 95: each family must independently meet the already-frozen family evidence
-    # minimum. Total cross-family trade count has no authority here.
-    maturity_pass = len(clusters) >= minimum_n
-
-    # 96: top winners must not be carrying the apparent edge. Top-1 and top-3 are
-    # formal gates; top-5 remains visible as a stronger diagnostic.
-    top_winner = _top_winner_proof(values, hurdle=hurdle)
-
-    # 97: every execution-stress scenario already frozen in strategy authority must
-    # retain positive log growth and positive leave-best-out mean.
-    stress = _stress_proof(values)
-
-    # 98: the locked holdout must itself be profitable. A one-observation holdout
-    # cannot pass because leave-best-out is undefined.
-    holdout_pass = bool(
-        holdout_values
-        and _growth_positive(holdout_profile)
-        and _leave_best_positive(holdout_profile)
+    current = _family_economic_evaluation(
+        clusters,
+        hurdle=hurdle,
+        minimum_n=minimum_n,
+        integrity_pass=bool(integrity.get("proof_eligible")),
+    )
+    legacy = _family_economic_evaluation(
+        legacy_clusters,
+        hurdle=hurdle,
+        minimum_n=minimum_n,
+        integrity_pass=True,
     )
 
     existing_promotion_claim = bool(promotion_family.get("promotion_claim_valid"))
-    economically_promising = bool(
-        existing_promotion_claim
-        and maturity_pass
-        and bool(top_winner.get("pass"))
-        and bool(stress.get("pass"))
-        and holdout_pass
+    legacy_promotion_claim = bool(
+        promotion_family.get("legacy_pre103_promotion_claim_valid", existing_promotion_claim)
     )
+    economically_promising = bool(existing_promotion_claim and current["economic_gates_pass"])
+    legacy_economically_promising = bool(legacy_promotion_claim and legacy["economic_gates_pass"])
     production_proven = bool(economically_promising and global_production_gates_pass)
+    legacy_production_proven = bool(legacy_economically_promising and global_production_gates_pass)
     classification = (
         CLASS_PRODUCTION_PROVEN
         if production_proven
@@ -165,41 +221,72 @@ def _family_certification(
         if economically_promising
         else CLASS_INSUFFICIENT_EVIDENCE
     )
+    legacy_classification = (
+        CLASS_PRODUCTION_PROVEN
+        if legacy_production_proven
+        else CLASS_ECONOMICALLY_PROMISING
+        if legacy_economically_promising
+        else CLASS_INSUFFICIENT_EVIDENCE
+    )
+
     blockers: list[str] = []
+    if not bool(integrity.get("proof_eligible")):
+        blockers.append("invalid_economic_measurement_integrity_threshold_exceeded")
     if not existing_promotion_claim:
         blockers.append("existing_v51_promotion_claim_not_valid")
-    if not maturity_pass:
+    if not current["maturity_pass"]:
         blockers.append("family_forward_maturity_minimum_not_met")
-    if not bool(top_winner.get("pass")):
+    if not bool(current["top_winner"].get("pass")):
         blockers.append("top_winner_removal_not_robustly_profitable")
-    if not bool(stress.get("pass")):
+    if not bool(current["stress"].get("pass")):
         blockers.append("execution_stress_not_robustly_profitable")
-    if not holdout_pass:
+    if not current["holdout_pass"]:
         blockers.append("locked_holdout_not_robustly_profitable")
     if economically_promising and not global_production_gates_pass:
         blockers.append("global_production_proof_incomplete")
 
+    current_full_profile = robust_profile(current["values"], fixed_fraction=current["selected_fraction"])
+    legacy_full_profile = robust_profile(legacy["values"], fixed_fraction=legacy["selected_fraction"])
     return {
         "family": family,
         "classification": classification,
         "economically_promising": economically_promising,
         "production_proven": production_proven,
         "blockers": blockers,
+        "economic_measurement_integrity": integrity,
+        "statistics_rebuild": {
+            "statistics_version": STATISTICS_VERSION,
+            "recomputed_from_immutable_outcomes": True,
+            "mutates_source_outcomes": False,
+            "previously_accepted_outcome_count": _legacy_raw_accepted_count(family_rows),
+            "newly_included_exact_total_loss_outcome_count": int(integrity.get("exact_total_loss_count") or 0),
+            "malformed_rows_removed_from_economic_proof": int(integrity.get("measurement_debt_count") or 0),
+            "before_family_statistics": legacy_full_profile,
+            "after_family_statistics": current_full_profile,
+            "before_promotion_state": legacy_promotion_claim,
+            "after_promotion_state": existing_promotion_claim,
+            "before_phase14_classification": legacy_classification,
+            "after_phase14_classification": classification,
+        },
         "95_forward_family_maturity": {
-            "pass": maturity_pass,
+            "pass": current["maturity_pass"],
             "independent_event_cluster_count": len(clusters),
             "minimum_independent_outcomes": minimum_n,
             "minimum_exact_outcomes_reference": exact_min,
             "uses_cross_family_total_for_maturity": False,
+            "invalid_economic_measurements_count_toward_maturity": False,
         },
-        "96_top_winner_removal": top_winner,
-        "97_stressed_profitability": stress,
+        "96_top_winner_removal": current["top_winner"],
+        "97_stressed_profitability": current["stress"],
         "98_locked_holdout_profitability": {
-            "pass": holdout_pass,
-            "holdout_cluster_count": len(holdout_values),
-            "validation_cluster_count": len(validation_values),
-            "holdout_profile": holdout_profile,
-            "validation_profile": validation_profile,
+            "pass": current["holdout_pass"],
+            "holdout_cluster_count": len(current["holdout_values"]),
+            "validation_cluster_count": len(current["validation_values"]),
+            "selected_fraction": current["selected_fraction"],
+            "selected_fraction_source": "validation",
+            "holdout_fraction_reoptimized": False,
+            "holdout_profile": current["holdout_profile"],
+            "validation_profile": current["validation_profile"],
             "no_holdout_can_be_production_proven": True,
         },
         "existing_v51_promotion_claim_valid": existing_promotion_claim,
@@ -327,6 +414,24 @@ def compose_phase14_profitability_certification(
         if promising
         else CLASS_INSUFFICIENT_EVIDENCE
     )
+    legacy_promising = sorted(
+        name
+        for name, proof in families.items()
+        if str(_dict(proof.get("statistics_rebuild")).get("before_phase14_classification"))
+        in {CLASS_ECONOMICALLY_PROMISING, CLASS_PRODUCTION_PROVEN}
+    )
+    legacy_proven = sorted(
+        name
+        for name, proof in families.items()
+        if str(_dict(proof.get("statistics_rebuild")).get("before_phase14_classification")) == CLASS_PRODUCTION_PROVEN
+    )
+    legacy_classification = (
+        CLASS_PRODUCTION_PROVEN
+        if legacy_proven
+        else CLASS_ECONOMICALLY_PROMISING
+        if legacy_promising
+        else CLASS_INSUFFICIENT_EVIDENCE
+    )
     blockers: list[str] = []
     if not promising:
         blockers.append("no_family_satisfies_phase14_economic_proof")
@@ -339,6 +444,7 @@ def compose_phase14_profitability_certification(
 
     return {
         "phase14_version": PHASE14_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "authority_id": AUTHORITY_ID,
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "classification": classification,
@@ -347,6 +453,24 @@ def compose_phase14_profitability_certification(
         "economically_promising_families": promising,
         "production_proven_families": proven,
         "blockers": blockers,
+        "103_108_statistics_migration": {
+            "recomputed_from_immutable_outcomes": True,
+            "proof_statistics_version": STATISTICS_VERSION,
+            "before_phase14_classification": legacy_classification,
+            "after_phase14_classification": classification,
+            "previously_accepted_outcome_count": sum(
+                int(_dict(proof.get("statistics_rebuild")).get("previously_accepted_outcome_count") or 0)
+                for proof in families.values()
+            ),
+            "newly_included_exact_total_loss_outcome_count": sum(
+                int(_dict(proof.get("statistics_rebuild")).get("newly_included_exact_total_loss_outcome_count") or 0)
+                for proof in families.values()
+            ),
+            "malformed_rows_removed_from_economic_proof": sum(
+                int(_dict(proof.get("statistics_rebuild")).get("malformed_rows_removed_from_economic_proof") or 0)
+                for proof in families.values()
+            ),
+        },
         "95_family_forward_maturity_is_independent": True,
         "99_opportunity_coverage": coverage,
         "100_measurement_epoch_validity": measurement,
