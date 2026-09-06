@@ -10,6 +10,7 @@ from .models import IntentKind, PaperPosition, SimulatedFill
 from .portfolio import PaperPortfolio
 from .quote import ExecutableQuote, LAMPORTS_PER_SOL
 from .shadow_execution import ShadowWalletExecutableQuoteHandoff
+from .v51_exact_exit_execution import install_exact_exit_execution_model
 
 
 _ENTRY_KINDS = {
@@ -263,6 +264,11 @@ def install_execution_realism() -> None:
     portfolio_apply = PaperPortfolio.apply
     if not bool(getattr(portfolio_apply, "_roi_execution_realism", False)):
         PaperPortfolio.apply = _exact_entry_apply(portfolio_apply)  # type: ignore[method-assign]
+
+    # Repairs 109-113 extend the already-existing execution-realism composition.
+    # The new final/FOMO sell path never calls the legacy quote-only settlement;
+    # exact held-size unsigned simulation is now the only current-epoch outcome path.
+    install_exact_exit_execution_model()
 
 
 __all__ = ["ObservedEntryExecution", "install_execution_realism"]
