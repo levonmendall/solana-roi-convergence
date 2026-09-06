@@ -89,7 +89,7 @@ def test_open_positions_are_outside_prospective_cap(monkeypatch) -> None:
 
     selected, reasons = adaptive._adaptive_selected_market_targets(plane)
     assert set(selected) == {open_address, candidate_a, candidate_b}
-    assert reasons[open_address] == "open_position_forced_live_outside_prospective_cap"
+    assert reasons[open_address] == "open_position_forced_live"
     assert plane._roi_adaptive_prospective_lane_count == 2
     assert plane._roi_adaptive_open_position_live_count == 1
 
