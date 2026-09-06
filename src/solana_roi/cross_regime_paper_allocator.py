@@ -84,7 +84,7 @@ def _family_key(*, surface: str, venue: str) -> str:
 def _append(
     grouped: dict[str, list[float]],
     metadata: dict[str, dict[str, str]],
-    measurement_debt: dict[str, int],
+    measurement_debt: dict[str, int] | None = None,
     *,
     surface: str,
     lane: str,
@@ -95,6 +95,14 @@ def _append(
     net_return: Any,
     source_signature: str = "",
 ) -> None:
+    """Append one validated economic observation.
+
+    `measurement_debt` is optional to preserve the pre-105 private helper contract
+    used by the compatible cross-release learning wrapper. Current canonical
+    allocator paths always provide it and publish the resulting debt. Legacy
+    callers still receive no imputed value: invalid returns are omitted rather
+    than converted to zero.
+    """
     key = _segment_key(
         surface=surface,
         lane=lane,
@@ -118,7 +126,8 @@ def _append(
         source_signature=source_signature,
     )
     if not validated.validity or validated.normalized_fraction is None:
-        measurement_debt[key] = measurement_debt.get(key, 0) + 1
+        if measurement_debt is not None:
+            measurement_debt[key] = measurement_debt.get(key, 0) + 1
         return
     grouped.setdefault(key, []).append(validated.normalized_fraction)
 
