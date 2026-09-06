@@ -54,17 +54,19 @@ from .wallet_realtime_tracking_repair import install_wallet_realtime_tracking_re
 from .wallet_venue_lifecycle_research import install_wallet_venue_lifecycle_research
 from .web_liveness_isolation_repair import install_web_liveness_isolation
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v1"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v2"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
+COMPOSITION_STATUS_PATH = "/v1/operations/production-composition"
 
 
 @dataclass(frozen=True)
 class ComponentHealth:
     name: str
-    module: str
+    owner_module: str
+    attribute: str
     required: bool
     available: bool
     detail: str
@@ -72,7 +74,8 @@ class ComponentHealth:
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
-            "module": self.module,
+            "owner_module": self.owner_module,
+            "attribute": self.attribute,
             "required": self.required,
             "available": self.available,
             "detail": self.detail,
@@ -84,7 +87,7 @@ class ProductionSystem:
     app: Any
     ingestion_runtime: Any
     components: tuple[ComponentHealth, ...]
-    compatibility_installers: tuple[str, ...]
+    compatibility_adapters: tuple[str, ...]
 
     @property
     def healthy(self) -> bool:
@@ -95,10 +98,17 @@ class ProductionSystem:
             "composition_version": COMPOSITION_VERSION,
             "healthy": self.healthy,
             "components": {component.name: component.as_dict() for component in self.components},
-            "compatibility_installers": list(self.compatibility_installers),
-            "compatibility_installers_self_activate": False,
+            "required_component_count": sum(1 for component in self.components if component.required),
+            "unavailable_required_components": [
+                component.name for component in self.components if component.required and not component.available
+            ],
+            "compatibility_adapters": list(self.compatibility_adapters),
+            "compatibility_adapters_self_activate": False,
+            "compatibility_adapter_owner": "ProductionSystem composition boundary",
             "single_production_composition_root": True,
             "package_import_has_runtime_install_side_effects": False,
+            "production_entrypoint": "solana_roi.production:app",
+            "composition_status_path": COMPOSITION_STATUS_PATH,
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -106,10 +116,12 @@ class ProductionSystem:
         }
 
 
-# Ordered compatibility adapters. They are invoked only here. This deliberately
-# preserves the already-certified behavior while retiring import-time installation
-# from solana_roi.__init__ and solana_roi.production.
-_COMPATIBILITY_INSTALLERS: tuple[tuple[str, Callable[[], None]], ...] = (
+# These compatibility adapters preserve already-certified transport/runtime behavior
+# while the owning subsystems absorb legacy repairs. The architectural boundary is
+# now explicit: they may be activated only by ProductionSystem, never by importing
+# the package or an arbitrary module. New strategy/economic behavior must not be
+# added here.
+_COMPATIBILITY_ADAPTERS: tuple[tuple[str, Callable[[], None]], ...] = (
     ("runtime_guards", install_runtime_guards),
     ("stream_resilience", install_stream_resilience),
     ("transport_hardening", install_transport_hardening),
@@ -164,13 +176,8 @@ _COMPATIBILITY_INSTALLERS: tuple[tuple[str, Callable[[], None]], ...] = (
 _BUILT: ProductionSystem | None = None
 
 
-def _install_direct_stream_first_class_guards() -> None:
-    """Install the two direct-stream resource guards owned by the composition root.
-
-    These were formerly hidden module-import side effects in production.py. Keeping
-    the tiny resource envelope here makes the production order explicit without
-    changing any market/economic authority.
-    """
+def _install_direct_stream_resource_guards() -> None:
+    """Composition-owned runtime resource envelope; no economic authority."""
     from . import direct_solana as direct_solana_module
     from .direct_solana import DirectSolanaIngestionPlane
 
@@ -202,8 +209,8 @@ def _component(name: str, module: str, attribute: str, *, required: bool = True)
         imported = __import__(module, fromlist=[attribute])
         value = getattr(imported, attribute)
     except Exception as exc:
-        return ComponentHealth(name, module, required, False, f"{type(exc).__name__}:{exc}")
-    return ComponentHealth(name, module, required, callable(value) or value is not None, f"attribute={attribute}")
+        return ComponentHealth(name, module, attribute, required, False, f"{type(exc).__name__}:{exc}")
+    return ComponentHealth(name, module, attribute, required, callable(value) or value is not None, "reachable")
 
 
 def _required_components() -> tuple[ComponentHealth, ...]:
@@ -211,9 +218,9 @@ def _required_components() -> tuple[ComponentHealth, ...]:
         _component("ingestion", "solana_roi.direct_solana", "DirectSolanaIngestionPlane"),
         _component("evidence", "solana_roi.v51_evidence_analytics", "build_evidence_validity_bundle"),
         _component("candidate", "solana_roi.v51_candidate_ledger", "refresh_candidate_pipeline"),
-        _component("strategy", "solana_roi.v51_production_authority", "install_v51_production_authority"),
-        _component("execution", "solana_roi.v51_exact_exit_execution", "status"),
-        _component("settlement", "solana_roi.settlement", "SettlementSimulator"),
+        _component("strategy", "solana_roi.strategy_v51_authority", "authority"),
+        _component("execution", "solana_roi.v51_exact_exit_execution", "observe_exact_exit_order"),
+        _component("settlement", "solana_roi.profit_first_entity_final_research", "FinalProfitFirstResearchAdapter"),
         _component("learning", "solana_roi.v51_evidence_analytics", "build_hazard_calibration"),
         _component("certification", "solana_roi.v51_phase17_context_certification", "build_phase17_context_certification"),
         _component("portfolio", "solana_roi.portfolio", "allocate_family_capital"),
@@ -221,16 +228,36 @@ def _required_components() -> tuple[ComponentHealth, ...]:
     )
 
 
+def _mount_composition_status(app: Any) -> None:
+    existing = {getattr(route, "path", None) for route in app.routes}
+    if COMPOSITION_STATUS_PATH in existing:
+        return
+
+    @app.get(COMPOSITION_STATUS_PATH)
+    def production_composition_status() -> dict[str, Any]:
+        system = getattr(app.state, "roi_production_system", None)
+        if system is None:
+            return {
+                "composition_version": COMPOSITION_VERSION,
+                "healthy": False,
+                "reason": "production_system_not_attached",
+                "paper_only": True,
+                "live_money_authority": False,
+                "signing_available": False,
+                "transaction_submission_available": False,
+            }
+        return system.status()
+
+
 def build_production_system() -> ProductionSystem:
     global _BUILT
     if _BUILT is not None:
         return _BUILT
 
-    for _name, installer in _COMPATIBILITY_INSTALLERS:
-        installer()
-    _install_direct_stream_first_class_guards()
+    for _name, adapter in _COMPATIBILITY_ADAPTERS:
+        adapter()
+    _install_direct_stream_resource_guards()
 
-    # Preserve the canonical frozen baseline binding before api builds the runtime.
     from . import runtime as runtime_module
     from .config import BASELINE
     runtime_module.BASELINE = BASELINE
@@ -251,15 +278,14 @@ def build_production_system() -> ProductionSystem:
         app=app,
         ingestion_runtime=ingestion_runtime,
         components=components,
-        compatibility_installers=tuple(name for name, _installer in _COMPATIBILITY_INSTALLERS),
+        compatibility_adapters=tuple(name for name, _adapter in _COMPATIBILITY_ADAPTERS),
     )
     if not system.healthy:
         raise RuntimeError("production composition failed closed")
 
-    # Cold-start observability is attached to app state and is therefore available
-    # without querying providers or granting strategy authority.
     app.state.roi_production_system = system
     app.state.roi_production_composition_status = system.status
+    _mount_composition_status(app)
     _BUILT = system
     return system
 
@@ -269,6 +295,7 @@ app = production_system.app
 ingestion_runtime = production_system.ingestion_runtime
 
 __all__ = [
+    "COMPOSITION_STATUS_PATH",
     "COMPOSITION_VERSION",
     "ComponentHealth",
     "ProductionSystem",
