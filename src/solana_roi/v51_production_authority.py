@@ -11,6 +11,10 @@ from .robinhood_live_getlogs_resilience import (
     install_robinhood_live_getlogs_resilience,
     status as live_getlogs_resilience_status,
 )
+from .robinhood_phase9_anchor_seed import (
+    install_robinhood_phase9_anchor_seed,
+    status as robinhood_phase9_anchor_status,
+)
 from .robinhood_production_provider_finalizer import (
     install_robinhood_production_provider_finalizer,
     status as production_provider_status,
@@ -157,6 +161,12 @@ def install_v51_production_authority(
         legacy_fresh_ready=_ORIGINAL_ROBINHOOD_FRESH_HEAD_READY,
     )
 
+    # The provider WebSocket runner bypasses the older forward-only poll loop, so
+    # explicitly seed only the latest head plus the existing bounded 64-block factory
+    # metadata insurance before the production subscription starts. No old swaps are
+    # replayed and the archival cursor never regains readiness authority.
+    install_robinhood_phase9_anchor_seed(RobinhoodChainPaperPlane)
+
     # Phase 9 tightens Robinhood runtime/evidence contracts without altering frozen
     # strategy economics. It retires historical-lag readiness semantics, validates
     # proof freshness at the nonblocking cache boundary, gives creation and reserve/
@@ -206,6 +216,7 @@ def install_v51_production_authority(
     app.state.roi_robinhood_decision_tail = True
     app.state.roi_robinhood_sequencer_frontier = True
     app.state.roi_robinhood_production_provider_finalizer = True
+    app.state.roi_robinhood_phase9_anchor_seed = True
     app.state.roi_robinhood_phase9_65_69 = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
@@ -225,6 +236,7 @@ def status() -> dict[str, Any]:
         "robinhood_decision_tail": decision_tail_status(),
         "robinhood_sequencer_frontier": sequencer_frontier_status(),
         "robinhood_production_provider": production_provider_status(),
+        "robinhood_phase9_anchor_seed": robinhood_phase9_anchor_status(),
         "robinhood_phase9_65_69": robinhood_phase9_status(),
         "robinhood_entry_freshness_checks": "running_worker_provider_v51_event_time; direct_test_calls_legacy_helper",
         "robinhood_proof_refresh": "separate_sqlite_connection_threadpool_not_live_frontier",
