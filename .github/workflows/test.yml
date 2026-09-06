@@ -102,8 +102,10 @@ jobs:
           python -m pytest tests/test_fomo_risk_conditioned_v5.py --junitxml=existing-regressions-native-fomo-v5.xml
           python - <<'PY'
           import pytest
+          from solana_roi.target_quorum import install_target_quorum
           from solana_roi.live_poll_redundancy import install_live_poll_redundancy
           from solana_roi.poll_watermark_repair import install_poll_watermark_repair
+          install_target_quorum()
           install_live_poll_redundancy()
           install_poll_watermark_repair()
           raise SystemExit(pytest.main([
