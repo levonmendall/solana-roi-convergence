@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import pytest
+import asyncio
 
 from solana_roi import robinhood_phase9_anchor_seed as phase9
 
@@ -16,8 +16,7 @@ class Plane:
         self._latest_block = None
 
 
-@pytest.mark.asyncio
-async def test_latest_seed_uses_only_bounded_factory_metadata_insurance(monkeypatch) -> None:
+def test_latest_seed_uses_only_bounded_factory_metadata_insurance(monkeypatch) -> None:
     calls = []
 
     async def fake_sync(self, *, latest, previous_live_cursor, reason):
@@ -31,7 +30,7 @@ async def test_latest_seed_uses_only_bounded_factory_metadata_insurance(monkeypa
 
     monkeypatch.setattr(phase9.forward_only, "_sync_bounded_metadata", fake_sync)
     plane = Plane()
-    await phase9._seed_current_anchor(plane)
+    asyncio.run(phase9._seed_current_anchor(plane))
 
     assert plane._latest_block == 12_345
     assert calls == [
