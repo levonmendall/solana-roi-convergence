@@ -77,7 +77,7 @@ def test_terminal_unsellable_position_is_settled_as_total_loss_not_dropped(monke
     _create_final_tables(adapter)
     exact._ensure_schema(adapter)
     due = "2026-09-06T12:00:00+00:00"
-    liquidation = exact._upsert_liquidation(
+    exact._upsert_liquidation(
         adapter,
         {
             "position_scope": "final",
@@ -142,7 +142,12 @@ def test_terminal_unsellable_position_is_settled_as_total_loss_not_dropped(monke
             (adapter.epoch_id,),
         ).fetchone()
         outcome = adapter.store.db.execute(
-            "SELECT net_return,exit_net_sol,exit_reason,execution_model_epoch FROM profit_first_final_outcomes "
+            "SELECT net_return,exit_net_sol,exit_reason FROM profit_first_final_outcomes "
+            "WHERE epoch_id=? AND source_signature='entry-terminal' AND lane='unified_profit_maximizer'",
+            (adapter.epoch_id,),
+        ).fetchone()
+        model = adapter.store.db.execute(
+            "SELECT execution_model_epoch,position_scope FROM profit_first_final_outcome_execution_models "
             "WHERE epoch_id=? AND source_signature='entry-terminal' AND lane='unified_profit_maximizer'",
             (adapter.epoch_id,),
         ).fetchone()
@@ -152,7 +157,8 @@ def test_terminal_unsellable_position_is_settled_as_total_loss_not_dropped(monke
     assert outcome["net_return"] == -1.0
     assert outcome["exit_net_sol"] == 0.0
     assert "terminal_unexitable_total_loss" in outcome["exit_reason"]
-    assert outcome["execution_model_epoch"] == followup.ACTIVE_EXECUTION_MODEL_EPOCH
+    assert model["execution_model_epoch"] == followup.ACTIVE_EXECUTION_MODEL_EPOCH
+    assert model["position_scope"] == "final"
 
 
 def test_fomo_liquidation_uses_its_own_scaled_raw_position() -> None:
@@ -233,24 +239,36 @@ def test_fomo_learning_rows_use_size_specific_paper_outcome_not_shadow_canonical
     assert rows[0]["net_return"] != 4.0
 
 
-def test_fresh_production_composition_activates_terminal_fomo_epoch() -> None:
+def test_followup_has_no_internal_settlement_monkeypatch_bridges() -> None:
+    assert not hasattr(followup, "_ORIGINAL_RECORD_OUTCOME_MODEL")
+    assert not hasattr(followup, "_ORIGINAL_SETTLE_FOMO")
+    assert not hasattr(followup, "_ORIGINAL_SYNC_V5")
+    payload = followup.status()
+    assert payload["single_active_exit_engine"] is True
+    assert payload["internal_settlement_monkeypatches"] is False
+
+
+def test_fresh_production_composition_activates_one_terminal_fomo_engine() -> None:
     script = r'''
 import importlib
 import solana_roi.production  # noqa: F401
 from solana_roi import v51_exact_exit_execution as exact
+from solana_roi import v51_exit_execution_integrity as previous_v2
 from solana_roi import v51_exit_execution_terminal_fomo_followup as followup
 from solana_roi import v51_measurement_integrity as measurement
 from solana_roi.profit_first_entity_final_research import FinalProfitFirstResearchAdapter
 
 assert followup._INSTALLED is True
 assert exact._INSTALLED is True
+assert previous_v2._INSTALLED is False
 assert exact.EXACT_EXIT_EXECUTION_MODEL_EPOCH == followup.ACTIVE_EXECUTION_MODEL_EPOCH
 assert measurement.EXECUTION_MODEL_EPOCH == followup.ACTIVE_EXECUTION_MODEL_EPOCH
+assert getattr(FinalProfitFirstResearchAdapter.observe, "_roi_fomo_runtime", False) is True
 
 # Prove the exact-exit sell is reachable through the actual fresh production
 # wrapper chain. Later strategy/learning wrappers are allowed, but every wrapper
-# must delegate through its captured original until the active exact-exit function
-# is reached.
+# must delegate through its captured original until the one active exact-exit
+# function is reached.
 current = FinalProfitFirstResearchAdapter._sell
 seen = set()
 chain = []
@@ -260,7 +278,7 @@ for _ in range(16):
         break
     seen.add(id(current))
     chain.append(f"{current.__module__}.{current.__name__}")
-    if getattr(current, "_roi_exact_exit_execution_v2", False):
+    if getattr(current, "_roi_exact_exit_execution_v3_terminal_fomo", False):
         found = True
         break
     module = importlib.import_module(current.__module__)
@@ -273,7 +291,7 @@ for _ in range(16):
     if len(delegates) != 1:
         break
     current = delegates[0]
-assert found, "sell delegation chain did not reach exact exit: " + " -> ".join(chain)
+assert found, "sell delegation chain did not reach active exact exit: " + " -> ".join(chain)
 '''
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -283,6 +301,6 @@ assert found, "sell delegation chain did not reach exact exit: " + " -> ".join(c
         timeout=30,
     )
     assert result.returncode == 0, (
-        "fresh production composition did not activate terminal/FOMO exact-exit semantics\n"
+        "fresh production composition did not activate one terminal/FOMO exact-exit engine\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
