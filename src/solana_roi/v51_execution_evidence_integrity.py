@@ -34,10 +34,10 @@ def _text(value: Any) -> str:
 def economic_sample_id(row: dict[str, Any]) -> str:
     """Return a family-independent identity for certification sample counting.
 
-    Explicit economic roots win when present.  The conservative fallback clusters
+    Explicit economic roots win when present. The conservative fallback clusters
     one token lifecycle as one economic sample across collectors/venue families so
     replay, recovery, FOMO context, or venue migration cannot manufacture multiple
-    independent samples.  Family-specific analytical cluster IDs remain separate.
+    independent samples. Family-specific analytical cluster IDs remain separate.
     """
 
     explicit = _text(row.get("economic_event_root_id") or row.get("economic_event_id"))
@@ -121,17 +121,18 @@ def ensure_lineage_schema(store: Any) -> None:
         store.db.execute(
             "CREATE TABLE IF NOT EXISTS v51_evidence_settlement_lineage ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, release_commit TEXT NOT NULL, settlement_id TEXT NOT NULL, "
-            "candidate_id TEXT NOT NULL, economic_sample_id TEXT NOT NULL, lineage_json TEXT NOT NULL, "
+            "economic_epoch TEXT NOT NULL, measurement_epoch TEXT NOT NULL, candidate_id TEXT NOT NULL, "
+            "economic_sample_id TEXT NOT NULL, lineage_json TEXT NOT NULL, "
             "paper_only INTEGER NOT NULL, live_money_authority INTEGER NOT NULL, "
-            "UNIQUE(release_commit,settlement_id))"
+            "UNIQUE(release_commit,settlement_id), UNIQUE(economic_epoch,economic_sample_id))"
         )
         store.db.execute(
             "CREATE INDEX IF NOT EXISTS ix_v51_evidence_lineage_candidate "
             "ON v51_evidence_settlement_lineage(release_commit,candidate_id)"
         )
         store.db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_v51_evidence_lineage_sample "
-            "ON v51_evidence_settlement_lineage(release_commit,economic_sample_id)"
+            "CREATE INDEX IF NOT EXISTS ix_v51_evidence_lineage_measurement "
+            "ON v51_evidence_settlement_lineage(economic_epoch,measurement_epoch)"
         )
 
 
@@ -143,11 +144,13 @@ def persist_complete_settlement_lineage(store: Any, lineage: dict[str, Any]) -> 
     with store._lock, store.db:
         cursor = store.db.execute(
             "INSERT OR IGNORE INTO v51_evidence_settlement_lineage("
-            "release_commit,settlement_id,candidate_id,economic_sample_id,lineage_json,paper_only,live_money_authority"
-            ") VALUES (?,?,?,?,?,1,0)",
+            "release_commit,settlement_id,economic_epoch,measurement_epoch,candidate_id,economic_sample_id,"
+            "lineage_json,paper_only,live_money_authority) VALUES (?,?,?,?,?,?,?,1,0)",
             (
                 _text(payload["release_commit"]),
                 _text(payload["settlement_id"]),
+                _text(payload["economic_epoch"]),
+                _text(payload["measurement_epoch"]),
                 _text(payload["candidate_id"]),
                 _text(payload["economic_sample_id"]),
                 json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
