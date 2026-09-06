@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from solana_roi.observation import WSOL_MINT
 from solana_roi.observation_store import ObservationEventStore
 from solana_roi.profit_first_entity_final_research import FinalProfitFirstResearchAdapter
+from solana_roi import risk_conditioned_alpha_v5 as risk_v5
 from solana_roi import v51_exact_exit_execution as exact
 
 
@@ -263,5 +264,9 @@ def test_113_new_execution_model_epoch_is_explicit_and_old_epoch_is_incompatible
     assert "quote_input_raw" in columns
 
 
-def test_113_production_composition_has_exact_exit_installed():
-    assert bool(getattr(FinalProfitFirstResearchAdapter._sell, "_roi_exact_exit_execution_v2", False))
+def test_113_production_composition_has_exact_exit_installed_beneath_v5_wrapper():
+    current = FinalProfitFirstResearchAdapter._sell
+    if bool(getattr(current, "_roi_exact_exit_execution_v2", False)):
+        return
+    assert bool(getattr(current, "_roi_risk_conditioned_v5", False))
+    assert bool(getattr(risk_v5._ORIGINAL_FINAL_SELL, "_roi_exact_exit_execution_v2", False))
