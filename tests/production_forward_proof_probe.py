@@ -19,7 +19,7 @@ TIMEOUT_SECONDS = float(os.getenv("FORWARD_PROOF_HTTP_TIMEOUT_SECONDS", "60"))
 def _get(path: str) -> dict:
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
-        headers={"Accept": "application/json", "User-Agent": "solana-roi-forward-proof-ci/2"},
+        headers={"Accept": "application/json", "User-Agent": "solana-roi-forward-proof-ci/3"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -48,12 +48,24 @@ def _probe_once() -> dict:
     assert certificate.get("signing_available") is False, "certificate: signing must remain unavailable"
     assert certificate.get("transaction_submission_available") is False, "certificate: submission must remain unavailable"
 
+    production = _get("/v1/strategy/production-proof")
+    _assert_safety(production, label="production proof")
+    assert production.get("signing_available") is False, "production proof: signing must remain unavailable"
+    assert production.get("transaction_submission_available") is False, "production proof: submission must remain unavailable"
+    assert production.get("read_only_observability") is True, "production proof must remain read-only"
+    assert production.get("changes_strategy_authority") is False
+    assert production.get("changes_economic_thresholds") is False
+
     e2e_sha = str(e2e.get("release_commit") or "")
     cert_sha = str(certificate.get("release_commit") or "")
+    production_sha = str((production.get("release") or {}).get("release_commit") or "")
     if EXPECTED_SHA:
         assert e2e_sha == EXPECTED_SHA, f"e2e release {e2e_sha!r} != expected {EXPECTED_SHA!r}"
         assert cert_sha == EXPECTED_SHA, f"certificate release {cert_sha!r} != expected {EXPECTED_SHA!r}"
-    assert e2e_sha and e2e_sha == cert_sha, "e2e/certificate release binding mismatch"
+        assert production_sha == EXPECTED_SHA, (
+            f"production proof release {production_sha!r} != expected {EXPECTED_SHA!r}"
+        )
+    assert e2e_sha and e2e_sha == cert_sha == production_sha, "production proof release binding mismatch"
 
     checks = certificate.get("checks") or {}
     assert (checks.get("35_exact_live_release") or {}).get("pass") is True, "exact release gate failed"
@@ -67,14 +79,30 @@ def _probe_once() -> dict:
     assert certificate.get("changes_strategy_authority") is False
     assert certificate.get("changes_economic_thresholds") is False
 
+    attestation_policy = production.get("surface_attestation_policy") or {}
+    assert attestation_policy.get("surface_scoped_attestation_required") is True
+    assert attestation_policy.get("aggregate_attestation_fallback_allowed") is False
+    resource_pressure = production.get("resource_pressure") or {}
+    assert resource_pressure.get("read_only_observability") is True
+    assert resource_pressure.get("state") in {"healthy", "warning", "critical", "unavailable"}
+    assert isinstance(production.get("candidate_accounting"), dict)
+    final = production.get("final_certification") or {}
+    _assert_safety(final, label="final certification")
+    assert final.get("surface_scoped_attestation_required") is True
+    assert final.get("aggregate_attestation_fallback_allowed") is False
+
     return {
         "release_commit": cert_sha,
         "state": certificate.get("state"),
         "system_forward_certified": certificate.get("system_forward_certified"),
+        "production_proof_state": production.get("state"),
+        "final_classification": final.get("classification"),
+        "coverage_debt_count": (production.get("candidate_accounting") or {}).get("coverage_debt_count"),
+        "resource_pressure_state": resource_pressure.get("state"),
         "promotion_eligible_families": certificate.get(
             "promotion_eligible_families_under_existing_v51_claims"
         ),
-        "blockers": certificate.get("blockers"),
+        "blockers": production.get("blockers"),
     }
 
 

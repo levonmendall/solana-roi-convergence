@@ -1,12 +1,14 @@
 name: Production Forward Proof
 
-# This verifier is intentionally manual-only. Render is configured with
-# autoDeployTrigger=checksPass, so a push-triggered workflow that waits for the
-# new Render release would create a circular dependency: Render waits for this
-# check while this check waits for Render. Run this only after the exact release
-# is live (or while explicitly diagnosing a deployment).
+# Render deploys main only after commit checks pass. A push/pull_request/workflow_run
+# verifier that waits for Render can therefore deadlock the deployment. Keep manual
+# strict verification, and add a scheduled post-deploy verifier that is deliberately
+# non-blocking when the exact release is still converging. The next scheduled pass
+# retries automatically and still binds every successful proof to github.sha.
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
 
 permissions:
   contents: read
@@ -25,6 +27,8 @@ jobs:
         with:
           python-version: '3.11'
       - name: Verify exact Render release and paper transports
+        id: production-proof
+        continue-on-error: ${{ github.event_name == 'schedule' }}
         env:
           EXPECTED_RELEASE_COMMIT: ${{ github.sha }}
           SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
@@ -32,3 +36,7 @@ jobs:
           FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
           FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
         run: python tests/production_forward_proof_probe.py
+      - name: Record scheduled retry state
+        if: ${{ github.event_name == 'schedule' && steps.production-proof.outcome == 'failure' }}
+        run: |
+          echo '::warning::Exact-live production proof has not converged for the current main SHA. This scheduled run is non-blocking so Render checksPass cannot deadlock; the next scheduled run will retry automatically.'
