@@ -7,7 +7,7 @@ from typing import Any
 
 from .strategy_v51_authority import ECONOMIC_FREEZE_EPOCH
 
-OPERATIONS_VERSION = "v51-phase12-13-operations-83-94-v1"
+OPERATIONS_VERSION = "v51-phase12-13-operations-83-94-v2"
 PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat()
 BACKPRESSURE_AGE_LIMIT_SECONDS = 120.0
 OUTPACING_AGE_LIMIT_SECONDS = 60.0
@@ -29,6 +29,14 @@ def _int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _release() -> str | None:
+    for key in ("RENDER_GIT_COMMIT", "SOLANA_ROI_RELEASE_COMMIT", "GIT_COMMIT"):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return None
 
 
 def _nested_first(payload: dict[str, Any], names: tuple[str, ...]) -> Any:
@@ -120,8 +128,8 @@ def _ensure_continuity_schema(store: Any) -> None:
             "CREATE TABLE IF NOT EXISTS v51_runtime_continuity ("
             "subsystem TEXT PRIMARY KEY,continuity_epoch TEXT NOT NULL,first_observed_at TEXT NOT NULL,"
             "last_observed_at TEXT NOT NULL,last_process_started_at TEXT,restart_count INTEGER NOT NULL DEFAULT 0,"
-            "last_restart_reason TEXT,cursor_restore_status TEXT NOT NULL,paper_only INTEGER NOT NULL,"
-            "live_money_authority INTEGER NOT NULL)"
+            "last_restart_reason TEXT,cursor_restore_status TEXT NOT NULL,current_release TEXT,previous_release TEXT,"
+            "paper_only INTEGER NOT NULL,live_money_authority INTEGER NOT NULL)"
         )
 
 
@@ -129,19 +137,19 @@ def _continuity_rows(store: Any, subsystems: dict[str, dict[str, Any]]) -> dict[
     _ensure_continuity_schema(store)
     now = datetime.now(timezone.utc).isoformat()
     reason = os.getenv("SOLANA_ROI_RESTART_REASON", "process_start_or_platform_restart").strip() or "process_start_or_platform_restart"
+    current_release = _release()
     rows: dict[str, Any] = {}
     for name, status in subsystems.items():
         restore = str(status.get("cursor_restore_status") or "restored_or_forward_fresh_boundary")
         with store._lock, store.db:
-            existing = store.db.execute(
-                "SELECT * FROM v51_runtime_continuity WHERE subsystem=?", (name,)
-            ).fetchone()
+            existing = store.db.execute("SELECT * FROM v51_runtime_continuity WHERE subsystem=?", (name,)).fetchone()
             if existing is None:
+                previous_release = None
                 store.db.execute(
                     "INSERT INTO v51_runtime_continuity(subsystem,continuity_epoch,first_observed_at,last_observed_at,"
-                    "last_process_started_at,restart_count,last_restart_reason,cursor_restore_status,paper_only,live_money_authority) "
-                    "VALUES (?,?,?,?,?,0,?,?,1,0)",
-                    (name, ECONOMIC_FREEZE_EPOCH, now, now, PROCESS_STARTED_AT, reason, restore),
+                    "last_process_started_at,restart_count,last_restart_reason,cursor_restore_status,current_release,previous_release,"
+                    "paper_only,live_money_authority) VALUES (?,?,?,?,?,0,?,?,?,?,1,0)",
+                    (name, ECONOMIC_FREEZE_EPOCH, now, now, PROCESS_STARTED_AT, reason, restore, current_release, previous_release),
                 )
                 restart_count = 0
                 first = now
@@ -149,11 +157,14 @@ def _continuity_rows(store: Any, subsystems: dict[str, dict[str, Any]]) -> dict[
                 changed = str(existing["last_process_started_at"] or "") != PROCESS_STARTED_AT
                 restart_count = int(existing["restart_count"] or 0) + int(changed)
                 first = str(existing["first_observed_at"])
+                prior_current = existing["current_release"]
+                previous_release = prior_current if current_release and prior_current and str(prior_current) != current_release else existing["previous_release"]
                 store.db.execute(
                     "UPDATE v51_runtime_continuity SET continuity_epoch=?,last_observed_at=?,last_process_started_at=?,"
-                    "restart_count=?,last_restart_reason=?,cursor_restore_status=?,paper_only=1,live_money_authority=0 "
-                    "WHERE subsystem=?",
-                    (ECONOMIC_FREEZE_EPOCH, now, PROCESS_STARTED_AT, restart_count, reason, restore, name),
+                    "restart_count=?,last_restart_reason=?,cursor_restore_status=?,current_release=?,previous_release=?,"
+                    "paper_only=1,live_money_authority=0 WHERE subsystem=?",
+                    (ECONOMIC_FREEZE_EPOCH, now, PROCESS_STARTED_AT, restart_count, reason, restore,
+                     current_release, previous_release, name),
                 )
         rows[name] = {
             "continuity_epoch": ECONOMIC_FREEZE_EPOCH,
@@ -161,7 +172,9 @@ def _continuity_rows(store: Any, subsystems: dict[str, dict[str, Any]]) -> dict[
             "process_started_at": PROCESS_STARTED_AT,
             "worker_started_at": status.get("worker_started_at") or PROCESS_STARTED_AT,
             "restart_count": restart_count,
-            "restart_reason": reason,
+            "last_restart_reason": reason,
+            "current_release": current_release,
+            "previous_release": previous_release,
             "cursor_restore_status": restore,
             "restart_changes_economic_epoch": False,
         }
@@ -174,6 +187,9 @@ def build_operations_proof(
     unified_status: dict[str, Any] | None = None,
     robinhood_status: dict[str, Any] | None = None,
     legacy_webhook_worker_enabled: bool = False,
+    proof_cycle_duration_seconds: float | None = None,
+    http_request_count: int = 0,
+    http_total_duration_seconds: float = 0.0,
 ) -> dict[str, Any]:
     unified = _dict(unified_status)
     direct_raw, direct_duration = _safe_status(getattr(runtime, "direct_ingestion", None))
@@ -184,18 +200,21 @@ def build_operations_proof(
     raw = {
         "solana_ingestion": direct_raw,
         "wallet_discovery": wallet_raw,
-        "risk_collectors": collectors_raw,
+        "risk_enrichment": collectors_raw,
         "fomo": fomo_raw,
         "robinhood": robinhood_raw,
+        "proof_publication": {"cycle_duration_seconds": proof_cycle_duration_seconds, "cycle_count": 1},
+        "http": {"cycle_duration_seconds": http_total_duration_seconds, "request_count": http_request_count},
     }
     subsystems = {name: normalize_subsystem(name, value) for name, value in raw.items()}
     subsystems["solana_ingestion"]["status_refresh_duration_seconds"] = direct_duration
     subsystems["wallet_discovery"]["status_refresh_duration_seconds"] = wallet_duration
-    subsystems["risk_collectors"]["status_refresh_duration_seconds"] = collectors_duration
-    subsystems["fomo"]["status_refresh_duration_seconds"] = None
-    subsystems["robinhood"]["status_refresh_duration_seconds"] = None
+    subsystems["risk_enrichment"]["status_refresh_duration_seconds"] = collectors_duration
+    for name in ("fomo", "robinhood", "proof_publication", "http"):
+        subsystems[name]["status_refresh_duration_seconds"] = None
     continuity = _continuity_rows(runtime.store, subsystems)
-    unhealthy = sorted(name for name, row in subsystems.items() if not bool(row["backpressure_healthy"]))
+    worker_names = ("solana_ingestion", "wallet_discovery", "risk_enrichment", "fomo", "robinhood")
+    unhealthy = sorted(name for name in worker_names if not bool(subsystems[name]["backpressure_healthy"]))
     return {
         "operations_version": OPERATIONS_VERSION,
         "backpressure": {
@@ -217,6 +236,7 @@ def build_operations_proof(
         "continuity": {
             "continuity_epoch": ECONOMIC_FREEZE_EPOCH,
             "process_started_at": PROCESS_STARTED_AT,
+            "current_release": current_release if (current_release := _release()) else None,
             "subsystems": continuity,
             "restart_changes_economic_epoch": False,
             "candidate_ledger_is_persistent": True,
