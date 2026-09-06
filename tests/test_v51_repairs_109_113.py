@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import sqlite3
 import threading
@@ -95,6 +96,10 @@ def _ctx(adapter: Adapter, *, amount: int, due: str = "exit-sig-1") -> exit_inte
     )
 
 
+def _run(coro: object) -> object:
+    return asyncio.run(coro)  # type: ignore[arg-type]
+
+
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JUPITER_API_KEY", "test-key")
@@ -102,16 +107,15 @@ def _credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(exit_integrity, "EXIT_RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0))
 
 
-@pytest.mark.asyncio
-async def test_109_exit_quote_uses_exact_actual_held_raw_amount() -> None:
+def test_109_exit_quote_uses_exact_actual_held_raw_amount() -> None:
     amount = 987_654_321
     client = Client([_order(amount=amount)])
     rpc = Rpc([{"context": {"slot": 10}, "value": {"err": None, "unitsConsumed": 88_000, "logs": []}}])
     adapter = Adapter(client=client, rpc=rpc)
 
-    result = await exit_integrity._exact_exit_route(
+    result = _run(exit_integrity._exact_exit_route(
         adapter, _ctx(adapter, amount=amount), "token-mint", exit_integrity.WSOL_MINT, amount
-    )
+    ))
 
     assert result == {"out_amount": 2_000_000, "fee_lamports": 8_000}
     assert client.calls[0]["params"]["amount"] == str(amount)
@@ -124,16 +128,15 @@ async def test_109_exit_quote_uses_exact_actual_held_raw_amount() -> None:
     assert row["exact_amount_match"] == 1
 
 
-@pytest.mark.asyncio
-async def test_110_actual_unsigned_exit_order_metadata_is_persisted_and_never_submitted() -> None:
+def test_110_actual_unsigned_exit_order_metadata_is_persisted_and_never_submitted() -> None:
     amount = 111_222_333
     client = Client([_order(amount=amount)])
     rpc = Rpc([{"context": {"slot": 99}, "value": {"err": None, "unitsConsumed": 144_000, "logs": ["ok"]}}])
     adapter = Adapter(client=client, rpc=rpc)
 
-    await exit_integrity._exact_exit_route(
+    _run(exit_integrity._exact_exit_route(
         adapter, _ctx(adapter, amount=amount), "token-mint", exit_integrity.WSOL_MINT, amount
-    )
+    ))
 
     with adapter.store._lock:
         row = adapter.store.db.execute(
@@ -156,8 +159,7 @@ async def test_110_actual_unsigned_exit_order_metadata_is_persisted_and_never_su
     assert rpc.calls[0][1][1]["replaceRecentBlockhash"] is True
 
 
-@pytest.mark.asyncio
-async def test_111_exit_simulation_failure_is_independent_and_classified() -> None:
+def test_111_exit_simulation_failure_is_independent_and_classified() -> None:
     amount = 444_555
     failure = {"InstructionError": [0, "InsufficientFunds"]}
     client = Client([_order(amount=amount) for _ in range(3)])
@@ -168,9 +170,9 @@ async def test_111_exit_simulation_failure_is_independent_and_classified() -> No
     ])
     adapter = Adapter(client=client, rpc=rpc)
 
-    result = await exit_integrity._exact_exit_route(
+    result = _run(exit_integrity._exact_exit_route(
         adapter, _ctx(adapter, amount=amount), "token-mint", exit_integrity.WSOL_MINT, amount
-    )
+    ))
 
     assert result is None
     with adapter.store._lock:
@@ -186,8 +188,7 @@ async def test_111_exit_simulation_failure_is_independent_and_classified() -> No
     assert all(row["status"] == "paper_exit_execution_failed" for row in rows)
 
 
-@pytest.mark.asyncio
-async def test_112_unexitable_position_persists_failure_retries_and_no_synthetic_fill() -> None:
+def test_112_unexitable_position_persists_failure_retries_and_no_synthetic_fill() -> None:
     amount = 777_888
     client = Client([_order(amount=amount) for _ in range(3)])
     rpc = Rpc([
@@ -197,9 +198,9 @@ async def test_112_unexitable_position_persists_failure_retries_and_no_synthetic
     ])
     adapter = Adapter(client=client, rpc=rpc)
 
-    assert await exit_integrity._exact_exit_route(
+    assert _run(exit_integrity._exact_exit_route(
         adapter, _ctx(adapter, amount=amount), "token-mint", exit_integrity.WSOL_MINT, amount
-    ) is None
+    )) is None
 
     with adapter.store._lock:
         state = adapter.store.db.execute("SELECT * FROM v51_exact_exit_state").fetchone()
@@ -215,23 +216,22 @@ async def test_112_unexitable_position_persists_failure_retries_and_no_synthetic
     assert outcome_table is None
 
 
-@pytest.mark.asyncio
-async def test_112_later_fresh_route_can_realize_eventual_exit_after_prior_failure() -> None:
+def test_112_later_fresh_route_can_realize_eventual_exit_after_prior_failure() -> None:
     amount = 246_810
     failed_client = Client([_order(amount=amount) for _ in range(3)])
     failed_rpc = Rpc([{"value": {"err": "blocked"}} for _ in range(3)])
     adapter = Adapter(client=failed_client, rpc=failed_rpc)
-    await exit_integrity._exact_exit_route(
+    _run(exit_integrity._exact_exit_route(
         adapter, _ctx(adapter, amount=amount), "token-mint", exit_integrity.WSOL_MINT, amount
-    )
+    ))
 
     adapter._http = Client([_order(amount=amount, out_amount=3_000_000)])
     adapter.discovery.rpc = Rpc([{"context": {"slot": 55}, "value": {"err": None, "unitsConsumed": 50_000, "logs": []}}])
     later = _ctx(adapter, amount=amount, due="exit-sig-2")
     later.first_due_by_source["entry-sig-1"] = "2026-09-06T12:00:00+00:00"
-    result = await exit_integrity._exact_exit_route(
+    result = _run(exit_integrity._exact_exit_route(
         adapter, later, "token-mint", exit_integrity.WSOL_MINT, amount
-    )
+    ))
     assert result is not None
     with adapter.store._lock:
         state = adapter.store.db.execute("SELECT * FROM v51_exact_exit_state").fetchone()
