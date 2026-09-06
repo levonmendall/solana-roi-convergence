@@ -23,6 +23,7 @@ from .v51_evidence_analytics import (
 from .v51_forward_certification import _e2e_status, build_forward_certification
 from .v51_phase10_proof import PHASE10_VERSION, dashboard_funnel, family_proof_confidence
 from .v51_phase12_13_operations import OPERATIONS_VERSION, build_operations_proof
+from .v51_schema_cache import install_v51_schema_cache, stats as schema_cache_stats
 from .v51_strategy_api import (
     _isolated_robinhood_proof_state,
     _merged_certification,
@@ -31,7 +32,7 @@ from .v51_strategy_api import (
     _merged_promotion_certification,
 )
 
-SYSTEM_PROOF_VERSION = "v51-canonical-system-proof-v2-phase12-13-83-94"
+SYSTEM_PROOF_VERSION = "v51-canonical-system-proof-v3-phase13-precompute-schema-cache"
 SYSTEM_STATES = (
     "READY_FOR_FORWARD_PROOF",
     "DEGRADED",
@@ -116,7 +117,9 @@ def build_system_proof(
     runtime: Any,
     *,
     robinhood_status_provider: Callable[[], dict[str, Any]] | None = None,
+    http_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    proof_started = time.perf_counter()
     expected_release = _expected_release()
     unified = _e2e_status(app)
     local_coverage = refresh_candidate_pipeline(runtime.store)
@@ -154,12 +157,32 @@ def build_system_proof(
         local_counterfactuals=local_counterfactuals,
         robinhood_proof=proof,
     )
+    http = _dict(http_metrics)
     operations = build_operations_proof(
         runtime,
         unified_status=unified,
         robinhood_status=robinhood_status,
         legacy_webhook_worker_enabled=legacy_webhook_worker_enabled(),
+        proof_cycle_duration_seconds=max(0.0, time.perf_counter() - proof_started),
+        http_request_count=int(http.get("request_count") or 0),
+        http_total_duration_seconds=float(http.get("total_duration_seconds") or 0.0),
     )
+    background = _dict(operations.get("background_work"))
+    background.update(
+        {
+            "system_proof_precompute_worker_enabled": bool(
+                getattr(app.state, "roi_v51_system_proof_precompute_worker_enabled", False)
+            ),
+            "system_proof_precompute_state": getattr(
+                app.state, "roi_v51_system_proof_precompute_state", "not_started"
+            ),
+            "system_proof_precompute_last_completed_at": getattr(
+                app.state, "roi_v51_system_proof_precompute_last_completed_at", None
+            ),
+            "schema_introspection_cache": schema_cache_stats(),
+        }
+    )
+    operations["background_work"] = background
     operations_healthy = bool(_dict(operations.get("backpressure")).get("healthy", False))
     state = system_state(
         forward_certification=forward,
@@ -234,6 +257,7 @@ def build_system_proof(
         },
         "resource_health": {
             "operations": operations,
+            "schema_introspection_cache": schema_cache_stats(),
             "robinhood_main_uvicorn_sqlite_reads": False,
             "liveness_endpoint_requires_runtime_or_sqlite": False,
             "readiness_endpoint_is_deep": True,
@@ -280,7 +304,10 @@ def _failed_closed_system_proof(error: Exception) -> dict[str, Any]:
         "paper_portfolio": {},
         "settlement": {},
         "learning": {},
-        "resource_health": {"system_proof_error_type": type(error).__name__},
+        "resource_health": {
+            "system_proof_error_type": type(error).__name__,
+            "schema_introspection_cache": schema_cache_stats(),
+        },
         "operations_proof": {},
         "dashboard_funnel": {},
         "proof_confidence_by_family": {},
@@ -300,12 +327,23 @@ def install_system_proof(
     if bool(getattr(app.state, "roi_v51_system_proof_70_74", False)):
         return
 
+    # Phase 13 caches the proof-plane schema inspection helpers before any public
+    # proof request can traverse them. PRAGMA schema_version automatically clears
+    # cached table/column metadata after DDL.
+    install_v51_schema_cache()
+
     cache_lock = threading.RLock()
     cache: dict[str, Any] = {"payload": None, "built_monotonic": 0.0}
+    http_lock = threading.RLock()
+    http_metrics: dict[str, Any] = {"request_count": 0, "total_duration_seconds": 0.0}
     try:
         cache_seconds = max(1.0, float(os.getenv("SOLANA_ROI_SYSTEM_PROOF_CACHE_SECONDS", "15")))
     except ValueError:
         cache_seconds = 15.0
+
+    def http_snapshot() -> dict[str, Any]:
+        with http_lock:
+            return dict(http_metrics)
 
     def current_proof() -> dict[str, Any]:
         now = time.monotonic()
@@ -319,6 +357,7 @@ def install_system_proof(
                     "age_seconds": max(0.0, age),
                     "max_age_seconds": cache_seconds,
                     "shared_by_system_proof_readiness_and_dashboard": True,
+                    "kept_warm_by_background_precompute": True,
                 }
                 return result
         try:
@@ -327,6 +366,7 @@ def install_system_proof(
                 app,
                 runtime,
                 robinhood_status_provider=robinhood_status_provider,
+                http_metrics=http_snapshot(),
             )
         except Exception as exc:
             result = _failed_closed_system_proof(exc)
@@ -338,8 +378,21 @@ def install_system_proof(
             "age_seconds": 0.0,
             "max_age_seconds": cache_seconds,
             "shared_by_system_proof_readiness_and_dashboard": True,
+            "kept_warm_by_background_precompute": True,
         }
         return result
+
+    # Lightweight attribution only; no request body or sensitive content is stored.
+    @app.middleware("http")
+    async def phase13_http_work_attribution(request: Any, call_next: Any) -> Any:
+        started = time.perf_counter()
+        try:
+            return await call_next(request)
+        finally:
+            elapsed = max(0.0, time.perf_counter() - started)
+            with http_lock:
+                http_metrics["request_count"] = int(http_metrics["request_count"]) + 1
+                http_metrics["total_duration_seconds"] = float(http_metrics["total_duration_seconds"]) + elapsed
 
     existing = {getattr(route, "path", None) for route in app.routes}
     if "/v1/liveness" not in existing:
@@ -401,9 +454,16 @@ def install_system_proof(
                 )
             )
 
+    # The FastAPI lifespan starts this callback in asyncio.to_thread, keeping the
+    # shared proof cache warm without adding proof SQL to the Uvicorn event loop.
+    app.state.roi_v51_system_proof_precompute = current_proof
+    app.state.roi_v51_system_proof_precompute_seconds = cache_seconds
+    app.state.roi_v51_system_proof_precompute_state = "configured"
+    app.state.roi_v51_system_proof_http_metrics = http_metrics
     app.state.roi_v51_system_proof_70_74 = True
     app.state.roi_v51_phase12_13_83_94 = True
     app.state.roi_v51_system_proof_cache_seconds = cache_seconds
+    app.state.roi_v51_schema_introspection_cache = True
 
 
 __all__ = [
