@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 from functools import wraps
@@ -173,14 +172,10 @@ def _control(self: Any, *, demand: int, open_positions: int) -> int:
     desired = current
     reason = "hold"
 
-    # When there is no simultaneous prospective demand, collapse back to the safe
-    # minimum. This is a capacity decision only; broad discovery and research remain on.
     if demand <= max(1, minimum):
         desired = max(1, minimum)
         reason = "quiet_or_single_candidate"
     elif effective >= target * EMERGENCY_FRACTION:
-        # Open positions are never evicted. If they are already consuming the budget,
-        # prospecting may temporarily go to zero; otherwise retain one prospective lane.
         desired = 0 if open_positions > 0 else max(1, minimum)
         reason = "provider_budget_emergency"
     elif effective >= target * HARD_CONTRACTION_FRACTION:
@@ -224,14 +219,15 @@ def _adaptive_selected_market_targets(self: Any) -> tuple[dict[str, int], dict[s
     selected: dict[str, int] = {}
     reasons: dict[str, str] = {}
 
-    # Open positions are outside the prospective cap and are always forced live.
     for address in sorted(open_markets):
         descriptor = universe.get(address)
         if descriptor is None:
             continue
         budget._ensure_runtime_market(self, descriptor)
         selected[address] = int(descriptor["launch_block"])
-        reasons[address] = "open_position_forced_live_outside_prospective_cap"
+        # Preserve the canonical reason string for downstream compatibility. Status
+        # separately proves that open positions do not consume prospective capacity.
+        reasons[address] = "open_position_forced_live"
 
     added = 0
     for address, _score, reason in rankings:
@@ -264,11 +260,12 @@ def _status_wrapper(original: Callable[[Any], dict[str, Any]]) -> Callable[[Any]
         selected = dict(getattr(self, "_roi_budget_live_targets", {}) or {})
         open_count = int(getattr(self, "_roi_adaptive_open_position_live_count", 0) or 0)
         prospective_count = int(getattr(self, "_roi_adaptive_prospective_lane_count", 0) or 0)
+        prospective_cap = int(state.get("prospective_lane_cap", 1) or 0)
         authority.update(
             {
                 "adaptive_lane_controller_enabled": True,
                 "adaptive_lane_controller_version": CONTROLLER_VERSION,
-                "adaptive_prospective_lane_cap": int(state.get("prospective_lane_cap", 1) or 0),
+                "adaptive_prospective_lane_cap": prospective_cap,
                 "adaptive_min_prospective_lanes": _min_lanes(),
                 "adaptive_max_prospective_lanes": _max_lanes(),
                 "adaptive_target_cu_per_minute": _target_cu_per_minute(),
@@ -281,6 +278,8 @@ def _status_wrapper(original: Callable[[Any], dict[str, Any]]) -> Callable[[Any]
                 "adaptive_ranked_demand": int(state.get("ranked_demand", 0) or 0),
                 "adaptive_open_positions_forced_live": open_count,
                 "adaptive_prospective_live_count": prospective_count,
+                "alchemy_live_market_cap": open_count + prospective_cap,
+                "alchemy_live_market_cap_mode": "adaptive_prospective_plus_all_forced_open_positions",
                 "alchemy_live_market_count": len(selected),
                 "open_positions_consume_prospective_cap": False,
                 "candidate_discovery_constrained_by_adaptive_cap": False,
