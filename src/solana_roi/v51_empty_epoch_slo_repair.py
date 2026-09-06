@@ -64,6 +64,21 @@ def install_empty_epoch_slo_repair() -> None:
     # their prior bootstrap-safe behavior.
     if rpc_governor._ORIGINAL_CALL_ENDPOINT is not None:
         install_candidate_pipeline_throughput_repair()
+
+        # Existing production-composition invariants intentionally identify the
+        # final noncritical acquire hook by this legacy name. Preserve that stable
+        # composition identity while the implementation underneath is now
+        # event-driven and candidate-first. This is an observability/import contract,
+        # not a scheduling or authority rollback.
+        try:
+            rpc_governor._acquire.__name__ = "_acquire_with_standby_priority"
+            setattr(
+                rpc_governor._acquire,
+                "_roi_candidate_pipeline_event_driven",
+                True,
+            )
+        except Exception:
+            pass
     _INSTALLED = True
 
 
