@@ -9,13 +9,11 @@ from typing import Any
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority
 from .v51_economic_core import robust_profile
 from .v51_evidence_analytics import ensure_counterfactual_schema, refresh_rejected_counterfactuals
+from .v51_return_validation import STATISTICS_VERSION, validate_return
 
 
 LATENCY_CHALLENGER_VERSION = "v51-latency-challenger-research-v1"
 
-# These are research cohorts only. The frozen v5.1 authority remains exactly as
-# specified in strategy_v51_authority.json and continues to reject paper entries
-# above execution.latency_hard_max_seconds.
 RESEARCH_BANDS: tuple[tuple[str, float | None, float | None], ...] = (
     ("authorized_le_20s", 0.0, 20.0),
     ("challenger_20_40s", 20.0, 40.0),
@@ -45,7 +43,7 @@ def _columns(store: Any, table: str) -> set[str]:
 def _safe(value: Any) -> float | None:
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return result if math.isfinite(result) else None
 
@@ -76,12 +74,6 @@ def latency_research_band(seconds: float | None) -> str:
 
 
 def _trial_metadata(store: Any) -> dict[tuple[str, str], dict[str, Any]]:
-    """Return economic latency/chase metadata for canonical Solana/FOMO candidates.
-
-    signal_to_entry_seconds comes from the final amount-specific quote path and is
-    intentionally distinct from transport/ingestion latency. We prefer the unified
-    profit-maximizer row when more than one lane exists for the source signature.
-    """
     table = "profit_first_final_trials"
     cols = _columns(store, table)
     required = {"source_signature", "signal_to_entry_seconds"}
@@ -175,12 +167,7 @@ def _candidate_metadata(store: Any) -> dict[tuple[str, str], dict[str, Any]]:
         cols = _columns(store, "v51_robinhood_candidate_ledger")
         wanted = [
             column
-            for column in (
-                "candidate_id",
-                "release_commit",
-                "venue",
-                "lifecycle",
-            )
+            for column in ("candidate_id", "release_commit", "venue", "lifecycle")
             if column in cols
         ]
         if "candidate_id" in wanted:
@@ -210,10 +197,9 @@ def _return_summary(values: list[float]) -> dict[str, Any]:
 def build_latency_challenger_research(store: Any) -> dict[str, Any]:
     """Measure whether the frozen 20-second cliff is leaving forward edge behind.
 
-    This function is deliberately non-authoritative. It reads existing candidate,
-    quote and rejected-counterfactual evidence; it never creates a paper trial,
-    changes sizing, selects a lane, submits a transaction, or retroactively grants
-    entry authority.
+    This function is deliberately non-authoritative. Return measurements use the
+    canonical v5.1 validator; malformed values remain explicit measurement debt and
+    never become zero-return observations.
     """
     refresh_rejected_counterfactuals(store)
     ensure_counterfactual_schema(store)
@@ -237,6 +223,7 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
     counts: dict[tuple[str, str, str, str], dict[str, int]] = defaultdict(
         lambda: {"candidate_count": 0, "resolved_count": 0, "positive_count": 0}
     )
+    invalid_return_debt: dict[tuple[str, str, str, str], int] = defaultdict(int)
     missing_by_surface: dict[str, int] = defaultdict(int)
     above_authority_count = 0
     resolved_above_authority = 0
@@ -255,9 +242,24 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
         lifecycle = str(meta.get("lifecycle") or candidate_row.get("lifecycle") or "unknown")
         key = (surface, venue, lifecycle, band)
         counts[key]["candidate_count"] += 1
-        value = _safe(row.get("forward_net_return"))
-        if value is None and surface == "ROBINHOOD_CHAIN":
-            value = _safe(row.get("forward_gross_return"))
+
+        raw_return = row.get("forward_net_return")
+        return_semantics = "net"
+        if raw_return is None and surface == "ROBINHOOD_CHAIN":
+            raw_return = row.get("forward_gross_return")
+            return_semantics = "gross"
+        value: float | None = None
+        if raw_return is not None:
+            validated = validate_return(
+                raw_return,
+                source_surface=surface,
+                source_signature=candidate,
+            )
+            if validated.validity and validated.normalized_fraction is not None:
+                value = validated.normalized_fraction
+            else:
+                invalid_return_debt[key] += 1
+
         if value is not None:
             counts[key]["resolved_count"] += 1
             counts[key]["positive_count"] += int(value > 0.0)
@@ -277,6 +279,7 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
             "lifecycle": lifecycle,
             "latency_band": band,
             **counts[key],
+            "invalid_economic_measurement_count": invalid_return_debt.get(key, 0),
             "return_semantics": (
                 "gross_observed_market_return_research_only_not_executable_pnl"
                 if surface == "ROBINHOOD_CHAIN"
@@ -292,13 +295,16 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
 
     by_band_values: dict[str, list[float]] = defaultdict(list)
     by_band_counts: dict[str, int] = defaultdict(int)
+    by_band_invalid: dict[str, int] = defaultdict(int)
     for key, counter in counts.items():
         band = key[3]
         by_band_counts[band] += int(counter["candidate_count"])
         by_band_values[band].extend(grouped.get(key, []))
+        by_band_invalid[band] += invalid_return_debt.get(key, 0)
     bands = {
         band: {
             "candidate_count": by_band_counts.get(band, 0),
+            "invalid_economic_measurement_count": by_band_invalid.get(band, 0),
             **_return_summary(by_band_values.get(band, [])),
         }
         for band, _low, _high in RESEARCH_BANDS
@@ -307,11 +313,13 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
     if missing_numeric_latency:
         bands["unknown"] = {
             "candidate_count": missing_numeric_latency,
+            "invalid_economic_measurement_count": by_band_invalid.get("unknown", 0),
             **_return_summary(by_band_values.get("unknown", [])),
         }
 
     return {
         "latency_challenger_version": LATENCY_CHALLENGER_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "authority_id": AUTHORITY_ID,
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "current_authorized_hard_max_seconds": hard_max,
@@ -329,6 +337,8 @@ def build_latency_challenger_research(store: Any) -> dict[str, Any]:
         "rejected_candidate_count": len(rejected_rows),
         "above_current_authority_candidate_count": above_authority_count,
         "resolved_above_current_authority_count": resolved_above_authority,
+        "invalid_economic_measurement_count": sum(invalid_return_debt.values()),
+        "invalid_economic_measurements_are_not_imputed": True,
         "missing_numeric_signal_to_entry_count": missing_numeric_latency,
         "missing_numeric_signal_to_entry_by_surface": dict(sorted(missing_by_surface.items())),
         "measurement_debt": (
