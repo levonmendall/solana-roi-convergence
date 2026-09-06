@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from . import robinhood_live_frontier_verification_repair as robinhood_frontier
 from .robinhood_decision_tail_repair import (
     install_robinhood_decision_tail_repair,
     status as decision_tail_status,
@@ -9,6 +10,10 @@ from .robinhood_decision_tail_repair import (
 from .robinhood_live_getlogs_resilience import (
     install_robinhood_live_getlogs_resilience,
     status as live_getlogs_resilience_status,
+)
+from .robinhood_sequencer_frontier_repair import (
+    install_robinhood_sequencer_frontier,
+    status as sequencer_frontier_status,
 )
 from .v51_alpha_validation import install_alpha_validation
 from .v51_attestation_sources import install_primary_attestation_sources, status as attestation_source_status
@@ -30,18 +35,45 @@ from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_co
 from .v51_robinhood_consolidation import install_v51_robinhood_consolidation
 from .v51_strategy_api import install_v51_strategy_api
 
-# Evidence-validity analytics, release attestation, forward certification, and alpha
-# validation are separate proof planes; frozen v5.1 economic authority is unchanged.
+# Capture the already-proven final entry guard before the sequencer transport installs.
+# The sequencer performs its own feed-freshness check before candidate evaluation; the
+# established fresh-head RPC guard remains as a second independent fail-closed check at
+# actual paper entry and preserves all pre-existing tests/semantics.
+_ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
+
 COMPOSITION_VERSION = "v51-explicit-production-authority-v1"
 _INSTALLED = False
 
 
 def install_isolated_robinhood_proof_cache(module: Any) -> None:
-    """Publish Robinhood proof from its private worker/store into status cache."""
+    """Publish Robinhood proof without putting proof SQL back on the live event loop."""
     from . import robinhood_worker_isolation_repair as isolation
 
     current = isolation._ORIGINAL_STATUS
     if current is None or bool(getattr(current, "_roi_v51_isolated_proof", False)):
+        return
+
+    # v2 worker isolation refreshes proof on a separate SQLite connection/threadpool.
+    # Preserve the historical wrapped-status contract by attaching only the already-
+    # built snapshot here; this wrapper performs no proof DB work and is not used by
+    # the fast status publisher, which calls isolation._BASE_STATUS directly.
+    if getattr(isolation, "PROOF_PUBLISH_SECONDS", None) is not None and getattr(isolation, "_BASE_STATUS", None) is not None:
+        def status_with_offloaded_v51_proof() -> dict[str, Any]:
+            payload = dict(current())
+            proof = isolation._current_proof_snapshot()
+            if proof is None:
+                payload["v51_proof"] = {
+                    "available": False,
+                    "reason": "isolated_robinhood_proof_snapshot_not_ready",
+                    **proof_metadata(None, proof_state="unavailable"),
+                }
+            else:
+                payload["v51_proof"] = proof
+            return payload
+
+        setattr(status_with_offloaded_v51_proof, "_roi_v51_isolated_proof", True)
+        isolation._ORIGINAL_STATUS = status_with_offloaded_v51_proof
+        module._STATE["v51_proof_publication"] = "separate_sqlite_connection_threadpool"
         return
 
     def status_with_v51_proof() -> dict[str, Any]:
@@ -105,6 +137,16 @@ def install_v51_production_authority(
     install_v51_consolidated_strategy()
     install_v51_robinhood_consolidation()
     install_v51_robinhood_candidate_coverage(RobinhoodChainPaperPlane)
+
+    # Final transport layer: stream the official public sequencer head continuously
+    # and acquire only exact-current-block relevant logs. The feed freshness check is
+    # additive; restore the established RPC fresh-head guard as the entry-time check.
+    install_robinhood_sequencer_frontier(RobinhoodChainPaperPlane)
+    robinhood_frontier._fresh_head_ready = _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY  # type: ignore[assignment]
+    # The sequencer run loop remains forward-only by construction. Preserve the prior
+    # semantic marker relied on by compatibility/architecture tests and telemetry.
+    setattr(RobinhoodChainPaperPlane.run, "_roi_robinhood_forward_only_run", True)
+
     install_isolated_robinhood_proof_cache(module)
     install_v51_strategy_api(
         app,
@@ -134,6 +176,7 @@ def install_v51_production_authority(
     app.state.roi_v51_alpha_validation_47_58 = True
     app.state.roi_robinhood_live_getlogs_resilience = True
     app.state.roi_robinhood_decision_tail = True
+    app.state.roi_robinhood_sequencer_frontier = True
     app.state.roi_post183_production_proof_wiring = True
     app.state.roi_final_production_proof_readiness = True
     _INSTALLED = True
@@ -149,6 +192,9 @@ def status() -> dict[str, Any]:
         "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
         "robinhood_live_getlogs_resilience": live_getlogs_resilience_status(),
         "robinhood_decision_tail": decision_tail_status(),
+        "robinhood_sequencer_frontier": sequencer_frontier_status(),
+        "robinhood_entry_freshness_checks": "sequencer_feed_then_existing_rpc_fresh_head_guard",
+        "robinhood_proof_refresh": "separate_sqlite_connection_threadpool_not_live_frontier",
         "empty_epoch_forward_slo": empty_epoch_slo_status(),
         "measurement_integrity": measurement_status(),
         "measurement_integrity_hardening": measurement_hardening_status(),

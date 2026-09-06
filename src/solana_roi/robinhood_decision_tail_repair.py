@@ -6,9 +6,9 @@ from . import post177_forward_pipeline_bottleneck_repair as post177
 from . import robinhood_forward_only_runtime_repair as forward
 from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_chain_runtime as runtime
-from .v51_counterfactual_extension import refresh_all_rejected_counterfactuals
+from .v51_counterfactual_extension import refresh_all_rejected_counterfactuals  # compatibility symbol only
 
-REPAIR_VERSION = "robinhood-current-decision-tail-v1"
+REPAIR_VERSION = "robinhood-current-decision-tail-v2-no-proof-work"
 METADATA_WINDOW_BLOCKS = int(frontier.MAX_LIVE_FRONTIER_GAP_BLOCKS)
 DECISION_WINDOW_BLOCKS = int(runtime.LIVE_LAG_BLOCKS)
 _INSTALLED = False
@@ -23,11 +23,9 @@ async def _advance_current_decision_tail(self: Any) -> None:
     """Keep metadata bounded while evaluating only the decision-current trade tail.
 
     Older continuously observed blocks cannot satisfy the existing two-block paper
-    frontier by the time a wide market-log scan completes.  They therefore have no
-    immediate entry authority.  We retain a bounded 64-block factory-metadata read so
-    new markets remain discoverable, clear stale flow, then acquire swap logs only for
-    the unchanged two-block decision tail.  No skipped block is replayed as a paper
-    entry and no strategy/economic threshold is changed.
+    frontier by the time a wide market-log scan completes. They therefore have no
+    immediate entry authority. No proof/counterfactual analytics run on this latency-
+    critical path; those are published separately by the isolated proof worker.
     """
     frontier._inc(self, "polls")
     post177._schedule_rwa_refresh(self)
@@ -73,11 +71,8 @@ async def _advance_current_decision_tail(self: Any) -> None:
         setattr(self, "_roi_live_epoch_ready", ready)
         if ready:
             setattr(self, "_roi_live_epoch_last_success_at", frontier._utcnow())
-        refresh_all_rejected_counterfactuals(self.store)
         return
 
-    # Recover only the recent market-definition window.  This is metadata, not a
-    # replay of swap flow and has no paper-entry authority.
     metadata_from = max(live_cursor + 1, latest - METADATA_WINDOW_BLOCKS + 1)
     decision_from = max(live_cursor + 1, latest - DECISION_WINDOW_BLOCKS + 1)
     stale_skipped = max(0, decision_from - (live_cursor + 1))
@@ -132,17 +127,10 @@ async def _advance_current_decision_tail(self: Any) -> None:
         },
     )
 
-    # Fix the prior cold-start handshake: mark the just-completed cursor provisionally
-    # ready, then let the unchanged fresh-head guard revoke it unless the *new* chain
-    # head remains within the existing two-block readiness envelope.
     provisional = bool(post177._observer_head_fresh(self))
     setattr(self, "_roi_live_epoch_ready", provisional)
     ready = bool(provisional and await frontier._fresh_head_ready(self))
     setattr(self, "_roi_live_epoch_ready", ready)
-
-    # Counterfactual resolution is observational only and bounded inside the isolated
-    # Robinhood worker. It can never create a historical or retrospective paper entry.
-    refresh_all_rejected_counterfactuals(self.store)
 
     if not ready:
         return
@@ -159,8 +147,6 @@ def install_robinhood_decision_tail_repair() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    # The final verified-live poll wrapper resolves this module global dynamically.
-    # Install after all historical compatibility composition is complete.
     frontier._advance_live_epoch = _advance_current_decision_tail  # type: ignore[assignment]
     _INSTALLED = True
 
@@ -171,6 +157,7 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "metadata_window_blocks": METADATA_WINDOW_BLOCKS,
         "decision_window_blocks": DECISION_WINDOW_BLOCKS,
+        "proof_or_counterfactual_work_on_decision_loop": False,
         "readiness_gate_blocks_changed": False,
         "stale_trade_blocks_have_retrospective_entry_authority": False,
         "strategy_thresholds_changed": False,
