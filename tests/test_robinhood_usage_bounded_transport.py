@@ -51,7 +51,7 @@ def test_usage_bounded_source_has_no_global_newheads_subscription() -> None:
     assert '"newHeads"' not in source
     assert '"address": addresses' in source
     assert '"topics": [topics]' in source
-    assert '"live_authority": False' in source
+    assert "live_authority=False" in source
     assert "new_target_gap_backfill_research_only" in source
 
 
