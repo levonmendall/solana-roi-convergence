@@ -186,6 +186,8 @@ def _exact_entry_apply(
         *,
         scout_wallet: str,
         reference_price: float,
+        family: str = "legacy_runtime",
+        context: str = "unclassified",
     ) -> None:
         evidence = _CURRENT_ENTRY_EXECUTION.get()
         use_exact = bool(
@@ -202,7 +204,14 @@ def _exact_entry_apply(
             )
         )
         if not use_exact or evidence is None:
-            return original(self, intent, scout_wallet=scout_wallet, reference_price=reference_price)
+            return original(
+                self,
+                intent,
+                scout_wallet=scout_wallet,
+                reference_price=reference_price,
+                family=family,
+                context=context,
+            )
 
         # Consume exactly once. A confirmation add receives its own independently
         # built and simulated Jupiter order and therefore its own context.
@@ -211,10 +220,7 @@ def _exact_entry_apply(
         position = self.positions.get(intent.token_mint)
         if position is None:
             position = PaperPosition(intent.token_mint, scout_wallet, intent.observed_at)
-            self.positions[intent.token_mint] = position
-            self._trade_start_nav[intent.token_mint] = self.nav(
-                {intent.token_mint: evidence.order_effective_price_sol}
-            )
+            self.ledger.register_position(position, family=family, context=context)
 
         network_fee_usd = max(0.0, float(evidence.network_fee_usd))
         full = self.full_position_notional({intent.token_mint: evidence.order_effective_price_sol})
@@ -246,6 +252,7 @@ def _exact_entry_apply(
         position.cost_basis_usd += total_cash_cost
         position.entry_capital_usd += total_cash_cost
         position.fills.append(fill)
+        self.ledger.record_equity({intent.token_mint: evidence.order_effective_price_sol})
 
     try:
         apply.__dict__.update(getattr(original, "__dict__", {}))
