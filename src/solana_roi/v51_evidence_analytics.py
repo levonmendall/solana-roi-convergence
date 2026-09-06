@@ -8,18 +8,25 @@ from statistics import mean, median
 from typing import Any, Iterable
 
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority
+from .v51_economic_clustering import cluster_economic_rows, cluster_economic_rows_legacy_pre103
 from .v51_economic_core import execution_stress_profiles, hierarchical_profile, robust_profile
 from .v51_promotion_proof import (
     FDR_Q,
     benjamini_hochberg,
-    cluster_rows,
     positive_edge_p_value,
     refresh_release_attestation,
 )
+from .v51_return_validation import (
+    STATISTICS_VERSION,
+    persist_invalid_measurement_debt,
+    return_integrity_summary,
+    validate_return,
+    validate_row_return,
+)
 
 
-ANALYTICS_VERSION = "v51-evidence-validity-analytics-v1"
-PORTFOLIO_VERSION = "v51-single-capital-base-reconciliation-v1"
+ANALYTICS_VERSION = "v51-evidence-validity-analytics-v2-statistical-integrity"
+PORTFOLIO_VERSION = "v51-single-capital-base-reconciliation-v2-return-integrity"
 SLO_VERSION = "v51-forward-proof-slo-v1"
 COUNTERFACTUAL_VERSION = "v51-rejected-counterfactual-ledger-v1"
 COST_LEDGER_VERSION = "v51-normalized-execution-cost-ledger-v1"
@@ -53,9 +60,10 @@ def _columns(store: Any, table: str) -> set[str]:
 
 
 def _safe(value: Any, default: float = 0.0) -> float:
+    """Finite numeric helper for non-return operational fields only."""
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return result if math.isfinite(result) else default
 
@@ -79,6 +87,15 @@ def _surface_for_row(row: dict[str, Any]) -> str:
     return surface or "UNKNOWN"
 
 
+def _valid_cluster_values(rows: Iterable[dict[str, Any]]) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        validated = validate_row_return(row)
+        if validated.validity and validated.normalized_fraction is not None:
+            values.append(validated.normalized_fraction)
+    return values
+
+
 def _family_minimum(family: str, family_rows: list[dict[str, Any]]) -> tuple[int, int, float]:
     risk_signature = "clean"
     severity = 0.0
@@ -90,15 +107,14 @@ def _family_minimum(family: str, family_rows: list[dict[str, Any]]) -> tuple[int
     requirements = authority()["hazard_evidence_burden"]
     if risk_signature == "clean":
         cfg = requirements["clean"]
+    elif severity >= 0.70:
+        cfg = requirements["extreme"]
+    elif severity >= 0.50:
+        cfg = requirements["high"]
+    elif severity >= 0.30:
+        cfg = requirements["moderate"]
     else:
-        if severity >= 0.70:
-            cfg = requirements["extreme"]
-        elif severity >= 0.50:
-            cfg = requirements["high"]
-        elif severity >= 0.30:
-            cfg = requirements["moderate"]
-        else:
-            cfg = requirements["low"]
+        cfg = requirements["low"]
     return (
         int(cfg["minimum_independent_outcomes"]),
         int(cfg["minimum_exact_outcomes"]),
@@ -107,8 +123,8 @@ def _family_minimum(family: str, family_rows: list[dict[str, Any]]) -> tuple[int
 
 
 def _capital_efficiency(profile: dict[str, Any], evidence_n: int, minimum_n: int) -> float:
-    growth = profile.get("best_expected_log_growth")
-    if growth is None or _safe(growth) <= 0.0:
+    growth = profile.get("lower_confidence_expected_log_growth")
+    if growth is None or _safe(growth, -1.0) <= 0.0:
         return 0.0
     shortfall = min(0.0, _safe(profile.get("expected_shortfall_20")))
     drawdown = max(0.0, _safe(profile.get("max_drawdown_at_best_fraction")))
@@ -216,7 +232,7 @@ def _cost_overlay(store: Any) -> dict[tuple[str, str], float]:
 
 
 def promotion_records(store: Any) -> list[dict[str, Any]]:
-    from .v51_measurement_integrity import MEASUREMENT_EPOCH
+    from .v51_measurement_integrity import EXECUTION_MODEL_EPOCH, MEASUREMENT_EPOCH
 
     records = _audit_records(store)
     costs = _cost_overlay(store)
@@ -235,6 +251,9 @@ def promotion_records(store: Any) -> list[dict[str, Any]]:
         if (release, surface) not in attested:
             continue
         item = dict(row)
+        item.setdefault("surface", surface)
+        item.setdefault("measurement_epoch", MEASUREMENT_EPOCH)
+        item.setdefault("execution_model_epoch", EXECUTION_MODEL_EPOCH)
         signature = str(item.get("source_signature") or item.get("trial_id") or item.get("id") or "")
         key = (surface, signature)
         if key in costs:
@@ -243,34 +262,85 @@ def promotion_records(store: Any) -> list[dict[str, Any]]:
     return selected
 
 
+def _legacy_promotion_claim(
+    clusters: list[dict[str, Any]],
+    *,
+    minimum_n: int,
+    hurdle: float,
+    fdr_accepted: bool,
+) -> tuple[bool, dict[str, Any]]:
+    values = _valid_cluster_values(clusters)
+    profile = robust_profile(values)
+    validation_n = sum(1 for row in clusters if row.get("evidence_partition") == "validation")
+    holdout_n = sum(1 for row in clusters if row.get("evidence_partition") == "holdout")
+    robust_positive = bool(
+        profile.get("leave_best_trade_out_mean") is not None
+        and _safe(profile.get("leave_best_trade_out_mean")) > 0.0
+        and profile.get("best_expected_log_growth") is not None
+        and _safe(profile.get("best_expected_log_growth")) > hurdle
+    )
+    return bool(
+        len(clusters) >= minimum_n
+        and validation_n > 0
+        and holdout_n > 0
+        and fdr_accepted
+        and robust_positive
+    ), profile
+
+
 def _promotion_certification_from_records(rows: list[dict[str, Any]]) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row.get("family") or "UNKNOWN")].append(row)
 
-    family_clusters: dict[str, list[dict[str, Any]]] = {
-        family: cluster_rows(items, family=family, promotion_only=True)
+    family_clusters = {
+        family: cluster_economic_rows(items, family=family, promotion_only=True)
+        for family, items in grouped.items()
+    }
+    legacy_clusters = {
+        family: cluster_economic_rows_legacy_pre103(items, family=family, promotion_only=True)
         for family, items in grouped.items()
     }
     p_values = {
-        family: positive_edge_p_value([_safe(row.get("net_return")) for row in clusters])
+        family: positive_edge_p_value(_valid_cluster_values(clusters))
         for family, clusters in family_clusters.items()
     }
+    legacy_p_values = {
+        family: positive_edge_p_value(_valid_cluster_values(clusters))
+        for family, clusters in legacy_clusters.items()
+    }
     fdr = benjamini_hochberg(p_values, q=FDR_Q)
+    legacy_fdr = benjamini_hochberg(legacy_p_values, q=FDR_Q)
+
     families: dict[str, Any] = {}
     scores: dict[str, float] = {}
     for family, clusters in family_clusters.items():
-        values = [_safe(row.get("net_return")) for row in clusters]
-        validation_n = sum(1 for row in clusters if row.get("evidence_partition") == "validation")
-        holdout_n = sum(1 for row in clusters if row.get("evidence_partition") == "holdout")
+        values = _valid_cluster_values(clusters)
+        validation_values = _valid_cluster_values(
+            row for row in clusters if row.get("evidence_partition") == "validation"
+        )
+        holdout_values = _valid_cluster_values(
+            row for row in clusters if row.get("evidence_partition") == "holdout"
+        )
+        validation_n = len(validation_values)
+        holdout_n = len(holdout_values)
         minimum_n, exact_min, hurdle = _family_minimum(family, grouped[family])
-        profile = robust_profile(values)
+        integrity = return_integrity_summary(grouped[family])
+        validation_profile = robust_profile(validation_values)
+        selected_fraction = float(validation_profile.get("best_fraction") or 0.0)
+        profile = robust_profile(values, fixed_fraction=selected_fraction)
+        holdout_profile = robust_profile(holdout_values, fixed_fraction=selected_fraction)
         hp = hierarchical_profile(values, (), (), risk_signature="clean", max_fraction=0.20)
-        robust_positive = (
-            profile.get("leave_best_trade_out_mean") is not None
+        robust_positive = bool(
+            integrity.get("proof_eligible")
+            and profile.get("leave_best_trade_out_mean") is not None
             and _safe(profile.get("leave_best_trade_out_mean")) > 0.0
-            and profile.get("best_expected_log_growth") is not None
-            and _safe(profile.get("best_expected_log_growth")) > hurdle
+            and profile.get("lower_confidence_expected_log_growth") is not None
+            and _safe(profile.get("lower_confidence_expected_log_growth"), -1.0) > hurdle
+            and holdout_profile.get("leave_best_trade_out_mean") is not None
+            and _safe(holdout_profile.get("leave_best_trade_out_mean")) > 0.0
+            and holdout_profile.get("lower_confidence_expected_log_growth") is not None
+            and _safe(holdout_profile.get("lower_confidence_expected_log_growth"), -1.0) > 0.0
         )
         promotion_claim_valid = bool(
             len(clusters) >= minimum_n
@@ -279,9 +349,16 @@ def _promotion_certification_from_records(rows: list[dict[str, Any]]) -> dict[st
             and fdr.get(family, False)
             and robust_positive
         )
+        legacy_claim, legacy_profile = _legacy_promotion_claim(
+            legacy_clusters.get(family, []),
+            minimum_n=minimum_n,
+            hurdle=hurdle,
+            fdr_accepted=bool(legacy_fdr.get(family, False)),
+        )
         score = _capital_efficiency(profile, len(clusters), minimum_n) if promotion_claim_valid else 0.0
         scores[family] = score
         families[family] = {
+            "statistics_version": STATISTICS_VERSION,
             "raw_outcome_count": len(grouped[family]),
             "independent_event_cluster_count": len(clusters),
             "validation_cluster_count": validation_n,
@@ -293,11 +370,19 @@ def _promotion_certification_from_records(rows: list[dict[str, Any]]) -> dict[st
             "fdr_q": FDR_Q,
             "fdr_accepted": bool(fdr.get(family, False)),
             "promotion_claim_valid": promotion_claim_valid,
+            "legacy_pre103_promotion_claim_valid": legacy_claim,
+            "economic_measurement_integrity": integrity,
+            "selected_fraction": selected_fraction,
+            "selected_fraction_source": "validation",
+            "holdout_fraction_reoptimized": False,
+            "validation_profile": validation_profile,
+            "holdout_profile": holdout_profile,
             "robust_profile": profile,
+            "legacy_pre103_robust_profile": legacy_profile,
             "promotion_kill_profile": hp,
             "capital_efficiency_score": score,
-            "execution_stress": execution_stress_profiles(values),
-            "partition_policy": "discovery_excluded; validation_and_locked_holdout_only",
+            "execution_stress": execution_stress_profiles(values, fixed_fraction=selected_fraction),
+            "partition_policy": "discovery_excluded; validation_selects_fraction; locked_holdout_evaluates_preselected_fraction",
         }
 
     priority = list(authority()["research_family_priority"])
@@ -314,14 +399,17 @@ def _promotion_certification_from_records(rows: list[dict[str, Any]]) -> dict[st
         weight = min(float(authority()["allocation"]["immature_family_max_weight"]), raw, remaining)
         weights[family] = weight
         remaining -= weight
+    integrity = return_integrity_summary(rows)
     return {
         "promotion_certification_version": ANALYTICS_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "authority_id": AUTHORITY_ID,
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "evidence_scope": "live_attested_measurement_compatible_validation_plus_locked_holdout_event_clusters",
         "audit_evidence_scope_is_separate": True,
         "raw_attested_outcome_count": len(rows),
         "independent_event_cluster_count": sum(len(value) for value in family_clusters.values()),
+        "economic_measurement_integrity": integrity,
         "families": families,
         "research_family_ranking": ordered,
         "paper_allocation_weights": weights,
@@ -335,7 +423,11 @@ def _promotion_certification_from_records(rows: list[dict[str, Any]]) -> dict[st
 
 def build_promotion_certification(store: Any) -> dict[str, Any]:
     refresh_release_attestation(store)
-    return _promotion_certification_from_records(promotion_records(store))
+    records = promotion_records(store)
+    debt = persist_invalid_measurement_debt(store, records)
+    result = _promotion_certification_from_records(records)
+    result["persisted_economic_measurement_debt"] = debt
+    return result
 
 
 def _pearson(left: list[float], right: list[float]) -> float | None:
@@ -354,14 +446,19 @@ def build_cross_family_correlation(store: Any, rows: list[dict[str, Any]] | None
     records = rows if rows is not None else promotion_records(store)
     clustered: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for family, items in _group_by_family(records).items():
-        clustered[family] = cluster_rows(items, family=family, promotion_only=True)
+        clustered[family] = cluster_economic_rows(items, family=family, promotion_only=True)
     by_family_day: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    invalid_count = 0
     for family, items in clustered.items():
         for row in items:
             at = _dt(row.get("settled_at"))
             if at is None:
                 continue
-            by_family_day[family][at.date().isoformat()].append(_safe(row.get("net_return")))
+            validated = validate_row_return(row)
+            if not validated.validity or validated.normalized_fraction is None:
+                invalid_count += 1
+                continue
+            by_family_day[family][at.date().isoformat()].append(validated.normalized_fraction)
     families = sorted(by_family_day)
     pairs: dict[str, Any] = {}
     for index, left_name in enumerate(families):
@@ -384,8 +481,10 @@ def build_cross_family_correlation(store: Any, rows: list[dict[str, Any]] | None
             }
     return {
         "correlation_proof_version": ANALYTICS_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "aligned_period": "UTC settlement day",
         "minimum_aligned_periods": CORRELATION_MIN_ALIGNED_PERIODS,
+        "invalid_economic_measurement_count": invalid_count,
         "pairs": pairs,
         "unknown_correlation_is_zero": False,
         "paper_only": True,
@@ -419,7 +518,7 @@ def build_maturity_allocation_proof(store: Any) -> dict[str, Any]:
             default=None,
         )
         material = (proof.get("execution_stress") or {}).get("material") or {}
-        stressed_positive = _safe(material.get("best_expected_log_growth"), -1.0) > 0.0
+        stressed_positive = _safe(material.get("lower_confidence_expected_log_growth"), -1.0) > 0.0
         future_eligible = bool(
             proof.get("promotion_claim_valid")
             and correlations_known
@@ -439,6 +538,7 @@ def build_maturity_allocation_proof(store: Any) -> dict[str, Any]:
         }
     return {
         "allocation_maturity_version": ANALYTICS_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "active_allocation_cap_remains_frozen": current_cap,
         "future_permanent_ceiling": permanent_cap,
         "families": families,
@@ -473,7 +573,16 @@ def _entry_time_map(store: Any) -> dict[tuple[str, str], str]:
 def _portfolio_reconcile(records: list[dict[str, Any]]) -> dict[str, Any]:
     events: list[tuple[datetime, int, dict[str, Any]]] = []
     fallback_count = 0
-    for row in records:
+    invalid_count = 0
+    valid_records: list[dict[str, Any]] = []
+    for raw in records:
+        validated = validate_row_return(raw)
+        if not validated.validity or validated.normalized_fraction is None:
+            invalid_count += 1
+            continue
+        row = dict(raw)
+        row["_validated_net_return"] = validated.normalized_fraction
+        valid_records.append(row)
         entry = _dt(row.get("entry_at"))
         settled = _dt(row.get("settled_at"))
         if settled is None:
@@ -509,7 +618,7 @@ def _portfolio_reconcile(records: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             allocated = active.pop(identity, 0.0)
             if allocated > 0.0:
-                cash += max(0.0, allocated * (1.0 + _safe(row.get("net_return"))))
+                cash += max(0.0, allocated * (1.0 + float(row["_validated_net_return"])))
         nav = cash + sum(active.values())
         peak = max(peak, nav)
         if peak > 0.0:
@@ -517,12 +626,16 @@ def _portfolio_reconcile(records: list[dict[str, Any]]) -> dict[str, Any]:
     final_nav = cash + sum(active.values())
     return {
         "portfolio_version": PORTFOLIO_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "starting_nav": 1.0,
         "ending_nav": final_nav,
         "portfolio_roi_fraction": final_nav - 1.0,
         "portfolio_roi_pct": (final_nav - 1.0) * 100.0,
         "max_realized_drawdown_fraction": worst_drawdown,
-        "settled_record_count": len(records),
+        "raw_settled_record_count": len(records),
+        "settled_record_count": len(valid_records),
+        "invalid_economic_measurement_count": invalid_count,
+        "invalid_economic_measurements_are_not_imputed": True,
         "chronological_entry_count": entered,
         "cash_capacity_shortfall_count": shortfalls,
         "entry_time_fallback_to_settlement_count": fallback_count,
@@ -542,6 +655,7 @@ def build_portfolio_reconciliation(store: Any) -> dict[str, Any]:
             row["entry_at"] = entry_map.get((surface, key))
     return {
         "portfolio_reconciliation_version": PORTFOLIO_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "audit_epoch_portfolio": _portfolio_reconcile(audit),
         "promotion_compatible_portfolio": _portfolio_reconcile(promo),
         "family_navs_are_not_summed_as_independent_capital": True,
@@ -567,7 +681,10 @@ def _counterfactual_return(store: Any, surface: str, candidate_id: str) -> tuple
     if surface == "SOLANA":
         candidates = [("profit_first_final_outcomes", "source_signature", "net_return")]
     elif surface == "FOMO":
-        candidates = [("fomo_shadow_outcomes", "source_signature", "net_return"), ("profit_first_final_outcomes", "source_signature", "net_return")]
+        candidates = [
+            ("fomo_shadow_outcomes", "source_signature", "net_return"),
+            ("profit_first_final_outcomes", "source_signature", "net_return"),
+        ]
     for table, key_col, value_col in candidates:
         cols = _columns(store, table)
         if not {key_col, value_col}.issubset(cols):
@@ -578,7 +695,13 @@ def _counterfactual_return(store: Any, surface: str, candidate_id: str) -> tuple
                 (candidate_id,),
             ).fetchone()
         if row is not None and row["net_return"] is not None:
-            return _safe(row["net_return"]), table
+            validated = validate_return(
+                row["net_return"],
+                source_surface=surface,
+                source_signature=candidate_id,
+            )
+            if validated.validity and validated.normalized_fraction is not None:
+                return validated.normalized_fraction, table
     return None, None
 
 
@@ -676,10 +799,16 @@ def _hazard_bin(severity: float, signature: str) -> str:
 def build_hazard_calibration(store: Any) -> dict[str, Any]:
     refresh_rejected_counterfactuals(store)
     grouped: dict[str, list[float]] = defaultdict(list)
+    debt_by_bin: dict[str, int] = defaultdict(int)
     for row in _audit_records(store):
         signature = str(row.get("risk_signature") or "clean")
         severity = _safe(row.get("risk_severity"), 0.0 if signature == "clean" else 0.45)
-        grouped[_hazard_bin(severity, signature)].append(_safe(row.get("net_return")))
+        bin_name = _hazard_bin(severity, signature)
+        validated = validate_row_return(row)
+        if validated.validity and validated.normalized_fraction is not None:
+            grouped[bin_name].append(validated.normalized_fraction)
+        else:
+            debt_by_bin[bin_name] += 1
     rejected: dict[str, dict[str, int]] = defaultdict(lambda: {"rejected": 0, "resolved": 0, "resolved_positive": 0})
     if _table_exists(store, "v51_rejected_counterfactuals"):
         with store._lock:
@@ -698,6 +827,7 @@ def build_hazard_calibration(store: Any) -> dict[str, Any]:
         values = grouped.get(name, [])
         bins[name] = {
             "settled_entered_count": len(values),
+            "invalid_economic_measurement_count": debt_by_bin.get(name, 0),
             "entered_return_profile": robust_profile(values),
             "rejected_candidate_count": rejected[name]["rejected"],
             "rejected_resolved_count": rejected[name]["resolved"],
@@ -705,7 +835,10 @@ def build_hazard_calibration(store: Any) -> dict[str, Any]:
         }
     return {
         "hazard_calibration_version": ANALYTICS_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "bins": bins,
+        "invalid_economic_measurement_count": sum(debt_by_bin.values()),
+        "invalid_economic_measurements_are_not_imputed": True,
         "current_hazard_evidence_burden": authority()["hazard_evidence_burden"],
         "changes_current_hazard_multipliers": False,
         "purpose": "diagnose whether a future economic epoch should recalibrate hazard evidence burden or sizing",
@@ -806,6 +939,7 @@ def build_evidence_validity_bundle(store: Any) -> dict[str, Any]:
     slo = build_forward_proof_slo(store)
     return {
         "analytics_version": ANALYTICS_VERSION,
+        "statistics_version": STATISTICS_VERSION,
         "release_attestation": attestation,
         "execution_cost_ledger": cost,
         "promotion_certification": promotion,
