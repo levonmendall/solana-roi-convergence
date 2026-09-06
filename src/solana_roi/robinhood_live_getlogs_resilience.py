@@ -1,17 +1,45 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
-from functools import wraps
 from typing import Any
 
 from . import robinhood_catchup_capacity_repair as catchup
 from . import robinhood_live_frontier_verification_repair as frontier
 
 
-REPAIR_VERSION = "robinhood-live-getlogs-resilience-v1"
+REPAIR_VERSION = "robinhood-live-getlogs-resilience-v2"
+_TERMINAL_JSONRPC_CODES = frozenset({-32600, -32601, -32602})
 _INSTALLED = False
 _ORIGINAL: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None
+
+
+def _jsonrpc_error_code(exc: BaseException) -> int | None:
+    text = str(exc)
+    match = re.search(r"[\"']?code[\"']?\s*:\s*(-?\d+)", text)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _deterministic_request_error(exc: BaseException) -> bool:
+    return _jsonrpc_error_code(exc) in _TERMINAL_JSONRPC_CODES
+
+
+def _range_limit_error(exc: BaseException) -> bool:
+    if not _deterministic_request_error(exc):
+        return False
+    text = str(exc).lower()
+    return bool(
+        ("block" in text and "range" in text)
+        or ("block" in text and "at most" in text)
+        or ("block" in text and "maximum" in text)
+        or "maxblockrange" in text
+    )
 
 
 async def _resilient_live_logs(
@@ -22,14 +50,13 @@ async def _resilient_live_logs(
     addresses: list[str],
     topics: list[Any] | None,
 ) -> list[dict[str, Any]]:
-    """Acquire every requested log without treating a 64-block timeout as terminal.
+    """Acquire every requested log without retrying deterministic bad requests.
 
-    The prior helper retried a failing live request but only split ranges larger than
-    the legacy 200-block scanner batch. Production's authoritative live window is 64
-    blocks, so repeated ReadTimeouts aborted the whole current-window cycle. Split any
-    multi-block range after bounded retries; if one exact block still fails and the
-    address set is compound, split the addresses. No block/address is skipped and no
-    failed interval gains paper-entry authority.
+    Transient provider failures still receive three bounded attempts before recursive
+    range/address splitting. JSON-RPC invalid-request/method/params errors are terminal:
+    malformed requests fail immediately, while an explicit provider block-range limit
+    is split immediately instead of sending the same invalid range three times. No
+    block/address is skipped and no failed interval gains paper-entry authority.
     """
     last_error: BaseException | None = None
     for attempt in range(3):
@@ -44,6 +71,13 @@ async def _resilient_live_logs(
             raise
         except Exception as exc:
             last_error = exc
+            if _deterministic_request_error(exc):
+                # Only an explicit block-range limit is safely recoverable through
+                # partitioning. Other invalid-request/invalid-params errors must not
+                # be multiplied across smaller ranges or address sets.
+                if _range_limit_error(exc) and int(from_block) < int(to_block):
+                    break
+                raise
             if attempt < 2:
                 await asyncio.sleep(0.10 * (2**attempt))
 
@@ -115,6 +149,10 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "splits_failed_live_ranges_below_legacy_200_block_batch": True,
         "single_block_address_split_fallback": True,
+        "deterministic_jsonrpc_error_codes": sorted(_TERMINAL_JSONRPC_CODES),
+        "deterministic_invalid_request_retries": False,
+        "range_limit_errors_split_immediately": True,
+        "malformed_invalid_requests_split": False,
         "skips_failed_blocks": False,
         "changes_strategy_thresholds": False,
         "paper_only": True,
@@ -126,6 +164,9 @@ def status() -> dict[str, Any]:
 
 __all__ = [
     "REPAIR_VERSION",
+    "_deterministic_request_error",
+    "_jsonrpc_error_code",
+    "_range_limit_error",
     "_resilient_live_logs",
     "install_robinhood_live_getlogs_resilience",
     "status",

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+import pytest
+
 from solana_roi import robinhood_catchup_capacity_repair as catchup
 from solana_roi import robinhood_live_frontier_verification_repair as frontier
 from solana_roi.robinhood_live_getlogs_resilience import (
@@ -29,6 +31,36 @@ class _RangeLimitedRPC:
             {"blockNumber": hex(block), "address": addresses[0], "logIndex": "0x0", "transactionIndex": "0x0"}
             for block in range(from_block, to_block + 1)
         ]
+
+
+@dataclass
+class _InvalidRangeRPC:
+    max_blocks: int = 10
+    calls: list[tuple[int, int, tuple[str, ...]]] | None = None
+
+    def __post_init__(self) -> None:
+        self.calls = []
+
+    async def get_logs(self, *, from_block: int, to_block: int, addresses: list[str], topics):
+        assert self.calls is not None
+        self.calls.append((from_block, to_block, tuple(addresses)))
+        if to_block - from_block + 1 > self.max_blocks:
+            raise RuntimeError(
+                "eth_getLogs: {'code': -32600, 'message': 'block range can be at most 10 blocks'}"
+            )
+        return [
+            {"blockNumber": hex(block), "address": addresses[0], "logIndex": "0x0", "transactionIndex": "0x0"}
+            for block in range(from_block, to_block + 1)
+        ]
+
+
+@dataclass
+class _MalformedRPC:
+    calls: int = 0
+
+    async def get_logs(self, *, from_block: int, to_block: int, addresses: list[str], topics):
+        self.calls += 1
+        raise RuntimeError("eth_getLogs: {'code': -32602, 'message': 'invalid topics parameter'}")
 
 
 @dataclass
@@ -66,12 +98,45 @@ def test_failed_64_block_live_range_is_split_without_skipping_blocks() -> None:
     blocks = [int(str(row["blockNumber"]), 16) for row in rows]
     assert blocks == list(range(100, 164))
     assert len(set(blocks)) == 64
-    # The original 64-block request was actually attempted/retried, proving the
-    # regression covers the production failure boundary rather than pre-splitting.
+    # Transient timeouts still receive the established bounded retries before split.
     assert rpc.calls is not None
     assert sum(1 for start, end, _ in rpc.calls if (start, end) == (100, 163)) == 3
     assert (100, 131, ("0xmarket",)) in rpc.calls
     assert (132, 163, ("0xmarket",)) in rpc.calls
+
+
+def test_deterministic_range_limit_splits_after_one_invalid_request() -> None:
+    rpc = _InvalidRangeRPC(max_blocks=10)
+    rows = asyncio.run(
+        _resilient_live_logs(
+            _Plane(rpc),
+            from_block=300,
+            to_block=324,
+            addresses=["0xmarket"],
+            topics=["0xtopic"],
+        )
+    )
+    blocks = [int(str(row["blockNumber"]), 16) for row in rows]
+    assert blocks == list(range(300, 325))
+    assert rpc.calls is not None
+    assert sum(1 for start, end, _ in rpc.calls if (start, end) == (300, 324)) == 1
+    successful_ranges = [(start, end) for start, end, _ in rpc.calls if end - start + 1 <= 10]
+    assert successful_ranges
+
+
+def test_malformed_invalid_params_are_not_retried_or_recursively_split() -> None:
+    rpc = _MalformedRPC()
+    with pytest.raises(RuntimeError, match="invalid topics parameter"):
+        asyncio.run(
+            _resilient_live_logs(
+                _Plane(rpc),
+                from_block=400,
+                to_block=463,
+                addresses=["0xa", "0xb", "0xc"],
+                topics=["bad"],
+            )
+        )
+    assert rpc.calls == 1
 
 
 def test_single_block_failure_falls_back_to_disjoint_address_splits() -> None:
@@ -98,6 +163,8 @@ def test_installer_patches_both_dynamic_log_read_references() -> None:
     assert frontier._logs_with_resilient_range is _resilient_live_logs
     proof = status()
     assert proof["installed"] is True
+    assert proof["deterministic_invalid_request_retries"] is False
+    assert proof["range_limit_errors_split_immediately"] is True
     assert proof["skips_failed_blocks"] is False
     assert proof["changes_strategy_thresholds"] is False
     assert proof["paper_only"] is True

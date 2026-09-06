@@ -16,6 +16,10 @@ from .robinhood_event_driven_settlement import (
     install_robinhood_event_driven_settlement,
     status as event_driven_settlement_status,
 )
+from .robinhood_getlogs_provider_guard import (
+    install_robinhood_getlogs_provider_guard,
+    status as getlogs_provider_guard_status,
+)
 from .robinhood_provider_budget_transport import (
     install_robinhood_provider_budget_transport,
     status as provider_budget_transport_status,
@@ -26,7 +30,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v5-adaptive-lanes"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v6-getlogs-guard"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -76,14 +80,17 @@ def install_robinhood_production_provider_finalizer(
     Event-driven settlement removes redundant exact provider quotes. The adaptive lane
     controller then varies only prospective Alchemy capacity from 1-4 lanes according
     to locally metered provider load and ranked simultaneous demand; all open positions
-    remain forced live outside that cap. Strategy economics and frozen v5.1 entry
-    authority remain downstream and unchanged.
+    remain forced live outside that cap. The HTTP getLogs provider guard is installed
+    before those transports so Alchemy never receives a range beyond its validated
+    safe limit. Strategy economics and frozen v5.1 entry authority remain downstream
+    and unchanged.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
         return
 
     _LEGACY_FRESH_READY = legacy_fresh_ready
+    install_robinhood_getlogs_provider_guard()
     install_robinhood_provider_budget_transport()
     # The budget installer patches the bounded module before it is installed. Restore
     # the two-stage wrapper *function* here (not the already-bound wrapper factory), so
@@ -110,6 +117,7 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "instance_scoped_production_enforcement": True,
         "public_transport_can_authorize_running_worker": False,
+        "getlogs_provider_guard": getlogs_provider_guard_status(),
         "provider_budget_transport": provider_budget_transport_status(),
         "provider_transport": usage_bounded_transport_status(),
         "event_driven_settlement": event_driven_settlement_status(),
