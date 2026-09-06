@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from .v51_candidate_lane_accounting import build_five_lane_candidate_accounting
 from .v51_phase14_profitability_certification import PHASE14_VERSION
 from .v51_phase17_attestation_hardening import (
     ATTESTATION_HARDENING_VERSION,
@@ -171,6 +172,11 @@ def install_phase14_profitability_certification(
             release = _dict(proof.get("release"))
             authority = _dict(proof.get("authority"))
             stage_summary = _dict(coverage.get("stage_summary"))
+            runtime_obj = runtime_provider() if callable(runtime_provider) else runtime_provider
+            five_lane_accounting = build_five_lane_candidate_accounting(
+                runtime_obj.store,
+                merged_coverage=coverage,
+            )
             resource_pressure = resource_pressure_snapshot()
             blockers = list(runtime.get("blockers") or [])
             blockers.extend(str(value) for value in (final.get("blockers") or []) if str(value) not in blockers)
@@ -195,6 +201,13 @@ def install_phase14_profitability_certification(
                     "proof_state": coverage.get("proof_state"),
                     "stage_summary": stage_summary,
                     "robinhood": coverage.get("robinhood"),
+                    "accounting_version": five_lane_accounting.get("accounting_version"),
+                    "lane_accounting": five_lane_accounting.get("lanes"),
+                    "candidate_conservation": five_lane_accounting.get("candidate_conservation"),
+                    "classification_anomalies": five_lane_accounting.get("classification_anomalies"),
+                    "local_accounted_subtotal": five_lane_accounting.get("local_accounted_subtotal"),
+                    "accounting_scope": five_lane_accounting.get("scope"),
+                    "conservation_equation": five_lane_accounting.get("equation"),
                     "full_candidate_coverage": coverage,
                 },
                 "forward_certification": forward,
