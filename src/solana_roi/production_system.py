@@ -1,60 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
-from .alchemy_handshake_pump import install_alchemy_handshake_pump
-from .alchemy_multiplexed_stream import install_alchemy_multiplexed_stream
-from .candidate_execution_evidence_plane import install_candidate_execution_evidence_plane
-from .candidate_risk_window_repair import install_candidate_risk_window_repair
-from .certification_hotpath_repair import install_certification_hotpath_repair
-from .continuity_durability_repair import install_continuity_durability_repair
-from .continuity_gap_clock_repair import install_continuity_gap_clock_repair
-from .continuity_recovery_isolation_repair import install_continuity_recovery_isolation_repair
-from .continuity_startup_barrier import install_continuity_startup_barrier
-from .continuity_storage_capacity_repair import install_continuity_storage_capacity_repair
-from .coverage_completeness_repair import install_coverage_completeness_repair
-from .execution_realism import install_execution_realism
-from .full_scope_dispatch_capacity_repair import install_full_scope_dispatch_capacity_repair
-from .funding_provenance_repair import install_funding_provenance_repair
-from .handshake_pump import install_handshake_pump
-from .launch_coverage_bridge import install_launch_coverage_bridge
-from .launch_lateness_repair import install_launch_lateness_repair
-from .launch_ws_frontier_timing_repair import install_launch_ws_frontier_timing_repair
-from .live_poll_redundancy import install_live_poll_redundancy
-from .poll_chain_head_rearm import install_poll_chain_head_rearm
-from .poll_exception_rearm import install_poll_exception_rearm
-from .poll_pagination_context import install_poll_pagination_context
-from .poll_receipt_offloop_repair import install_poll_receipt_offloop_repair
-from .poll_recoverability_lease import install_poll_recoverability_lease
-from .poll_standby_rearm import install_poll_standby_rearm
-from .poll_watermark_repair import install_poll_watermark_repair
-from .post104_production_architecture_repair import install_post104_production_architecture_repair
-from .production_boundary_compatibility import install_production_boundary_compatibility
-from .production_capacity_repair import install_production_capacity_repair
-from .public_data_economics import install_public_data_economics
-from .public_ws_shard_transport_repair import install_public_ws_shard_transport_repair
-from .render_runtime_bootstrap_repair import install_render_runtime_bootstrap_handoff
-from .runtime_guards import install_runtime_guards
-from .semantic_candidate_attribution_architecture import install_semantic_candidate_attribution_architecture
-from .stream_redundancy import install_stream_redundancy
-from .stream_resilience import install_stream_resilience
-from .target_quorum import install_target_quorum
-from .target_stream_fanout import install_target_stream_fanout
-from .transport_hardening import install_transport_hardening
-from .wallet_context_router import install_wallet_context_router
-from .wallet_context_router_precision_repair import install_wallet_context_router_precision_repair
-from .wallet_discovery_startup_repair import install_wallet_discovery_startup_isolation
-from .wallet_intelligence_startup_repair import install_wallet_intelligence_startup_isolation
-from .wallet_live_priority_repair import install_wallet_live_priority_repair
-from .wallet_realtime_intelligence_boundary import install_wallet_realtime_intelligence_boundary
-from .wallet_realtime_status_compat import install_wallet_realtime_status_compatibility
-from .wallet_realtime_tracking_repair import install_wallet_realtime_tracking_repair
-from .wallet_venue_lifecycle_research import install_wallet_venue_lifecycle_research
-from .web_liveness_isolation_repair import install_web_liveness_isolation
-
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v2"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v3"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -83,11 +34,32 @@ class ComponentHealth:
 
 
 @dataclass(frozen=True)
+class CompatibilityAdapter:
+    name: str
+    module: str
+    installer: str
+    owner: str
+
+    def activate(self) -> None:
+        imported = importlib.import_module(self.module)
+        callback = getattr(imported, self.installer)
+        callback()
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "module": self.module,
+            "installer": self.installer,
+            "owner": self.owner,
+        }
+
+
+@dataclass(frozen=True)
 class ProductionSystem:
     app: Any
     ingestion_runtime: Any
     components: tuple[ComponentHealth, ...]
-    compatibility_adapters: tuple[str, ...]
+    compatibility_adapters: tuple[CompatibilityAdapter, ...]
 
     @property
     def healthy(self) -> bool:
@@ -102,9 +74,9 @@ class ProductionSystem:
             "unavailable_required_components": [
                 component.name for component in self.components if component.required and not component.available
             ],
-            "compatibility_adapters": list(self.compatibility_adapters),
+            "compatibility_adapters": [adapter.as_dict() for adapter in self.compatibility_adapters],
             "compatibility_adapters_self_activate": False,
-            "compatibility_adapter_owner": "ProductionSystem composition boundary",
+            "compatibility_adapter_activation": "lazy_ordered_only_from_build_production_system",
             "single_production_composition_root": True,
             "package_import_has_runtime_install_side_effects": False,
             "production_entrypoint": "solana_roi.production:app",
@@ -116,61 +88,63 @@ class ProductionSystem:
         }
 
 
-# These compatibility adapters preserve already-certified transport/runtime behavior
-# while the owning subsystems absorb legacy repairs. The architectural boundary is
-# now explicit: they may be activated only by ProductionSystem, never by importing
-# the package or an arbitrary module. New strategy/economic behavior must not be
-# added here.
-_COMPATIBILITY_ADAPTERS: tuple[tuple[str, Callable[[], None]], ...] = (
-    ("runtime_guards", install_runtime_guards),
-    ("stream_resilience", install_stream_resilience),
-    ("transport_hardening", install_transport_hardening),
-    ("handshake_pump", install_handshake_pump),
-    ("target_stream_fanout", install_target_stream_fanout),
-    ("target_quorum", install_target_quorum),
-    ("stream_redundancy", install_stream_redundancy),
-    ("live_poll_redundancy", install_live_poll_redundancy),
-    ("poll_watermark", install_poll_watermark_repair),
-    ("poll_standby_rearm", install_poll_standby_rearm),
-    ("poll_recoverability_lease", install_poll_recoverability_lease),
-    ("poll_pagination_context", install_poll_pagination_context),
-    ("poll_exception_rearm", install_poll_exception_rearm),
-    ("poll_chain_head_rearm", install_poll_chain_head_rearm),
-    ("continuity_startup_barrier", install_continuity_startup_barrier),
-    ("continuity_durability", install_continuity_durability_repair),
-    ("continuity_gap_clock", install_continuity_gap_clock_repair),
-    ("continuity_recovery_isolation", install_continuity_recovery_isolation_repair),
-    ("alchemy_multiplexed_stream", install_alchemy_multiplexed_stream),
-    ("alchemy_handshake_pump", install_alchemy_handshake_pump),
-    ("public_data_economics", install_public_data_economics),
-    ("public_ws_shard_transport", install_public_ws_shard_transport_repair),
-    ("launch_coverage_bridge", install_launch_coverage_bridge),
-    ("coverage_completeness", install_coverage_completeness_repair),
-    ("launch_lateness", install_launch_lateness_repair),
-    ("launch_ws_frontier_timing", install_launch_ws_frontier_timing_repair),
-    ("production_boundary_compatibility", install_production_boundary_compatibility),
-    ("funding_provenance", install_funding_provenance_repair),
-    ("execution_realism", install_execution_realism),
-    ("poll_receipt_offloop", install_poll_receipt_offloop_repair),
-    ("production_capacity", install_production_capacity_repair),
-    ("certification_hotpath", install_certification_hotpath_repair),
-    ("wallet_realtime_tracking", install_wallet_realtime_tracking_repair),
-    ("wallet_live_priority", install_wallet_live_priority_repair),
-    ("full_scope_dispatch_capacity", install_full_scope_dispatch_capacity_repair),
-    ("wallet_realtime_status_compat", install_wallet_realtime_status_compatibility),
-    ("wallet_realtime_intelligence_boundary", install_wallet_realtime_intelligence_boundary),
-    ("wallet_intelligence_startup", install_wallet_intelligence_startup_isolation),
-    ("wallet_discovery_startup", install_wallet_discovery_startup_isolation),
-    ("web_liveness_isolation", install_web_liveness_isolation),
-    ("continuity_storage_capacity", install_continuity_storage_capacity_repair),
-    ("render_runtime_bootstrap", install_render_runtime_bootstrap_handoff),
-    ("candidate_risk_window", install_candidate_risk_window_repair),
-    ("wallet_venue_lifecycle_research", install_wallet_venue_lifecycle_research),
-    ("wallet_context_router", install_wallet_context_router),
-    ("wallet_context_router_precision", install_wallet_context_router_precision_repair),
-    ("post104_production_architecture", install_post104_production_architecture_repair),
-    ("candidate_execution_evidence_plane", install_candidate_execution_evidence_plane),
-    ("semantic_candidate_attribution", install_semantic_candidate_attribution_architecture),
+def _adapter(name: str, module: str, installer: str, owner: str) -> CompatibilityAdapter:
+    return CompatibilityAdapter(name, module, installer, owner)
+
+
+# Compatibility adapters are a finite migration boundary, not a place for new
+# economic behavior. Lazy activation preserves the previously certified sequencing:
+# each module is imported only after the preceding adapter has been activated.
+_COMPATIBILITY_ADAPTERS: tuple[CompatibilityAdapter, ...] = (
+    _adapter("runtime_guards", "solana_roi.runtime_guards", "install_runtime_guards", "ingestion"),
+    _adapter("stream_resilience", "solana_roi.stream_resilience", "install_stream_resilience", "ingestion"),
+    _adapter("transport_hardening", "solana_roi.transport_hardening", "install_transport_hardening", "ingestion"),
+    _adapter("handshake_pump", "solana_roi.handshake_pump", "install_handshake_pump", "ingestion"),
+    _adapter("target_stream_fanout", "solana_roi.target_stream_fanout", "install_target_stream_fanout", "ingestion"),
+    _adapter("target_quorum", "solana_roi.target_quorum", "install_target_quorum", "ingestion"),
+    _adapter("stream_redundancy", "solana_roi.stream_redundancy", "install_stream_redundancy", "ingestion"),
+    _adapter("live_poll_redundancy", "solana_roi.live_poll_redundancy", "install_live_poll_redundancy", "ingestion"),
+    _adapter("poll_watermark", "solana_roi.poll_watermark_repair", "install_poll_watermark_repair", "ingestion"),
+    _adapter("poll_standby_rearm", "solana_roi.poll_standby_rearm", "install_poll_standby_rearm", "ingestion"),
+    _adapter("poll_recoverability_lease", "solana_roi.poll_recoverability_lease", "install_poll_recoverability_lease", "ingestion"),
+    _adapter("poll_pagination_context", "solana_roi.poll_pagination_context", "install_poll_pagination_context", "ingestion"),
+    _adapter("poll_exception_rearm", "solana_roi.poll_exception_rearm", "install_poll_exception_rearm", "ingestion"),
+    _adapter("poll_chain_head_rearm", "solana_roi.poll_chain_head_rearm", "install_poll_chain_head_rearm", "ingestion"),
+    _adapter("continuity_startup_barrier", "solana_roi.continuity_startup_barrier", "install_continuity_startup_barrier", "ingestion"),
+    _adapter("continuity_durability", "solana_roi.continuity_durability_repair", "install_continuity_durability_repair", "ingestion"),
+    _adapter("continuity_gap_clock", "solana_roi.continuity_gap_clock_repair", "install_continuity_gap_clock_repair", "ingestion"),
+    _adapter("continuity_recovery_isolation", "solana_roi.continuity_recovery_isolation_repair", "install_continuity_recovery_isolation_repair", "ingestion"),
+    _adapter("alchemy_multiplexed_stream", "solana_roi.alchemy_multiplexed_stream", "install_alchemy_multiplexed_stream", "ingestion"),
+    _adapter("alchemy_handshake_pump", "solana_roi.alchemy_handshake_pump", "install_alchemy_handshake_pump", "ingestion"),
+    _adapter("public_data_economics", "solana_roi.public_data_economics", "install_public_data_economics", "ingestion"),
+    _adapter("public_ws_shard_transport", "solana_roi.public_ws_shard_transport_repair", "install_public_ws_shard_transport_repair", "ingestion"),
+    _adapter("launch_coverage_bridge", "solana_roi.launch_coverage_bridge", "install_launch_coverage_bridge", "evidence"),
+    _adapter("coverage_completeness", "solana_roi.coverage_completeness_repair", "install_coverage_completeness_repair", "evidence"),
+    _adapter("launch_lateness", "solana_roi.launch_lateness_repair", "install_launch_lateness_repair", "evidence"),
+    _adapter("launch_ws_frontier_timing", "solana_roi.launch_ws_frontier_timing_repair", "install_launch_ws_frontier_timing_repair", "evidence"),
+    _adapter("production_boundary_compatibility", "solana_roi.production_boundary_compatibility", "install_production_boundary_compatibility", "evidence"),
+    _adapter("funding_provenance", "solana_roi.funding_provenance_repair", "install_funding_provenance_repair", "evidence"),
+    _adapter("execution_realism", "solana_roi.execution_realism", "install_execution_realism", "execution"),
+    _adapter("poll_receipt_offloop", "solana_roi.poll_receipt_offloop_repair", "install_poll_receipt_offloop_repair", "ingestion"),
+    _adapter("production_capacity", "solana_roi.production_capacity_repair", "install_production_capacity_repair", "ingestion"),
+    _adapter("certification_hotpath", "solana_roi.certification_hotpath_repair", "install_certification_hotpath_repair", "certification"),
+    _adapter("wallet_realtime_tracking", "solana_roi.wallet_realtime_tracking_repair", "install_wallet_realtime_tracking_repair", "learning"),
+    _adapter("wallet_live_priority", "solana_roi.wallet_live_priority_repair", "install_wallet_live_priority_repair", "learning"),
+    _adapter("full_scope_dispatch_capacity", "solana_roi.full_scope_dispatch_capacity_repair", "install_full_scope_dispatch_capacity_repair", "ingestion"),
+    _adapter("wallet_realtime_status_compat", "solana_roi.wallet_realtime_status_compat", "install_wallet_realtime_status_compatibility", "learning"),
+    _adapter("wallet_realtime_intelligence_boundary", "solana_roi.wallet_realtime_intelligence_boundary", "install_wallet_realtime_intelligence_boundary", "learning"),
+    _adapter("wallet_intelligence_startup", "solana_roi.wallet_intelligence_startup_repair", "install_wallet_intelligence_startup_isolation", "learning"),
+    _adapter("wallet_discovery_startup", "solana_roi.wallet_discovery_startup_repair", "install_wallet_discovery_startup_isolation", "learning"),
+    _adapter("web_liveness_isolation", "solana_roi.web_liveness_isolation_repair", "install_web_liveness_isolation", "ingestion"),
+    _adapter("continuity_storage_capacity", "solana_roi.continuity_storage_capacity_repair", "install_continuity_storage_capacity_repair", "ingestion"),
+    _adapter("render_runtime_bootstrap", "solana_roi.render_runtime_bootstrap_repair", "install_render_runtime_bootstrap_handoff", "ingestion"),
+    _adapter("candidate_risk_window", "solana_roi.candidate_risk_window_repair", "install_candidate_risk_window_repair", "candidate"),
+    _adapter("wallet_venue_lifecycle_research", "solana_roi.wallet_venue_lifecycle_research", "install_wallet_venue_lifecycle_research", "learning"),
+    _adapter("wallet_context_router", "solana_roi.wallet_context_router", "install_wallet_context_router", "strategy"),
+    _adapter("wallet_context_router_precision", "solana_roi.wallet_context_router_precision_repair", "install_wallet_context_router_precision_repair", "strategy"),
+    _adapter("post104_production_architecture", "solana_roi.post104_production_architecture_repair", "install_post104_production_architecture_repair", "strategy"),
+    _adapter("candidate_execution_evidence_plane", "solana_roi.candidate_execution_evidence_plane", "install_candidate_execution_evidence_plane", "execution"),
+    _adapter("semantic_candidate_attribution", "solana_roi.semantic_candidate_attribution_architecture", "install_semantic_candidate_attribution_architecture", "candidate"),
 )
 
 _BUILT: ProductionSystem | None = None
@@ -206,7 +180,7 @@ def _install_direct_stream_resource_guards() -> None:
 
 def _component(name: str, module: str, attribute: str, *, required: bool = True) -> ComponentHealth:
     try:
-        imported = __import__(module, fromlist=[attribute])
+        imported = importlib.import_module(module)
         value = getattr(imported, attribute)
     except Exception as exc:
         return ComponentHealth(name, module, attribute, required, False, f"{type(exc).__name__}:{exc}")
@@ -254,8 +228,8 @@ def build_production_system() -> ProductionSystem:
     if _BUILT is not None:
         return _BUILT
 
-    for _name, adapter in _COMPATIBILITY_ADAPTERS:
-        adapter()
+    for adapter in _COMPATIBILITY_ADAPTERS:
+        adapter.activate()
     _install_direct_stream_resource_guards()
 
     from . import runtime as runtime_module
@@ -278,7 +252,7 @@ def build_production_system() -> ProductionSystem:
         app=app,
         ingestion_runtime=ingestion_runtime,
         components=components,
-        compatibility_adapters=tuple(name for name, _adapter in _COMPATIBILITY_ADAPTERS),
+        compatibility_adapters=_COMPATIBILITY_ADAPTERS,
     )
     if not system.healthy:
         raise RuntimeError("production composition failed closed")
@@ -297,6 +271,7 @@ ingestion_runtime = production_system.ingestion_runtime
 __all__ = [
     "COMPOSITION_STATUS_PATH",
     "COMPOSITION_VERSION",
+    "CompatibilityAdapter",
     "ComponentHealth",
     "ProductionSystem",
     "app",
