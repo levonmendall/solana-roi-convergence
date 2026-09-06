@@ -1,13 +1,40 @@
 {
-  "policy_version": "v51-module-reachability-130-v2",
+  "policy_version": "v51-module-reachability-130-v3-native-cutover",
   "production_root": "solana_roi.production",
   "test_only": [
     "solana_roi.v51_seeded_e2e"
   ],
   "migration_only": [
+    "solana_roi.alchemy_handshake_pump",
+    "solana_roi.alchemy_multiplexed_stream",
     "solana_roi.cli",
+    "solana_roi.continuity_startup_barrier",
+    "solana_roi.continuous_strategy_learning",
+    "solana_roi.fomo_venue_lifecycle_reporting",
+    "solana_roi.funding_rpc_freshness_repair",
+    "solana_roi.handshake_pump",
+    "solana_roi.launch_context_rpc_repair",
+    "solana_roi.launch_lateness_repair",
+    "solana_roi.launch_reference_signed_delta_repair",
+    "solana_roi.notification_dispatch_backpressure_repair",
+    "solana_roi.poll_chain_head_rearm",
+    "solana_roi.poll_receipt_offloop_repair",
+    "solana_roi.production_boundary_compatibility",
+    "solana_roi.public_ws_shard_transport_repair",
+    "solana_roi.raw_receipt_dedup_repair",
     "solana_roi.split_webhooks",
-    "solana_roi.v51_architecture_retirement"
+    "solana_roi.storage_maintenance_liveness_repair",
+    "solana_roi.stream_redundancy",
+    "solana_roi.transport_hardening",
+    "solana_roi.v51_architecture_retirement",
+    "solana_roi.venue_resource_governance",
+    "solana_roi.wallet_context_router_precision_repair",
+    "solana_roi.wallet_context_tracking_assignment",
+    "solana_roi.wallet_discovery_startup_repair",
+    "solana_roi.wallet_intelligence_startup_repair",
+    "solana_roi.wallet_realtime_intelligence_boundary",
+    "solana_roi.wallet_realtime_status_compat",
+    "solana_roi.web_liveness_isolation_repair"
   ],
   "archived_fixture_roots": [
     "docs/archive"
