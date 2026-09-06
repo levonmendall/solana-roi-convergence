@@ -38,6 +38,19 @@ def install_empty_epoch_slo_repair() -> None:
     # endpoint on the same semantics. build_evidence_validity_bundle resolves the
     # analytics module global dynamically and therefore needs no additional wrapper.
     strategy_api.build_forward_proof_slo = _measurable_empty_epoch
+
+    # This installer is invoked only after the canonical Solana app and Robinhood
+    # runtime have composed and after post-183 proof wiring is attached. Use that
+    # exact late boundary to install repairs 116-123 without reopening v5.1
+    # economics, the 20-second hard maximum, certification gates, or paper-only
+    # authority.
+    from .e2e_production_hardening_repair import install_e2e_production_hardening
+    from .e2e_production_hardening_followup import (
+        install_e2e_production_hardening_followup,
+    )
+
+    install_e2e_production_hardening()
+    install_e2e_production_hardening_followup()
     _INSTALLED = True
 
 
