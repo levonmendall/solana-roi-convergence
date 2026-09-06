@@ -337,7 +337,9 @@ def test_batch4_preserves_v51_economics_and_paper_only_authority() -> None:
     current = authority()
     assert current["paper_only"] is True
     assert current["live_money_authority"] is False
-    assert current["signing"] is False
-    assert current["transaction_submission"] is False
-    assert current["latency_hard_max_seconds"] == 20.0
+    assert current["signing_available"] is False
+    assert current["transaction_submission_available"] is False
+    assert current["execution"]["latency_hard_max_seconds"] == 20.0
+    assert current["execution"]["chase_baseline_fraction"] == 0.15
+    assert current["execution"]["chase_observe_only_above_fraction"] == 0.40
     assert ATOMIC_CAPITAL_VERSION == "v51-atomic-paper-capital-v1"
