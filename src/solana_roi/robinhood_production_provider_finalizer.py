@@ -6,9 +6,13 @@ from typing import Any, Awaitable, Callable
 
 from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_production_ws_transport as production_transport
+from .robinhood_usage_bounded_transport import (
+    install_robinhood_usage_bounded_transport,
+    status as usage_bounded_transport_status,
+)
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v1"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v2-usage-bounded"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -55,12 +59,18 @@ def install_robinhood_production_provider_finalizer(
     This finalizer then makes enforcement instance-scoped and restores a composite
     module-level freshness function so old direct tests keep their historical helper
     while the actual running production plane cannot use it for authority.
+
+    The usage-bounded patch is deliberately installed immediately before the
+    production transport wrapper. It changes only provider acquisition mechanics:
+    all known Robinhood factory addresses remain discovery-authoritative while
+    Alchemy receives only factory events plus the bounded active market address set.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
         return
 
     _LEGACY_FRESH_READY = legacy_fresh_ready
+    install_robinhood_usage_bounded_transport()
     production_transport.install_robinhood_production_ws_transport(plane_cls)
 
     current_run = plane_cls.run
@@ -78,6 +88,7 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "instance_scoped_production_enforcement": True,
         "public_transport_can_authorize_running_worker": False,
+        "provider_transport": usage_bounded_transport_status(),
         "canonical_latency_hard_max_seconds": production_transport.canonical_latency_hard_max_seconds(),
         "legacy_two_block_gate_has_production_authority": False,
         "paper_only": True,
