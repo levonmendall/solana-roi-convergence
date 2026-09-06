@@ -4,6 +4,7 @@ import os
 from dataclasses import asdict
 from typing import Any, Mapping
 
+from .dependency_integrity import dependency_integrity_status
 from .deployment import (
     FORBIDDEN_SECRET_ENV_NAMES,
     FROZEN_PROGRAM_ADDRESSES,
@@ -168,6 +169,14 @@ def deployment_preflight(env: Mapping[str, str] | None = None) -> dict[str, Any]
     profiles_ok, profiles_detail = _profiles_check(str(values.get("SOLANA_ROI_WALLET_PROFILES_JSON") or ""))
     checks.append(PreflightCheck("frozen_scout_cohort", profiles_ok, profiles_detail))
 
+    dependency_integrity = dependency_integrity_status()
+    checks.append(PreflightCheck(
+        "deterministic_dependency_lock",
+        bool(dependency_integrity.get("requirements_lock_present"))
+        and bool(dependency_integrity.get("compatibility_review_matches_lock")),
+        "requirements.lock must be present and match dependency_compatibility.json",
+    ))
+
     return {
         "ready_for_live_shadow_collection": all(check.ok for check in checks),
         "paper_only": True,
@@ -188,6 +197,7 @@ def deployment_preflight(env: Mapping[str, str] | None = None) -> dict[str, Any]
             for endpoint in endpoints
         ],
         "rpc_endpoint_config_error_type": endpoint_error,
+        "dependency_integrity": dependency_integrity,
     }
 
 
