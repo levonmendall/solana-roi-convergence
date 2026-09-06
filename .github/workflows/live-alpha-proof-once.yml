@@ -16,28 +16,52 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Measure public sequencer cadence
+      - name: Measure steady-state public sequencer cadence
         run: |
           python -m pip install -q websockets==15.0.1
           python - <<'PY'
-          import asyncio, json, time
+          import asyncio, json, time, urllib.request
           import websockets
 
-          URL='wss://feed.mainnet.chain.robinhood.com'
+          FEED='wss://feed.mainnet.chain.robinhood.com'
+          RPC='https://rpc.mainnet.chain.robinhood.com'
+
+          def rpc_head():
+              body=json.dumps({'jsonrpc':'2.0','id':1,'method':'eth_blockNumber','params':[]}).encode()
+              req=urllib.request.Request(RPC,data=body,headers={'Content-Type':'application/json','User-Agent':'roi-seq-steady/1'})
+              with urllib.request.urlopen(req,timeout=10) as r:
+                  obj=json.loads(r.read().decode())
+              return int(obj['result'],16)
 
           async def main():
-              async with websockets.connect(URL,open_timeout=10,close_timeout=3,ping_interval=20,max_size=8*1024*1024) as ws:
-                  prior_t=None
-                  prior_seq=None
-                  for i in range(12):
+              target=await asyncio.to_thread(rpc_head)
+              print('HTTP_TARGET',target)
+              async with websockets.connect(FEED,open_timeout=10,close_timeout=3,ping_interval=20,max_size=8*1024*1024) as ws:
+                  drained=0
+                  latest=None
+                  t=time.monotonic()
+                  while latest is None or latest < target:
+                      raw=await asyncio.wait_for(ws.recv(),timeout=30)
+                      msgs=json.loads(raw).get('messages') or []
+                      seqs=[int(m['sequenceNumber']) for m in msgs if isinstance(m,dict) and m.get('sequenceNumber') is not None]
+                      if seqs:
+                          latest=max(seqs)
+                          drained += len(seqs)
+                  print('SYNCED','seq',latest,'drained',drained,'seconds',round(time.monotonic()-t,4),'target_delta',latest-target)
+                  prior_t=time.monotonic()
+                  prior_seq=latest
+                  for i in range(20):
                       t0=time.monotonic()
                       raw=await asyncio.wait_for(ws.recv(),timeout=30)
                       now=time.monotonic()
-                      obj=json.loads(raw)
-                      msgs=obj.get('messages') or []
+                      msgs=json.loads(raw).get('messages') or []
                       seqs=[int(m['sequenceNumber']) for m in msgs if isinstance(m,dict) and m.get('sequenceNumber') is not None]
-                      latest=max(seqs) if seqs else None
-                      print('FEED',i+1,'wait_s',round(now-t0,4),'since_prior_s',None if prior_t is None else round(now-prior_t,4),'messages',len(msgs),'min_seq',min(seqs) if seqs else None,'max_seq',latest,'seq_delta',None if prior_seq is None or latest is None else latest-prior_seq)
+                      latest=max(seqs) if seqs else prior_seq
+                      if i in {0,4,9,14,19}:
+                          head=await asyncio.to_thread(rpc_head)
+                      else:
+                          head=None
+                      print('STEADY',i+1,'wait_s',round(now-t0,4),'since_prior_s',round(now-prior_t,4),'messages',len(msgs),'seq',latest,'seq_delta',latest-prior_seq,'http_head',head,'http_lag',None if head is None else max(0,head-latest))
                       prior_t=now
                       prior_seq=latest
           asyncio.run(main())
