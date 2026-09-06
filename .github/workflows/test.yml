@@ -66,6 +66,8 @@ jobs:
         run: python -m pytest tests/test_v51_repairs_103_108.py tests/test_v51_repairs_103_108_compatibility.py
       - name: Phase 16 exact exit execution integrity 109-113
         run: python -m pytest tests/test_v51_repairs_109_113.py tests/test_v51_phase16_terminal_fomo_followup.py
+      - name: Phase 16 exit survivability analytics 114
+        run: python -m pytest tests/test_v51_repair_114_exit_survivability.py
       - name: No live-money authority regression
         run: python -m pytest tests/test_v51_phase12_13_83_94.py -k 'preserve_frozen_paper_only_authority'
       - name: Launched production HTTP smoke
