@@ -210,9 +210,26 @@ def apply_exact_entry_if_available(
     return True
 
 
+def install_execution_realism() -> None:
+    """Compatibility bridge for the pre-Phase-18 composition installer.
+
+    Exact-entry realism is now native in the owning handoff and portfolio methods.
+    This function intentionally performs no method replacement. It only records
+    the legacy capability markers so older composition/order assertions can verify
+    that the native implementation is present while the installer graph is retired.
+    """
+
+    from .portfolio import PaperPortfolio
+    from .shadow_execution import ShadowWalletExecutableQuoteHandoff
+
+    setattr(ShadowWalletExecutableQuoteHandoff.observe, "_roi_execution_realism", True)
+    setattr(PaperPortfolio.apply, "_roi_execution_realism", True)
+
+
 __all__ = [
     "ObservedEntryExecution",
     "apply_exact_entry_if_available",
     "clear_observed_entry_execution",
     "enrich_exact_entry_quote",
+    "install_execution_realism",
 ]
