@@ -1,0 +1,57 @@
+name: Diagnostic Paper Lifecycle Live Proof
+
+on:
+  push:
+    branches:
+      - diagnostic/paper-lifecycle-live-proof
+
+permissions:
+  contents: read
+
+jobs:
+  live-paper-lifecycle-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Read launched production status surfaces
+        env:
+          PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          EXPECTED_RELEASE_COMMIT: b91c7a2375d66aabfd90413acc40135322ac334f
+          PYTHONUNBUFFERED: '1'
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          base = os.environ['PRODUCTION_URL'].rstrip('/')
+          paths = [
+              '/health',
+              '/v1/operations/production-composition',
+              '/v1/strategy/e2e-status',
+              '/v1/strategy/authority',
+              '/v1/system-proof',
+          ]
+          for path in paths:
+              print(f'=== {path} ===', flush=True)
+              try:
+                  with urllib.request.urlopen(base + path, timeout=60) as response:
+                      body = response.read().decode('utf-8', 'replace')
+                      print(f'HTTP {response.status}', flush=True)
+                      try:
+                          print(json.dumps(json.loads(body), sort_keys=True), flush=True)
+                      except Exception:
+                          print(body, flush=True)
+              except Exception as exc:
+                  print(f'ERROR {type(exc).__name__}: {exc}', flush=True)
+          PY
+      - name: Run canonical exact-release forward proof
+        env:
+          EXPECTED_RELEASE_COMMIT: b91c7a2375d66aabfd90413acc40135322ac334f
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          FORWARD_PROOF_PROBE_ATTEMPTS: '1'
+          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '1'
+          FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
+          PYTHONUNBUFFERED: '1'
+        run: python tests/production_forward_proof_probe.py
