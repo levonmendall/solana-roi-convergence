@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-paper-lifecycle-truth"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v14-same-release-continuity-successor"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -112,6 +112,12 @@ class ProductionSystem:
             "batch9_canonical_contracts_preserved": bool(
                 getattr(self.app.state, "roi_batch9_canonical_contracts_preserved", False)
             ),
+            "same_release_continuity_epoch_repair": bool(
+                getattr(self.app.state, "roi_same_release_continuity_epoch_repair", False)
+            ),
+            "same_release_continuity_epoch_repair_version": getattr(
+                self.app.state, "roi_same_release_continuity_epoch_repair_version", None
+            ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -183,12 +189,19 @@ def build_production_system() -> ProductionSystem:
     from . import legacy_production_composition as _legacy_production_composition
     from .batch9_finalization_repair import install_batch9_finalization_repair
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
+    from .same_release_continuity_epoch_repair import (
+        REPAIR_VERSION as SAME_RELEASE_CONTINUITY_REPAIR_VERSION,
+        install_same_release_continuity_epoch_repair,
+    )
 
     _ = _legacy_package_runtime_composition
     app = _legacy_production_composition.app
     ingestion_runtime = _legacy_production_composition.ingestion_runtime
 
     install_batch9_finalization_repair(app)
+    install_same_release_continuity_epoch_repair()
+    app.state.roi_same_release_continuity_epoch_repair = True
+    app.state.roi_same_release_continuity_epoch_repair_version = SAME_RELEASE_CONTINUITY_REPAIR_VERSION
     install_e2e_status_read_boundary_repair(app, ingestion_runtime)
 
     components = _required_components()
