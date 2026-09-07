@@ -20,6 +20,7 @@ _ORIGINAL_OBSERVE: Callable[..., Any] | None = None
 _ORIGINAL_STATUS: Callable[..., dict[str, Any]] | None = None
 _ORIGINAL_REALTIME_RUN: Callable[..., Any] | None = None
 _ORIGINAL_ATTEMPT_LIQUIDATION: Callable[..., Any] | None = None
+_ACTIVE_ADAPTER: Any | None = None
 
 _LAST_TICK_AT: str | None = None
 _LAST_ERROR: str | None = None
@@ -265,7 +266,8 @@ def _candidate_signatures(adapter: Any) -> set[str]:
 
 
 def sync_entry_reservations(adapter: Any, signature: str | None = None) -> int:
-    global _RESERVATION_SYNC_COUNT
+    global _RESERVATION_SYNC_COUNT, _ACTIVE_ADAPTER
+    _ACTIVE_ADAPTER = adapter
     _ensure_schema(adapter.store)
     signatures = {signature} if signature else _candidate_signatures(adapter)
     changed = 0
@@ -322,7 +324,8 @@ def _settle_one(
 
 
 def sync_settlements(adapter: Any) -> int:
-    global _SETTLEMENT_SYNC_COUNT
+    global _SETTLEMENT_SYNC_COUNT, _ACTIVE_ADAPTER
+    _ACTIVE_ADAPTER = adapter
     _ensure_schema(adapter.store)
     changed = 0
     if _table_exists(adapter.store, "risk_conditioned_alpha_v5_outcomes"):
@@ -569,9 +572,10 @@ def _persist_runtime_state(adapter: Any) -> None:
 
 
 async def lifecycle_tick(adapter: Any) -> dict[str, int]:
-    global _LAST_TICK_AT, _LAST_ERROR, _TICK_COUNT, _RETRY_TICK_COUNT
+    global _LAST_TICK_AT, _LAST_ERROR, _TICK_COUNT, _RETRY_TICK_COUNT, _ACTIVE_ADAPTER
     from . import v51_exact_exit_execution as exact
 
+    _ACTIVE_ADAPTER = adapter
     entries = sync_entry_reservations(adapter)
     await exact._retry_due(adapter)
     _RETRY_TICK_COUNT += 1
@@ -634,8 +638,10 @@ async def _run_with_lifecycle(self: Any, stop: asyncio.Event) -> None:
 
 
 async def _observe_with_lifecycle(self: Any, signature: str) -> None:
+    global _ACTIVE_ADAPTER
     if _ORIGINAL_OBSERVE is None:
         raise RuntimeError("paper lifecycle runtime missing final observe owner")
+    _ACTIVE_ADAPTER = self
     await _ORIGINAL_OBSERVE(self, signature)
     sync_entry_reservations(self, signature)
     sync_settlements(self)
@@ -656,6 +662,7 @@ def _status_payload(store: Any | None = None, release_commit: str | None = None)
         "research_trials_are_portfolio_positions": False,
         "atomic_capital_reservation_defines_open_position": True,
         "paper_wallet_balance_artifact_policy": "insufficient_funds_only_plus_exact_route_amount_and_no_restriction",
+        "lifecycle_proven": False,
         "paper_only": True,
         "live_money_authority": False,
         "signing_available": False,
@@ -698,6 +705,9 @@ def _status_payload(store: Any | None = None, release_commit: str | None = None)
 
 
 def status(store: Any | None = None, release_commit: str | None = None) -> dict[str, Any]:
+    if (store is None or not release_commit) and _ACTIVE_ADAPTER is not None:
+        store = getattr(_ACTIVE_ADAPTER, "store", None)
+        release_commit = str(getattr(_ACTIVE_ADAPTER, "release_commit", "") or "") or None
     return _status_payload(store, release_commit)
 
 
