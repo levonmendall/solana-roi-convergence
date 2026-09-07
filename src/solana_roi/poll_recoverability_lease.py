@@ -434,7 +434,15 @@ async def _leased_poll_target(self: Any, target: WatchTarget, stop: asyncio.Even
                         degraded_started_at,
                     )
                 rearmed = None
-                if websocket_covered and current_generation != cursor_ws_generation:
+                # A scout still covered by the same stable WebSocket generation has
+                # not lost prospective strategy evidence. After the poll lease
+                # expires, re-baseline only the redundant poll standby instead of
+                # withdrawing that scout from quorum forever. A real WS generation
+                # change is still latched above and remains fail-closed for this
+                # exact release; re-arming merely restores future redundancy.
+                if websocket_covered and (
+                    current_generation != cursor_ws_generation or target.kind == "scout"
+                ):
                     try:
                         rearmed = await _try_rearm_with_stable_websocket(
                             self, target, cursor_slot, current_generation
@@ -467,7 +475,7 @@ async def _leased_poll_target(self: Any, target: WatchTarget, stop: asyncio.Even
                         degraded=False,
                         lease_age_seconds=0.0,
                         overflow_rearmed=True,
-                        recorded_gap_standby_rearmed=True,
+                        recorded_gap_standby_rearmed=gap_recorded,
                     )
                     await target_quorum._quorum_set_target_state(
                         self, live_poll._POLL_ENDPOINT, target, connected=True
@@ -528,6 +536,7 @@ def _status_with_recoverability(
             poll["inflight_recovery_attempt_honors_start_time"] = True
             poll["recorded_gap_standby_rearm_enabled"] = True
             poll["recorded_gap_standby_rearm_restores_gap"] = False
+            poll["stable_scout_websocket_can_rearm_expired_poll_standby"] = True
         policy = payload.setdefault("provider_runtime_policy", {})
         if isinstance(policy, dict):
             policy.update(
@@ -541,6 +550,7 @@ def _status_with_recoverability(
                     "live_poll_recorded_gap_can_rearm_standby": True,
                     "live_poll_recorded_gap_rearm_requires_stable_ws_generation": True,
                     "live_poll_recorded_gap_rearm_can_restore_gap": False,
+                    "live_poll_expired_scout_standby_rearms_under_same_stable_ws_generation": True,
                 }
             )
         return payload
