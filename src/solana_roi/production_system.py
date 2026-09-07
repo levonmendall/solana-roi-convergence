@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v11-explicit-compatibility"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v12-batch9-continuity-frontier-proof"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -65,6 +65,12 @@ class ProductionSystem:
             "e2e_status_read_boundary": bool(getattr(self.app.state, "roi_e2e_status_read_boundary", False)),
             "e2e_status_read_boundary_version": getattr(
                 self.app.state, "roi_e2e_status_read_boundary_version", None
+            ),
+            "batch9_continuity_frontier_proof_repair": bool(
+                getattr(self.app.state, "roi_batch9_continuity_frontier_proof_repair", False)
+            ),
+            "batch9_continuity_frontier_proof_repair_version": getattr(
+                self.app.state, "roi_batch9_continuity_frontier_proof_repair_version", None
             ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
@@ -132,11 +138,25 @@ def build_production_system() -> ProductionSystem:
     # behavior without restoring hidden package-import authority.
     from . import legacy_package_runtime_composition as _legacy_package_runtime_composition
     from . import legacy_production_composition as _legacy_production_composition
+    from .batch9_continuity_frontier_proof_repair import (
+        install_batch9_continuity_frontier_proof_repair,
+    )
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
 
     _ = _legacy_package_runtime_composition
     app = _legacy_production_composition.app
     ingestion_runtime = _legacy_production_composition.ingestion_runtime
+
+    # Exact-release production evidence after Batch 8 exposed three root boundaries:
+    # strategy-scout polling lacked a durable per-target restart checkpoint, the
+    # isolated Robinhood proof worker was a second SQLite writer on the live store,
+    # and production WSS readiness advanced a cursor before establishing a concrete
+    # generation anchor/processing closed blocks. Phase-13 proof precompute was also
+    # configured but never scheduled. Install the coordinated repair only after the
+    # full legacy graph has composed so it wraps the actual final runtime methods.
+    # Economic rules, 20-second authority, paper sizing, signing/submission and
+    # live-money boundaries are unchanged.
+    install_batch9_continuity_frontier_proof_repair(app)
 
     # The dedicated certification surface must not synchronously execute the full
     # ingestion audit (including append-only event-chain verification) and then
