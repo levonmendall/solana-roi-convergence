@@ -13,7 +13,7 @@ def _get(path: str) -> dict:
     started = time.monotonic()
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
-        headers={"Accept": "application/json", "User-Agent": "solana-roi-live-certification-diagnostic/1"},
+        headers={"Accept": "application/json", "User-Agent": "solana-roi-live-certification-diagnostic/2"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -25,6 +25,7 @@ def _get(path: str) -> dict:
 
 def main() -> None:
     health = _get("/health")
+    direct = _get("/v1/direct-solana/status")
     e2e = _get("/v1/strategy/e2e-status")
     certificate = _get("/v1/strategy/forward-certification")
     production = _get("/v1/strategy/production-proof")
@@ -60,6 +61,20 @@ def main() -> None:
         for name, value in components.items()
         if name in {"ingestion", "candidate", "strategy", "execution", "settlement"}
     }
+    direct_summary = {
+        "enabled": direct.get("enabled"),
+        "connected_provider_count": direct.get("connected_provider_count"),
+        "provider_states": direct.get("provider_states"),
+        "continuity_ok": direct.get("continuity_ok"),
+        "unresolved_gap": direct.get("unresolved_gap"),
+        "outage_started_at": direct.get("outage_started_at"),
+        "last_backfill_complete_at": direct.get("last_backfill_complete_at"),
+        "last_backfill_error": direct.get("last_backfill_error"),
+        "hydration_queue": direct.get("hydration_queue"),
+        "source_receipts_last_hour": direct.get("source_receipts_last_hour"),
+        "hydration": direct.get("hydration"),
+        "paper_only": direct.get("paper_only"),
+    }
 
     payload = {
         "health": {
@@ -67,6 +82,7 @@ def main() -> None:
             "paper_only": health.get("paper_only"),
             "live_money_authority": health.get("live_money_authority"),
         },
+        "direct_solana": direct_summary,
         "e2e_release_commit": e2e.get("release_commit"),
         "certificate_release_commit": certificate.get("release_commit"),
         "production_release_commit": (production.get("release") or {}).get("release_commit"),
@@ -85,6 +101,7 @@ def main() -> None:
 
     # This workflow is intentionally read-only and diagnostic. It must never mutate
     # paper state or loosen an economic/safety gate merely to manufacture proof.
+    assert direct.get("paper_only") is True
     assert (e2e.get("overall") or {}).get("paper_only") is True
     assert (e2e.get("overall") or {}).get("live_money_authority") is False
     assert (e2e.get("overall") or {}).get("signing_available") is False
