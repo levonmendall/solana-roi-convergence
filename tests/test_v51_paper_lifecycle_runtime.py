@@ -13,6 +13,17 @@ from solana_roi.v51_atomic_paper_capital import capital_reconciliation, lifecycl
 RELEASE = "f" * 40
 
 
+@pytest.fixture(autouse=True)
+def _isolate_lifecycle_runtime_state():
+    # Tests intentionally close temporary ObservationEventStore instances. The
+    # production lifecycle process owns one long-lived adapter, but test processes
+    # reuse this module across cases, so never let one closed test adapter leak into
+    # the next status read.
+    lifecycle._ACTIVE_ADAPTER = None
+    yield
+    lifecycle._ACTIVE_ADAPTER = None
+
+
 class DummyAdapter:
     def __init__(self, store: ObservationEventStore) -> None:
         self.store = store
@@ -65,7 +76,6 @@ def test_selected_entry_becomes_exact_atomic_open_and_settles_once(tmp_path) -> 
     rows = lifecycle_events(store, release_commit=RELEASE, candidate_id="sol-entry")
     assert [row["stage"] for row in rows] == ["OPEN"]
 
-    # Reservation replay must be idempotent and must not create a second OPEN event.
     assert lifecycle.sync_entry_reservations(adapter, "sol-entry") == 1
     rows = lifecycle_events(store, release_commit=RELEASE, candidate_id="sol-entry")
     assert [row["stage"] for row in rows] == ["OPEN"]
