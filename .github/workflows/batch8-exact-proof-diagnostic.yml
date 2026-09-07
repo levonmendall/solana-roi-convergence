@@ -1,0 +1,28 @@
+name: Batch 8 Exact Proof Diagnostic
+
+on:
+  push:
+    branches:
+      - ops/batch8-exact-proof-4d2cfa
+
+permissions:
+  contents: read
+
+jobs:
+  exact-release-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Probe exact deployed Batch 8 release
+        env:
+          EXPECTED_RELEASE_COMMIT: 4d2cfa3f8a6037bbc61e1d1b8e81de787fc70db1
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          FORWARD_PROOF_PROBE_ATTEMPTS: '1'
+          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
+          FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
+          PYTHONUNBUFFERED: '1'
+        run: python tests/production_forward_proof_probe.py
