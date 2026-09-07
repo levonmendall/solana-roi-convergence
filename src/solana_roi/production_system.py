@@ -141,6 +141,9 @@ def build_production_system() -> ProductionSystem:
     from .batch9_continuity_frontier_proof_repair import (
         install_batch9_continuity_frontier_proof_repair,
     )
+    from .batch9_scout_checkpoint_commit_repair import (
+        install_batch9_scout_checkpoint_commit_repair,
+    )
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
 
     _ = _legacy_package_runtime_composition
@@ -157,6 +160,9 @@ def build_production_system() -> ProductionSystem:
     # Economic rules, 20-second authority, paper sizing, signing/submission and
     # live-money boundaries are unchanged.
     install_batch9_continuity_frontier_proof_repair(app)
+    # A fallback-only scout delta must commit receipts before its durable cursor can
+    # move. This preserves restart losslessness if a receipt write itself fails.
+    install_batch9_scout_checkpoint_commit_repair()
 
     # The dedicated certification surface must not synchronously execute the full
     # ingestion audit (including append-only event-chain verification) and then
