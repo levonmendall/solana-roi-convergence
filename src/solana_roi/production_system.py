@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-paper-lifecycle-truth"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v14-production-proof-read-boundary"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -103,6 +103,12 @@ class ProductionSystem:
             "e2e_status_read_boundary_version": getattr(
                 self.app.state, "roi_e2e_status_read_boundary_version", None
             ),
+            "production_proof_read_boundary": bool(
+                getattr(self.app.state, "roi_production_proof_read_boundary", False)
+            ),
+            "production_proof_read_boundary_version": getattr(
+                self.app.state, "roi_production_proof_read_boundary_version", None
+            ),
             "batch9_continuity_frontier_proof_repair": bool(
                 getattr(self.app.state, "roi_batch9_continuity_frontier_proof_repair", False)
             ),
@@ -183,6 +189,7 @@ def build_production_system() -> ProductionSystem:
     from . import legacy_production_composition as _legacy_production_composition
     from .batch9_finalization_repair import install_batch9_finalization_repair
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
+    from .production_proof_read_boundary_repair import install_production_proof_read_boundary_repair
 
     _ = _legacy_package_runtime_composition
     app = _legacy_production_composition.app
@@ -190,6 +197,7 @@ def build_production_system() -> ProductionSystem:
 
     install_batch9_finalization_repair(app)
     install_e2e_status_read_boundary_repair(app, ingestion_runtime)
+    install_production_proof_read_boundary_repair(app)
 
     components = _required_components()
     missing = [component.name for component in components if component.required and not component.available]
