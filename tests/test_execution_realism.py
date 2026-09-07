@@ -130,6 +130,21 @@ async def _quote_then_apply(handoff: ShadowWalletExecutableQuoteHandoff):
     return quote, portfolio
 
 
+async def _quote_then_apply_after_cash_change(handoff: ShadowWalletExecutableQuoteHandoff):
+    quote = await handoff.observe(
+        token_mint="MINT",
+        stage="starter",
+        fraction_of_full_position=0.30,
+        scout_reference_price_sol=0.001,
+        trigger_observed_at=T0,
+    )
+    assert quote is not None and quote.usable
+    portfolio = PaperPortfolio()
+    portfolio.cash_usd = 1.0
+    portfolio.apply(_intent(), scout_wallet="scout", reference_price=quote.effective_price_sol)
+    return quote, portfolio
+
+
 def test_successful_shadow_order_drives_exact_amount_units_price_and_network_cash_cost(tmp_path):
     store, handoff = _handoff(tmp_path)
     quote, portfolio = asyncio.run(_quote_then_apply(handoff))
@@ -200,19 +215,8 @@ def test_quote_that_becomes_stale_during_simulation_fails_closed(tmp_path):
 
 def test_exact_quote_cannot_be_rescaled_after_capital_state_changes(tmp_path):
     _store, handoff = _handoff(tmp_path)
-    quote = asyncio.run(
-        handoff.observe(
-            token_mint="MINT",
-            stage="starter",
-            fraction_of_full_position=0.30,
-            scout_reference_price_sol=0.001,
-            trigger_observed_at=T0,
-        )
-    )
-    assert quote is not None and quote.usable
-    portfolio = PaperPortfolio()
-    portfolio.cash_usd = 1.0
-    portfolio.apply(_intent(), scout_wallet="scout", reference_price=quote.effective_price_sol)
+    quote, portfolio = asyncio.run(_quote_then_apply_after_cash_change(handoff))
+    assert quote.usable is True
     assert "MINT" not in portfolio.positions
     assert portfolio.cash_usd == pytest.approx(1.0)
 
