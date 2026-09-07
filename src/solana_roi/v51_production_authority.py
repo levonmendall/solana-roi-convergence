@@ -41,6 +41,10 @@ from .v51_measurement_integrity_hardening import (
     install_measurement_integrity_hardening,
     status as measurement_hardening_status,
 )
+from .v51_paper_lifecycle_runtime import (
+    install_paper_lifecycle_runtime,
+    status as paper_lifecycle_status,
+)
 from .v51_phase14_api import install_phase14_profitability_certification
 from .v51_promotion_proof import install_release_attestation_gate, status as promotion_proof_status
 from .v51_robinhood_candidate_coverage import install_v51_robinhood_candidate_coverage
@@ -54,7 +58,7 @@ from .v51_system_proof import install_system_proof
 
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v5-candidate-fomo-explicit"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v6-paper-lifecycle"
 _INSTALLED = False
 
 
@@ -149,6 +153,14 @@ def install_v51_production_authority(
 
     install_measurement_integrity()
     install_measurement_integrity_hardening()
+
+    # Measurement hardening installs the one canonical Phase-16 exact-exit engine.
+    # The lifecycle runtime is then composed explicitly at this same production
+    # boundary: it gives selected Solana/FOMO paper entries shared atomic capital
+    # ownership and advances due exit retries on an independent durable clock. It
+    # does not change strategy thresholds, signing, submission, or live-money authority.
+    install_paper_lifecycle_runtime()
+
     install_release_attestation_gate()
     install_primary_attestation_sources()
     install_measurement_compatible_promotion_filters()
@@ -205,6 +217,7 @@ def install_v51_production_authority(
     app.state.roi_v51_economic_composition = COMPOSITION_VERSION
     app.state.roi_v51_economic_composition_explicit = True
     app.state.roi_v51_measurement_integrity = True
+    app.state.roi_v51_paper_lifecycle_runtime = True
     app.state.roi_v51_release_attestation_gate = True
     app.state.roi_v51_primary_attestation_sources = True
     app.state.roi_v51_measurement_compatibility_filters = True
@@ -236,6 +249,8 @@ def status() -> dict[str, Any]:
         "candidate_execution_plane_installation": "explicit_before_measurement_integrity",
         "fomo_runtime_installation": "explicit_first_class_paper_surface_before_terminal_exact_exit",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
+        "paper_lifecycle_installation": "explicit_after_single_phase16_exact_exit_engine_at_production_boundary",
+        "paper_lifecycle_runtime": paper_lifecycle_status(),
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
         "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
         "system_proof_70_74_installation": "read_only_canonical_certification_and_dashboard_composition",
