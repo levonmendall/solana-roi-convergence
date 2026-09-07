@@ -1,0 +1,28 @@
+name: Batch 9 Live Proof Now
+
+on:
+  push:
+    branches:
+      - diagnostic/batch9-live-proof-a4948d12
+
+permissions:
+  contents: read
+
+jobs:
+  exact-release-live-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify exact deployed Batch 9 release and paper transports
+        env:
+          EXPECTED_RELEASE_COMMIT: a4948d12ecd5f14ef845e79565743f49939ff500
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          FORWARD_PROOF_PROBE_ATTEMPTS: '1'
+          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
+          FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
+          PYTHONUNBUFFERED: '1'
+        run: python tests/production_forward_proof_probe.py
