@@ -36,7 +36,9 @@ def _assert_safety(payload: dict, *, label: str) -> None:
 
 def _five_lane_result(production: dict) -> dict:
     accounting = production.get("candidate_accounting") or {}
-    lanes = accounting.get("lane_accounting") or {}
+    # Canonical Batch 7 schema is `lanes`; retain the Batch 6 alias only as a
+    # read-compatibility fallback for older deployed proof payloads.
+    lanes = accounting.get("lanes") or accounting.get("lane_accounting") or {}
     conservation = accounting.get("candidate_conservation") or {}
     assert isinstance(lanes, dict), "production proof: lane accounting unavailable"
     missing = [lane for lane in FIVE_LANES if lane not in lanes]
