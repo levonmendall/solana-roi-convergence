@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from .v51_batch6_production_proof_release_gate import build_batch6_production_proof_gate
 from .v51_candidate_lane_accounting import build_five_lane_candidate_accounting
 from .v51_phase14_profitability_certification import PHASE14_VERSION
 from .v51_phase17_attestation_hardening import (
@@ -68,10 +69,7 @@ def install_phase14_profitability_certification(
     if bool(getattr(app.state, "roi_v51_phase14_95_102", False)):
         return
 
-    # Current-release certification is surface-scoped. An aggregate attestation can
-    # no longer substitute for missing Solana, FOMO, or Robinhood evidence.
     install_phase17_surface_attestation_hardening()
-    # Resource sampling is read-only, bounded, and has no strategy/economic authority.
     ensure_resource_pressure_sampler()
 
     def current_system_proof() -> dict[str, Any] | None:
@@ -131,14 +129,22 @@ def install_phase14_profitability_certification(
 
         @app.get("/v1/strategy/production-proof")
         def canonical_production_proof() -> dict[str, Any]:
+            runtime_obj = runtime_provider() if callable(runtime_provider) else runtime_provider
             proof = current_system_proof()
             if not isinstance(proof, dict):
                 certificate = _insufficient_certificate()
+                batch6_gate = build_batch6_production_proof_gate(
+                    runtime_obj.store,
+                    system_proof={},
+                    candidate_accounting={},
+                    forward_certification={},
+                )
                 return {
                     "production_proof_api_version": PRODUCTION_PROOF_API_VERSION,
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "state": "DEGRADED",
                     "ready_for_forward_proof": False,
+                    "production_proof_pass": False,
                     "release": {},
                     "authority": {
                         "paper_only": True,
@@ -149,6 +155,7 @@ def install_phase14_profitability_certification(
                     "candidate_accounting": {},
                     "forward_certification": {},
                     "final_certification": certificate,
+                    "batch6_release_gate": batch6_gate,
                     "worker_readiness": {},
                     "resource_pressure": resource_pressure_snapshot(),
                     "surface_attestation_policy": _attestation_policy(),
@@ -172,46 +179,63 @@ def install_phase14_profitability_certification(
             release = _dict(proof.get("release"))
             authority = _dict(proof.get("authority"))
             stage_summary = _dict(coverage.get("stage_summary"))
-            runtime_obj = runtime_provider() if callable(runtime_provider) else runtime_provider
             five_lane_accounting = build_five_lane_candidate_accounting(
                 runtime_obj.store,
                 merged_coverage=coverage,
             )
+            candidate_accounting = {
+                "coverage_complete": bool(coverage.get("coverage_complete")),
+                "coverage_debt_count": int(coverage.get("coverage_debt_count") or 0),
+                "proof_state": coverage.get("proof_state"),
+                "stage_summary": stage_summary,
+                "robinhood": coverage.get("robinhood"),
+                "accounting_version": five_lane_accounting.get("accounting_version"),
+                "lane_accounting": five_lane_accounting.get("lanes"),
+                "candidate_conservation": five_lane_accounting.get("candidate_conservation"),
+                "classification_anomalies": five_lane_accounting.get("classification_anomalies"),
+                "local_accounted_subtotal": five_lane_accounting.get("local_accounted_subtotal"),
+                "accounting_scope": five_lane_accounting.get("scope"),
+                "conservation_equation": five_lane_accounting.get("equation"),
+                "full_candidate_coverage": coverage,
+            }
+            batch6_gate = build_batch6_production_proof_gate(
+                runtime_obj.store,
+                system_proof=proof,
+                candidate_accounting=candidate_accounting,
+                forward_certification=forward,
+            )
+            base_ready = bool(proof.get("ready_for_forward_proof"))
+            ready_for_forward_proof = bool(base_ready and batch6_gate.get("pass"))
             resource_pressure = resource_pressure_snapshot()
             blockers = list(runtime.get("blockers") or [])
             blockers.extend(str(value) for value in (final.get("blockers") or []) if str(value) not in blockers)
+            for value in batch6_gate.get("blockers") or []:
+                blocker = f"batch6_release_gate:{value}"
+                if blocker not in blockers:
+                    blockers.append(blocker)
             if resource_pressure.get("state") == "critical" and "critical_resource_pressure" not in blockers:
                 blockers.append("critical_resource_pressure")
 
             return {
                 "production_proof_api_version": PRODUCTION_PROOF_API_VERSION,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "state": proof.get("state"),
-                "ready_for_forward_proof": bool(proof.get("ready_for_forward_proof")),
+                "state": proof.get("state") if ready_for_forward_proof or not base_ready else "BLOCKED_BATCH6_RELEASE_GATE",
+                "ready_for_forward_proof": ready_for_forward_proof,
+                "production_proof_pass": ready_for_forward_proof,
+                "underlying_system_proof_ready": base_ready,
                 "release": release,
                 "authority": authority,
                 "epochs": {
+                    "economic_epoch": batch6_gate.get("economic_epoch"),
                     "economic_freeze_epoch": authority.get("economic_freeze_epoch"),
-                    "measurement_epoch": final.get("measurement_epoch"),
+                    "measurement_epoch": batch6_gate.get("measurement_epoch"),
                     "execution_model_epoch": final.get("execution_model_epoch"),
+                    "batch6_starts_new_measurement_epoch": False,
                 },
-                "candidate_accounting": {
-                    "coverage_complete": bool(coverage.get("coverage_complete")),
-                    "coverage_debt_count": int(coverage.get("coverage_debt_count") or 0),
-                    "proof_state": coverage.get("proof_state"),
-                    "stage_summary": stage_summary,
-                    "robinhood": coverage.get("robinhood"),
-                    "accounting_version": five_lane_accounting.get("accounting_version"),
-                    "lane_accounting": five_lane_accounting.get("lanes"),
-                    "candidate_conservation": five_lane_accounting.get("candidate_conservation"),
-                    "classification_anomalies": five_lane_accounting.get("classification_anomalies"),
-                    "local_accounted_subtotal": five_lane_accounting.get("local_accounted_subtotal"),
-                    "accounting_scope": five_lane_accounting.get("scope"),
-                    "conservation_equation": five_lane_accounting.get("equation"),
-                    "full_candidate_coverage": coverage,
-                },
+                "candidate_accounting": candidate_accounting,
                 "forward_certification": forward,
                 "final_certification": final,
+                "batch6_release_gate": batch6_gate,
                 "worker_readiness": {
                     "surfaces": runtime.get("surfaces"),
                     "forward_certification_state": runtime.get("forward_certification_state"),
