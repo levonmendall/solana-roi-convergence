@@ -8,8 +8,9 @@ from typing import Any
 from . import risk_conditioned_alpha_v51 as v51
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority
 from .v51_economic_core import execution_stress_profiles, hierarchical_profile, robust_profile
+from .v51_execution_evidence_integrity import dedupe_economic_samples
 
-CERTIFICATION_VERSION = "v51-economic-certification-v1"
+CERTIFICATION_VERSION = "v51-economic-certification-v2-batch5-evidence-integrity"
 STARTING_NAV = 1.0
 
 
@@ -259,7 +260,8 @@ def incremental_alpha_attribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_economic_certification(store: Any) -> dict[str, Any]:
-    rows = _records(store)
+    raw_rows = _records(store)
+    rows, duplicate_rows = dedupe_economic_samples(raw_rows)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row.get("family") or "unknown")].append(row)
@@ -268,8 +270,8 @@ def build_economic_certification(store: Any) -> dict[str, Any]:
     for family, family_rows in grouped.items():
         returns = [_safe(row.get("net_return")) for row in family_rows]
         profile = robust_profile(returns)
-        signatures = {str(row.get("source_signature") or row.get("trial_id") or row.get("id")) for row in family_rows}
-        independent_n = len(signatures)
+        independent_ids = {str(row.get("economic_sample_id") or "") for row in family_rows if row.get("economic_sample_id")}
+        independent_n = len(independent_ids)
         dominant_risk = "clean" if all(str(row.get("risk_signature") or "clean") == "clean" for row in family_rows) else "hazard"
         severity = max((_safe(row.get("risk_severity")) for row in family_rows), default=0.0)
         hierarchical = hierarchical_profile(returns, (), (), risk_severity=severity, risk_signature="clean" if dominant_risk == "clean" else "hazard")
@@ -310,7 +312,10 @@ def build_economic_certification(store: Any) -> dict[str, Any]:
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "economic_rules_frozen": True,
         "historical_pre_epoch_promotion_authority": False,
+        "raw_closed_outcome_count": len(raw_rows),
         "closed_outcome_count": len(rows),
+        "duplicate_economic_sample_count": len(duplicate_rows),
+        "economic_sample_deduplication": "family_independent_token_lifecycle_or_explicit_economic_root",
         "families": families,
         "research_family_ranking": ordered,
         "paper_allocation_weights": weights,
