@@ -18,13 +18,12 @@ from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
 
-REPAIR_VERSION = "batch9-continuity-frontier-proof-v3-finalized"
+REPAIR_VERSION = "batch9-continuity-frontier-proof-v4-finalized"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
 
-_ORIGINAL_DELTA_HOOK: Callable[..., Awaitable[Any]] | None = None
 _ORIGINAL_BOUNDED_PROCESS_BLOCK: Callable[..., Awaitable[Any]] | None = None
 _ORIGINAL_READER_GENERATION_START: Callable[[Any], int] | None = None
 _INSTALLED = False
@@ -62,23 +61,6 @@ def _strict_record_reconciliation_audit_rows(
         ):
             inserted += 1
     return inserted
-
-
-async def _scout_then_existing_delta_hook(
-    self: Any,
-    target: WatchTarget,
-    cursor_slot: int,
-) -> Any:
-    """Specialize scouts below canonical pagination/exception-rearm identities."""
-
-    if target.kind == "scout":
-        return await checkpoint_commit._fetch_with_commit_order(self, target, cursor_slot)
-    if _ORIGINAL_DELTA_HOOK is None:
-        return None
-    return await _ORIGINAL_DELTA_HOOK(self, target, cursor_slot)
-
-
-setattr(_scout_then_existing_delta_hook, "_roi_batch9_scout_checkpoint", True)
 
 
 def _item_block(item: dict[str, Any]) -> int:
@@ -187,8 +169,6 @@ setattr(_reader_generation_start_with_epoch_reset, "_roi_batch9_generation_ancho
 
 
 def _install_solana_scout_recovery() -> None:
-    global _ORIGINAL_DELTA_HOOK
-
     # The high-volume wrapper is the canonical top-level page identity. Insert the
     # scout baseline/restart checkpoint immediately below it instead of replacing it.
     if high_volume._ORIGINAL_SLOT_POLL_PAGE is None:
@@ -197,14 +177,16 @@ def _install_solana_scout_recovery() -> None:
         batch9._ORIGINAL_SLOT_PAGE = high_volume._ORIGINAL_SLOT_POLL_PAGE
         high_volume._ORIGINAL_SLOT_POLL_PAGE = batch9._slot_page_with_durable_scout_checkpoint
 
-    # Pagination intentionally exposes one lower specialization hook. Compose the
-    # scout delegate ahead of the already-installed high-volume delegate while
-    # leaving watermark._slot_fetch_delta == exception-rearm canonical identity.
-    if pagination._HIGH_VOLUME_DELTA_HOOK is not _scout_then_existing_delta_hook:
-        _ORIGINAL_DELTA_HOOK = pagination._HIGH_VOLUME_DELTA_HOOK
-        pagination._HIGH_VOLUME_DELTA_HOOK = _scout_then_existing_delta_hook
+    # Preserve the exact high-volume delta specialization identity. Scout hedging is
+    # already applied at the lower page boundary above, which canonical pagination
+    # invokes for every scout page. This keeps pagination -> exception-rearm and the
+    # high-volume server-side-until hook unchanged while still hedging scout reads.
+    if pagination._HIGH_VOLUME_DELTA_HOOK is not high_volume._maybe_fetch_high_volume_exact_cursor:
+        raise RuntimeError("Batch 9 requires the canonical high-volume delta specialization")
 
-    # Fallback receipts must durably commit before the scout cursor advances.
+    # Fallback receipts must durably commit before the scout cursor advances. The
+    # canonical pagination result flows through this recorder, so no custom fetch
+    # wrapper is needed and the exception-rearm identity remains untouched.
     if live_poll._record_poll_rows is not checkpoint_commit._record_rows_then_checkpoint:
         checkpoint_commit._ORIGINAL_RECORD_ROWS = live_poll._record_poll_rows
         live_poll._record_poll_rows = checkpoint_commit._record_rows_then_checkpoint
@@ -296,7 +278,6 @@ __all__ = [
     "REPAIR_VERSION",
     "_process_block_with_generation_anchor",
     "_reader_generation_start_with_epoch_reset",
-    "_scout_then_existing_delta_hook",
     "_strict_record_reconciliation_audit_rows",
     "install_batch9_finalization_repair",
 ]
