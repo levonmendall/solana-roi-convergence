@@ -4,7 +4,7 @@ from datetime import timedelta
 from typing import Any, Callable
 
 
-RECOVERY_VERSION = "v51-exit-due-recovery-v1"
+RECOVERY_VERSION = "v51-exit-due-recovery-v2-mechanical-balance-proof"
 STALE_EXIT_DUE_SECONDS = 5.0
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
@@ -64,15 +64,21 @@ async def _retry_due_with_exit_due(adapter: Any) -> None:
 
 
 def install_exit_due_recovery() -> None:
-    """Install restart-safe exit ownership after the canonical lifecycle wrapper."""
+    """Install mechanical paper-balance proof, then restart-safe exit ownership."""
 
     global _INSTALLED, _ORIGINAL_RETRY_DUE
     if _INSTALLED:
         return
     from . import v51_exact_exit_execution as exact
+    from .v51_paper_balance_artifact_hardening import install_paper_balance_artifact_hardening
 
     if not bool(getattr(exact, "_INSTALLED", False)):
         raise RuntimeError("canonical_exact_exit_engine_must_be_installed_first")
+
+    # Production authority installs this recovery boundary immediately after the
+    # canonical paper lifecycle. Harden the paper-wallet artifact exception before
+    # any restart-recovered liquidation can use it.
+    install_paper_balance_artifact_hardening()
 
     _ORIGINAL_RETRY_DUE = exact._retry_due
     exact._retry_due = _retry_due_with_exit_due  # type: ignore[assignment]
@@ -80,6 +86,8 @@ def install_exit_due_recovery() -> None:
 
 
 def status() -> dict[str, Any]:
+    from .v51_paper_balance_artifact_hardening import status as balance_proof_status
+
     return {
         "version": RECOVERY_VERSION,
         "installed": _INSTALLED,
@@ -90,6 +98,7 @@ def status() -> dict[str, Any]:
         "owns_initial_exit_due_after_restart": True,
         "failed_retry_semantics_preserved": True,
         "uses_canonical_attempt_liquidation": True,
+        "paper_balance_artifact_hardening": balance_proof_status(),
         "paper_only": True,
         "live_money_authority": False,
         "signing_available": False,
