@@ -21,3 +21,12 @@ def test_post_deploy_probe_still_requires_exact_release_binding() -> None:
     assert "production_sha == EXPECTED_SHA" in probe
     assert '"/v1/strategy/production-proof"' in probe
     assert "aggregate_attestation_fallback_allowed" in probe
+
+
+def test_post_deploy_probe_prefers_canonical_five_lane_schema() -> None:
+    probe = Path("tests/production_forward_proof_probe.py").read_text(encoding="utf-8")
+    canonical = 'accounting.get("lanes")'
+    legacy = 'accounting.get("lane_accounting")'
+    assert canonical in probe
+    assert legacy in probe
+    assert probe.index(canonical) < probe.index(legacy)
