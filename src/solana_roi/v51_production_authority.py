@@ -30,6 +30,7 @@ from .v51_attestation_sources import install_primary_attestation_sources, status
 from .v51_consolidated_strategy import install_v51_consolidated_strategy
 from .v51_cost_normalization import install_api_cost_normalization, status as cost_normalization_status
 from .v51_empty_epoch_slo_repair import install_empty_epoch_slo_repair, status as empty_epoch_slo_status
+from .v51_exit_due_recovery import install_exit_due_recovery, status as exit_due_recovery_status
 from .v51_forward_certification import install_forward_certification
 from .v51_latency_challenger_api import install_v51_latency_challenger_api
 from .v51_measurement_compatibility_filters import (
@@ -58,7 +59,7 @@ from .v51_system_proof import install_system_proof
 
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v6-paper-lifecycle"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v7-exit-due-recovery"
 _INSTALLED = False
 
 
@@ -161,6 +162,11 @@ def install_v51_production_authority(
     # does not change strategy thresholds, signing, submission, or live-money authority.
     install_paper_lifecycle_runtime()
 
+    # Recover initial durable exit_due rows that survive a process loss before the
+    # immediate liquidation call. This is installed after the lifecycle wrapper so
+    # recovered attempts still use canonical paper inventory and settlement.
+    install_exit_due_recovery()
+
     install_release_attestation_gate()
     install_primary_attestation_sources()
     install_measurement_compatible_promotion_filters()
@@ -218,6 +224,7 @@ def install_v51_production_authority(
     app.state.roi_v51_economic_composition_explicit = True
     app.state.roi_v51_measurement_integrity = True
     app.state.roi_v51_paper_lifecycle_runtime = True
+    app.state.roi_v51_exit_due_recovery = True
     app.state.roi_v51_release_attestation_gate = True
     app.state.roi_v51_primary_attestation_sources = True
     app.state.roi_v51_measurement_compatibility_filters = True
@@ -250,7 +257,9 @@ def status() -> dict[str, Any]:
         "fomo_runtime_installation": "explicit_first_class_paper_surface_before_terminal_exact_exit",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "paper_lifecycle_installation": "explicit_after_single_phase16_exact_exit_engine_at_production_boundary",
+        "exit_due_recovery_installation": "explicit_after_paper_lifecycle_wrapper_at_production_boundary",
         "paper_lifecycle_runtime": paper_lifecycle_status(),
+        "exit_due_recovery": exit_due_recovery_status(),
         "forward_certification_installation": "read_only_cross_surface_composition_of_existing_transport_and_evidence_proof_planes",
         "alpha_validation_47_58_installation": "read_only_prospective_alpha_certificate_over_existing_frozen_v51_claims",
         "system_proof_70_74_installation": "read_only_canonical_certification_and_dashboard_composition",
