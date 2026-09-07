@@ -13,7 +13,7 @@ def _get(path: str) -> dict:
     started = time.monotonic()
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
-        headers={"Accept": "application/json", "User-Agent": "solana-roi-live-certification-diagnostic/3"},
+        headers={"Accept": "application/json", "User-Agent": "solana-roi-live-certification-diagnostic/4"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -26,6 +26,7 @@ def _get(path: str) -> dict:
 def main() -> None:
     health = _get("/health")
     direct = _get("/v1/direct-solana/status")
+    robinhood = _get("/v1/robinhood-chain/status")
     e2e = _get("/v1/strategy/e2e-status")
     certificate = _get("/v1/strategy/forward-certification")
     production = _get("/v1/strategy/production-proof")
@@ -91,6 +92,7 @@ def main() -> None:
             "live_money_authority": health.get("live_money_authority"),
         },
         "direct_solana": direct_summary,
+        "robinhood_status": robinhood,
         "e2e_release_commit": e2e.get("release_commit"),
         "e2e_solana": e2e.get("solana"),
         "e2e_fomo": e2e.get("fomo"),
@@ -111,9 +113,9 @@ def main() -> None:
     }
     print("LIVE_CERTIFICATION_DIAGNOSTIC=" + json.dumps(payload, sort_keys=True, default=str), flush=True)
 
-    # This workflow is intentionally read-only and diagnostic. It must never mutate
-    # paper state or loosen an economic/safety gate merely to manufacture proof.
     assert direct.get("paper_only") is True
+    assert robinhood.get("paper_only") is True
+    assert robinhood.get("live_money_authority") is False
     assert (e2e.get("overall") or {}).get("paper_only") is True
     assert (e2e.get("overall") or {}).get("live_money_authority") is False
     assert (e2e.get("overall") or {}).get("signing_available") is False
