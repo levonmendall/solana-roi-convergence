@@ -251,9 +251,19 @@ class SolanaRpcPool:
                     errors.append(exc)
             raise RuntimeError(f"all Solana RPC endpoints failed for {method}") from (errors[-1] if errors else None)
         finally:
-            for task in (primary, hedge_task):
-                if task is not None and not task.done():
+            # Every created task must be observed before this coroutine returns.
+            # asyncio.wait(FIRST_COMPLETED) may report both hedge tasks in ``done``
+            # in the same loop turn. If one succeeds and the sibling has already
+            # failed, consuming only the winner leaves the sibling exception
+            # unretrieved and production emits "Task exception was never retrieved".
+            # Gather both tasks unconditionally so done failures are consumed and
+            # unfinished losers are cancelled/drained without changing RPC choice.
+            tasks = [task for task in (primary, hedge_task) if task is not None]
+            for task in tasks:
+                if not task.done():
                     task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def call(self, method: str, params: list[Any], *, hedge: bool = False) -> Any:
         result, _provider, _latency = await self.call_with_meta(method, params, hedge=hedge)
