@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v14-paper-lifecycle-truth"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -42,10 +42,50 @@ class ProductionSystem:
     def healthy(self) -> bool:
         return all(component.available for component in self.components if component.required)
 
+    def _paper_lifecycle_status(self) -> dict[str, Any]:
+        try:
+            from . import v51_paper_lifecycle_runtime as lifecycle
+
+            return dict(lifecycle.status())
+        except Exception as exc:
+            return {
+                "installed": False,
+                "worker_running": False,
+                "lifecycle_proven": False,
+                "last_error": f"{type(exc).__name__}:{exc}",
+                "paper_only": True,
+                "live_money_authority": False,
+                "signing_available": False,
+                "transaction_submission_available": False,
+            }
+
     def status(self) -> dict[str, Any]:
+        lifecycle = self._paper_lifecycle_status()
+        code_present = bool(self.healthy and lifecycle.get("installed"))
+        worker_active = bool(lifecycle.get("worker_running"))
+        lifecycle_proven = bool(lifecycle.get("lifecycle_proven"))
+        if lifecycle_proven:
+            lifecycle_state = "LIFECYCLE_PROVEN"
+        elif worker_active:
+            lifecycle_state = "WORKER_ACTIVE"
+        elif code_present:
+            lifecycle_state = "CODE_PRESENT"
+        else:
+            lifecycle_state = "UNAVAILABLE"
         return {
             "composition_version": COMPOSITION_VERSION,
+            # Backward-compatible composition health. This intentionally means only
+            # that mandatory owner code is present and importable; it is not economic
+            # proof that a paper position has opened or closed.
             "healthy": self.healthy,
+            "composition_healthy": self.healthy,
+            "health_semantics": {
+                "code_present": code_present,
+                "worker_active": worker_active,
+                "lifecycle_proven": lifecycle_proven,
+                "state": lifecycle_state,
+            },
+            "paper_execution_lifecycle": lifecycle,
             "components": {component.name: component.as_dict() for component in self.components},
             "required_component_count": sum(1 for component in self.components if component.required),
             "unavailable_required_components": [
@@ -98,6 +138,7 @@ def _required_components() -> tuple[ComponentHealth, ...]:
         _component("candidate", "solana_roi.v51_candidate_ledger", "refresh_candidate_pipeline"),
         _component("strategy", "solana_roi.strategy_v51_authority", "authority"),
         _component("execution", "solana_roi.v51_exact_exit_execution", "observe_exact_exit_order"),
+        _component("paper_lifecycle", "solana_roi.v51_paper_lifecycle_runtime", "install_paper_lifecycle_runtime"),
         _component("settlement", "solana_roi.profit_first_entity_final_research", "FinalProfitFirstResearchAdapter"),
         _component("learning", "solana_roi.v51_evidence_analytics", "build_hazard_calibration"),
         _component("certification", "solana_roi.v51_phase17_context_certification", "build_phase17_context_certification"),
@@ -118,6 +159,13 @@ def _mount_composition_status(app: Any) -> None:
             return {
                 "composition_version": COMPOSITION_VERSION,
                 "healthy": False,
+                "composition_healthy": False,
+                "health_semantics": {
+                    "code_present": False,
+                    "worker_active": False,
+                    "lifecycle_proven": False,
+                    "state": "UNAVAILABLE",
+                },
                 "reason": "production_system_not_attached",
                 "paper_only": True,
                 "live_money_authority": False,
