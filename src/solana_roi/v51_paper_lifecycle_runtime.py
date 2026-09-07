@@ -150,6 +150,8 @@ def _sync_solana_entry(adapter: Any, signature: str) -> int:
         lane=f"SOLANA:{trial.get('lane') or 'unknown'}",
         candidate_id=signature,
         requested_fraction=requested,
+        allow_downsize=False,
+        minimum_fraction=requested,
     )
     reservation_status = str(reservation.get("status") or "")
     if reservation_status == "settled":
@@ -205,6 +207,8 @@ def _sync_fomo_entry(adapter: Any, signature: str) -> int:
         lane="FOMO",
         candidate_id=signature,
         requested_fraction=requested,
+        allow_downsize=False,
+        minimum_fraction=requested,
     )
     reservation_status = str(reservation.get("status") or "")
     if reservation_status == "settled":
