@@ -18,7 +18,7 @@ jobs:
           BASE_URL: https://solana-roi-convergence.onrender.com
           EXPECTED_SHA: ceb6f7743c7f9d4ac72bbd3a8c95bbe78a8cb579
         run: |
-          python - <<'PY'
+          python - <<'PY' | tee /tmp/lifecycle-proof.txt
           import json, os, urllib.request
 
           base = os.environ['BASE_URL'].rstrip('/')
@@ -31,7 +31,7 @@ jobs:
           ]
 
           def get(path):
-              req = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'solana-roi-lifecycle-diagnostic/1'})
+              req = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'solana-roi-lifecycle-diagnostic/2'})
               with urllib.request.urlopen(req, timeout=90) as r:
                   return json.loads(r.read().decode())
 
@@ -77,10 +77,14 @@ jobs:
               for key,val in collect(p):
                   print(key, '=', json.dumps(val, sort_keys=True, default=str))
 
-          # Print compact top-level keys for proof surface discovery without dumping secrets.
           for path,p in payloads.items():
               if isinstance(p,dict): print('TOP_KEYS', path, sorted(p.keys()))
 
-          # This diagnostic is read-only and does not fail merely because lifecycle is not yet proven.
           assert any(str(v)==expected for _,v in releases), f'live release does not expose expected SHA {expected}'
           PY
+          {
+            echo '## Current live lifecycle proof';
+            echo '```text';
+            cat /tmp/lifecycle-proof.txt;
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
