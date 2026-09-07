@@ -62,6 +62,10 @@ class ProductionSystem:
             "package_import_has_runtime_install_side_effects": False,
             "production_entrypoint": "solana_roi.production:app",
             "composition_status_path": COMPOSITION_STATUS_PATH,
+            "e2e_status_read_boundary": bool(getattr(self.app.state, "roi_e2e_status_read_boundary", False)),
+            "e2e_status_read_boundary_version": getattr(
+                self.app.state, "roi_e2e_status_read_boundary_version", None
+            ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -128,10 +132,17 @@ def build_production_system() -> ProductionSystem:
     # behavior without restoring hidden package-import authority.
     from . import legacy_package_runtime_composition as _legacy_package_runtime_composition
     from . import legacy_production_composition as _legacy_production_composition
+    from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
 
     _ = _legacy_package_runtime_composition
     app = _legacy_production_composition.app
     ingestion_runtime = _legacy_production_composition.ingestion_runtime
+
+    # The dedicated certification surface must not synchronously execute the full
+    # ingestion audit (including append-only event-chain verification) and then
+    # discard it. Compose the bounded read only after the canonical legacy runtime
+    # has installed the unified E2E route; the full ingestion endpoint is unchanged.
+    install_e2e_status_read_boundary_repair(app, ingestion_runtime)
 
     components = _required_components()
     missing = [component.name for component in components if component.required and not component.available]
