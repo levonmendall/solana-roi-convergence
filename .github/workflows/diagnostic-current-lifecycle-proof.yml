@@ -6,19 +6,22 @@ on:
       - diagnostic/current-lifecycle-proof-20260907
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   probe:
+    if: ${{ !contains(github.event.head_commit.message, '[diagnostic-result]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
       - name: Probe exact live lifecycle truth
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
           EXPECTED_SHA: ceb6f7743c7f9d4ac72bbd3a8c95bbe78a8cb579
         run: |
-          python - <<'PY' | tee /tmp/lifecycle-proof.txt
+          mkdir -p diagnostics
+          python - <<'PY' | tee diagnostics/current-lifecycle-proof.txt
           import json, os, urllib.request
 
           base = os.environ['BASE_URL'].rstrip('/')
@@ -31,7 +34,7 @@ jobs:
           ]
 
           def get(path):
-              req = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'solana-roi-lifecycle-diagnostic/2'})
+              req = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'solana-roi-lifecycle-diagnostic/3'})
               with urllib.request.urlopen(req, timeout=90) as r:
                   return json.loads(r.read().decode())
 
@@ -44,7 +47,8 @@ jobs:
                       'settlement_sync_count','open_position_count','open_positions_by_lane',
                       'lifecycle_event_counts','capital_reconciliation','settlement_count','realized_pnl',
                       'realized_pnl_sol','realized_return','paper_only','live_money_authority',
-                      'signing_available','transaction_submission_available','release_commit'
+                      'signing_available','transaction_submission_available','release_commit',
+                      'state','blockers','runtime_ready','all_regimes_paper_capable','all_regimes_e2e_proven'
                   }
                   for k,v in obj.items():
                       p=f'{path}.{k}'
@@ -76,15 +80,14 @@ jobs:
               print('===',path,'===')
               for key,val in collect(p):
                   print(key, '=', json.dumps(val, sort_keys=True, default=str))
-
-          for path,p in payloads.items():
-              if isinstance(p,dict): print('TOP_KEYS', path, sorted(p.keys()))
+              if isinstance(p,dict): print('TOP_KEYS', sorted(p.keys()))
 
           assert any(str(v)==expected for _,v in releases), f'live release does not expose expected SHA {expected}'
           PY
-          {
-            echo '## Current live lifecycle proof';
-            echo '```text';
-            cat /tmp/lifecycle-proof.txt;
-            echo '```';
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Persist diagnostic result on diagnostic branch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add diagnostics/current-lifecycle-proof.txt
+          git commit -m '[diagnostic-result] persist current lifecycle proof' || exit 0
+          git push
