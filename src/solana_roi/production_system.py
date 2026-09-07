@@ -85,6 +85,10 @@ class ProductionSystem:
                 "lifecycle_proven": lifecycle_proven,
                 "state": lifecycle_state,
             },
+            # Paper lifecycle is an execution-proof plane composed beneath the
+            # canonical execution/settlement owners, not an eleventh production-root
+            # component. Keeping it separate preserves the frozen Phase-18 ten-owner
+            # architecture while exposing stronger runtime truth.
             "paper_execution_lifecycle": lifecycle,
             "components": {component.name: component.as_dict() for component in self.components},
             "required_component_count": sum(1 for component in self.components if component.required),
@@ -138,7 +142,6 @@ def _required_components() -> tuple[ComponentHealth, ...]:
         _component("candidate", "solana_roi.v51_candidate_ledger", "refresh_candidate_pipeline"),
         _component("strategy", "solana_roi.strategy_v51_authority", "authority"),
         _component("execution", "solana_roi.v51_exact_exit_execution", "observe_exact_exit_order"),
-        _component("paper_lifecycle", "solana_roi.v51_paper_lifecycle_runtime", "install_paper_lifecycle_runtime"),
         _component("settlement", "solana_roi.profit_first_entity_final_research", "FinalProfitFirstResearchAdapter"),
         _component("learning", "solana_roi.v51_evidence_analytics", "build_hazard_calibration"),
         _component("certification", "solana_roi.v51_phase17_context_certification", "build_phase17_context_certification"),
