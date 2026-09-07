@@ -55,6 +55,7 @@ def test_batch7_rotation_does_not_rewrite_historical_epoch_tags(monkeypatch) -> 
         )
 
     preserved = ensure_release_compatibility(store, historical_release)
+    monkeypatch.setenv("RENDER_GIT_COMMIT", current_release)
     current = ensure_release_compatibility(store, current_release)
 
     assert preserved is not None
@@ -65,7 +66,6 @@ def test_batch7_rotation_does_not_rewrite_historical_epoch_tags(monkeypatch) -> 
     assert current["economic_epoch"] == ECONOMIC_FREEZE_EPOCH
     assert preserved["economic_fingerprint"] == current["economic_fingerprint"] == authority_fingerprint()
 
-    monkeypatch.setenv("RENDER_GIT_COMMIT", current_release)
     metadata = proof_metadata(store)
     assert metadata["measurement_epoch"] == BATCH7_MEASUREMENT_EPOCH
     assert metadata["economic_freeze_epoch"] == ECONOMIC_FREEZE_EPOCH
