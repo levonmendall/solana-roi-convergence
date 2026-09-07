@@ -1,0 +1,28 @@
+name: Batch 8 Final Certification Proof
+
+on:
+  push:
+    branches:
+      - batch8-final-certification-269f1338
+
+permissions:
+  contents: read
+
+jobs:
+  exact-release-forward-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify Batch 8 exact Render release and paper transports
+        env:
+          EXPECTED_RELEASE_COMMIT: 269f13387536e89aaf0bc25b825a78b2336ecae5
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          FORWARD_PROOF_PROBE_ATTEMPTS: '3'
+          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '30'
+          FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
+          PYTHONUNBUFFERED: '1'
+        run: python tests/production_forward_proof_probe.py
