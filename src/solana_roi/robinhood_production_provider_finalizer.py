@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from functools import wraps
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
 
 from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_production_ws_transport as production_transport
@@ -30,9 +32,51 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v6-getlogs-guard"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v7-private-https-wss-derivation"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
+
+
+def _normalized_endpoint(value: str) -> str:
+    return value.rstrip("/").lower()
+
+
+def _resolved_production_ws_url() -> str:
+    """Resolve production WSS without promoting public or insecure RPC transport.
+
+    An explicit WebSocket setting is authoritative and is returned unchanged for the
+    production transport's existing validation. Only when that setting is absent may
+    an explicitly configured private HTTPS Robinhood RPC be transformed to the
+    provider-equivalent ``wss://`` URL. The built-in public fallback and plain HTTP
+    are deliberately ineligible, so missing/unsafe configuration remains fail-closed.
+    """
+    explicit_ws = (os.getenv("ROBINHOOD_WS_URL") or "").strip()
+    if explicit_ws:
+        return explicit_ws
+
+    configured_rpc = (os.getenv("ROBINHOOD_RPC_URL") or "").strip()
+    if not configured_rpc:
+        return ""
+    if _normalized_endpoint(configured_rpc) == _normalized_endpoint(
+        production_transport.runtime.ROBINHOOD_PUBLIC_RPC
+    ):
+        return ""
+
+    try:
+        parsed = urlparse(configured_rpc)
+    except Exception:
+        return ""
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        return ""
+    return parsed._replace(scheme="wss").geturl()
+
+
+def _install_private_https_wss_derivation() -> None:
+    current = production_transport._ws_url
+    if bool(getattr(current, "_roi_private_https_wss_derivation", False)):
+        return
+    setattr(_resolved_production_ws_url, "_roi_private_https_wss_derivation", True)
+    production_transport._ws_url = _resolved_production_ws_url
 
 
 async def _final_fresh_ready(self: Any) -> bool:
@@ -98,6 +142,10 @@ def install_robinhood_production_provider_finalizer(
     # invoking a status method at import time.
     bounded_transport._augment_status_wrapper = provider_budget._augment_status_wrapper
     install_robinhood_usage_bounded_transport()
+    # Keep the production transport's existing validation as final authority. This
+    # resolver only supplies the provider-equivalent WSS when a private HTTPS RPC was
+    # explicitly configured and no explicit WSS override exists.
+    _install_private_https_wss_derivation()
     production_transport.install_robinhood_production_ws_transport(plane_cls)
     install_robinhood_event_driven_settlement(plane_cls)
     install_robinhood_adaptive_lane_controller(plane_cls)
@@ -117,6 +165,10 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "instance_scoped_production_enforcement": True,
         "public_transport_can_authorize_running_worker": False,
+        "private_https_rpc_wss_derivation": True,
+        "explicit_websocket_precedence": True,
+        "public_rpc_wss_derivation_allowed": False,
+        "plain_http_rpc_wss_derivation_allowed": False,
         "getlogs_provider_guard": getlogs_provider_guard_status(),
         "provider_budget_transport": provider_budget_transport_status(),
         "provider_transport": usage_bounded_transport_status(),
@@ -134,6 +186,8 @@ def status() -> dict[str, Any]:
 __all__ = [
     "FINALIZER_VERSION",
     "_final_fresh_ready",
+    "_install_private_https_wss_derivation",
+    "_resolved_production_ws_url",
     "install_robinhood_production_provider_finalizer",
     "status",
 ]

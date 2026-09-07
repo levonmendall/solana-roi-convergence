@@ -43,6 +43,58 @@ def test_nonpublic_rpc_and_websocket_pair_is_recognized(monkeypatch) -> None:
     assert transport.endpoint_kind() == "configured_production_rpc_and_websocket"
 
 
+def test_explicit_websocket_takes_precedence_over_private_rpc_derivation(monkeypatch) -> None:
+    monkeypatch.setenv("ROBINHOOD_RPC_URL", "https://robinhood-mainnet.g.alchemy.com/v2/rpc-secret")
+    monkeypatch.setenv("ROBINHOOD_WS_URL", "wss://private.example/ws-explicit")
+
+    assert finalizer._resolved_production_ws_url() == "wss://private.example/ws-explicit"
+
+
+def test_private_https_rpc_derives_matching_production_websocket(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "ROBINHOOD_RPC_URL",
+        "https://robinhood-mainnet.g.alchemy.com/v2/example?source=batch8",
+    )
+    monkeypatch.delenv("ROBINHOOD_WS_URL", raising=False)
+    finalizer._install_private_https_wss_derivation()
+
+    assert (
+        transport._ws_url()
+        == "wss://robinhood-mainnet.g.alchemy.com/v2/example?source=batch8"
+    )
+    assert transport.production_provider_configured() is True
+    assert transport.endpoint_kind() == "configured_production_rpc_and_websocket"
+
+
+def test_public_rpc_is_never_promoted_to_production_websocket(monkeypatch) -> None:
+    monkeypatch.setenv("ROBINHOOD_RPC_URL", runtime.ROBINHOOD_PUBLIC_RPC)
+    monkeypatch.delenv("ROBINHOOD_WS_URL", raising=False)
+    finalizer._install_private_https_wss_derivation()
+
+    assert transport._ws_url() == ""
+    assert transport.production_provider_configured() is False
+    assert transport.endpoint_kind() == "official_public_rate_limited_research_only"
+
+
+def test_plain_http_rpc_is_never_promoted_to_production_websocket(monkeypatch) -> None:
+    monkeypatch.setenv("ROBINHOOD_RPC_URL", "http://robinhood-mainnet.g.alchemy.com/v2/example")
+    monkeypatch.delenv("ROBINHOOD_WS_URL", raising=False)
+    finalizer._install_private_https_wss_derivation()
+
+    assert transport._ws_url() == ""
+    assert transport.production_provider_configured() is False
+    assert transport.endpoint_kind() == "production_provider_configuration_incomplete"
+
+
+def test_explicit_invalid_websocket_fails_closed_instead_of_deriving(monkeypatch) -> None:
+    monkeypatch.setenv("ROBINHOOD_RPC_URL", "https://robinhood-mainnet.g.alchemy.com/v2/example")
+    monkeypatch.setenv("ROBINHOOD_WS_URL", "http://private.example/not-websocket")
+    finalizer._install_private_https_wss_derivation()
+
+    assert transport._ws_url() == "http://private.example/not-websocket"
+    assert transport.production_provider_configured() is False
+
+
 def test_provider_finalizer_is_installed_after_sequencer_in_v51_authority() -> None:
     source = Path(v51_production_authority.__file__).read_text(encoding="utf-8")
     sequencer = source.index("install_robinhood_sequencer_frontier(RobinhoodChainPaperPlane)")
