@@ -32,9 +32,12 @@ jobs:
         env:
           EXPECTED_RELEASE_COMMIT: ${{ github.sha }}
           SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
-          FORWARD_PROOF_PROBE_ATTEMPTS: '30'
+          # One bounded deep-read attempt per run. The 15-minute schedule is the retry
+          # mechanism, so a single run cannot overrun its own eight-minute job budget.
+          FORWARD_PROOF_PROBE_ATTEMPTS: '1'
           FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
           FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
+          PYTHONUNBUFFERED: '1'
         run: python tests/production_forward_proof_probe.py
       - name: Record scheduled retry state
         if: ${{ github.event_name == 'schedule' && steps.production-proof.outcome == 'failure' }}

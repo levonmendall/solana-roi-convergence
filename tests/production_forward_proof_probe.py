@@ -18,12 +18,16 @@ FIVE_LANES = ("pump_fun", "pump_amm", "raydium", "fomo", "robinhood")
 
 
 def _get(path: str) -> dict:
+    started = time.monotonic()
+    print(f"GET {path} start timeout={TIMEOUT_SECONDS:.0f}s", flush=True)
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
         headers={"Accept": "application/json", "User-Agent": "solana-roi-forward-proof-ci/4"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
+    elapsed = time.monotonic() - started
+    print(f"GET {path} complete elapsed={elapsed:.2f}s", flush=True)
     if not isinstance(payload, dict):
         raise AssertionError(f"{path} returned non-object JSON")
     return payload
@@ -212,11 +216,17 @@ def main() -> None:
     for attempt in range(1, ATTEMPTS + 1):
         try:
             result = _probe_once()
-            print(json.dumps({"attempt": attempt, "production_forward_probe": result}, sort_keys=True))
+            print(
+                json.dumps({"attempt": attempt, "production_forward_probe": result}, sort_keys=True),
+                flush=True,
+            )
             return
         except (AssertionError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             last_error = exc
-            print(f"attempt {attempt}/{ATTEMPTS} not ready: {type(exc).__name__}: {exc}")
+            print(
+                f"attempt {attempt}/{ATTEMPTS} not ready: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
             if attempt < ATTEMPTS:
                 time.sleep(SLEEP_SECONDS)
     raise SystemExit(f"production forward proof did not converge: {type(last_error).__name__}: {last_error}")
