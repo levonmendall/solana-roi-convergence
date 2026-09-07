@@ -21,8 +21,8 @@ jobs:
         env:
           EXPECTED_RELEASE_COMMIT: dfa4173b2461b5f545867d2e55d2a4e780d38459
           SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
-          FORWARD_PROOF_PROBE_ATTEMPTS: '1'
-          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
+          FORWARD_PROOF_PROBE_ATTEMPTS: '3'
+          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '30'
           FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
           PYTHONUNBUFFERED: '1'
         run: python tests/production_forward_proof_probe.py
