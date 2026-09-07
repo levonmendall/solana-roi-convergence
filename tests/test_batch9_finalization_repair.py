@@ -8,6 +8,7 @@ from solana_roi import batch9_finalization_repair as repair
 from solana_roi import continuity_storage_capacity_repair as storage
 from solana_roi import high_volume_signature_cursor_repair as high_volume
 from solana_roi import poll_exception_rearm as exception_rearm
+from solana_roi import poll_pagination_context as pagination
 from solana_roi import poll_watermark_repair as watermark
 from solana_roi import robinhood_production_ws_transport as transport
 from solana_roi import robinhood_usage_bounded_transport as bounded
@@ -17,6 +18,7 @@ def test_production_finalizer_preserves_canonical_top_level_identities() -> None
     from solana_roi.production import app  # noqa: F401
 
     assert watermark._slot_fetch_delta is exception_rearm._exception_rearm_fetch_delta
+    assert pagination._HIGH_VOLUME_DELTA_HOOK is high_volume._maybe_fetch_high_volume_exact_cursor
     assert getattr(watermark._slot_poll_page, "_roi_high_volume_standby_priority", False) is True
     assert getattr(watermark._slot_poll_page, "_roi_high_volume_signature_cursor", False) is True
     assert transport._production_ws_run is bounded._production_ws_run
