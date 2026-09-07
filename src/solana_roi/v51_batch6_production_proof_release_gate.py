@@ -200,34 +200,66 @@ def _release_assertion(
 def _accounting_assertion(candidate_accounting: dict[str, Any]) -> dict[str, Any]:
     accounting = _dict(candidate_accounting)
     conservation = _dict(accounting.get("candidate_conservation"))
-    anomalies = accounting.get("classification_anomalies")
-    if not isinstance(anomalies, list):
-        anomalies = []
+    anomalies_raw = accounting.get("classification_anomalies")
+
+    # Canonical five-lane accounting uses explicit *_candidate_count names and
+    # `candidate_population_verifiable`. Batch 6 originally consumed shorter
+    # aliases that only existed in its unit-test fixture. Read the canonical schema
+    # first and retain aliases solely for backward-compatible test/replay payloads.
+    population_verifiable = bool(
+        conservation.get("candidate_population_verifiable", conservation.get("population_verifiable"))
+    )
+    observed = conservation.get("observed_candidate_count", conservation.get("observed"))
+    terminal = conservation.get("terminal_candidate_count", conservation.get("terminal"))
+    valid_pending = conservation.get("valid_pending_candidate_count", conservation.get("valid_pending"))
+    coverage_debt = conservation.get("coverage_debt_candidate_count", conservation.get("coverage_debt"))
+    unexplained = conservation.get("unexplained_candidate_count", conservation.get("unexplained"))
+
+    anomaly_blockers: list[str] = []
+    if isinstance(anomalies_raw, list):
+        anomaly_blockers = [str(value) for value in anomalies_raw if str(value)]
+    elif isinstance(anomalies_raw, dict):
+        if anomalies_raw.get("local_candidate_store_readable") is False:
+            anomaly_blockers.append("local_candidate_store_unreadable")
+        if int(anomalies_raw.get("unclassified_solana_candidate_count") or 0) > 0:
+            anomaly_blockers.append("unclassified_solana_candidates")
+        if int(anomalies_raw.get("orphan_stage_state_count") or 0) > 0:
+            anomaly_blockers.append("orphan_candidate_stage_states")
+        if bool(anomalies_raw.get("robinhood_count_inconsistency")):
+            anomaly_blockers.append("robinhood_candidate_count_inconsistency")
+
+    verification_blockers = conservation.get("verification_blockers")
+    if isinstance(verification_blockers, list):
+        anomaly_blockers.extend(
+            str(value) for value in verification_blockers if str(value) and str(value) not in anomaly_blockers
+        )
+
     passed = bool(
         accounting.get("coverage_complete")
-        and conservation.get("population_verifiable")
+        and population_verifiable
         and conservation.get("conserved")
         and conservation.get("reconciled")
-        and int(conservation.get("coverage_debt") or 0) == 0
-        and int(conservation.get("unexplained") or 0) == 0
-        and not anomalies
+        and int(coverage_debt or 0) == 0
+        and int(unexplained or 0) == 0
+        and not anomaly_blockers
     )
     return {
         "pass": passed,
         "coverage_complete": bool(accounting.get("coverage_complete")),
-        "population_verifiable": bool(conservation.get("population_verifiable")),
+        "population_verifiable": population_verifiable,
         "conserved": bool(conservation.get("conserved")),
         "reconciled": bool(conservation.get("reconciled")),
-        "observed": conservation.get("observed"),
-        "terminal": conservation.get("terminal"),
-        "valid_pending": conservation.get("valid_pending"),
-        "coverage_debt": conservation.get("coverage_debt"),
-        "unexplained": conservation.get("unexplained"),
+        "observed": observed,
+        "terminal": terminal,
+        "valid_pending": valid_pending,
+        "coverage_debt": coverage_debt,
+        "unexplained": unexplained,
         "conservation_delta": conservation.get("conservation_delta"),
-        "classification_anomalies": anomalies,
+        "classification_anomalies": anomalies_raw if isinstance(anomalies_raw, (list, dict)) else {},
+        "verification_blockers": anomaly_blockers,
         "no_disappeared_candidates": bool(
             conservation.get("reconciled")
-            and int(conservation.get("unexplained") or 0) == 0
+            and int(unexplained or 0) == 0
         ),
     }
 
