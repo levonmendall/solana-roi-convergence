@@ -12,10 +12,10 @@ jobs:
   probe:
     if: ${{ !contains(github.event.head_commit.message, '[diagnostic-result]') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Probe exact live lifecycle truth
+      - name: Inspect exact live continuity and lifecycle blockers
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
           EXPECTED_SHA: ceb6f7743c7f9d4ac72bbd3a8c95bbe78a8cb579
@@ -23,71 +23,33 @@ jobs:
           mkdir -p diagnostics
           python - <<'PY' | tee diagnostics/current-lifecycle-proof.txt
           import json, os, urllib.request
-
-          base = os.environ['BASE_URL'].rstrip('/')
-          expected = os.environ['EXPECTED_SHA']
-          paths = [
-              '/health',
-              '/v1/strategy/e2e-status',
-              '/v1/strategy/forward-certification',
-              '/v1/strategy/production-proof',
-          ]
-
+          base=os.environ['BASE_URL'].rstrip('/')
+          expected=os.environ['EXPECTED_SHA']
           def get(path):
-              req = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'solana-roi-lifecycle-diagnostic/3'})
-              with urllib.request.urlopen(req, timeout=90) as r:
-                  return json.loads(r.read().decode())
-
-          def collect(obj, path='$', out=None):
-              if out is None: out=[]
-              if isinstance(obj, dict):
-                  interesting = {
-                      'paper_execution_lifecycle','lifecycle_proven','worker_running','worker_healthy',
-                      'last_tick_at','last_error','tick_count','retry_tick_count','reservation_sync_count',
-                      'settlement_sync_count','open_position_count','open_positions_by_lane',
-                      'lifecycle_event_counts','capital_reconciliation','settlement_count','realized_pnl',
-                      'realized_pnl_sol','realized_return','paper_only','live_money_authority',
-                      'signing_available','transaction_submission_available','release_commit',
-                      'state','blockers','runtime_ready','all_regimes_paper_capable','all_regimes_e2e_proven'
-                  }
-                  for k,v in obj.items():
-                      p=f'{path}.{k}'
-                      if k in interesting:
-                          out.append((p,v))
-                      collect(v,p,out)
-              elif isinstance(obj, list):
-                  for i,v in enumerate(obj): collect(v,f'{path}[{i}]',out)
-              return out
-
-          payloads={}
-          for path in paths:
-              try:
-                  payloads[path]=get(path)
-                  print(f'FETCH_OK {path}')
-              except Exception as exc:
-                  print(f'FETCH_ERROR {path} {type(exc).__name__}: {exc}')
-
-          releases=[]
-          for path,p in payloads.items():
-              if isinstance(p,dict):
-                  if p.get('release_commit'): releases.append((path,p.get('release_commit')))
-                  rel=p.get('release')
-                  if isinstance(rel,dict) and rel.get('release_commit'): releases.append((path,rel.get('release_commit')))
-          print('EXPECTED_SHA', expected)
-          print('RELEASES', json.dumps(releases, sort_keys=True))
-
-          for path,p in payloads.items():
-              print('===',path,'===')
-              for key,val in collect(p):
-                  print(key, '=', json.dumps(val, sort_keys=True, default=str))
-              if isinstance(p,dict): print('TOP_KEYS', sorted(p.keys()))
-
-          assert any(str(v)==expected for _,v in releases), f'live release does not expose expected SHA {expected}'
+              req=urllib.request.Request(base+path,headers={'Accept':'application/json','User-Agent':'solana-roi-continuity-diagnostic/1'})
+              with urllib.request.urlopen(req,timeout=30) as r: return json.loads(r.read().decode())
+          e2e=get('/v1/strategy/e2e-status')
+          assert e2e.get('release_commit')==expected,(e2e.get('release_commit'),expected)
+          sol=e2e.get('solana') or {}
+          fomo=e2e.get('fomo') or {}
+          td=sol.get('transport_diagnostics') or {}
+          out={
+              'release_commit':e2e.get('release_commit'),
+              'solana_runtime_ready':sol.get('runtime_ready'),
+              'solana_blockers':sol.get('blockers'),
+              'fomo_runtime_ready':fomo.get('runtime_ready'),
+              'fomo_blockers':fomo.get('blockers'),
+              'strategy_relevant_continuity':td.get('strategy_relevant_continuity'),
+              'release_continuity_epoch':td.get('release_continuity_epoch'),
+              'direct_solana':td.get('direct_solana'),
+              'read_boundary':e2e.get('read_boundary'),
+          }
+          print(json.dumps(out,sort_keys=True,indent=2,default=str))
           PY
       - name: Persist diagnostic result on diagnostic branch
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add diagnostics/current-lifecycle-proof.txt
-          git commit -m '[diagnostic-result] persist current lifecycle proof' || exit 0
+          git commit -m '[diagnostic-result] persist continuity blocker proof' || exit 0
           git push
