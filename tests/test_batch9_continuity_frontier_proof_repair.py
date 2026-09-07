@@ -108,12 +108,12 @@ def test_epoch_integrity_binds_to_current_websocket_generation(monkeypatch) -> N
     assert repair._epoch_integrity(plane) is False
 
 
-def test_production_root_composes_batch9_after_legacy_graph() -> None:
+def test_production_root_composes_finalized_batch9_after_legacy_graph() -> None:
     from solana_roi import production_system
 
     source = Path(production_system.__file__).read_text(encoding="utf-8")
-    assert "install_batch9_continuity_frontier_proof_repair(app)" in source
-    assert "v12-batch9-continuity-frontier-proof" in source
+    assert "install_batch9_finalization_repair(app)" in source
+    assert "v13-batch9-finalized" in source
     assert '"paper_only": PAPER_ONLY' in source
     assert '"live_money_authority": LIVE_MONEY_AUTHORITY' in source
     assert '"signing_available": SIGNING_AVAILABLE' in source
