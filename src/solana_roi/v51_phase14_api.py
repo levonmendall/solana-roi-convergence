@@ -3,8 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from .v51_batch6_production_proof_release_gate import build_batch6_production_proof_gate
+from .strategy_v51_authority import ECONOMIC_FREEZE_EPOCH
+from .v51_batch6_production_proof_release_gate import (
+    BATCH6_PROOF_VERSION,
+    build_batch6_production_proof_gate,
+)
 from .v51_candidate_lane_accounting import build_five_lane_candidate_accounting
+from .v51_measurement_integrity import MEASUREMENT_EPOCH
 from .v51_phase14_profitability_certification import PHASE14_VERSION
 from .v51_phase17_attestation_hardening import (
     ATTESTATION_HARDENING_VERSION,
@@ -51,6 +56,36 @@ def _insufficient_certificate() -> dict[str, Any]:
         "surface_attestation_hardening_version": ATTESTATION_HARDENING_VERSION,
         "surface_scoped_attestation_required": True,
         "aggregate_attestation_fallback_allowed": False,
+        "changes_strategy_authority": False,
+        "changes_economic_thresholds": False,
+        "paper_only": True,
+        "live_money_authority": False,
+        "signing_available": False,
+        "transaction_submission_available": False,
+    }
+
+
+def _unavailable_batch6_gate(reason: str) -> dict[str, Any]:
+    return {
+        "batch6_production_proof_version": BATCH6_PROOF_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "proof_id": None,
+        "pass": False,
+        "verdict": "FAIL_CLOSED",
+        "single_fail_closed_verdict": True,
+        "missing_or_unknown_evidence_fails_closed": True,
+        "economic_epoch": ECONOMIC_FREEZE_EPOCH,
+        "measurement_epoch": MEASUREMENT_EPOCH,
+        "batch6_starts_new_measurement_epoch": False,
+        "assertions": {},
+        "blockers": [reason],
+        "artifact": {
+            "table": "v51_batch6_production_proof_artifacts",
+            "proof_id": None,
+            "persisted": False,
+            "reason": reason,
+        },
+        "read_only_strategy_authority": True,
         "changes_strategy_authority": False,
         "changes_economic_thresholds": False,
         "paper_only": True,
@@ -133,11 +168,16 @@ def install_phase14_profitability_certification(
             proof = current_system_proof()
             if not isinstance(proof, dict):
                 certificate = _insufficient_certificate()
-                batch6_gate = build_batch6_production_proof_gate(
-                    runtime_obj.store,
-                    system_proof={},
-                    candidate_accounting={},
-                    forward_certification={},
+                store = getattr(runtime_obj, "store", None)
+                batch6_gate = (
+                    build_batch6_production_proof_gate(
+                        store,
+                        system_proof={},
+                        candidate_accounting={},
+                        forward_certification={},
+                    )
+                    if store is not None
+                    else _unavailable_batch6_gate("canonical_runtime_store_unavailable")
                 )
                 return {
                     "production_proof_api_version": PRODUCTION_PROOF_API_VERSION,
@@ -151,6 +191,11 @@ def install_phase14_profitability_certification(
                         "live_money_authority": False,
                         "signing_available": False,
                         "transaction_submission_available": False,
+                    },
+                    "epochs": {
+                        "economic_epoch": ECONOMIC_FREEZE_EPOCH,
+                        "measurement_epoch": MEASUREMENT_EPOCH,
+                        "batch6_starts_new_measurement_epoch": False,
                     },
                     "candidate_accounting": {},
                     "forward_certification": {},
