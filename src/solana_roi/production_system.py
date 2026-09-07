@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v12-batch9-continuity-frontier-proof"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -72,6 +72,9 @@ class ProductionSystem:
             "batch9_continuity_frontier_proof_repair_version": getattr(
                 self.app.state, "roi_batch9_continuity_frontier_proof_repair_version", None
             ),
+            "batch9_canonical_contracts_preserved": bool(
+                getattr(self.app.state, "roi_batch9_canonical_contracts_preserved", False)
+            ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -138,31 +141,23 @@ def build_production_system() -> ProductionSystem:
     # behavior without restoring hidden package-import authority.
     from . import legacy_package_runtime_composition as _legacy_package_runtime_composition
     from . import legacy_production_composition as _legacy_production_composition
-    from .batch9_continuity_frontier_proof_repair import (
-        install_batch9_continuity_frontier_proof_repair,
-    )
-    from .batch9_scout_checkpoint_commit_repair import (
-        install_batch9_scout_checkpoint_commit_repair,
-    )
+    from .batch9_finalization_repair import install_batch9_finalization_repair
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
 
     _ = _legacy_package_runtime_composition
     app = _legacy_production_composition.app
     ingestion_runtime = _legacy_production_composition.ingestion_runtime
 
-    # Exact-release production evidence after Batch 8 exposed three root boundaries:
+    # Exact-release production evidence after Batch 8 exposed four root boundaries:
     # strategy-scout polling lacked a durable per-target restart checkpoint, the
     # isolated Robinhood proof worker was a second SQLite writer on the live store,
-    # and production WSS readiness advanced a cursor before establishing a concrete
-    # generation anchor/processing closed blocks. Phase-13 proof precompute was also
-    # configured but never scheduled. Install the coordinated repair only after the
-    # full legacy graph has composed so it wraps the actual final runtime methods.
+    # production WSS could publish readiness without a concrete generation anchor,
+    # and Phase-13 proof precompute was configured but never scheduled. The finalizer
+    # inserts those repairs beneath the already-established canonical poll, bounded
+    # WSS, and frontier contracts rather than replacing their top-level identities.
     # Economic rules, 20-second authority, paper sizing, signing/submission and
     # live-money boundaries are unchanged.
-    install_batch9_continuity_frontier_proof_repair(app)
-    # A fallback-only scout delta must commit receipts before its durable cursor can
-    # move. This preserves restart losslessness if a receipt write itself fails.
-    install_batch9_scout_checkpoint_commit_repair()
+    install_batch9_finalization_repair(app)
 
     # The dedicated certification surface must not synchronously execute the full
     # ingestion audit (including append-only event-chain verification) and then
