@@ -13,7 +13,7 @@ def _get(path: str) -> dict:
     started = time.monotonic()
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
-        headers={"Accept": "application/json", "User-Agent": "solana-roi-live-certification-diagnostic/2"},
+        headers={"Accept": "application/json", "User-Agent": "solana-roi-live-certification-diagnostic/3"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -71,8 +71,16 @@ def main() -> None:
         "last_backfill_complete_at": direct.get("last_backfill_complete_at"),
         "last_backfill_error": direct.get("last_backfill_error"),
         "hydration_queue": direct.get("hydration_queue"),
-        "source_receipts_last_hour": direct.get("source_receipts_last_hour"),
-        "hydration": direct.get("hydration"),
+        "recent_hydration_5m": direct.get("recent_hydration_5m"),
+        "target_stream_fanout": direct.get("target_stream_fanout"),
+        "full_scope_target_quorum": direct.get("full_scope_target_quorum"),
+        "live_poll_redundancy": direct.get("live_poll_redundancy"),
+        "strategy_relevant_continuity": direct.get("strategy_relevant_continuity"),
+        "strategy_scout_durable_poll_recovery": direct.get("strategy_scout_durable_poll_recovery"),
+        "continuity_startup_barrier": direct.get("continuity_startup_barrier"),
+        "continuity_epoch": direct.get("continuity_epoch"),
+        "subscription_setup": direct.get("subscription_setup"),
+        "provider_runtime_policy": direct.get("provider_runtime_policy"),
         "paper_only": direct.get("paper_only"),
     }
 
@@ -84,6 +92,10 @@ def main() -> None:
         },
         "direct_solana": direct_summary,
         "e2e_release_commit": e2e.get("release_commit"),
+        "e2e_solana": e2e.get("solana"),
+        "e2e_fomo": e2e.get("fomo"),
+        "e2e_robinhood": e2e.get("robinhood"),
+        "e2e_overall": e2e.get("overall"),
         "certificate_release_commit": certificate.get("release_commit"),
         "production_release_commit": (production.get("release") or {}).get("release_commit"),
         "composition_release_commit": composition.get("release_commit"),
