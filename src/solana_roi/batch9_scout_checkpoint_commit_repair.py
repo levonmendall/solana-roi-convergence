@@ -3,13 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 from . import batch9_continuity_frontier_proof_repair as batch9
+from . import continuity_storage_capacity_repair as storage_capacity
 from . import live_poll_redundancy as live_poll
 from . import poll_recoverability_lease as lease
 from . import poll_watermark_repair as watermark
 from .direct_solana import WatchTarget
 
 
-REPAIR_VERSION = "batch9-scout-checkpoint-commit-order-v1"
+REPAIR_VERSION = "batch9-scout-checkpoint-commit-order-v2-canonical-page-identity"
 _ORIGINAL_RECORD_ROWS = None
 _INSTALLED = False
 
@@ -66,6 +67,15 @@ def install_batch9_scout_checkpoint_commit_repair() -> None:
     _ORIGINAL_RECORD_ROWS = live_poll._record_poll_rows
     watermark._slot_fetch_delta = _fetch_with_commit_order  # type: ignore[assignment]
     live_poll._record_poll_rows = _record_rows_then_checkpoint  # type: ignore[assignment]
+
+    # Production composition historically exposes one canonical routine poll-page
+    # identity through all three compatibility references. Batch 9 changes scout-only
+    # behavior at that page boundary, so keep the established aliases synchronized
+    # rather than creating a parallel transport root. This changes no provider scope,
+    # recovery bound, lease, or authority semantics.
+    storage_capacity._sharded_slot_poll_page = watermark._slot_poll_page  # type: ignore[assignment]
+    live_poll._poll_page = watermark._slot_poll_page  # type: ignore[assignment]
+
     _INSTALLED = True
 
 
