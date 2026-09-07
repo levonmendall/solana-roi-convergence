@@ -63,7 +63,7 @@ def test_bounded_e2e_status_uses_only_required_live_status_inputs(monkeypatch) -
     assert result["read_boundary"]["transaction_submission_available"] is False
 
 
-def test_installer_replaces_only_dedicated_e2e_route(monkeypatch) -> None:
+def _fake_app():
     original_ingestion = lambda: {"full": "audit"}
     original_e2e = lambda: {"old": True}
     ingestion_route = SimpleNamespace(
@@ -80,22 +80,44 @@ def test_installer_replaces_only_dedicated_e2e_route(monkeypatch) -> None:
         routes=[ingestion_route, e2e_route],
         state=SimpleNamespace(),
     )
-    runtime = SimpleNamespace()
+    return app, ingestion_route, e2e_route, original_ingestion
 
-    monkeypatch.setattr(
-        repair,
-        "build_bounded_e2e_status",
-        lambda runtime_provider, robinhood_provider: {"bounded": runtime_provider() is runtime},
-    )
 
-    repair.install_e2e_status_read_boundary_repair(app, lambda: runtime)
+def test_installer_replaces_only_dedicated_e2e_route(monkeypatch) -> None:
+    app, ingestion_route, e2e_route, original_ingestion = _fake_app()
+    monkeypatch.setattr(repair, "_SNAPSHOT", None)
+    monkeypatch.setattr(repair, "_SNAPSHOT_PUBLISHED_MONOTONIC", None)
+    repair._publish_snapshot({"bounded": True})
+
+    repair.install_e2e_status_read_boundary_repair(app, lambda: SimpleNamespace())
 
     assert ingestion_route.endpoint is original_ingestion
     assert ingestion_route.dependant.call is original_ingestion
-    assert e2e_route.endpoint() == {"bounded": True}
+    assert e2e_route.endpoint()["bounded"] is True
     assert e2e_route.dependant.call is e2e_route.endpoint
     assert getattr(app.state, "roi_e2e_status_read_boundary") is True
+    assert getattr(app.state, "roi_e2e_status_read_boundary_v2") is True
+    assert getattr(app.state, "roi_e2e_status_http_deep_builder_disabled") is True
     assert getattr(app.state, "roi_e2e_status_read_boundary_version") == repair.REPAIR_VERSION
+
+
+def test_installer_is_app_scoped_not_process_global(monkeypatch) -> None:
+    monkeypatch.setattr(repair, "_SNAPSHOT", None)
+    monkeypatch.setattr(repair, "_SNAPSHOT_PUBLISHED_MONOTONIC", None)
+    repair._publish_snapshot({"bounded": "fresh"})
+
+    first_app, _, first_e2e, _ = _fake_app()
+    second_app, _, second_e2e, _ = _fake_app()
+
+    repair.install_e2e_status_read_boundary_repair(first_app, lambda: SimpleNamespace())
+    repair.install_e2e_status_read_boundary_repair(second_app, lambda: SimpleNamespace())
+
+    assert first_e2e.endpoint()["bounded"] == "fresh"
+    assert second_e2e.endpoint()["bounded"] == "fresh"
+    assert first_e2e.endpoint is repair._cached_e2e_status
+    assert second_e2e.endpoint is repair._cached_e2e_status
+    assert getattr(first_app.state, "roi_e2e_status_read_boundary_v2") is True
+    assert getattr(second_app.state, "roi_e2e_status_read_boundary_v2") is True
 
 
 def test_production_composition_owns_the_read_boundary() -> None:
