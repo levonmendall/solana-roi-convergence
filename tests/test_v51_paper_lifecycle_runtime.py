@@ -189,12 +189,25 @@ def test_shadow_balance_exception_is_narrow_and_preserves_real_failures() -> Non
         "token_restriction": False,
         "transfer_failure": False,
     }
-    assert lifecycle._proven_paper_balance_artifact(base) is True
-    assert lifecycle._proven_paper_balance_artifact({**base, "amount_match": False}) is False
-    assert lifecycle._proven_paper_balance_artifact({**base, "route_valid": False}) is False
-    assert lifecycle._proven_paper_balance_artifact({**base, "token_restriction": True}) is False
-    assert lifecycle._proven_paper_balance_artifact({**base, "transfer_failure": True}) is False
-    assert lifecycle._proven_paper_balance_artifact({**base, "error": "custom program error"}) is False
+    # A broad InsufficientFunds result is not sufficient. Production must also
+    # independently prove that this exact virtual PAPER position exceeds the real
+    # shadow wallet's observed balance for the same input mint.
+    assert lifecycle._proven_paper_balance_artifact(base) is False
+    proven = {
+        **base,
+        "shadow_wallet_balance_observed": True,
+        "shadow_wallet_input_balance_raw": 0,
+        "paper_position_exceeds_shadow_balance": True,
+    }
+    assert lifecycle._proven_paper_balance_artifact(proven) is True
+    assert lifecycle._proven_paper_balance_artifact({**proven, "shadow_wallet_balance_observed": False}) is False
+    assert lifecycle._proven_paper_balance_artifact({**proven, "shadow_wallet_input_balance_raw": None}) is False
+    assert lifecycle._proven_paper_balance_artifact({**proven, "paper_position_exceeds_shadow_balance": False}) is False
+    assert lifecycle._proven_paper_balance_artifact({**proven, "amount_match": False}) is False
+    assert lifecycle._proven_paper_balance_artifact({**proven, "route_valid": False}) is False
+    assert lifecycle._proven_paper_balance_artifact({**proven, "token_restriction": True}) is False
+    assert lifecycle._proven_paper_balance_artifact({**proven, "transfer_failure": True}) is False
+    assert lifecycle._proven_paper_balance_artifact({**proven, "error": "custom program error"}) is False
 
 
 def test_production_authority_wires_lifecycle_after_exact_exit_installation() -> None:
