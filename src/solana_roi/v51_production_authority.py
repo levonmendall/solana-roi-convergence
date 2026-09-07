@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from . import robinhood_live_frontier_verification_repair as robinhood_frontier
 from .candidate_execution_evidence_plane import install_candidate_execution_evidence_plane
+from .fomo_paper_strategy import install_fomo_paper_strategy
 from .fomo_runtime_install import install_fomo_runtime
 from .robinhood_decision_tail_repair import (
     install_robinhood_decision_tail_repair,
@@ -59,7 +60,7 @@ from .v51_system_proof import install_system_proof
 
 _ORIGINAL_ROBINHOOD_FRESH_HEAD_READY = robinhood_frontier._fresh_head_ready
 
-COMPOSITION_VERSION = "v51-explicit-production-authority-v7-exit-due-recovery"
+COMPOSITION_VERSION = "v51-explicit-production-authority-v8-fomo-paper-entry"
 _INSTALLED = False
 
 
@@ -147,10 +148,13 @@ def install_v51_production_authority(
     # created by the retired 47-adapter registry.
     install_candidate_execution_evidence_plane()
 
-    # FOMO is likewise a first-class paper surface, not an incidental side effect of
-    # wallet-router precision installation. Its observation layer must exist before
-    # Phase 16 installs the single terminal/FOMO exact-exit engine.
+    # FOMO is a first-class PAPER strategy. Install its read-only observation runtime
+    # first, then explicitly install the paper-entry authority before Phase 16 wraps
+    # the adapter with the single terminal/FOMO exact-exit engine. Keeping both calls
+    # here prevents a research-only FOMO surface from being mistaken for an active
+    # entry strategy and avoids relying on import side effects.
     install_fomo_runtime()
+    install_fomo_paper_strategy()
 
     install_measurement_integrity()
     install_measurement_integrity_hardening()
@@ -245,6 +249,7 @@ def install_v51_production_authority(
     app.state.roi_final_production_proof_readiness = True
     app.state.roi_candidate_execution_evidence_plane_explicit = True
     app.state.roi_fomo_runtime_explicit = True
+    app.state.roi_fomo_paper_strategy_explicit = True
     _INSTALLED = True
 
 
@@ -254,7 +259,8 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "economic_authority_installation": "explicit_call_from_solana_roi.production_after_robinhood_transport_install",
         "candidate_execution_plane_installation": "explicit_before_measurement_integrity",
-        "fomo_runtime_installation": "explicit_first_class_paper_surface_before_terminal_exact_exit",
+        "fomo_runtime_installation": "explicit_research_observation_before_fomo_paper_strategy",
+        "fomo_paper_strategy_installation": "explicit_active_paper_entry_authority_before_terminal_exact_exit",
         "measurement_integrity_installation": "separate_compatibility_plane_at_same_explicit_production_boundary",
         "paper_lifecycle_installation": "explicit_after_single_phase16_exact_exit_engine_at_production_boundary",
         "exit_due_recovery_installation": "explicit_after_paper_lifecycle_wrapper_at_production_boundary",
