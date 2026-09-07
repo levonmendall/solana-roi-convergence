@@ -46,6 +46,10 @@ def test_batch7_rotation_does_not_rewrite_historical_epoch_tags(monkeypatch) -> 
     historical_release = "1" * 40
     current_release = "2" * 40
 
+    # Only the running release may auto-register as measurement-valid. Register the
+    # first release while it is current, then preserve it as historical before
+    # switching the runtime identity to the Batch 7 release.
+    monkeypatch.setenv("RENDER_GIT_COMMIT", historical_release)
     historical = ensure_release_compatibility(store, historical_release)
     assert historical is not None
     with store._lock, store.db:
@@ -54,9 +58,9 @@ def test_batch7_rotation_does_not_rewrite_historical_epoch_tags(monkeypatch) -> 
             (PRE_BATCH7_MEASUREMENT_EPOCH, historical_release),
         )
 
-    preserved = ensure_release_compatibility(store, historical_release)
     monkeypatch.setenv("RENDER_GIT_COMMIT", current_release)
     current = ensure_release_compatibility(store, current_release)
+    preserved = ensure_release_compatibility(store, historical_release)
 
     assert preserved is not None
     assert current is not None
