@@ -11,7 +11,7 @@ from typing import Any, Callable
 from . import render_runtime_bootstrap_repair as render_bootstrap
 
 
-REPAIR_VERSION = "production-proof-read-boundary-v1-precomputed-nonblocking"
+REPAIR_VERSION = "production-proof-read-boundary-v2-stable-worker-chain"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -228,6 +228,28 @@ async def _runtime_workers_with_production_proof_snapshot(runtime: Any, stop: as
 setattr(_runtime_workers_with_production_proof_snapshot, "_roi_production_proof_snapshot_worker", True)
 
 
+def _current_worker_chain_already_contains_production_proof(current_workers: Callable[..., Any]) -> bool:
+    """Detect an existing production-proof worker even when E2E wrapped it later.
+
+    Tests and production composition can install these app-scoped read boundaries in
+    different orders in the same interpreter. The E2E wrapper stores its delegated
+    worker in its module-level `_ORIGINAL_RUNTIME_WORKERS`; if that delegated worker is
+    already this production-proof wrapper, wrapping E2E again would create a cycle:
+    E2E -> production proof -> E2E. Preserve the existing chain instead.
+    """
+    if bool(getattr(current_workers, "_roi_production_proof_snapshot_worker", False)):
+        return True
+    if not bool(getattr(current_workers, "_roi_e2e_status_snapshot_worker", False)):
+        return False
+    try:
+        from . import e2e_status_read_boundary_repair as e2e
+
+        delegated = getattr(e2e, "_ORIGINAL_RUNTIME_WORKERS", None)
+    except Exception:
+        delegated = None
+    return bool(getattr(delegated, "_roi_production_proof_snapshot_worker", False))
+
+
 def install_production_proof_read_boundary_repair(app: Any) -> None:
     """Move expensive canonical production-proof composition off the HTTP path."""
     global _ORIGINAL_RUNTIME_WORKERS, _ORIGINAL_PRODUCTION_PROOF
@@ -255,8 +277,17 @@ def install_production_proof_read_boundary_repair(app: Any) -> None:
         dependant.call = _cached_production_proof
 
     current_workers = render_bootstrap._run_runtime_workers
-    if not bool(getattr(current_workers, "_roi_production_proof_snapshot_worker", False)):
+    if _current_worker_chain_already_contains_production_proof(current_workers):
+        # Propagate the marker to an outer E2E wrapper so future app composition sees
+        # the whole chain as already owning the proof publisher and never re-wraps it.
+        setattr(current_workers, "_roi_production_proof_snapshot_worker", True)
+    else:
         _ORIGINAL_RUNTIME_WORKERS = current_workers
+        # When production composition installs E2E first, advertise that this outer
+        # wrapper still contains the E2E publisher. That prevents a later app-scoped
+        # E2E installation from wrapping us again and forming the opposite half-cycle.
+        delegates_e2e = bool(getattr(current_workers, "_roi_e2e_status_snapshot_worker", False))
+        setattr(_runtime_workers_with_production_proof_snapshot, "_roi_e2e_status_snapshot_worker", delegates_e2e)
         render_bootstrap._run_runtime_workers = _runtime_workers_with_production_proof_snapshot  # type: ignore[assignment]
 
     existing = {getattr(candidate, "path", None) for candidate in app.routes}
@@ -280,6 +311,7 @@ __all__ = [
     "SNAPSHOT_STALE_SECONDS",
     "_cache_state",
     "_cached_production_proof",
+    "_current_worker_chain_already_contains_production_proof",
     "_publish_snapshot",
     "install_production_proof_read_boundary_repair",
 ]
