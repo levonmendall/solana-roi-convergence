@@ -111,7 +111,8 @@ def test_exact_amount_reservation_rejects_instead_of_silent_downsize(tmp_path) -
             (RELEASE, "fomo-b"),
         )
 
-    lifecycle.sync_entry_reservations(adapter)
+    assert lifecycle.sync_entry_reservations(adapter, "sol-a") == 1
+    assert lifecycle.sync_entry_reservations(adapter, "fomo-b") == 0
     with store._lock:
         reservations = [
             dict(row)
@@ -124,8 +125,10 @@ def test_exact_amount_reservation_rejects_instead_of_silent_downsize(tmp_path) -
         fomo = store.db.execute(
             "SELECT decision,decision_reason,position_fraction FROM fomo_paper_trials WHERE source_signature='fomo-b'"
         ).fetchone()
+    assert reservations[0]["reservation_id"] == "solana:sol-a"
     assert reservations[0]["status"] == "active"
     assert reservations[0]["reserved_fraction"] == pytest.approx(0.60)
+    assert reservations[1]["reservation_id"] == "fomo:fomo-b"
     assert reservations[1]["status"] == "rejected"
     assert reservations[1]["requested_fraction"] == pytest.approx(0.50)
     assert reservations[1]["reserved_fraction"] == pytest.approx(0.0)
@@ -135,8 +138,7 @@ def test_exact_amount_reservation_rejects_instead_of_silent_downsize(tmp_path) -
     store.close()
 
 
-@pytest.mark.asyncio
-async def test_lifecycle_tick_advances_exit_retry_without_new_observation(tmp_path, monkeypatch) -> None:
+def test_lifecycle_tick_advances_exit_retry_without_new_observation(tmp_path, monkeypatch) -> None:
     store = ObservationEventStore(tmp_path / "tick.sqlite3")
     _schema(store)
     adapter = DummyAdapter(store)
@@ -148,7 +150,7 @@ async def test_lifecycle_tick_advances_exit_retry_without_new_observation(tmp_pa
 
     monkeypatch.setattr(exact, "_retry_due", retry_due)
     before = lifecycle.status()["retry_tick_count"]
-    result = await lifecycle.lifecycle_tick(adapter)
+    result = asyncio.run(lifecycle.lifecycle_tick(adapter))
     assert calls == ["retry"]
     assert result == {"entry_sync": 0, "settlement_sync": 0}
     assert lifecycle.status()["retry_tick_count"] == before + 1
