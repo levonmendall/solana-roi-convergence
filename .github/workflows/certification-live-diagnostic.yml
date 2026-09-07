@@ -1,0 +1,31 @@
+name: Certification Live Diagnostic
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/certification-live-diagnostic.yml'
+      - 'tests/production_live_certification_diagnostic.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: certification-live-diagnostic-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  live-read-only-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Read current launched production certification state
+        env:
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          CERTIFICATION_DIAGNOSTIC_HTTP_TIMEOUT_SECONDS: '60'
+          PYTHONUNBUFFERED: '1'
+        run: python tests/production_live_certification_diagnostic.py
