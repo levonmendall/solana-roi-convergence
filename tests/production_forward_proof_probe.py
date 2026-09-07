@@ -14,12 +14,13 @@ SLEEP_SECONDS = float(os.getenv("FORWARD_PROOF_PROBE_SLEEP_SECONDS", "10"))
 # planes. Production observation showed valid 200 responses can exceed 10 seconds;
 # this verifier is post-deploy and must distinguish a slow deep proof from an outage.
 TIMEOUT_SECONDS = float(os.getenv("FORWARD_PROOF_HTTP_TIMEOUT_SECONDS", "60"))
+FIVE_LANES = ("pump_fun", "pump_amm", "raydium", "fomo", "robinhood")
 
 
 def _get(path: str) -> dict:
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
-        headers={"Accept": "application/json", "User-Agent": "solana-roi-forward-proof-ci/3"},
+        headers={"Accept": "application/json", "User-Agent": "solana-roi-forward-proof-ci/4"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -31,6 +32,95 @@ def _get(path: str) -> dict:
 def _assert_safety(payload: dict, *, label: str) -> None:
     assert payload.get("paper_only") is True, f"{label}: paper_only must be true"
     assert payload.get("live_money_authority") is False, f"{label}: live money authority exposed"
+
+
+def _five_lane_result(production: dict) -> dict:
+    accounting = production.get("candidate_accounting") or {}
+    lanes = accounting.get("lane_accounting") or {}
+    conservation = accounting.get("candidate_conservation") or {}
+    assert isinstance(lanes, dict), "production proof: lane accounting unavailable"
+    missing = [lane for lane in FIVE_LANES if lane not in lanes]
+    assert not missing, f"production proof: missing five-lane accounting for {missing}"
+
+    lane_result: dict[str, dict] = {}
+    for lane in FIVE_LANES:
+        value = lanes.get(lane) or {}
+        verified = bool(value.get("verified"))
+        status = str(value.get("status") or "")
+        if not verified:
+            assert status == "unable_to_verify", (
+                f"{lane}: unverified population must be explicit unable_to_verify, got {status!r}"
+            )
+        observed = value.get("observed_candidate_count")
+        reconciled = bool(value.get("reconciled"))
+        if verified and reconciled and int(observed or 0) > 0:
+            outcome = "OBSERVED_AND_RECONCILED"
+        elif verified and reconciled:
+            outcome = "VERIFIED_ZERO_CANDIDATES"
+        else:
+            outcome = "UNABLE_TO_VERIFY"
+        lane_result[lane] = {
+            "outcome": outcome,
+            "verified": verified,
+            "status": status,
+            "observed_candidate_count": observed,
+            "terminal_candidate_count": value.get("terminal_candidate_count"),
+            "valid_pending_candidate_count": value.get("valid_pending_candidate_count"),
+            "coverage_debt_candidate_count": value.get("coverage_debt_candidate_count"),
+            "unexplained_candidate_count": value.get("unexplained_candidate_count"),
+            "conservation_delta": value.get("conservation_delta"),
+            "conserved": value.get("conserved"),
+            "reconciled": value.get("reconciled"),
+            "proof_state": value.get("proof_state"),
+            "coverage_complete": value.get("coverage_complete"),
+        }
+
+    population_verifiable = bool(
+        conservation.get(
+            "candidate_population_verifiable",
+            conservation.get("population_verifiable"),
+        )
+    )
+    unexplained = conservation.get(
+        "unexplained_candidate_count",
+        conservation.get("unexplained"),
+    )
+    coverage_debt = conservation.get(
+        "coverage_debt_candidate_count",
+        conservation.get("coverage_debt"),
+    )
+    if population_verifiable:
+        assert int(unexplained or 0) == 0, "candidate reconciliation has unexplained disappearance"
+        assert int(coverage_debt or 0) == 0, "candidate reconciliation has coverage debt"
+        assert int(conservation.get("conservation_delta") or 0) == 0, "candidate conservation delta is nonzero"
+        assert conservation.get("conserved") is True, "candidate population is not conserved"
+        assert conservation.get("reconciled") is True, "candidate population is not reconciled"
+
+    return {
+        "lanes": lane_result,
+        "candidate_population_verifiable": population_verifiable,
+        "all_lane_sources_verified": conservation.get("all_lane_sources_verified"),
+        "unverified_lanes": conservation.get("unverified_lanes"),
+        "verification_blockers": conservation.get("verification_blockers"),
+        "observed_candidate_count": conservation.get(
+            "observed_candidate_count",
+            conservation.get("observed"),
+        ),
+        "terminal_candidate_count": conservation.get(
+            "terminal_candidate_count",
+            conservation.get("terminal"),
+        ),
+        "valid_pending_candidate_count": conservation.get(
+            "valid_pending_candidate_count",
+            conservation.get("valid_pending"),
+        ),
+        "coverage_debt_candidate_count": coverage_debt,
+        "unexplained_candidate_count": unexplained,
+        "conservation_delta": conservation.get("conservation_delta"),
+        "conserved": conservation.get("conserved"),
+        "reconciled": conservation.get("reconciled"),
+        "classification_anomalies": accounting.get("classification_anomalies"),
+    }
 
 
 def _probe_once() -> dict:
@@ -86,18 +176,27 @@ def _probe_once() -> dict:
     assert resource_pressure.get("read_only_observability") is True
     assert resource_pressure.get("state") in {"healthy", "warning", "critical", "unavailable"}
     assert isinstance(production.get("candidate_accounting"), dict)
+    five_lane = _five_lane_result(production)
     final = production.get("final_certification") or {}
     _assert_safety(final, label="final certification")
     assert final.get("surface_scoped_attestation_required") is True
     assert final.get("aggregate_attestation_fallback_allowed") is False
 
+    batch6_gate = production.get("batch6_release_gate") or {}
+    epochs = production.get("epochs") or {}
     return {
         "release_commit": cert_sha,
         "state": certificate.get("state"),
         "system_forward_certified": certificate.get("system_forward_certified"),
         "production_proof_state": production.get("state"),
+        "production_proof_pass": production.get("production_proof_pass"),
+        "batch6_release_gate_verdict": batch6_gate.get("verdict"),
+        "batch6_release_gate_blockers": batch6_gate.get("blockers"),
+        "economic_epoch": epochs.get("economic_epoch") or epochs.get("economic_freeze_epoch"),
+        "measurement_epoch": epochs.get("measurement_epoch"),
         "final_classification": final.get("classification"),
         "coverage_debt_count": (production.get("candidate_accounting") or {}).get("coverage_debt_count"),
+        "five_lane_candidate_accounting": five_lane,
         "resource_pressure_state": resource_pressure.get("state"),
         "promotion_eligible_families": certificate.get(
             "promotion_eligible_families_under_existing_v51_claims"
