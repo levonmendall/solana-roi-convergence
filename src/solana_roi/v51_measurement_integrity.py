@@ -11,7 +11,7 @@ from typing import Any, Callable
 from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, authority, authority_fingerprint
 
 MEASUREMENT_INTEGRITY_VERSION = "v51-measurement-integrity-v1"
-MEASUREMENT_EPOCH = "v51-measurement-post185-20260905-1"
+MEASUREMENT_EPOCH = "v51-measurement-batch7-20260906-1"
 EXECUTION_MODEL_EPOCH = "v51-execution-model-20260905-1"
 PROOF_MAX_AGE_SECONDS = 120.0
 
