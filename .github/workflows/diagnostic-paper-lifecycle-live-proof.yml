@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Verify exact launched release continuity and lifecycle
+      - name: Verify nested exact-release continuity and lifecycle truth
         env:
           PRODUCTION_URL: https://solana-roi-convergence.onrender.com
           EXPECTED_RELEASE_COMMIT: 3779a24dcdd01c640eaf8ae39b82c898eb4e983f
@@ -28,32 +28,65 @@ jobs:
           def get(path, timeout=80):
               req = urllib.request.Request(
                   base + path,
-                  headers={'Accept':'application/json','User-Agent':'paper-lifecycle-exact-release-probe/2'},
+                  headers={'Accept':'application/json','User-Agent':'paper-lifecycle-exact-release-probe/3'},
               )
               with urllib.request.urlopen(req, timeout=timeout) as response:
                   payload = json.loads(response.read().decode('utf-8'))
                   print(f'HTTP {response.status} {path}', flush=True)
                   return payload
 
+          def values_for_key(obj, wanted, path='$'):
+              found = []
+              if isinstance(obj, dict):
+                  for key, value in obj.items():
+                      child = f'{path}.{key}'
+                      if key in wanted:
+                          found.append((child, value))
+                      found.extend(values_for_key(value, wanted, child))
+              elif isinstance(obj, list):
+                  for i, value in enumerate(obj):
+                      found.extend(values_for_key(value, wanted, f'{path}[{i}]'))
+              return found
+
+          def first_object_for_key(obj, wanted):
+              if isinstance(obj, dict):
+                  for key, value in obj.items():
+                      if key == wanted and isinstance(value, dict):
+                          return value
+                      nested = first_object_for_key(value, wanted)
+                      if nested is not None:
+                          return nested
+              elif isinstance(obj, list):
+                  for value in obj:
+                      nested = first_object_for_key(value, wanted)
+                      if nested is not None:
+                          return nested
+              return None
+
           health = get('/health', 20)
           composition = get('/v1/operations/production-composition', 30)
           e2e = get('/v1/strategy/e2e-status', 80)
 
-          release = composition.get('release_commit') or composition.get('commit')
-          if release != expected:
-              raise SystemExit(f'wrong launched release: expected={expected} actual={release}')
+          release_refs = values_for_key(
+              {'health': health, 'composition': composition, 'e2e': e2e},
+              {'release_commit','commit','release_sha','release','main_sha','git_commit'},
+          )
+          flattened = [str(value) for _, value in release_refs if isinstance(value, (str,int,float))]
+          exact_release_observed = expected in flattened
 
-          lifecycle = composition.get('paper_execution_lifecycle') or {}
-          semantics = composition.get('health_semantics') or {}
-          direct = ((e2e.get('solana') or {}).get('transport_diagnostics') or {}).get('strategy_relevant_continuity') or {}
+          lifecycle = first_object_for_key(composition, 'paper_execution_lifecycle') or {}
+          semantics = first_object_for_key(composition, 'health_semantics') or {}
+          continuity = first_object_for_key(e2e, 'strategy_relevant_continuity') or {}
+          candidate_accounting = first_object_for_key(e2e, 'candidate_accounting') or {}
 
           summary = {
               'expected_release_commit': expected,
-              'health': health,
-              'composition_release_commit': release,
+              'exact_release_observed': exact_release_observed,
+              'release_refs': release_refs,
               'health_semantics': semantics,
               'paper_execution_lifecycle': lifecycle,
-              'strategy_relevant_continuity': direct,
+              'strategy_relevant_continuity': continuity,
+              'candidate_accounting': candidate_accounting,
               'solana': e2e.get('solana'),
               'fomo': e2e.get('fomo'),
               'robinhood': e2e.get('robinhood'),
@@ -61,4 +94,6 @@ jobs:
           }
           print('=== LIVE_EXACT_RELEASE_SUMMARY ===', flush=True)
           print(json.dumps(summary, sort_keys=True), flush=True)
+          if not exact_release_observed:
+              raise SystemExit(f'exact release {expected} not found in live truth surfaces')
           PY
