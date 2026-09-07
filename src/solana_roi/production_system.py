@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v14-paper-lifecycle-truth"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-paper-lifecycle-truth"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -74,9 +74,6 @@ class ProductionSystem:
             lifecycle_state = "UNAVAILABLE"
         return {
             "composition_version": COMPOSITION_VERSION,
-            # Backward-compatible composition health. This intentionally means only
-            # that mandatory owner code is present and importable; it is not economic
-            # proof that a paper position has opened or closed.
             "healthy": self.healthy,
             "composition_healthy": self.healthy,
             "health_semantics": {
@@ -85,10 +82,6 @@ class ProductionSystem:
                 "lifecycle_proven": lifecycle_proven,
                 "state": lifecycle_state,
             },
-            # Paper lifecycle is an execution-proof plane composed beneath the
-            # canonical execution/settlement owners, not an eleventh production-root
-            # component. Keeping it separate preserves the frozen Phase-18 ten-owner
-            # architecture while exposing stronger runtime truth.
             "paper_execution_lifecycle": lifecycle,
             "components": {component.name: component.as_dict() for component in self.components},
             "required_component_count": sum(1 for component in self.components if component.required),
@@ -186,10 +179,6 @@ def build_production_system() -> ProductionSystem:
     if _BUILT is not None:
         return _BUILT
 
-    # Package import stays passive. The exact previously green repair composition is
-    # activated only from this one production root while the remaining installers are
-    # migrated natively into their owner modules. This preserves the proven runtime
-    # behavior without restoring hidden package-import authority.
     from . import legacy_package_runtime_composition as _legacy_package_runtime_composition
     from . import legacy_production_composition as _legacy_production_composition
     from .batch9_finalization_repair import install_batch9_finalization_repair
@@ -199,21 +188,7 @@ def build_production_system() -> ProductionSystem:
     app = _legacy_production_composition.app
     ingestion_runtime = _legacy_production_composition.ingestion_runtime
 
-    # Exact-release production evidence after Batch 8 exposed four root boundaries:
-    # strategy-scout polling lacked a durable per-target restart checkpoint, the
-    # isolated Robinhood proof worker was a second SQLite writer on the live store,
-    # production WSS could publish readiness without a concrete generation anchor,
-    # and Phase-13 proof precompute was configured but never scheduled. The finalizer
-    # inserts those repairs beneath the already-established canonical poll, bounded
-    # WSS, and frontier contracts rather than replacing their top-level identities.
-    # Economic rules, 20-second authority, paper sizing, signing/submission and
-    # live-money boundaries are unchanged.
     install_batch9_finalization_repair(app)
-
-    # The dedicated certification surface must not synchronously execute the full
-    # ingestion audit (including append-only event-chain verification) and then
-    # discard it. Compose the bounded read only after the canonical legacy runtime
-    # has installed the unified E2E route; the full ingestion endpoint is unchanged.
     install_e2e_status_read_boundary_repair(app, ingestion_runtime)
 
     components = _required_components()
