@@ -11,9 +11,9 @@ permissions:
 jobs:
   live-paper-lifecycle-proof:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
     steps:
-      - name: Read launched production lifecycle truth
+      - name: Read live E2E and strategy authority
         env:
           PRODUCTION_URL: https://solana-roi-convergence.onrender.com
           PYTHONUNBUFFERED: '1'
@@ -21,10 +21,10 @@ jobs:
           python - <<'PY'
           import json, os, urllib.request
           base = os.environ['PRODUCTION_URL'].rstrip('/')
-          for path in ('/health', '/v1/operations/production-composition'):
+          for path in ('/v1/strategy/e2e-status', '/v1/strategy/authority'):
               print(f'=== {path} ===', flush=True)
-              request = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'paper-lifecycle-truth-probe/1'})
-              with urllib.request.urlopen(request, timeout=20) as response:
+              request = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'paper-entry-boundary-probe/1'})
+              with urllib.request.urlopen(request, timeout=70) as response:
                   payload = json.loads(response.read().decode('utf-8'))
                   print(f'HTTP {response.status}', flush=True)
                   print(json.dumps(payload, sort_keys=True), flush=True)
