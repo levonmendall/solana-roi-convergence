@@ -24,19 +24,6 @@ from .production_system import (
     production_system,
 )
 from . import legacy_production_composition as _legacy_production
-from .rpc_task_ownership_repair import (
-    REPAIR_VERSION as RPC_TASK_OWNERSHIP_REPAIR_VERSION,
-    install_rpc_task_ownership_repair,
-)
-
-# Production composition has now installed the capacity/cooldown RPC wrapper. Add
-# the terminal task-ownership guard only after that wrapper exists so this final
-# transport safety layer delegates to, rather than bypasses, all existing endpoint
-# ordering, cooldown and failure semantics. Uvicorn has not started runtime workers
-# yet, so no live RPC task can race this installation.
-install_rpc_task_ownership_repair()
-app.state.roi_rpc_task_ownership_repair = True
-app.state.roi_rpc_task_ownership_repair_version = RPC_TASK_OWNERSHIP_REPAIR_VERSION
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
