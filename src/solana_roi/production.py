@@ -24,6 +24,13 @@ from .production_system import (
     production_system,
 )
 from . import legacy_production_composition as _legacy_production
+from .certification_proof_memory_repair import install_certification_proof_memory_repair
+
+# The canonical production system has already installed the E2E/proof read
+# boundaries and single-flight coordinator by the time this facade imports. Apply
+# the memory repair here so the background proof publisher retains the exact same
+# certification semantics while using bounded store reads when lifespan starts.
+install_certification_proof_memory_repair(app)
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
