@@ -349,16 +349,40 @@ def install_forward_certification(
     existing_paths = {getattr(route, "path", None) for route in app.routes}
     if "/v1/strategy/forward-certification" not in existing_paths:
         def forward_certification_status() -> dict[str, Any]:
-            runtime = runtime_provider()
-            expected_release = os.getenv("RENDER_GIT_COMMIT", "").strip() or None
-            proof, proof_state = _cached_robinhood_proof(robinhood_status_provider)
-            return build_forward_certification(
-                runtime.store,
-                unified_status=_e2e_status(app),
-                expected_release_commit=expected_release,
-                robinhood_proof=proof,
-                robinhood_proof_state=proof_state,
-            )
+            # Certification GET is a pure read boundary. The authoritative recurring
+            # production-proof publisher owns deep evidence materialization and stale
+            # semantics; HTTP traffic must not refresh attestations or dirty SQLite.
+            from . import production_proof_read_boundary_repair as proof_boundary
+
+            cached = proof_boundary._cached_production_proof()
+            forward = cached.get("forward_certification") if isinstance(cached, dict) else None
+            if isinstance(forward, dict) and forward:
+                import copy
+
+                payload = copy.deepcopy(forward)
+                payload["read_boundary"] = {
+                    "source": "production_proof_snapshot",
+                    "http_request_executes_evidence_materialization": False,
+                    "paper_only": True,
+                    "live_money_authority": False,
+                }
+                return payload
+            return {
+                "certification_version": CERTIFICATION_VERSION,
+                "system_forward_certified": False,
+                "state": "UNPROVEN_CERTIFICATION_EVIDENCE_INSUFFICIENT",
+                "blockers": ["production_proof_snapshot_not_ready_or_stale"],
+                "read_boundary": {
+                    "source": "production_proof_snapshot",
+                    "http_request_executes_evidence_materialization": False,
+                },
+                "changes_strategy_authority": False,
+                "changes_economic_thresholds": False,
+                "paper_only": True,
+                "live_money_authority": False,
+                "signing_available": False,
+                "transaction_submission_available": False,
+            }
 
         app.add_api_route(
             "/v1/strategy/forward-certification",

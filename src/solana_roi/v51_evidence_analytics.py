@@ -196,7 +196,14 @@ def refresh_execution_cost_ledger(store: Any) -> dict[str, Any]:
                 "VALUES (?,?,?,?,?,NULL,NULL,?,?,?,1,0) ON CONFLICT(surface,source_signature) DO UPDATE SET "
                 "family=excluded.family,release_commit=excluded.release_commit,token_mint=excluded.token_mint,"
                 "round_trip_cost_fraction=excluded.round_trip_cost_fraction,cost_source=excluded.cost_source,"
-                "normalized_at=excluded.normalized_at,paper_only=1,live_money_authority=0",
+                "normalized_at=excluded.normalized_at,paper_only=1,live_money_authority=0 "
+                "WHERE v51_execution_cost_ledger.family IS NOT excluded.family "
+                "OR v51_execution_cost_ledger.release_commit IS NOT excluded.release_commit "
+                "OR v51_execution_cost_ledger.token_mint IS NOT excluded.token_mint "
+                "OR v51_execution_cost_ledger.round_trip_cost_fraction IS NOT excluded.round_trip_cost_fraction "
+                "OR v51_execution_cost_ledger.cost_source IS NOT excluded.cost_source "
+                "OR v51_execution_cost_ledger.paper_only IS NOT 1 "
+                "OR v51_execution_cost_ledger.live_money_authority IS NOT 0",
                 (
                     surface,
                     str(row.get("family") or "UNKNOWN"),
@@ -755,7 +762,20 @@ def refresh_rejected_counterfactuals(store: Any) -> dict[str, Any]:
                 "decision_observed_at=excluded.decision_observed_at,forward_net_return=excluded.forward_net_return,"
                 "resolution_source=excluded.resolution_source,counterfactual_state=excluded.counterfactual_state,"
                 "hazard_signature=excluded.hazard_signature,hazard_severity=excluded.hazard_severity,payload_json=excluded.payload_json,"
-                "updated_at=excluded.updated_at,retrospective_entry_authority=0,paper_only=1,live_money_authority=0",
+                "updated_at=excluded.updated_at,retrospective_entry_authority=0,paper_only=1,live_money_authority=0 "
+                "WHERE v51_rejected_counterfactuals.release_commit IS NOT excluded.release_commit "
+                "OR v51_rejected_counterfactuals.token_mint IS NOT excluded.token_mint "
+                "OR v51_rejected_counterfactuals.decision_reason IS NOT excluded.decision_reason "
+                "OR v51_rejected_counterfactuals.decision_observed_at IS NOT excluded.decision_observed_at "
+                "OR v51_rejected_counterfactuals.forward_net_return IS NOT excluded.forward_net_return "
+                "OR v51_rejected_counterfactuals.resolution_source IS NOT excluded.resolution_source "
+                "OR v51_rejected_counterfactuals.counterfactual_state IS NOT excluded.counterfactual_state "
+                "OR v51_rejected_counterfactuals.hazard_signature IS NOT excluded.hazard_signature "
+                "OR v51_rejected_counterfactuals.hazard_severity IS NOT excluded.hazard_severity "
+                "OR v51_rejected_counterfactuals.payload_json IS NOT excluded.payload_json "
+                "OR v51_rejected_counterfactuals.retrospective_entry_authority IS NOT 0 "
+                "OR v51_rejected_counterfactuals.paper_only IS NOT 1 "
+                "OR v51_rejected_counterfactuals.live_money_authority IS NOT 0",
                 (
                     surface,
                     candidate_id,

@@ -34,6 +34,46 @@ _ORIGINAL_DISCOVERY_STATUS = ContinuousWalletDiscovery.status
 
 _ACTIVE_DIRECT_PLANE: weakref.ReferenceType[Any] | None = None
 
+_ROI_CAPACITY_TASK_OWNERSHIP_VERSION = "capacity-endpoint-root-terminal-ownership-v1"
+_ROI_CAPACITY_TASK_OWNERSHIP = {
+    "owned_tasks": 0,
+    "terminal_successes": 0,
+    "terminal_failures": 0,
+    "terminal_cancellations": 0,
+}
+
+
+def _observe_capacity_endpoint_terminal_state(task: asyncio.Task[Any]) -> None:
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        _ROI_CAPACITY_TASK_OWNERSHIP["terminal_cancellations"] += 1
+        return
+    except BaseException:
+        _ROI_CAPACITY_TASK_OWNERSHIP["terminal_failures"] += 1
+        return
+    if exc is None:
+        _ROI_CAPACITY_TASK_OWNERSHIP["terminal_successes"] += 1
+    else:
+        _ROI_CAPACITY_TASK_OWNERSHIP["terminal_failures"] += 1
+
+
+def _own_capacity_endpoint_task() -> None:
+    task = asyncio.current_task()
+    if task is None:
+        return
+    try:
+        root_code = getattr(task.get_coro(), "cr_code", None)
+    except BaseException:
+        return
+    if root_code is not _capacity_call_endpoint.__code__:
+        return
+    if bool(getattr(task, "_roi_capacity_endpoint_terminal_observer", False)):
+        return
+    setattr(task, "_roi_capacity_endpoint_terminal_observer", True)
+    task.add_done_callback(_observe_capacity_endpoint_terminal_state)
+    _ROI_CAPACITY_TASK_OWNERSHIP["owned_tasks"] += 1
+
 
 class RpcEndpointCoolingDown(RuntimeError):
     """Internal signal that a read-only endpoint is temporarily unavailable."""
@@ -115,6 +155,7 @@ async def _capacity_call_endpoint(
     method: str,
     params: list[Any],
 ) -> tuple[Any, str, float]:
+    _own_capacity_endpoint_task()
     remaining = _cooldown_remaining(self, endpoint)
     if remaining > 0.0:
         _cooldowns, _limits, skips, _servers = _capacity_maps(self)
@@ -211,6 +252,12 @@ def _capacity_status(self: SolanaRpcPool) -> dict[str, Any]:
         "endpoint_count": len(endpoint_capacity),
         "endpoints": endpoint_capacity,
         "read_only": True,
+        "endpoint_task_terminal_ownership": {
+            "version": _ROI_CAPACITY_TASK_OWNERSHIP_VERSION,
+            **dict(_ROI_CAPACITY_TASK_OWNERSHIP),
+            "root_coroutine": "_capacity_call_endpoint",
+            "failure_semantics_changed": False,
+        },
     }
     return payload
 
