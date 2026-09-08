@@ -305,11 +305,35 @@ def install_runtime_memory_capacity_repair() -> None:
         direct.DirectSolanaIngestionPlane._prefill_launch_context = _bounded_prefill_launch_context  # type: ignore[assignment]
     with _STATE_LOCK:
         _STATE["installed"] = True
+    # The forensic sampler is observability-only. It persists only two bounded JSON
+    # snapshots beside the canonical DB so an abrupt cgroup OOM cannot erase the
+    # last memory.current/memory.stat/memory.events evidence. Installation and
+    # persistence failures must never alter runtime or certification semantics.
+    try:
+        from .cgroup_oom_forensics import install_cgroup_oom_forensics
+
+        install_cgroup_oom_forensics()
+    except Exception:
+        pass
 
 
 def status() -> dict[str, Any]:
     with _STATE_LOCK:
         state = dict(_STATE)
+    try:
+        from .cgroup_oom_forensics import status as cgroup_forensics_status
+
+        forensics = cgroup_forensics_status()
+    except Exception as exc:
+        forensics = {
+            "installed": False,
+            "last_error": f"{type(exc).__name__}:{exc}",
+            "read_only_observability": True,
+            "paper_only": True,
+            "live_money_authority": False,
+            "signing_available": False,
+            "transaction_submission_available": False,
+        }
     return {
         **state,
         "repair_version": REPAIR_VERSION,
@@ -324,6 +348,7 @@ def status() -> dict[str, Any]:
         "memory_pressure_defer_fraction": MEMORY_PRESSURE_DEFER_FRACTION,
         "memory_pressure_min_headroom_bytes": MEMORY_PRESSURE_MIN_HEADROOM_BYTES,
         "cgroup_memory": cgroup_memory_status(),
+        "cgroup_oom_forensics": forensics,
         "certification_thresholds_changed": CERTIFICATION_THRESHOLDS_CHANGED,
         "economic_thresholds_changed": ECONOMIC_THRESHOLDS_CHANGED,
         "canonical_evidence_reset": CANONICAL_EVIDENCE_RESET,
