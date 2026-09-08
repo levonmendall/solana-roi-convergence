@@ -15,21 +15,105 @@ jobs:
       - name: Observe exact live certification state
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: fb660df1d98a43029380a6e5f2e56a22b6a94284
+          EXPECTED_RELEASE: a590df54c17d6d9ab9d201412b23dad48e1dfc30
         run: |
-          sleep 10
-          set -o pipefail
-          echo LIVE_CERTIFICATION_OBSERVER_BEGIN
-          for path in \
-            /health \
-            /v1/strategy/e2e-status \
-            /v1/strategy/e2e-status/cache \
-            /v1/operations/production-composition \
-            /v1/strategy/production-proof \
-            /v1/strategy/production-proof/cache \
-            /v1/strategy/batch9-continuity
-          do
-            echo "=== ${path} ==="
-            curl --fail --silent --show-error --max-time 20 "${BASE_URL}${path}" | python -m json.tool
-          done
-          echo LIVE_CERTIFICATION_OBSERVER_END
+          python - <<'PY'
+          import json, os, pathlib, time, urllib.error, urllib.request
+
+          base = os.environ["BASE_URL"].rstrip("/")
+          expected = os.environ["EXPECTED_RELEASE"]
+          out = pathlib.Path("observer-output")
+          out.mkdir(parents=True, exist_ok=True)
+          endpoints = {
+              "health": "/health",
+              "e2e-status": "/v1/strategy/e2e-status",
+              "e2e-status-cache": "/v1/strategy/e2e-status/cache",
+              "production-composition": "/v1/operations/production-composition",
+              "production-proof": "/v1/strategy/production-proof",
+              "production-proof-cache": "/v1/strategy/production-proof/cache",
+              "batch9-continuity": "/v1/strategy/batch9-continuity",
+          }
+
+          def get(name, path):
+              started = time.monotonic()
+              result = {"name": name, "path": path}
+              body = b""
+              try:
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/3"})
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      result["http_status"] = response.status
+                      body = response.read()
+              except urllib.error.HTTPError as exc:
+                  result["http_status"] = exc.code
+                  result["error"] = f"HTTPError:{exc.code}"
+                  body = exc.read()
+              except Exception as exc:
+                  result["error"] = f"{type(exc).__name__}:{exc}"
+              result["latency_ms"] = round((time.monotonic() - started) * 1000, 3)
+              text = body.decode("utf-8", errors="replace")
+              try:
+                  result["json"] = json.loads(text) if text else None
+              except Exception as exc:
+                  result["json"] = None
+                  result["json_error"] = f"{type(exc).__name__}:{exc}"
+              (out / f"{name}.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+              return result
+
+          time.sleep(20)
+          surfaces = {name: get(name, path) for name, path in endpoints.items()}
+          def payload(name):
+              value = surfaces[name].get("json")
+              return value if isinstance(value, dict) else {}
+
+          e2e = payload("e2e-status")
+          composition = payload("production-composition")
+          proof = payload("production-proof")
+          releases = []
+          direct = e2e.get("release_commit")
+          if direct:
+              releases.append(direct)
+          release = proof.get("release")
+          if isinstance(release, dict) and release.get("release_commit"):
+              releases.append(release["release_commit"])
+
+          summary = {
+              "observer_version": "live-production-certification-observer-pr-v3",
+              "read_only": True,
+              "expected_release": expected,
+              "observed_releases": releases,
+              "http": {k: {x: v.get(x) for x in ("http_status", "latency_ms", "error", "json_error")} for k, v in surfaces.items()},
+              "e2e_status": e2e,
+              "production_composition": composition,
+              "production_proof": proof,
+              "e2e_status_cache": payload("e2e-status-cache"),
+              "production_proof_cache": payload("production-proof-cache"),
+              "batch9_continuity": payload("batch9-continuity"),
+          }
+          (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+          print("LIVE_CERTIFICATION_OBSERVER_BEGIN")
+          print(json.dumps({
+              "expected_release": expected,
+              "observed_releases": releases,
+              "http": summary["http"],
+              "solana": e2e.get("solana"),
+              "fomo": e2e.get("fomo"),
+              "robinhood": e2e.get("robinhood"),
+              "health_semantics": composition.get("health_semantics"),
+              "paper_execution_lifecycle": composition.get("paper_execution_lifecycle"),
+              "proof_state": proof.get("state"),
+              "proof_blockers": proof.get("blockers"),
+              "resource_pressure": proof.get("resource_pressure"),
+          }, indent=2, sort_keys=True))
+          print("LIVE_CERTIFICATION_OBSERVER_END")
+          if not releases or any(value != expected for value in releases):
+              raise SystemExit(f"live release mismatch: {releases} != {expected}")
+          PY
+
+      - name: Upload exact live observer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-production-certification-observer-pr
+          path: observer-output/
+          if-no-files-found: error
+          retention-days: 7
