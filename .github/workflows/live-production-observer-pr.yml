@@ -15,7 +15,7 @@ jobs:
       - name: Observe repeated exact-live certification state
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: 075079b125491a69cf3ae29ae32912a226c99107
+          EXPECTED_RELEASE: c9a55e021a6693baf42465303f6ed10918c3cff8
           EXPECTED_RPC_OWNERSHIP_VERSION: rpc-endpoint-task-terminal-ownership-v3-captured-capacity-reference
         run: |
           python - <<'PY'
