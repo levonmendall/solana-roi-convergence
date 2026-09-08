@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable
 from .solana_rpc import RpcEndpoint, SolanaRpcPool
 
 
-REPAIR_VERSION = "rpc-endpoint-task-terminal-ownership-v1"
+REPAIR_VERSION = "rpc-endpoint-task-terminal-ownership-v2-capacity-root"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -18,10 +18,12 @@ CANONICAL_EVIDENCE_RESET = False
 
 _CallEndpoint = Callable[[SolanaRpcPool, RpcEndpoint, str, list[Any]], Awaitable[tuple[Any, str, float]]]
 _ORIGINAL_CALL_ENDPOINT: _CallEndpoint | None = None
+_ORIGINAL_CAPACITY_CALL_ENDPOINT: _CallEndpoint | None = None
 _STATE_LOCK = threading.Lock()
 _STATE: dict[str, Any] = {
     "installed": False,
     "owned_endpoint_tasks": 0,
+    "owned_capacity_root_tasks": 0,
     "terminal_successes_observed": 0,
     "terminal_failures_observed": 0,
     "terminal_cancellations_observed": 0,
@@ -37,7 +39,7 @@ def _observe_terminal_state(task: asyncio.Task[Any]) -> None:
     """Retrieve a detached endpoint task's terminal state without changing it.
 
     Calling ``Task.exception()`` marks a finished exception as observed, but it does
-    not alter later ``Task.result()``/``await`` behavior.  The normal RPC caller
+    not alter later ``Task.result()``/``await`` behavior. The normal RPC caller
     therefore still receives the exact same success, failure or cancellation while
     the event loop can no longer emit an orphaned ``Task exception was never
     retrieved`` warning if an outer wrapper/cancellation path loses ownership.
@@ -59,20 +61,36 @@ def _observe_terminal_state(task: asyncio.Task[Any]) -> None:
         _increment("terminal_failures_observed")
 
 
-def _current_task_is_endpoint_task(task: asyncio.Task[Any]) -> bool:
-    """True only when this wrapper itself is the Task's root coroutine.
-
-    Sequential RPC calls merely ``await self._call_endpoint(...)`` inside their
-    existing owner task.  We do not attach observers to those parent tasks.  Hedged
-    RPC calls create a distinct task whose root coroutine is this endpoint wrapper;
-    those are the tasks that require an independent terminal-state ownership guard.
-    """
+def _task_root_is(task: asyncio.Task[Any], callback: Callable[..., Any]) -> bool:
+    """Return true only when ``callback`` is the distinct Task's root coroutine."""
 
     try:
         coro = task.get_coro()
     except BaseException:
         return False
-    return getattr(coro, "cr_code", None) is _owned_call_endpoint.__code__
+    return getattr(coro, "cr_code", None) is getattr(callback, "__code__", None)
+
+
+def _claim_current_root_task(callback: Callable[..., Any], *, capacity_root: bool = False) -> None:
+    """Attach one terminal observer only to a distinct endpoint child Task.
+
+    A sequential/direct ``await`` executes inside its parent's Task, whose root code
+    is not the endpoint wrapper, so no observer is attached to the parent. This
+    preserves ordinary exception ownership while making detached hedge/cancellation
+    tasks terminally owned even when a late production-capacity composition layer
+    becomes the root coroutine.
+    """
+
+    task = asyncio.current_task()
+    if task is None or not _task_root_is(task, callback):
+        return
+    if bool(getattr(task, "_roi_endpoint_terminal_observer", False)):
+        return
+    setattr(task, "_roi_endpoint_terminal_observer", True)
+    task.add_done_callback(_observe_terminal_state)
+    _increment("owned_endpoint_tasks")
+    if capacity_root:
+        _increment("owned_capacity_root_tasks")
 
 
 async def _owned_call_endpoint(
@@ -81,12 +99,7 @@ async def _owned_call_endpoint(
     method: str,
     params: list[Any],
 ) -> tuple[Any, str, float]:
-    task = asyncio.current_task()
-    if task is not None and _current_task_is_endpoint_task(task):
-        if not bool(getattr(task, "_roi_endpoint_terminal_observer", False)):
-            setattr(task, "_roi_endpoint_terminal_observer", True)
-            task.add_done_callback(_observe_terminal_state)
-            _increment("owned_endpoint_tasks")
+    _claim_current_root_task(_owned_call_endpoint)
 
     original = _ORIGINAL_CALL_ENDPOINT
     if original is None:
@@ -97,41 +110,118 @@ async def _owned_call_endpoint(
 setattr(_owned_call_endpoint, "_roi_rpc_task_terminal_ownership", True)
 
 
-def install_rpc_task_ownership_repair() -> None:
-    """Guarantee terminal observation for every distinct hedged endpoint task.
+async def _owned_capacity_call_endpoint(
+    self: SolanaRpcPool,
+    endpoint: RpcEndpoint,
+    method: str,
+    params: list[Any],
+) -> tuple[Any, str, float]:
+    """Own a detached Task whose root is the late production-capacity wrapper.
 
-    The installer captures the *current* endpoint implementation at install time so
-    it composes after capacity/cooldown wrappers instead of bypassing them.  It is
-    intentionally safe to call again if another production composition layer has
-    replaced ``_call_endpoint`` since an earlier test/import.
+    Production evidence from the v1 release showed that a late capacity composition
+    path could make ``production_capacity_repair._capacity_call_endpoint`` the Task
+    root. In that topology the outer ownership wrapper never executes, so v1 could
+    report installed while the event loop still received orphaned ConnectTimeout/429
+    failures. Guard the capacity root itself without changing its result semantics.
+    """
+
+    _claim_current_root_task(_owned_capacity_call_endpoint, capacity_root=True)
+    original = _ORIGINAL_CAPACITY_CALL_ENDPOINT
+    if original is None:
+        raise RuntimeError("RPC capacity task ownership guard missing delegated capacity call")
+    return await original(self, endpoint, method, params)
+
+
+setattr(_owned_capacity_call_endpoint, "_roi_rpc_task_terminal_ownership", True)
+
+
+def _install_capacity_root_guard() -> None:
+    """Make the capacity module's callable terminally owned even if installed late."""
+
+    global _ORIGINAL_CAPACITY_CALL_ENDPOINT
+    try:
+        from . import production_capacity_repair as capacity
+    except Exception:
+        # The generic ownership wrapper is still valid in compositions that do not
+        # include production capacity control.
+        return
+
+    current = capacity._capacity_call_endpoint
+    if bool(getattr(current, "_roi_rpc_task_terminal_ownership", False)):
+        return
+
+    _ORIGINAL_CAPACITY_CALL_ENDPOINT = current
+    try:
+        _owned_capacity_call_endpoint.__dict__.update(getattr(current, "__dict__", {}))
+    except Exception:
+        pass
+    setattr(_owned_capacity_call_endpoint, "_roi_rpc_task_terminal_ownership", True)
+    capacity._capacity_call_endpoint = _owned_capacity_call_endpoint
+
+
+def install_rpc_task_ownership_repair() -> None:
+    """Guarantee terminal observation for every distinct endpoint task.
+
+    Two composition orders are supported deliberately:
+
+    1. Capacity is already installed: the generic endpoint wrapper captures it.
+    2. Capacity is installed/reinstalled later: the capacity module global already
+       points at ``_owned_capacity_call_endpoint``, so any later class assignment is
+       terminally owned at its actual Task root.
+
+    No retry, provider ordering, timeout, strategy, certification, signing, evidence,
+    or live-money behavior is changed.
     """
 
     global _ORIGINAL_CALL_ENDPOINT
-    current = SolanaRpcPool._call_endpoint
-    if bool(getattr(current, "_roi_rpc_task_terminal_ownership", False)):
-        with _STATE_LOCK:
-            _STATE["installed"] = True
-        return
+    _install_capacity_root_guard()
 
-    _ORIGINAL_CALL_ENDPOINT = current
-    try:
-        _owned_call_endpoint.__dict__.update(getattr(current, "__dict__", {}))
-    except Exception:
-        pass
-    setattr(_owned_call_endpoint, "_roi_rpc_task_terminal_ownership", True)
-    SolanaRpcPool._call_endpoint = _owned_call_endpoint  # type: ignore[method-assign]
+    current = SolanaRpcPool._call_endpoint
+    if not bool(getattr(current, "_roi_rpc_task_terminal_ownership", False)):
+        _ORIGINAL_CALL_ENDPOINT = current
+        try:
+            _owned_call_endpoint.__dict__.update(getattr(current, "__dict__", {}))
+        except Exception:
+            pass
+        setattr(_owned_call_endpoint, "_roi_rpc_task_terminal_ownership", True)
+        SolanaRpcPool._call_endpoint = _owned_call_endpoint  # type: ignore[method-assign]
+
     with _STATE_LOCK:
         _STATE["installed"] = True
+
+
+def _active_guard_status() -> tuple[str, bool, str | None, bool | None]:
+    current = SolanaRpcPool._call_endpoint
+    active_name = str(getattr(current, "__name__", type(current).__name__))
+    active_owned = bool(getattr(current, "_roi_rpc_task_terminal_ownership", False))
+    try:
+        from . import production_capacity_repair as capacity
+
+        capacity_current = capacity._capacity_call_endpoint
+        capacity_name = str(getattr(capacity_current, "__name__", type(capacity_current).__name__))
+        capacity_owned: bool | None = bool(
+            getattr(capacity_current, "_roi_rpc_task_terminal_ownership", False)
+        )
+    except Exception:
+        capacity_name = None
+        capacity_owned = None
+    return active_name, active_owned, capacity_name, capacity_owned
 
 
 def status() -> dict[str, Any]:
     with _STATE_LOCK:
         state = dict(_STATE)
+    active_name, active_owned, capacity_name, capacity_owned = _active_guard_status()
     return {
         **state,
         "repair_version": REPAIR_VERSION,
+        "active_call_endpoint_name": active_name,
+        "active_call_endpoint_terminally_owned": active_owned,
+        "capacity_call_endpoint_name": capacity_name,
+        "capacity_call_endpoint_terminally_owned": capacity_owned,
         "task_terminal_state_retrieved_without_changing_result_semantics": True,
         "sequential_parent_tasks_observed": False,
+        "late_capacity_composition_guarded": True,
         "certification_thresholds_changed": CERTIFICATION_THRESHOLDS_CHANGED,
         "economic_thresholds_changed": ECONOMIC_THRESHOLDS_CHANGED,
         "canonical_evidence_reset": CANONICAL_EVIDENCE_RESET,
@@ -145,11 +235,15 @@ def status() -> dict[str, Any]:
 def _reset_state_for_tests() -> None:
     global _ORIGINAL_CALL_ENDPOINT
     _ORIGINAL_CALL_ENDPOINT = None
+    # Do not clear the capacity delegate here. The composed regression process may
+    # already have installed the capacity-root guard globally; clearing its delegate
+    # would poison unrelated tests after a fixture restores the class method.
     with _STATE_LOCK:
         _STATE.update(
             {
                 "installed": False,
                 "owned_endpoint_tasks": 0,
+                "owned_capacity_root_tasks": 0,
                 "terminal_successes_observed": 0,
                 "terminal_failures_observed": 0,
                 "terminal_cancellations_observed": 0,
