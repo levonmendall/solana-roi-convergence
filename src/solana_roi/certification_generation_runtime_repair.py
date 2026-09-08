@@ -17,6 +17,7 @@ from .certification_generation_coordinator import (
     exclusive_generation,
     install_status_route,
 )
+from .strategy_v51_authority import AUTHORITY_ID, STRATEGY_VERSION
 
 
 REPAIR_VERSION = "certification-generation-runtime-v1-single-flight-forward-cache"
@@ -157,6 +158,8 @@ def _forward_cache_state() -> dict[str, Any]:
 def _fail_closed_forward(reason: str) -> dict[str, Any]:
     blocker = str(reason or "forward_certification_snapshot_unavailable")
     return {
+        "authority_id": AUTHORITY_ID,
+        "strategy_version": STRATEGY_VERSION,
         "certification_version": forward.CERTIFICATION_VERSION,
         "state": "measurement_degraded",
         "system_forward_certified": False,
