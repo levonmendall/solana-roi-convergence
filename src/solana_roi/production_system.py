@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -143,6 +143,15 @@ class ProductionSystem:
             "production_proof_read_boundary_version": getattr(
                 self.app.state, "roi_production_proof_read_boundary_version", None
             ),
+            "certification_generation_single_flight": bool(
+                getattr(self.app.state, "roi_certification_generation_single_flight", False)
+            ),
+            "certification_generation_runtime_repair_version": getattr(
+                self.app.state, "roi_certification_generation_runtime_repair_version", None
+            ),
+            "forward_certification_http_deep_builder_disabled": bool(
+                getattr(self.app.state, "roi_forward_certification_http_deep_builder_disabled", False)
+            ),
             "batch9_continuity_frontier_proof_repair": bool(
                 getattr(self.app.state, "roi_batch9_continuity_frontier_proof_repair", False)
             ),
@@ -251,7 +260,9 @@ def build_production_system() -> ProductionSystem:
 
     from . import legacy_package_runtime_composition as _legacy_package_runtime_composition
     from . import legacy_production_composition as _legacy_production_composition
+    from . import render_runtime_bootstrap_repair as _render_runtime_bootstrap
     from .batch9_finalization_repair import install_batch9_finalization_repair
+    from .certification_generation_runtime_repair import install_certification_generation_runtime_repair
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
     from .production_proof_read_boundary_repair import install_production_proof_read_boundary_repair
     from .rpc_task_ownership_repair import (
@@ -299,6 +310,16 @@ def build_production_system() -> ProductionSystem:
     )
     install_e2e_status_read_boundary_repair(app, ingestion_runtime)
     install_production_proof_read_boundary_repair(app)
+    install_certification_generation_runtime_repair(app)
+
+    # The certification worker wraps a chain that already owns both E2E and
+    # production-proof snapshot publishers. Preserve those marker contracts on
+    # the new outer worker so later app/test composition remains idempotent and
+    # cannot re-wrap the same mutable delegate globals into a recursion cycle.
+    certification_workers = _render_runtime_bootstrap._run_runtime_workers
+    if bool(getattr(certification_workers, "_roi_forward_certification_snapshot_worker", False)):
+        setattr(certification_workers, "_roi_e2e_status_snapshot_worker", True)
+        setattr(certification_workers, "_roi_production_proof_snapshot_worker", True)
 
     components = _required_components()
     missing = [component.name for component in components if component.required and not component.available]
