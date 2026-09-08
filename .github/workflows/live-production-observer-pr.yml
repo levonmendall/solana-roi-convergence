@@ -1,0 +1,35 @@
+name: Live Production Observer PR
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Observe exact live certification state
+        env:
+          BASE_URL: https://solana-roi-convergence.onrender.com
+          EXPECTED_RELEASE: fb660df1d98a43029380a6e5f2e56a22b6a94284
+        run: |
+          sleep 10
+          set -o pipefail
+          echo LIVE_CERTIFICATION_OBSERVER_BEGIN
+          for path in \
+            /health \
+            /v1/strategy/e2e-status \
+            /v1/strategy/e2e-status/cache \
+            /v1/operations/production-composition \
+            /v1/strategy/production-proof \
+            /v1/strategy/production-proof/cache \
+            /v1/strategy/batch9-continuity
+          do
+            echo "=== ${path} ==="
+            curl --fail --silent --show-error --max-time 20 "${BASE_URL}${path}" | python -m json.tool
+          done
+          echo LIVE_CERTIFICATION_OBSERVER_END
