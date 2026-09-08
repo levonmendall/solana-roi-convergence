@@ -1,0 +1,1 @@
+Read-only observer trigger for exact live release 820c65ec70db56edaf004fc9d17713d9e7d36ff5. Diagnostic branch only; do not merge.
