@@ -21,6 +21,7 @@ from .storage_inventory_diagnostic import inventory_storage
 BOOTSTRAP_RETRY_SECONDS = 0.50
 _STORAGE_INVENTORY_ROOT = "/var/data"
 _STORAGE_INVENTORY_TOP_N = 20
+_STORAGE_INVENTORY_START_DELAY_SECONDS = 5.0
 _STORAGE_INVENTORY_LOG_EMITTED = False
 _LOGGER = logging.getLogger(__name__)
 _BOOTSTRAP_STATE: dict[str, Any] = {
@@ -54,18 +55,20 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
 
 
 async def _emit_storage_inventory_once_if_enabled() -> None:
-    """Emit one private app-log inventory after durable runtime bootstrap.
+    """Emit one private app-log inventory independently of SQLite readiness.
 
-    The scan is feature-gated and runs in a worker thread so ASGI liveness and the
-    event loop never wait on filesystem traversal. The inventory implementation
-    reads metadata only, never opens SQLite, never follows symlinks, and has no
-    retention or cleanup capability.
+    The scan is feature-gated, waits briefly after ASGI startup, and runs in a worker
+    thread so neither liveness nor the event loop waits on filesystem traversal. The
+    inventory reads metadata only, never opens SQLite, never follows symlinks, and
+    has no retention or cleanup capability.
     """
     global _STORAGE_INVENTORY_LOG_EMITTED
     if _STORAGE_INVENTORY_LOG_EMITTED or not _env_true("SOLANA_ROI_STORAGE_INVENTORY_LOG_ONCE"):
         return
     _STORAGE_INVENTORY_LOG_EMITTED = True
     try:
+        if _STORAGE_INVENTORY_START_DELAY_SECONDS > 0.0:
+            await asyncio.sleep(_STORAGE_INVENTORY_START_DELAY_SECONDS)
         payload = await asyncio.to_thread(
             inventory_storage,
             _STORAGE_INVENTORY_ROOT,
@@ -234,17 +237,7 @@ async def _bootstrap_and_run(stop: asyncio.Event) -> None:
     runtime = await _build_runtime_until_ready(stop)
     if runtime is None or stop.is_set():
         return
-    inventory_task = asyncio.create_task(
-        _emit_storage_inventory_once_if_enabled(),
-        name="read-only-storage-inventory",
-    )
-    try:
-        await _run_runtime_workers(runtime, stop)
-    finally:
-        if not inventory_task.done():
-            inventory_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await inventory_task
+    await _run_runtime_workers(runtime, stop)
 
 
 def _guarded_ingestion_runtime() -> Any:
@@ -291,11 +284,19 @@ async def _render_handoff_lifespan(_app: Any):
         }
     )
     stop = asyncio.Event()
+    inventory_task = asyncio.create_task(
+        _emit_storage_inventory_once_if_enabled(),
+        name="read-only-storage-inventory",
+    )
     bootstrap_task = asyncio.create_task(_bootstrap_and_run(stop), name="runtime-bootstrap-handoff")
     try:
         yield
     finally:
         stop.set()
+        if not inventory_task.done():
+            inventory_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await inventory_task
         with suppress(asyncio.CancelledError):
             await bootstrap_task
         _BOOTSTRAP_STATE["lifespan_active"] = False
