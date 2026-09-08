@@ -24,6 +24,12 @@ from .production_system import (
     production_system,
 )
 from . import legacy_production_composition as _legacy_production
+from .certification_status_log_diagnostic import install_certification_status_log_diagnostic
+
+# Private observability only: no route, strategy authority, execution authority, or
+# runtime builder is introduced here. The observer wraps the already-composed
+# lifespan and remains disabled unless exact-release diagnostic env gates are set.
+install_certification_status_log_diagnostic(app)
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
