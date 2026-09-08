@@ -10,12 +10,12 @@ permissions:
 jobs:
   observe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
-      - name: Observe exact live certification state
+      - name: Observe repeated exact-live certification state
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: a590df54c17d6d9ab9d201412b23dad48e1dfc30
+          EXPECTED_RELEASE: 625f4e91f866f4edd1cbd2a875d0ac7b6422294d
         run: |
           python - <<'PY'
           import json, os, pathlib, time, urllib.error, urllib.request
@@ -34,12 +34,12 @@ jobs:
               "batch9-continuity": "/v1/strategy/batch9-continuity",
           }
 
-          def get(name, path):
+          def get(name, path, sample_dir):
               started = time.monotonic()
               result = {"name": name, "path": path}
               body = b""
               try:
-                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/3"})
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/4"})
                   with urllib.request.urlopen(req, timeout=20) as response:
                       result["http_status"] = response.status
                       body = response.read()
@@ -56,57 +56,127 @@ jobs:
               except Exception as exc:
                   result["json"] = None
                   result["json_error"] = f"{type(exc).__name__}:{exc}"
-              (out / f"{name}.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+              (sample_dir / f"{name}.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
               return result
 
-          time.sleep(20)
-          surfaces = {name: get(name, path) for name, path in endpoints.items()}
-          def payload(name):
+          def payload(surfaces, name):
               value = surfaces[name].get("json")
               return value if isinstance(value, dict) else {}
 
-          e2e = payload("e2e-status")
-          composition = payload("production-composition")
-          proof = payload("production-proof")
-          releases = []
-          direct = e2e.get("release_commit")
-          if direct:
-              releases.append(direct)
-          release = proof.get("release")
-          if isinstance(release, dict) and release.get("release_commit"):
-              releases.append(release["release_commit"])
+          def release_values(surfaces):
+              values = []
+              health = payload(surfaces, "health")
+              e2e = payload(surfaces, "e2e-status")
+              proof = payload(surfaces, "production-proof")
+              for value in (
+                  health.get("release_commit"),
+                  e2e.get("release_commit"),
+              ):
+                  if value:
+                      values.append(str(value))
+              release = proof.get("release")
+              if isinstance(release, dict) and release.get("release_commit"):
+                  values.append(str(release["release_commit"]))
+              return values
+
+          def cache_brief(surfaces, name):
+              cache = payload(surfaces, name)
+              return {
+                  "snapshot_available": cache.get("snapshot_available"),
+                  "snapshot_fresh": cache.get("snapshot_fresh"),
+                  "snapshot_age_seconds": cache.get("snapshot_age_seconds"),
+                  "attempts": cache.get("attempts"),
+                  "successes": cache.get("successes"),
+                  "failures": cache.get("failures"),
+                  "last_started_at": cache.get("last_started_at"),
+                  "last_completed_at": cache.get("last_completed_at"),
+                  "last_duration_seconds": cache.get("last_duration_seconds"),
+                  "last_error_type": cache.get("last_error_type"),
+              }
+
+          samples = []
+          time.sleep(25)
+          for index in range(3):
+              sample_dir = out / f"sample-{index + 1}"
+              sample_dir.mkdir(parents=True, exist_ok=True)
+              surfaces = {name: get(name, path, sample_dir) for name, path in endpoints.items()}
+              e2e = payload(surfaces, "e2e-status")
+              composition = payload(surfaces, "production-composition")
+              proof = payload(surfaces, "production-proof")
+              sample = {
+                  "sample": index + 1,
+                  "captured_monotonic": time.monotonic(),
+                  "releases": release_values(surfaces),
+                  "http": {k: {x: v.get(x) for x in ("http_status", "latency_ms", "error", "json_error")} for k, v in surfaces.items()},
+                  "e2e_cache": cache_brief(surfaces, "e2e-status-cache"),
+                  "proof_cache": cache_brief(surfaces, "production-proof-cache"),
+                  "e2e_state": e2e.get("overall"),
+                  "solana": e2e.get("solana"),
+                  "fomo": e2e.get("fomo"),
+                  "robinhood": e2e.get("robinhood"),
+                  "composition_version": composition.get("composition_version"),
+                  "health_semantics": composition.get("health_semantics"),
+                  "paper_execution_lifecycle": composition.get("paper_execution_lifecycle"),
+                  "storage_maintenance_lock_isolation": composition.get("storage_maintenance_lock_isolation"),
+                  "storage_maintenance_lock_isolation_version": composition.get("storage_maintenance_lock_isolation_version"),
+                  "proof_state": proof.get("state"),
+                  "proof_blockers": proof.get("blockers"),
+                  "resource_pressure": proof.get("resource_pressure"),
+                  "batch9_continuity": payload(surfaces, "batch9-continuity"),
+              }
+              samples.append(sample)
+              (sample_dir / "sample-summary.json").write_text(json.dumps(sample, indent=2, sort_keys=True), encoding="utf-8")
+              if index < 2:
+                  time.sleep(25)
+
+          def monotonic_non_decreasing(values):
+              clean = [int(value) for value in values if isinstance(value, (int, float))]
+              return len(clean) == len(values) and all(b >= a for a, b in zip(clean, clean[1:]))
+
+          e2e_attempts = [sample["e2e_cache"].get("attempts") for sample in samples]
+          e2e_successes = [sample["e2e_cache"].get("successes") for sample in samples]
+          proof_attempts = [sample["proof_cache"].get("attempts") for sample in samples]
+          proof_successes = [sample["proof_cache"].get("successes") for sample in samples]
+          all_releases = [value for sample in samples for value in sample["releases"]]
+          release_exact = bool(all_releases) and all(value == expected for value in all_releases)
+          e2e_advancing = monotonic_non_decreasing(e2e_attempts) and monotonic_non_decreasing(e2e_successes) and e2e_attempts[-1] > e2e_attempts[0] and e2e_successes[-1] > e2e_successes[0]
+          proof_advancing = monotonic_non_decreasing(proof_attempts) and monotonic_non_decreasing(proof_successes) and proof_attempts[-1] > proof_attempts[0] and proof_successes[-1] > proof_successes[0]
+          e2e_fresh = all(sample["e2e_cache"].get("snapshot_fresh") is True for sample in samples)
+          proof_fresh = all(sample["proof_cache"].get("snapshot_fresh") is True for sample in samples)
 
           summary = {
-              "observer_version": "live-production-certification-observer-pr-v3",
+              "observer_version": "live-production-certification-observer-pr-v4-repeated-refresh",
               "read_only": True,
               "expected_release": expected,
-              "observed_releases": releases,
-              "http": {k: {x: v.get(x) for x in ("http_status", "latency_ms", "error", "json_error")} for k, v in surfaces.items()},
-              "e2e_status": e2e,
-              "production_composition": composition,
-              "production_proof": proof,
-              "e2e_status_cache": payload("e2e-status-cache"),
-              "production_proof_cache": payload("production-proof-cache"),
-              "batch9_continuity": payload("batch9-continuity"),
+              "release_exact": release_exact,
+              "e2e_attempts": e2e_attempts,
+              "e2e_successes": e2e_successes,
+              "proof_attempts": proof_attempts,
+              "proof_successes": proof_successes,
+              "e2e_repeated_refresh_advancing": e2e_advancing,
+              "production_proof_repeated_refresh_advancing": proof_advancing,
+              "e2e_all_samples_fresh": e2e_fresh,
+              "production_proof_all_samples_fresh": proof_fresh,
+              "samples": samples,
           }
           (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
           print("LIVE_CERTIFICATION_OBSERVER_BEGIN")
-          print(json.dumps({
-              "expected_release": expected,
-              "observed_releases": releases,
-              "http": summary["http"],
-              "solana": e2e.get("solana"),
-              "fomo": e2e.get("fomo"),
-              "robinhood": e2e.get("robinhood"),
-              "health_semantics": composition.get("health_semantics"),
-              "paper_execution_lifecycle": composition.get("paper_execution_lifecycle"),
-              "proof_state": proof.get("state"),
-              "proof_blockers": proof.get("blockers"),
-              "resource_pressure": proof.get("resource_pressure"),
-          }, indent=2, sort_keys=True))
+          print(json.dumps(summary, indent=2, sort_keys=True))
           print("LIVE_CERTIFICATION_OBSERVER_END")
-          if not releases or any(value != expected for value in releases):
-              raise SystemExit(f"live release mismatch: {releases} != {expected}")
+
+          blockers = []
+          if not release_exact:
+              blockers.append("live_release_mismatch")
+          if not e2e_advancing:
+              blockers.append("e2e_background_refresh_not_advancing")
+          if not proof_advancing:
+              blockers.append("production_proof_background_refresh_not_advancing")
+          if not e2e_fresh:
+              blockers.append("e2e_snapshot_not_fresh_across_samples")
+          if not proof_fresh:
+              blockers.append("production_proof_snapshot_not_fresh_across_samples")
+          if blockers:
+              raise SystemExit("observer blockers: " + ",".join(blockers))
           PY
 
       - name: Upload exact live observer evidence
