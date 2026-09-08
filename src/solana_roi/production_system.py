@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -130,6 +130,12 @@ class ProductionSystem:
             "target_scoped_successor_evidence_repair_version": getattr(
                 self.app.state, "roi_target_scoped_successor_evidence_repair_version", None
             ),
+            "storage_maintenance_lock_isolation": bool(
+                getattr(self.app.state, "roi_storage_maintenance_lock_isolation", False)
+            ),
+            "storage_maintenance_lock_isolation_version": getattr(
+                self.app.state, "roi_storage_maintenance_lock_isolation_version", None
+            ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -206,6 +212,10 @@ def build_production_system() -> ProductionSystem:
         REPAIR_VERSION as SAME_RELEASE_CONTINUITY_REPAIR_VERSION,
         install_same_release_continuity_epoch_repair,
     )
+    from .storage_maintenance_lock_isolation_repair import (
+        REPAIR_VERSION as STORAGE_MAINTENANCE_LOCK_ISOLATION_VERSION,
+        install_storage_maintenance_lock_isolation,
+    )
     from .target_scoped_successor_evidence_repair import (
         REPAIR_VERSION as TARGET_SCOPED_SUCCESSOR_EVIDENCE_REPAIR_VERSION,
         install_target_scoped_successor_evidence_repair,
@@ -215,6 +225,9 @@ def build_production_system() -> ProductionSystem:
     app = _legacy_production_composition.app
     ingestion_runtime = _legacy_production_composition.ingestion_runtime
 
+    install_storage_maintenance_lock_isolation()
+    app.state.roi_storage_maintenance_lock_isolation = True
+    app.state.roi_storage_maintenance_lock_isolation_version = STORAGE_MAINTENANCE_LOCK_ISOLATION_VERSION
     install_batch9_finalization_repair(app)
     install_same_release_continuity_epoch_repair()
     app.state.roi_same_release_continuity_epoch_repair = True
