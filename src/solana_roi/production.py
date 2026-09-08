@@ -24,6 +24,17 @@ from .production_system import (
     production_system,
 )
 from . import legacy_production_composition as _legacy_production
+from .certification_generation_runtime_repair import (
+    install_certification_generation_runtime_repair,
+)
+
+# The canonical composition root has already installed E2E, production-proof and
+# forward-certification surfaces by the time this thin Uvicorn facade imports. Bind
+# those expensive read-only certification builders to one process-safe generation
+# lease before ASGI lifespan starts. This changes no strategy/economic authority;
+# it prevents the independently scheduled proof builders from multiplying the same
+# SQLite/page-cache working set and moves forward certification off the HTTP path.
+install_certification_generation_runtime_repair(app)
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
