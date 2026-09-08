@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -59,8 +59,24 @@ class ProductionSystem:
                 "transaction_submission_available": False,
             }
 
+    def _runtime_memory_capacity_status(self) -> dict[str, Any]:
+        try:
+            from . import runtime_memory_capacity_repair as memory_capacity
+
+            return dict(memory_capacity.status())
+        except Exception as exc:
+            return {
+                "installed": False,
+                "last_error": f"{type(exc).__name__}:{exc}",
+                "paper_only": True,
+                "live_money_authority": False,
+                "signing_available": False,
+                "transaction_submission_available": False,
+            }
+
     def status(self) -> dict[str, Any]:
         lifecycle = self._paper_lifecycle_status()
+        runtime_memory_capacity = self._runtime_memory_capacity_status()
         code_present = bool(self.healthy and lifecycle.get("installed"))
         worker_active = bool(lifecycle.get("worker_running"))
         lifecycle_proven = bool(lifecycle.get("lifecycle_proven"))
@@ -83,6 +99,7 @@ class ProductionSystem:
                 "state": lifecycle_state,
             },
             "paper_execution_lifecycle": lifecycle,
+            "runtime_memory_capacity": runtime_memory_capacity,
             "components": {component.name: component.as_dict() for component in self.components},
             "required_component_count": sum(1 for component in self.components if component.required),
             "unavailable_required_components": [
@@ -135,6 +152,12 @@ class ProductionSystem:
             ),
             "storage_maintenance_lock_isolation_version": getattr(
                 self.app.state, "roi_storage_maintenance_lock_isolation_version", None
+            ),
+            "runtime_memory_capacity_repair": bool(
+                getattr(self.app.state, "roi_runtime_memory_capacity_repair", False)
+            ),
+            "runtime_memory_capacity_repair_version": getattr(
+                self.app.state, "roi_runtime_memory_capacity_repair_version", None
             ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
@@ -208,6 +231,10 @@ def build_production_system() -> ProductionSystem:
     from .batch9_finalization_repair import install_batch9_finalization_repair
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
     from .production_proof_read_boundary_repair import install_production_proof_read_boundary_repair
+    from .runtime_memory_capacity_repair import (
+        REPAIR_VERSION as RUNTIME_MEMORY_CAPACITY_REPAIR_VERSION,
+        install_runtime_memory_capacity_repair,
+    )
     from .same_release_continuity_epoch_repair import (
         REPAIR_VERSION as SAME_RELEASE_CONTINUITY_REPAIR_VERSION,
         install_same_release_continuity_epoch_repair,
@@ -225,6 +252,9 @@ def build_production_system() -> ProductionSystem:
     app = _legacy_production_composition.app
     ingestion_runtime = _legacy_production_composition.ingestion_runtime
 
+    install_runtime_memory_capacity_repair()
+    app.state.roi_runtime_memory_capacity_repair = True
+    app.state.roi_runtime_memory_capacity_repair_version = RUNTIME_MEMORY_CAPACITY_REPAIR_VERSION
     install_storage_maintenance_lock_isolation()
     app.state.roi_storage_maintenance_lock_isolation = True
     app.state.roi_storage_maintenance_lock_isolation_version = STORAGE_MAINTENANCE_LOCK_ISOLATION_VERSION
