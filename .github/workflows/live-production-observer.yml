@@ -16,7 +16,7 @@ jobs:
       - name: Read exact live production release
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: 075079b125491a69cf3ae29ae32912a226c99107
+          EXPECTED_RELEASE: c9a55e021a6693baf42465303f6ed10918c3cff8
           EXPECTED_RPC_OWNERSHIP_VERSION: rpc-endpoint-task-terminal-ownership-v3-captured-capacity-reference
         run: |
           python - <<'PY'
@@ -39,7 +39,7 @@ jobs:
               result = {"name": name, "path": path}
               body = b""
               try:
-                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/9"})
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/10"})
                   with urllib.request.urlopen(req, timeout=20) as response:
                       result["http_status"] = response.status
                       body = response.read()
@@ -76,15 +76,19 @@ jobs:
 
           ownership = composition.get("rpc_task_ownership") or {}
           summary = {
-              "observer_version": "live-production-certification-observer-v5-exact-v3-ownership",
+              "observer_version": "live-production-certification-observer-v6-cgroup-forensics",
               "read_only": True,
               "expected_release": expected,
               "observed_releases": releases,
               "release_exact": bool(releases) and all(value == expected for value in releases),
               "rpc_task_ownership_repair_version": composition.get("rpc_task_ownership_repair_version"),
               "rpc_task_ownership": ownership,
+              "runtime_memory_capacity": composition.get("runtime_memory_capacity"),
               "http": {name: {k: value.get(k) for k in ("http_status", "error", "json_error")} for name, value in surfaces.items()},
               "e2e_state": e2e.get("overall"),
+              "solana": e2e.get("solana"),
+              "fomo": e2e.get("fomo"),
+              "robinhood": e2e.get("robinhood"),
               "proof_state": proof.get("state"),
               "proof_blockers": proof.get("blockers"),
               "batch9_continuity": payload("batch9-continuity"),
