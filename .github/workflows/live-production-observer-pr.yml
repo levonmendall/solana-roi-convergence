@@ -15,7 +15,7 @@ jobs:
       - name: Observe repeated exact-live certification state
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: 625f4e91f866f4edd1cbd2a875d0ac7b6422294d
+          EXPECTED_RELEASE: 8f1a4eac32570ba05f8def8ede62b8cfbfca9f0a
         run: |
           python - <<'PY'
           import json, os, pathlib, time, urllib.error, urllib.request
@@ -39,7 +39,7 @@ jobs:
               result = {"name": name, "path": path}
               body = b""
               try:
-                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/4"})
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/5"})
                   with urllib.request.urlopen(req, timeout=20) as response:
                       result["http_status"] = response.status
                       body = response.read()
@@ -119,6 +119,9 @@ jobs:
                   "paper_execution_lifecycle": composition.get("paper_execution_lifecycle"),
                   "storage_maintenance_lock_isolation": composition.get("storage_maintenance_lock_isolation"),
                   "storage_maintenance_lock_isolation_version": composition.get("storage_maintenance_lock_isolation_version"),
+                  "runtime_memory_capacity_repair": composition.get("runtime_memory_capacity_repair"),
+                  "runtime_memory_capacity_repair_version": composition.get("runtime_memory_capacity_repair_version"),
+                  "runtime_memory_capacity": composition.get("runtime_memory_capacity"),
                   "proof_state": proof.get("state"),
                   "proof_blockers": proof.get("blockers"),
                   "resource_pressure": proof.get("resource_pressure"),
@@ -143,9 +146,17 @@ jobs:
           proof_advancing = monotonic_non_decreasing(proof_attempts) and monotonic_non_decreasing(proof_successes) and proof_attempts[-1] > proof_attempts[0] and proof_successes[-1] > proof_successes[0]
           e2e_fresh = all(sample["e2e_cache"].get("snapshot_fresh") is True for sample in samples)
           proof_fresh = all(sample["proof_cache"].get("snapshot_fresh") is True for sample in samples)
+          memory_repair_live = all(sample.get("runtime_memory_capacity_repair") is True for sample in samples)
+          memory_limits_bounded = all(
+              isinstance((sample.get("runtime_memory_capacity") or {}).get("candidate_context_fetch_concurrency_global_per_plane"), int)
+              and (sample.get("runtime_memory_capacity") or {}).get("candidate_context_fetch_concurrency_global_per_plane") <= 24
+              and (sample.get("runtime_memory_capacity") or {}).get("candidate_context_worker_tasks_per_prefill_max") <= 24
+              and (sample.get("runtime_memory_capacity") or {}).get("legacy_outer_memory_gate_preserved") is True
+              for sample in samples
+          )
 
           summary = {
-              "observer_version": "live-production-certification-observer-pr-v4-repeated-refresh",
+              "observer_version": "live-production-certification-observer-pr-v5-runtime-memory",
               "read_only": True,
               "expected_release": expected,
               "release_exact": release_exact,
@@ -157,6 +168,8 @@ jobs:
               "production_proof_repeated_refresh_advancing": proof_advancing,
               "e2e_all_samples_fresh": e2e_fresh,
               "production_proof_all_samples_fresh": proof_fresh,
+              "runtime_memory_capacity_repair_live": memory_repair_live,
+              "runtime_memory_limits_bounded": memory_limits_bounded,
               "samples": samples,
           }
           (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -175,6 +188,10 @@ jobs:
               blockers.append("e2e_snapshot_not_fresh_across_samples")
           if not proof_fresh:
               blockers.append("production_proof_snapshot_not_fresh_across_samples")
+          if not memory_repair_live:
+              blockers.append("runtime_memory_capacity_repair_not_live")
+          if not memory_limits_bounded:
+              blockers.append("runtime_memory_limits_not_bounded")
           if blockers:
               raise SystemExit("observer blockers: " + ",".join(blockers))
           PY
