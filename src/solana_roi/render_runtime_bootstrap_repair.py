@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager, suppress
@@ -13,9 +15,14 @@ from .canonical_production_architecture import (
     legacy_helius_compat_enabled,
 )
 from .execution_transfer_certification import V4ExecutionTransferCertification
+from .storage_inventory_diagnostic import inventory_storage
 
 
 BOOTSTRAP_RETRY_SECONDS = 0.50
+_STORAGE_INVENTORY_ROOT = "/var/data"
+_STORAGE_INVENTORY_TOP_N = 20
+_STORAGE_INVENTORY_LOG_EMITTED = False
+_LOGGER = logging.getLogger(__name__)
 _BOOTSTRAP_STATE: dict[str, Any] = {
     "state": "not_started",
     "attempts": 0,
@@ -35,11 +42,59 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _is_sqlite_lock_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
         return False
     message = str(exc).lower()
     return "locked" in message or "busy" in message
+
+
+async def _emit_storage_inventory_once_if_enabled() -> None:
+    """Emit one private app-log inventory after durable runtime bootstrap.
+
+    The scan is feature-gated and runs in a worker thread so ASGI liveness and the
+    event loop never wait on filesystem traversal. The inventory implementation
+    reads metadata only, never opens SQLite, never follows symlinks, and has no
+    retention or cleanup capability.
+    """
+    global _STORAGE_INVENTORY_LOG_EMITTED
+    if _STORAGE_INVENTORY_LOG_EMITTED or not _env_true("SOLANA_ROI_STORAGE_INVENTORY_LOG_ONCE"):
+        return
+    _STORAGE_INVENTORY_LOG_EMITTED = True
+    try:
+        payload = await asyncio.to_thread(
+            inventory_storage,
+            _STORAGE_INVENTORY_ROOT,
+            top_n=_STORAGE_INVENTORY_TOP_N,
+        )
+        payload["diagnostic"] = "read_only_storage_inventory"
+        payload["release_commit"] = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GITHUB_SHA") or "unknown"
+        _LOGGER.warning(
+            "SOLANA_ROI_STORAGE_INVENTORY %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _LOGGER.warning(
+            "SOLANA_ROI_STORAGE_INVENTORY_FAILED %s",
+            json.dumps(
+                {
+                    "diagnostic": "read_only_storage_inventory",
+                    "error_type": type(exc).__name__,
+                    "file_contents_read": False,
+                    "sqlite_opened": False,
+                    "retention_changed": False,
+                    "cleanup_performed": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
 
 
 def _public_status() -> dict[str, Any]:
@@ -179,7 +234,17 @@ async def _bootstrap_and_run(stop: asyncio.Event) -> None:
     runtime = await _build_runtime_until_ready(stop)
     if runtime is None or stop.is_set():
         return
-    await _run_runtime_workers(runtime, stop)
+    inventory_task = asyncio.create_task(
+        _emit_storage_inventory_once_if_enabled(),
+        name="read-only-storage-inventory",
+    )
+    try:
+        await _run_runtime_workers(runtime, stop)
+    finally:
+        if not inventory_task.done():
+            inventory_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await inventory_task
 
 
 def _guarded_ingestion_runtime() -> Any:
@@ -298,6 +363,7 @@ __all__ = [
     "BOOTSTRAP_RETRY_SECONDS",
     "_architecture_route",
     "_build_runtime_until_ready",
+    "_emit_storage_inventory_once_if_enabled",
     "_guarded_ingestion_runtime",
     "_is_sqlite_lock_error",
     "_profitability_route",
