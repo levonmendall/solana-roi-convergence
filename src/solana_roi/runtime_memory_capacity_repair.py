@@ -8,9 +8,11 @@ from typing import Any
 from . import direct_solana as direct
 
 
-REPAIR_VERSION = "bounded-context-runtime-memory-v1"
+REPAIR_VERSION = "bounded-context-runtime-memory-v2-preserve-outer-gates"
 CONTEXT_FETCH_CONCURRENCY = 24
 CONTEXT_WORKER_TASKS_PER_PREFILL = 24
+LEGACY_CANDIDATE_CONTEXT_SLOTS = 3
+LEGACY_BACKGROUND_CONTEXT_SLOTS = 1
 MEMORY_PRESSURE_DEFER_FRACTION = 0.80
 MEMORY_PRESSURE_MIN_HEADROOM_BYTES = 256 * 1024 * 1024
 PAPER_ONLY = True
@@ -35,6 +37,10 @@ _STATE: dict[str, Any] = {
     "peak_worker_tasks": 0,
     "active_fetches": 0,
     "peak_fetches": 0,
+    "active_candidate_prefills": 0,
+    "peak_candidate_prefills": 0,
+    "active_background_prefills": 0,
+    "peak_background_prefills": 0,
 }
 
 
@@ -136,16 +142,8 @@ def _shared_fetch_gate(plane: Any) -> asyncio.Semaphore:
     return gate
 
 
-async def _bounded_prefill_launch_context(self: Any, candidate: Any) -> bool:
-    """Preserve launch-context semantics while bounding task and RPC fan-out.
-
-    The legacy implementation allocated one asyncio Task for every signature (up to
-    600) and created a fresh Semaphore(24) for every concurrent hydrator. With 12
-    hydration workers that allowed thousands of live Tasks and hundreds of RPC calls
-    to exist at once. This implementation keeps the existing signature window,
-    deadline, normalization and persistence rules, but uses a fixed worker pool and a
-    semaphore shared by the whole ingestion plane.
-    """
+async def _bounded_prefill_launch_context_inner(self: Any, candidate: Any) -> bool:
+    """Preserve context semantics while bounding per-signature task/RPC fan-out."""
 
     _state_inc("prefill_attempts")
     if _memory_pressure_high():
@@ -256,10 +254,48 @@ async def _bounded_prefill_launch_context(self: Any, candidate: Any) -> bool:
     return True
 
 
+async def _bounded_prefill_launch_context(self: Any, candidate: Any) -> bool:
+    """Retain the pre-existing 3-candidate/1-background outer memory envelope.
+
+    The legacy production guard already limited the number of simultaneous context
+    expansions. PR-257 must strengthen the *inner* fan-out without accidentally
+    removing that outer gate. Reuse the exact legacy instance attributes so a plane
+    that already created either semaphore before this installer runs keeps the same
+    gate object and capacity.
+    """
+
+    critical = False
+    try:
+        profile = self.service.registry.get(candidate.wallet)
+        critical = bool(profile is not None and str(candidate.side).lower() == "buy")
+    except Exception:
+        critical = False
+
+    if critical:
+        attribute = "_roi_candidate_context_gate"
+        slots = LEGACY_CANDIDATE_CONTEXT_SLOTS
+        active_name = "active_candidate_prefills"
+        peak_name = "peak_candidate_prefills"
+    else:
+        attribute = "_roi_background_context_gate"
+        slots = LEGACY_BACKGROUND_CONTEXT_SLOTS
+        active_name = "active_background_prefills"
+        peak_name = "peak_background_prefills"
+
+    gate = getattr(self, attribute, None)
+    if not isinstance(gate, asyncio.Semaphore):
+        gate = asyncio.Semaphore(slots)
+        setattr(self, attribute, gate)
+
+    async with gate:
+        _state_active(active_name, peak_name, 1)
+        try:
+            return await _bounded_prefill_launch_context_inner(self, candidate)
+        finally:
+            _state_active(active_name, peak_name, -1)
+
+
 setattr(_bounded_prefill_launch_context, "_roi_bounded_context_runtime", True)
-# Preserve the pre-existing production guard contract used by architecture and
-# legacy-entrypoint regressions. This repair is stricter than the older memory
-# boundary, but downstream guard checks still use this marker as the invariant.
 setattr(_bounded_prefill_launch_context, "_roi_memory_bounded", True)
 
 
@@ -279,6 +315,9 @@ def status() -> dict[str, Any]:
         "repair_version": REPAIR_VERSION,
         "candidate_context_fetch_concurrency_global_per_plane": CONTEXT_FETCH_CONCURRENCY,
         "candidate_context_worker_tasks_per_prefill_max": CONTEXT_WORKER_TASKS_PER_PREFILL,
+        "candidate_context_outer_candidate_slots": LEGACY_CANDIDATE_CONTEXT_SLOTS,
+        "candidate_context_outer_background_slots": LEGACY_BACKGROUND_CONTEXT_SLOTS,
+        "legacy_outer_memory_gate_preserved": True,
         "candidate_context_one_task_per_signature": False,
         "candidate_context_semaphore_scope": "ingestion_plane",
         "timeout_cancels_and_drains_workers": True,
@@ -304,6 +343,8 @@ def _reset_state_for_tests() -> None:
 __all__ = [
     "CONTEXT_FETCH_CONCURRENCY",
     "CONTEXT_WORKER_TASKS_PER_PREFILL",
+    "LEGACY_BACKGROUND_CONTEXT_SLOTS",
+    "LEGACY_CANDIDATE_CONTEXT_SLOTS",
     "MEMORY_PRESSURE_DEFER_FRACTION",
     "MEMORY_PRESSURE_MIN_HEADROOM_BYTES",
     "REPAIR_VERSION",
