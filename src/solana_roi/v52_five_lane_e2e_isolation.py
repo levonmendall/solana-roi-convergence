@@ -2,12 +2,9 @@ from __future__ import annotations
 
 """v5.2 Batch 3: five-lane positive/negative E2E plus synthetic isolation.
 
-This module is deliberately research/test-only. It certifies the existing canonical
-seeded five-lane harness without creating a second decision path. It proves that each
-lane has a qualifying synthetic case through paper settlement/learning, a legitimate
-rejection that remains losslessly accounted, immutable synthetic provenance, zero
-canonical statistics contamination, and economic-event de-duplication that preserves
-per-lane observability.
+Research/test-only verifier around the existing canonical seeded five-lane harness.
+It adds no decision path, strategy authority, economic threshold, signing, submission,
+or live-money capability.
 """
 
 from dataclasses import asdict, dataclass
@@ -41,9 +38,6 @@ INCUMBENT_AUTHORITY_CHANGED = False
 EXPECTED_POSITIVE_STAGE_TAIL: tuple[str, ...] = ("settlement", "learning")
 EXPECTED_NEGATIVE_FINAL_STAGE = "position"
 
-# These are canonical economic/statistical surfaces that seeded fixtures must never
-# populate. The verifier checks only identifier columns actually present in a table,
-# so it remains compatible with schema evolution while failing closed on contamination.
 CANONICAL_STATISTICS_TABLES: tuple[str, ...] = (
     "risk_conditioned_alpha_v5_trials",
     "risk_conditioned_alpha_v5_outcomes",
@@ -91,19 +85,18 @@ def _text(value: Any) -> str:
 
 
 def _case_candidate_id(lane: str, *, qualifying: bool) -> str:
-    suffix = "positive" if qualifying else "negative"
-    return f"batch3-{lane}-{suffix}"
+    return f"batch3-{lane}-{'positive' if qualifying else 'negative'}"
 
 
 def reconcile_economic_events(
     observations: Iterable[EconomicEventObservation],
 ) -> EconomicEventAccounting:
-    """Count one economic event once while retaining every lane observation."""
+    """Count each economic event once while preserving every lane observation."""
 
     errors: list[str] = []
     event_lanes: dict[str, set[str]] = {}
     per_lane = {lane: 0 for lane in CANONICAL_LANES}
-    seen_observations: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     observation_count = 0
 
     for index, observation in enumerate(observations):
@@ -120,24 +113,26 @@ def reconcile_economic_events(
             errors.append(f"observation[{index}]:candidate_id_missing")
             continue
         key = (event_id, lane, candidate_id)
-        if key in seen_observations:
-            errors.append(f"observation[{index}]:duplicate_lane_observation:{event_id}:{lane}:{candidate_id}")
+        if key in seen:
+            errors.append(
+                f"observation[{index}]:duplicate_lane_observation:"
+                f"{event_id}:{lane}:{candidate_id}"
+            )
             continue
-        seen_observations.add(key)
+        seen.add(key)
         observation_count += 1
         per_lane[lane] += 1
         event_lanes.setdefault(event_id, set()).add(lane)
 
-    normalized_event_lanes = {
+    normalized = {
         event_id: tuple(sorted(lanes)) for event_id, lanes in sorted(event_lanes.items())
     }
-    cross_lane = sum(1 for lanes in normalized_event_lanes.values() if len(lanes) > 1)
     return EconomicEventAccounting(
         lane_observation_count=observation_count,
-        unique_economic_event_count=len(normalized_event_lanes),
-        cross_lane_event_count=cross_lane,
+        unique_economic_event_count=len(normalized),
+        cross_lane_event_count=sum(1 for lanes in normalized.values() if len(lanes) > 1),
         per_lane_observation_count=per_lane,
-        event_lanes=normalized_event_lanes,
+        event_lanes=normalized,
         validation_errors=tuple(errors),
         economic_events_counted_once=not errors,
     )
@@ -172,17 +167,14 @@ def _synthetic_statistics_contamination(
     store: Any,
     candidate_ids: Iterable[str],
 ) -> tuple[int, tuple[str, ...]]:
-    ids = tuple(sorted({_text(value) for value in candidate_ids if _text(value)}))
+    ids = tuple(sorted({_text(item) for item in candidate_ids if _text(item)}))
     if not ids:
         return 0, ()
-    contaminated: set[str] = set()
     placeholders = ",".join("?" for _ in ids)
+    contaminated: set[str] = set()
     for table in CANONICAL_STATISTICS_TABLES:
         columns = _table_columns(store, table)
-        id_columns = [column for column in CANDIDATE_ID_COLUMNS if column in columns]
-        if not id_columns:
-            continue
-        for column in id_columns:
+        for column in (name for name in CANDIDATE_ID_COLUMNS if name in columns):
             with store._lock:
                 rows = store.db.execute(
                     f"SELECT {column} AS candidate_id FROM {table} "
@@ -206,12 +198,18 @@ def _default_economic_observations() -> tuple[EconomicEventObservation, ...]:
     )
 
 
+def _provenance_value(lane_report: Mapping[str, Any], label: str, field: str) -> Any:
+    label_report = ((lane_report.get("provenance") or {}).get(label) or {})
+    provenance = label_report.get("provenance") or {}
+    return provenance.get(field)
+
+
 def run_batch3_five_lane_e2e_isolation(
     store: Any,
     *,
     economic_event_observations: Iterable[EconomicEventObservation] | None = None,
 ) -> dict[str, Any]:
-    """Verify the canonical five-lane seeded matrix against the Batch 3 contract."""
+    """Run and verify the exact five-lane Batch 3 synthetic contract."""
 
     matrix = run_five_lane_capability_matrix(store)
     errors: list[str] = []
@@ -223,7 +221,7 @@ def run_batch3_five_lane_e2e_isolation(
     lane_reports: dict[str, Any] = {}
     observed: list[ObservedCandidate] = []
     accounting_records: list[CandidateAccountingRecord] = []
-    all_candidate_ids: list[str] = []
+    candidate_ids: list[str] = []
 
     for lane in CANONICAL_LANES:
         descriptor = LANE_DESCRIPTORS[lane]
@@ -234,16 +232,16 @@ def run_batch3_five_lane_e2e_isolation(
         negative_result = negative.get("result") or {}
         positive_id = _case_candidate_id(lane, qualifying=True)
         negative_id = _case_candidate_id(lane, qualifying=False)
-        all_candidate_ids.extend((positive_id, negative_id))
+        candidate_ids.extend((positive_id, negative_id))
 
         positive_rows = _pipeline_rows(store, positive_id)
         negative_rows = _pipeline_rows(store, negative_id)
         positive_stages = [str(row.get("stage") or "") for row in positive_rows]
         negative_stages = [str(row.get("stage") or "") for row in negative_rows]
 
-        positive_settled = (
+        positive_settled = bool(
             positive_result.get("decision") == "paper_enter"
-            and len(positive_stages) >= 2
+            and len(positive_rows) >= 2
             and tuple(positive_stages[-2:]) == EXPECTED_POSITIVE_STAGE_TAIL
             and all(str(row.get("status") or "") == "complete" for row in positive_rows[-2:])
         )
@@ -251,10 +249,10 @@ def run_batch3_five_lane_e2e_isolation(
             errors.append(f"{lane}:positive_case_did_not_reach_settlement_learning")
 
         expected_negative_reason = str(negative.get("expected_negative_reason") or "")
-        negative_accounted = (
+        negative_accounted = bool(
             negative_result.get("decision") == "paper_reject"
             and str(negative_result.get("reason") or "") == expected_negative_reason
-            and bool(negative_rows)
+            and negative_rows
             and negative_stages[-1] == EXPECTED_NEGATIVE_FINAL_STAGE
             and str(negative_rows[-1].get("status") or "") == "not_opened"
             and "settlement" not in negative_stages
@@ -265,14 +263,13 @@ def run_batch3_five_lane_e2e_isolation(
 
         provenance_reports: dict[str, Any] = {}
         provenance_valid = True
-        for label, candidate_id in (("positive", positive_id), ("negative", negative_id)):
-            provenance = synthetic_provenance_for(store, candidate_id)
-            expected_origin = f"batch3_lane_capability:{lane}:{label}"
+        for label, item_id in (("positive", positive_id), ("negative", negative_id)):
+            provenance = synthetic_provenance_for(store, item_id)
             valid = bool(
                 provenance
                 and provenance.get("synthetic") is True
                 and provenance.get("surface") == SYNTHETIC_SURFACE
-                and provenance.get("origin") == expected_origin
+                and provenance.get("origin") == f"batch3_lane_capability:{lane}:{label}"
                 and provenance.get("lane") == descriptor["lane"]
                 and provenance.get("economic_surface") == descriptor["economic_surface"]
                 and provenance.get("venue") == descriptor["venue"]
@@ -282,10 +279,7 @@ def run_batch3_five_lane_e2e_isolation(
             if not valid:
                 provenance_valid = False
                 errors.append(f"{lane}:{label}:synthetic_provenance_invalid")
-            provenance_reports[label] = {
-                "valid": valid,
-                "provenance": provenance,
-            }
+            provenance_reports[label] = {"valid": valid, "provenance": provenance}
 
         observed.extend(
             (
@@ -303,7 +297,6 @@ def run_batch3_five_lane_e2e_isolation(
                 ),
             )
         )
-
         lane_reports[lane] = {
             "positive_candidate_id": positive_id,
             "negative_candidate_id": negative_id,
@@ -322,7 +315,7 @@ def run_batch3_five_lane_e2e_isolation(
         errors.append("batch2_lossless_accounting_gate_failed")
 
     contamination_count, contamination = _synthetic_statistics_contamination(
-        store, all_candidate_ids
+        store, candidate_ids
     )
     if contamination_count:
         errors.append("synthetic_canonical_statistics_contamination")
@@ -335,16 +328,18 @@ def run_batch3_five_lane_e2e_isolation(
     if economic_accounting.validation_errors:
         errors.append("economic_event_accounting_invalid")
     observed_event_lanes = {
-        lane for lane, count in economic_accounting.per_lane_observation_count.items() if count > 0
+        lane
+        for lane, count in economic_accounting.per_lane_observation_count.items()
+        if count > 0
     }
     if observed_event_lanes != expected_lanes:
         errors.append("economic_event_lane_observability_incomplete")
 
-    fomo = lane_reports.get("fomo") or {}
+    fomo_matrix = (matrix.get("lanes") or {}).get("fomo") or {}
     fomo_shadow_non_authoritative = bool(
-        fomo.get("synthetic_provenance_verified")
-        and (matrix.get("lanes") or {}).get("fomo", {}).get("positive", {}).get("promotion_eligible") is False
-        and (matrix.get("lanes") or {}).get("fomo", {}).get("negative", {}).get("promotion_eligible") is False
+        (lane_reports.get("fomo") or {}).get("synthetic_provenance_verified")
+        and (fomo_matrix.get("positive") or {}).get("promotion_eligible") is False
+        and (fomo_matrix.get("negative") or {}).get("promotion_eligible") is False
         and not CHALLENGER_ENTRY_AUTHORITY
         and not PRODUCTION_COMPOSITION_HOOK
     )
@@ -355,13 +350,11 @@ def run_batch3_five_lane_e2e_isolation(
     robinhood_provenance_survives = bool(
         robinhood.get("synthetic_provenance_verified")
         and all(
-            ((robinhood.get("provenance") or {}).get(label) or {}).get("provenance", {}).get("economic_surface")
-            == "ROBINHOOD_CHAIN"
+            _provenance_value(robinhood, label, "economic_surface") == "ROBINHOOD_CHAIN"
             for label in ("positive", "negative")
         )
         and all(
-            ((robinhood.get("provenance") or {}).get(label) or {}).get("provenance", {}).get("venue")
-            == "UNISWAP_V3"
+            _provenance_value(robinhood, label, "venue") == "UNISWAP_V3"
             for label in ("positive", "negative")
         )
     )
@@ -376,10 +369,9 @@ def run_batch3_five_lane_e2e_isolation(
     if not matrix_isolation_valid:
         errors.append("synthetic_matrix_eligibility_boundary_failed")
 
-    ready = not errors
     return {
         "batch_version": BATCH_VERSION,
-        "batch3_ready": ready,
+        "batch3_ready": not errors,
         "validation_errors": errors,
         "canonical_lanes": list(CANONICAL_LANES),
         "positive_case_count": len(CANONICAL_LANES),
@@ -387,8 +379,10 @@ def run_batch3_five_lane_e2e_isolation(
         "lanes": lane_reports,
         "batch2_candidate_accounting": lossless.as_dict(),
         "unexplained_disappearance_count": lossless.unexplained_disappearance_count,
-        "synthetic_candidate_count": len(all_candidate_ids),
-        "synthetic_certification_contribution_count": 0 if matrix_isolation_valid else len(all_candidate_ids),
+        "synthetic_candidate_count": len(candidate_ids),
+        "synthetic_certification_contribution_count": (
+            0 if matrix_isolation_valid else len(candidate_ids)
+        ),
         "synthetic_profitability_contribution_count": contamination_count,
         "canonical_statistics_contamination_count": contamination_count,
         "canonical_statistics_contamination": list(contamination),
