@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -103,6 +103,12 @@ class ProductionSystem:
             "e2e_status_read_boundary_version": getattr(
                 self.app.state, "roi_e2e_status_read_boundary_version", None
             ),
+            "production_proof_read_boundary": bool(
+                getattr(self.app.state, "roi_production_proof_read_boundary", False)
+            ),
+            "production_proof_read_boundary_version": getattr(
+                self.app.state, "roi_production_proof_read_boundary_version", None
+            ),
             "batch9_continuity_frontier_proof_repair": bool(
                 getattr(self.app.state, "roi_batch9_continuity_frontier_proof_repair", False)
             ),
@@ -189,6 +195,7 @@ def build_production_system() -> ProductionSystem:
     from . import legacy_production_composition as _legacy_production_composition
     from .batch9_finalization_repair import install_batch9_finalization_repair
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
+    from .production_proof_read_boundary_repair import install_production_proof_read_boundary_repair
     from .same_release_continuity_epoch_repair import (
         REPAIR_VERSION as SAME_RELEASE_CONTINUITY_REPAIR_VERSION,
         install_same_release_continuity_epoch_repair,
@@ -203,6 +210,7 @@ def build_production_system() -> ProductionSystem:
     app.state.roi_same_release_continuity_epoch_repair = True
     app.state.roi_same_release_continuity_epoch_repair_version = SAME_RELEASE_CONTINUITY_REPAIR_VERSION
     install_e2e_status_read_boundary_repair(app, ingestion_runtime)
+    install_production_proof_read_boundary_repair(app)
 
     components = _required_components()
     missing = [component.name for component in components if component.required and not component.available]
