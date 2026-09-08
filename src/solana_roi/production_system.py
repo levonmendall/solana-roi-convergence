@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary"
+COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -124,6 +124,12 @@ class ProductionSystem:
             "same_release_continuity_epoch_repair_version": getattr(
                 self.app.state, "roi_same_release_continuity_epoch_repair_version", None
             ),
+            "target_scoped_successor_evidence_repair": bool(
+                getattr(self.app.state, "roi_target_scoped_successor_evidence_repair", False)
+            ),
+            "target_scoped_successor_evidence_repair_version": getattr(
+                self.app.state, "roi_target_scoped_successor_evidence_repair_version", None
+            ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -200,6 +206,10 @@ def build_production_system() -> ProductionSystem:
         REPAIR_VERSION as SAME_RELEASE_CONTINUITY_REPAIR_VERSION,
         install_same_release_continuity_epoch_repair,
     )
+    from .target_scoped_successor_evidence_repair import (
+        REPAIR_VERSION as TARGET_SCOPED_SUCCESSOR_EVIDENCE_REPAIR_VERSION,
+        install_target_scoped_successor_evidence_repair,
+    )
 
     _ = _legacy_package_runtime_composition
     app = _legacy_production_composition.app
@@ -209,6 +219,11 @@ def build_production_system() -> ProductionSystem:
     install_same_release_continuity_epoch_repair()
     app.state.roi_same_release_continuity_epoch_repair = True
     app.state.roi_same_release_continuity_epoch_repair_version = SAME_RELEASE_CONTINUITY_REPAIR_VERSION
+    install_target_scoped_successor_evidence_repair()
+    app.state.roi_target_scoped_successor_evidence_repair = True
+    app.state.roi_target_scoped_successor_evidence_repair_version = (
+        TARGET_SCOPED_SUCCESSOR_EVIDENCE_REPAIR_VERSION
+    )
     install_e2e_status_read_boundary_repair(app, ingestion_runtime)
     install_production_proof_read_boundary_repair(app)
 
