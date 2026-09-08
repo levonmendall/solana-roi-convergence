@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import sqlite3
+import threading
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+
+from . import continuity_storage_capacity_repair as storage_capacity
+from . import direct_solana as direct_solana_module
+
+
+REPAIR_VERSION = "storage-maintenance-lock-isolation-v1"
+MAINTENANCE_BUSY_TIMEOUT_MS = 250
+PAPER_ONLY = True
+LIVE_MONEY_AUTHORITY = False
+SIGNING_AVAILABLE = False
+TRANSACTION_SUBMISSION_AVAILABLE = False
+CERTIFICATION_THRESHOLDS_CHANGED = False
+CANONICAL_EVIDENCE_PRUNED = False
+
+_STATE_LOCK = threading.Lock()
+_STATE: dict[str, Any] = {
+    "installed": False,
+    "prune_attempts": 0,
+    "prune_busy_deferrals": 0,
+    "checkpoint_attempts": 0,
+    "checkpoint_busy_deferrals": 0,
+    "last_error_type": None,
+}
+
+
+def _connection(store: Any) -> sqlite3.Connection:
+    path = Path(getattr(store, "path", ""))
+    if not str(path):
+        raise RuntimeError("canonical SQLite path unavailable for isolated maintenance")
+    connection = sqlite3.connect(
+        path,
+        timeout=max(0.001, float(MAINTENANCE_BUSY_TIMEOUT_MS) / 1000.0),
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout={int(MAINTENANCE_BUSY_TIMEOUT_MS)}")
+    connection.execute("PRAGMA synchronous=FULL")
+    return connection
+
+
+def _ensure_state(connection: sqlite3.Connection) -> None:
+    with connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS direct_solana_storage_maintenance ("
+            "id INTEGER PRIMARY KEY CHECK(id=1), "
+            "queue_rows_pruned INTEGER NOT NULL DEFAULT 0, "
+            "metric_rows_pruned INTEGER NOT NULL DEFAULT 0, "
+            "last_maintenance_at TEXT, last_checkpoint_at TEXT, "
+            "last_checkpoint_busy INTEGER, last_checkpoint_log INTEGER, "
+            "last_checkpointed INTEGER, last_error TEXT)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO direct_solana_storage_maintenance(id) VALUES (1)"
+        )
+
+
+def _state_inc(name: str) -> None:
+    with _STATE_LOCK:
+        _STATE[name] = int(_STATE.get(name, 0) or 0) + 1
+
+
+def _state_error(exc: BaseException | None) -> None:
+    with _STATE_LOCK:
+        _STATE["last_error_type"] = type(exc).__name__ if exc is not None else None
+
+
+def _record_error(connection: sqlite3.Connection, message: str) -> None:
+    try:
+        with connection:
+            connection.execute(
+                "UPDATE direct_solana_storage_maintenance SET last_error=? WHERE id=1",
+                (message,),
+            )
+    except sqlite3.Error:
+        return
+
+
+def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
+    """Prune disposable operational rows without acquiring the canonical store lock.
+
+    The production store uses one Python RLock around its shared SQLite connection.
+    Retention maintenance is not candidate/evidence authority, so it must not hold
+    that lock while scanning a large persistent database. A dedicated WAL connection
+    lets canonical readers proceed concurrently and defers quickly if another writer
+    currently owns SQLite's write lock.
+    """
+
+    _state_inc("prune_attempts")
+    now = direct_solana_module.utcnow()
+    queue_cutoff = (
+        now - timedelta(seconds=storage_capacity.TERMINAL_QUEUE_RETENTION_SECONDS)
+    ).isoformat()
+    metric_cutoff = (
+        now - timedelta(seconds=storage_capacity.HYDRATION_METRIC_RETENTION_SECONDS)
+    ).isoformat()
+    connection = _connection(self.store)
+    try:
+        _ensure_state(connection)
+        with connection:
+            queue_cur = connection.execute(
+                "DELETE FROM direct_solana_hydration_queue WHERE signature IN ("
+                "SELECT signature FROM direct_solana_hydration_queue "
+                "WHERE status IN ('complete','failed') AND updated_at<? "
+                "ORDER BY updated_at, signature LIMIT ?)",
+                (queue_cutoff, storage_capacity.MAINTENANCE_BATCH_ROWS),
+            )
+            metric_cur = connection.execute(
+                "DELETE FROM direct_solana_hydration_metrics WHERE signature IN ("
+                "SELECT signature FROM direct_solana_hydration_metrics "
+                "WHERE historical_recovery=0 AND hydrated_at<? "
+                "ORDER BY hydrated_at, signature LIMIT ?)",
+                (metric_cutoff, storage_capacity.MAINTENANCE_BATCH_ROWS),
+            )
+            queue_rows = int(queue_cur.rowcount or 0)
+            metric_rows = int(metric_cur.rowcount or 0)
+            connection.execute(
+                "UPDATE direct_solana_storage_maintenance SET "
+                "queue_rows_pruned=queue_rows_pruned+?, metric_rows_pruned=metric_rows_pruned+?, "
+                "last_maintenance_at=?, last_error=NULL WHERE id=1",
+                (queue_rows, metric_rows, now.isoformat()),
+            )
+        _state_error(None)
+        return queue_rows, metric_rows
+    except sqlite3.OperationalError as exc:
+        # Maintenance is housekeeping only. If canonical evidence writing owns the
+        # SQLite writer lock, defer this pass instead of waiting behind it or taking
+        # the in-process evidence lock. The worker will retry on its normal cadence.
+        _state_inc("prune_busy_deferrals")
+        _state_error(exc)
+        _record_error(connection, f"{type(exc).__name__}: isolated storage maintenance deferred")
+        return 0, 0
+    finally:
+        connection.close()
+
+
+def _checkpoint_wal_isolated(self: Any) -> tuple[int, int, int] | None:
+    """Checkpoint WAL on a dedicated connection with bounded writer contention."""
+
+    _state_inc("checkpoint_attempts")
+    now = direct_solana_module.utcnow()
+    connection = _connection(self.store)
+    try:
+        _ensure_state(connection)
+        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        result = (0, 0, 0) if row is None else (int(row[0]), int(row[1]), int(row[2]))
+        with connection:
+            connection.execute(
+                "UPDATE direct_solana_storage_maintenance SET last_checkpoint_at=?, "
+                "last_checkpoint_busy=?, last_checkpoint_log=?, last_checkpointed=?, last_error=NULL WHERE id=1",
+                (now.isoformat(), result[0], result[1], result[2]),
+            )
+        _state_error(None)
+        return result
+    except sqlite3.OperationalError as exc:
+        _state_inc("checkpoint_busy_deferrals")
+        _state_error(exc)
+        _record_error(connection, f"{type(exc).__name__}: isolated WAL checkpoint deferred")
+        return None
+    finally:
+        connection.close()
+
+
+setattr(
+    _prune_operational_rows_once_isolated,
+    "_roi_storage_maintenance_lock_isolation",
+    True,
+)
+setattr(
+    _checkpoint_wal_isolated,
+    "_roi_storage_maintenance_lock_isolation",
+    True,
+)
+
+
+def install_storage_maintenance_lock_isolation() -> None:
+    """Remove housekeeping work from the canonical evidence-store Python lock."""
+
+    current_prune = storage_capacity._prune_operational_rows_once
+    current_checkpoint = storage_capacity._checkpoint_wal
+    already_installed = bool(
+        getattr(current_prune, "_roi_storage_maintenance_lock_isolation", False)
+        and getattr(current_checkpoint, "_roi_storage_maintenance_lock_isolation", False)
+    )
+    if not already_installed:
+        storage_capacity._prune_operational_rows_once = _prune_operational_rows_once_isolated
+        storage_capacity._checkpoint_wal = _checkpoint_wal_isolated
+    with _STATE_LOCK:
+        _STATE["installed"] = True
+
+
+def status() -> dict[str, Any]:
+    with _STATE_LOCK:
+        state = dict(_STATE)
+    return {
+        **state,
+        "repair_version": REPAIR_VERSION,
+        "maintenance_connection": "dedicated_sqlite_wal_connection",
+        "maintenance_busy_timeout_ms": MAINTENANCE_BUSY_TIMEOUT_MS,
+        "canonical_store_python_lock_acquired_by_retention_prune": False,
+        "canonical_store_python_lock_acquired_by_wal_checkpoint": False,
+        "canonical_evidence_pruned": CANONICAL_EVIDENCE_PRUNED,
+        "certification_thresholds_changed": CERTIFICATION_THRESHOLDS_CHANGED,
+        "paper_only": PAPER_ONLY,
+        "live_money_authority": LIVE_MONEY_AUTHORITY,
+        "signing_available": SIGNING_AVAILABLE,
+        "transaction_submission_available": TRANSACTION_SUBMISSION_AVAILABLE,
+    }
+
+
+__all__ = [
+    "MAINTENANCE_BUSY_TIMEOUT_MS",
+    "REPAIR_VERSION",
+    "_checkpoint_wal_isolated",
+    "_prune_operational_rows_once_isolated",
+    "install_storage_maintenance_lock_isolation",
+    "status",
+]
