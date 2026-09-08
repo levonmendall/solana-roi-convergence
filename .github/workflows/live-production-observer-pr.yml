@@ -15,13 +15,15 @@ jobs:
       - name: Observe repeated exact-live certification state
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: e7f27f9564ab47daf542678974d15b912db6c79e
+          EXPECTED_RELEASE: 555ad1bec7566986c5e6efc0aae9b73f56338f9f
+          EXPECTED_RPC_OWNERSHIP_VERSION: rpc-endpoint-task-terminal-ownership-v2-capacity-root
         run: |
           python - <<'PY'
           import json, os, pathlib, time, urllib.error, urllib.request
 
           base = os.environ["BASE_URL"].rstrip("/")
           expected = os.environ["EXPECTED_RELEASE"]
+          expected_rpc_version = os.environ["EXPECTED_RPC_OWNERSHIP_VERSION"]
           out = pathlib.Path("observer-output")
           out.mkdir(parents=True, exist_ok=True)
           endpoints = {
@@ -39,7 +41,7 @@ jobs:
               result = {"name": name, "path": path}
               body = b""
               try:
-                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/6"})
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/7"})
                   with urllib.request.urlopen(req, timeout=20) as response:
                       result["http_status"] = response.status
                       body = response.read()
@@ -147,11 +149,16 @@ jobs:
           e2e_fresh = all(sample["e2e_cache"].get("snapshot_fresh") is True for sample in samples)
           proof_fresh = all(sample["proof_cache"].get("snapshot_fresh") is True for sample in samples)
           memory_repair_live = all(sample.get("runtime_memory_capacity_repair") is True for sample in samples)
+          ownership = [sample.get("rpc_task_ownership") or {} for sample in samples]
           task_ownership_live = all(sample.get("rpc_task_ownership_repair") is True for sample in samples)
-          task_ownership_installed = all((sample.get("rpc_task_ownership") or {}).get("installed") is True for sample in samples)
+          task_ownership_version = all(sample.get("rpc_task_ownership_repair_version") == expected_rpc_version for sample in samples)
+          task_ownership_installed = all(item.get("installed") is True for item in ownership)
+          active_root_owned = all(item.get("active_call_endpoint_terminally_owned") is True for item in ownership)
+          capacity_root_owned = all(item.get("capacity_call_endpoint_terminally_owned") is True for item in ownership)
+          late_capacity_guarded = all(item.get("late_capacity_composition_guarded") is True for item in ownership)
 
           summary = {
-              "observer_version": "live-production-certification-observer-pr-v6-rpc-task-ownership",
+              "observer_version": "live-production-certification-observer-pr-v7-rpc-capacity-root-ownership",
               "read_only": True,
               "expected_release": expected,
               "release_exact": release_exact,
@@ -165,7 +172,11 @@ jobs:
               "production_proof_all_samples_fresh": proof_fresh,
               "runtime_memory_capacity_repair_live": memory_repair_live,
               "rpc_task_ownership_repair_live": task_ownership_live,
+              "rpc_task_ownership_version_exact": task_ownership_version,
               "rpc_task_ownership_installed": task_ownership_installed,
+              "active_endpoint_root_terminally_owned": active_root_owned,
+              "capacity_endpoint_root_terminally_owned": capacity_root_owned,
+              "late_capacity_composition_guarded": late_capacity_guarded,
               "samples": samples,
           }
           (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -181,7 +192,11 @@ jobs:
           if not proof_fresh: blockers.append("production_proof_snapshot_not_fresh_across_samples")
           if not memory_repair_live: blockers.append("runtime_memory_capacity_repair_not_live")
           if not task_ownership_live: blockers.append("rpc_task_ownership_repair_not_live")
+          if not task_ownership_version: blockers.append("rpc_task_ownership_version_mismatch")
           if not task_ownership_installed: blockers.append("rpc_task_ownership_not_installed")
+          if not active_root_owned: blockers.append("active_rpc_endpoint_root_not_terminally_owned")
+          if not capacity_root_owned: blockers.append("capacity_rpc_endpoint_root_not_terminally_owned")
+          if not late_capacity_guarded: blockers.append("late_capacity_composition_not_guarded")
           if blockers:
               raise SystemExit("observer blockers: " + ",".join(blockers))
           PY
