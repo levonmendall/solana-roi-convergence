@@ -5,6 +5,7 @@
     "solana_roi.v51_lane_capability_e2e",
     "solana_roi.v51_seeded_e2e",
     "solana_roi.v51_synthetic_provenance",
+    "solana_roi.v52_candidate_continuity",
     "solana_roi.v52_continuation_capture"
   ],
   "migration_only": [
