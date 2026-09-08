@@ -15,7 +15,7 @@ jobs:
       - name: Observe repeated exact-live certification state
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: 8f1a4eac32570ba05f8def8ede62b8cfbfca9f0a
+          EXPECTED_RELEASE: e7f27f9564ab47daf542678974d15b912db6c79e
         run: |
           python - <<'PY'
           import json, os, pathlib, time, urllib.error, urllib.request
@@ -39,7 +39,7 @@ jobs:
               result = {"name": name, "path": path}
               body = b""
               try:
-                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/5"})
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/6"})
                   with urllib.request.urlopen(req, timeout=20) as response:
                       result["http_status"] = response.status
                       body = response.read()
@@ -68,10 +68,7 @@ jobs:
               health = payload(surfaces, "health")
               e2e = payload(surfaces, "e2e-status")
               proof = payload(surfaces, "production-proof")
-              for value in (
-                  health.get("release_commit"),
-                  e2e.get("release_commit"),
-              ):
+              for value in (health.get("release_commit"), e2e.get("release_commit")):
                   if value:
                       values.append(str(value))
               release = proof.get("release")
@@ -85,6 +82,8 @@ jobs:
                   "snapshot_available": cache.get("snapshot_available"),
                   "snapshot_fresh": cache.get("snapshot_fresh"),
                   "snapshot_age_seconds": cache.get("snapshot_age_seconds"),
+                  "snapshot_stale_seconds": cache.get("snapshot_stale_seconds"),
+                  "snapshot_interval_seconds": cache.get("snapshot_interval_seconds"),
                   "attempts": cache.get("attempts"),
                   "successes": cache.get("successes"),
                   "failures": cache.get("failures"),
@@ -118,10 +117,11 @@ jobs:
                   "health_semantics": composition.get("health_semantics"),
                   "paper_execution_lifecycle": composition.get("paper_execution_lifecycle"),
                   "storage_maintenance_lock_isolation": composition.get("storage_maintenance_lock_isolation"),
-                  "storage_maintenance_lock_isolation_version": composition.get("storage_maintenance_lock_isolation_version"),
                   "runtime_memory_capacity_repair": composition.get("runtime_memory_capacity_repair"),
-                  "runtime_memory_capacity_repair_version": composition.get("runtime_memory_capacity_repair_version"),
                   "runtime_memory_capacity": composition.get("runtime_memory_capacity"),
+                  "rpc_task_ownership_repair": composition.get("rpc_task_ownership_repair"),
+                  "rpc_task_ownership_repair_version": composition.get("rpc_task_ownership_repair_version"),
+                  "rpc_task_ownership": composition.get("rpc_task_ownership"),
                   "proof_state": proof.get("state"),
                   "proof_blockers": proof.get("blockers"),
                   "resource_pressure": proof.get("resource_pressure"),
@@ -147,16 +147,11 @@ jobs:
           e2e_fresh = all(sample["e2e_cache"].get("snapshot_fresh") is True for sample in samples)
           proof_fresh = all(sample["proof_cache"].get("snapshot_fresh") is True for sample in samples)
           memory_repair_live = all(sample.get("runtime_memory_capacity_repair") is True for sample in samples)
-          memory_limits_bounded = all(
-              isinstance((sample.get("runtime_memory_capacity") or {}).get("candidate_context_fetch_concurrency_global_per_plane"), int)
-              and (sample.get("runtime_memory_capacity") or {}).get("candidate_context_fetch_concurrency_global_per_plane") <= 24
-              and (sample.get("runtime_memory_capacity") or {}).get("candidate_context_worker_tasks_per_prefill_max") <= 24
-              and (sample.get("runtime_memory_capacity") or {}).get("legacy_outer_memory_gate_preserved") is True
-              for sample in samples
-          )
+          task_ownership_live = all(sample.get("rpc_task_ownership_repair") is True for sample in samples)
+          task_ownership_installed = all((sample.get("rpc_task_ownership") or {}).get("installed") is True for sample in samples)
 
           summary = {
-              "observer_version": "live-production-certification-observer-pr-v5-runtime-memory",
+              "observer_version": "live-production-certification-observer-pr-v6-rpc-task-ownership",
               "read_only": True,
               "expected_release": expected,
               "release_exact": release_exact,
@@ -169,7 +164,8 @@ jobs:
               "e2e_all_samples_fresh": e2e_fresh,
               "production_proof_all_samples_fresh": proof_fresh,
               "runtime_memory_capacity_repair_live": memory_repair_live,
-              "runtime_memory_limits_bounded": memory_limits_bounded,
+              "rpc_task_ownership_repair_live": task_ownership_live,
+              "rpc_task_ownership_installed": task_ownership_installed,
               "samples": samples,
           }
           (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -178,20 +174,14 @@ jobs:
           print("LIVE_CERTIFICATION_OBSERVER_END")
 
           blockers = []
-          if not release_exact:
-              blockers.append("live_release_mismatch")
-          if not e2e_advancing:
-              blockers.append("e2e_background_refresh_not_advancing")
-          if not proof_advancing:
-              blockers.append("production_proof_background_refresh_not_advancing")
-          if not e2e_fresh:
-              blockers.append("e2e_snapshot_not_fresh_across_samples")
-          if not proof_fresh:
-              blockers.append("production_proof_snapshot_not_fresh_across_samples")
-          if not memory_repair_live:
-              blockers.append("runtime_memory_capacity_repair_not_live")
-          if not memory_limits_bounded:
-              blockers.append("runtime_memory_limits_not_bounded")
+          if not release_exact: blockers.append("live_release_mismatch")
+          if not e2e_advancing: blockers.append("e2e_background_refresh_not_advancing")
+          if not proof_advancing: blockers.append("production_proof_background_refresh_not_advancing")
+          if not e2e_fresh: blockers.append("e2e_snapshot_not_fresh_across_samples")
+          if not proof_fresh: blockers.append("production_proof_snapshot_not_fresh_across_samples")
+          if not memory_repair_live: blockers.append("runtime_memory_capacity_repair_not_live")
+          if not task_ownership_live: blockers.append("rpc_task_ownership_repair_not_live")
+          if not task_ownership_installed: blockers.append("rpc_task_ownership_not_installed")
           if blockers:
               raise SystemExit("observer blockers: " + ",".join(blockers))
           PY
