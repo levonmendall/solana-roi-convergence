@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 from typing import Any, Awaitable, Callable
 
 from .solana_rpc import RpcEndpoint, SolanaRpcPool
 
 
-REPAIR_VERSION = "rpc-endpoint-task-terminal-ownership-v2-capacity-root"
+REPAIR_VERSION = "rpc-endpoint-task-terminal-ownership-v3-captured-capacity-reference"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -24,15 +25,16 @@ _STATE: dict[str, Any] = {
     "installed": False,
     "owned_endpoint_tasks": 0,
     "owned_capacity_root_tasks": 0,
+    "captured_capacity_references_rebound": 0,
     "terminal_successes_observed": 0,
     "terminal_failures_observed": 0,
     "terminal_cancellations_observed": 0,
 }
 
 
-def _increment(name: str) -> None:
+def _increment(name: str, amount: int = 1) -> None:
     with _STATE_LOCK:
-        _STATE[name] = int(_STATE.get(name, 0) or 0) + 1
+        _STATE[name] = int(_STATE.get(name, 0) or 0) + int(amount)
 
 
 def _observe_terminal_state(task: asyncio.Task[Any]) -> None:
@@ -116,14 +118,7 @@ async def _owned_capacity_call_endpoint(
     method: str,
     params: list[Any],
 ) -> tuple[Any, str, float]:
-    """Own a detached Task whose root is the late production-capacity wrapper.
-
-    Production evidence from the v1 release showed that a late capacity composition
-    path could make ``production_capacity_repair._capacity_call_endpoint`` the Task
-    root. In that topology the outer ownership wrapper never executes, so v1 could
-    report installed while the event loop still received orphaned ConnectTimeout/429
-    failures. Guard the capacity root itself without changing its result semantics.
-    """
+    """Own a detached Task whose root is the production-capacity wrapper."""
 
     _claim_current_root_task(_owned_capacity_call_endpoint, capacity_root=True)
     original = _ORIGINAL_CAPACITY_CALL_ENDPOINT
@@ -135,8 +130,38 @@ async def _owned_capacity_call_endpoint(
 setattr(_owned_capacity_call_endpoint, "_roi_rpc_task_terminal_ownership", True)
 
 
+def _rebind_loaded_capacity_references(
+    original: _CallEndpoint,
+    replacement: _CallEndpoint,
+) -> int:
+    """Replace already-captured module globals that still point at capacity v1.
+
+    Production proved that a late wrapper can report itself active while an earlier
+    repair module still holds the exact pre-ownership capacity function object in a
+    module-global delegate. A Task created from that stale reference never enters the
+    class-level ownership wrapper. Rebind only exact object-identity matches inside
+    already-loaded ``solana_roi.*`` modules. Do not inspect closures, instances,
+    external packages, or arbitrary callables, and never rewrite this module's own
+    original delegate because that delegate is required to preserve call semantics.
+    """
+
+    rebound = 0
+    for module_name, module in tuple(sys.modules.items()):
+        if not module_name.startswith("solana_roi.") or module_name == __name__ or module is None:
+            continue
+        namespace = getattr(module, "__dict__", None)
+        if not isinstance(namespace, dict):
+            continue
+        for name, value in tuple(namespace.items()):
+            if value is not original:
+                continue
+            namespace[name] = replacement
+            rebound += 1
+    return rebound
+
+
 def _install_capacity_root_guard() -> None:
-    """Make the capacity module's callable terminally owned even if installed late."""
+    """Own both the capacity module global and stale loaded module captures."""
 
     global _ORIGINAL_CAPACITY_CALL_ENDPOINT
     try:
@@ -148,6 +173,12 @@ def _install_capacity_root_guard() -> None:
 
     current = capacity._capacity_call_endpoint
     if bool(getattr(current, "_roi_rpc_task_terminal_ownership", False)):
+        original = _ORIGINAL_CAPACITY_CALL_ENDPOINT
+        if original is not None:
+            _increment(
+                "captured_capacity_references_rebound",
+                _rebind_loaded_capacity_references(original, _owned_capacity_call_endpoint),
+            )
         return
 
     _ORIGINAL_CAPACITY_CALL_ENDPOINT = current
@@ -157,17 +188,23 @@ def _install_capacity_root_guard() -> None:
         pass
     setattr(_owned_capacity_call_endpoint, "_roi_rpc_task_terminal_ownership", True)
     capacity._capacity_call_endpoint = _owned_capacity_call_endpoint
+    _increment(
+        "captured_capacity_references_rebound",
+        _rebind_loaded_capacity_references(current, _owned_capacity_call_endpoint),
+    )
 
 
 def install_rpc_task_ownership_repair() -> None:
     """Guarantee terminal observation for every distinct endpoint task.
 
-    Two composition orders are supported deliberately:
+    The final ownership layer covers three production composition shapes:
 
     1. Capacity is already installed: the generic endpoint wrapper captures it.
-    2. Capacity is installed/reinstalled later: the capacity module global already
-       points at ``_owned_capacity_call_endpoint``, so any later class assignment is
-       terminally owned at its actual Task root.
+    2. Capacity is installed/reinstalled later: the capacity module global points at
+       ``_owned_capacity_call_endpoint``.
+    3. A previously loaded repair module captured the original capacity function
+       object before ownership installation: exact in-package module-global captures
+       are rebound to the owned capacity wrapper.
 
     No retry, provider ordering, timeout, strategy, certification, signing, evidence,
     or live-money behavior is changed.
@@ -222,6 +259,7 @@ def status() -> dict[str, Any]:
         "task_terminal_state_retrieved_without_changing_result_semantics": True,
         "sequential_parent_tasks_observed": False,
         "late_capacity_composition_guarded": True,
+        "preowned_capacity_module_captures_rebound": True,
         "certification_thresholds_changed": CERTIFICATION_THRESHOLDS_CHANGED,
         "economic_thresholds_changed": ECONOMIC_THRESHOLDS_CHANGED,
         "canonical_evidence_reset": CANONICAL_EVIDENCE_RESET,
@@ -244,6 +282,7 @@ def _reset_state_for_tests() -> None:
                 "installed": False,
                 "owned_endpoint_tasks": 0,
                 "owned_capacity_root_tasks": 0,
+                "captured_capacity_references_rebound": 0,
                 "terminal_successes_observed": 0,
                 "terminal_failures_observed": 0,
                 "terminal_cancellations_observed": 0,
