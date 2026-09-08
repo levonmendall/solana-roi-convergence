@@ -12,175 +12,242 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
-      - name: Observe repeated exact-live certification state
+      - name: Observe PR264 exact-live certification state
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: c9a55e021a6693baf42465303f6ed10918c3cff8
-          EXPECTED_RPC_OWNERSHIP_VERSION: rpc-endpoint-task-terminal-ownership-v3-captured-capacity-reference
+          EXPECTED_RELEASE: 0475b6d9cb98032566c1519b4282104157e3b70d
         run: |
           python - <<'PY'
           import json, os, pathlib, time, urllib.error, urllib.request
 
           base = os.environ["BASE_URL"].rstrip("/")
           expected = os.environ["EXPECTED_RELEASE"]
-          expected_rpc_version = os.environ["EXPECTED_RPC_OWNERSHIP_VERSION"]
           out = pathlib.Path("observer-output")
           out.mkdir(parents=True, exist_ok=True)
           endpoints = {
               "health": "/health",
-              "e2e-status": "/v1/strategy/e2e-status",
-              "e2e-status-cache": "/v1/strategy/e2e-status/cache",
-              "production-composition": "/v1/operations/production-composition",
-              "production-proof": "/v1/strategy/production-proof",
-              "production-proof-cache": "/v1/strategy/production-proof/cache",
-              "batch9-continuity": "/v1/strategy/batch9-continuity",
+              "composition": "/v1/operations/production-composition",
+              "coordinator": "/v1/operations/certification-generation-coordinator",
+              "e2e": "/v1/strategy/e2e-status",
+              "e2e_cache": "/v1/strategy/e2e-status/cache",
+              "proof": "/v1/strategy/production-proof",
+              "proof_cache": "/v1/strategy/production-proof/cache",
+              "forward": "/v1/strategy/forward-certification",
+              "forward_cache": "/v1/strategy/forward-certification/cache",
+              "continuity": "/v1/strategy/batch9-continuity",
           }
 
           def get(name, path, sample_dir):
               started = time.monotonic()
-              result = {"name": name, "path": path}
+              row = {"name": name, "path": path, "http_status": None, "json": None}
               body = b""
               try:
-                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/8"})
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-pr264-observer/2"})
                   with urllib.request.urlopen(req, timeout=20) as response:
-                      result["http_status"] = response.status
+                      row["http_status"] = response.status
                       body = response.read()
               except urllib.error.HTTPError as exc:
-                  result["http_status"] = exc.code
-                  result["error"] = f"HTTPError:{exc.code}"
+                  row["http_status"] = exc.code
+                  row["error"] = f"HTTPError:{exc.code}"
                   body = exc.read()
               except Exception as exc:
-                  result["error"] = f"{type(exc).__name__}:{exc}"
-              result["latency_ms"] = round((time.monotonic() - started) * 1000, 3)
+                  row["error"] = f"{type(exc).__name__}:{exc}"
+              row["latency_ms"] = round((time.monotonic() - started) * 1000.0, 3)
               text = body.decode("utf-8", errors="replace")
               try:
-                  result["json"] = json.loads(text) if text else None
+                  row["json"] = json.loads(text) if text else None
               except Exception as exc:
-                  result["json"] = None
-                  result["json_error"] = f"{type(exc).__name__}:{exc}"
-              (sample_dir / f"{name}.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
-              return result
+                  row["json_error"] = f"{type(exc).__name__}:{exc}"
+                  row["body_prefix"] = text[:1000]
+              (sample_dir / f"{name}.json").write_text(json.dumps(row, indent=2, sort_keys=True), encoding="utf-8")
+              return row
 
-          def payload(surfaces, name):
-              value = surfaces[name].get("json")
+          def payload(rows, name):
+              value = rows[name].get("json")
               return value if isinstance(value, dict) else {}
 
-          def release_values(surfaces):
-              values = []
-              health = payload(surfaces, "health")
-              e2e = payload(surfaces, "e2e-status")
-              proof = payload(surfaces, "production-proof")
-              for value in (health.get("release_commit"), e2e.get("release_commit")):
-                  if value:
-                      values.append(str(value))
-              release = proof.get("release")
-              if isinstance(release, dict) and release.get("release_commit"):
-                  values.append(str(release["release_commit"]))
-              return values
+          def brief_cache(cache):
+              keys = (
+                  "snapshot_available", "snapshot_fresh", "snapshot_age_seconds",
+                  "attempts", "successes", "failures", "consecutive_failures",
+                  "last_duration_seconds", "last_error_type", "last_generation_id",
+                  "single_flight", "http_request_executes_deep_forward_builder",
+              )
+              return {k: cache.get(k) for k in keys}
 
-          def cache_brief(surfaces, name):
-              cache = payload(surfaces, name)
+          def forensic_brief(composition):
+              runtime = composition.get("runtime_memory_capacity")
+              runtime = runtime if isinstance(runtime, dict) else {}
+              f = runtime.get("cgroup_oom_forensics")
+              f = f if isinstance(f, dict) else {}
+              snap = f.get("current_snapshot")
+              snap = snap if isinstance(snap, dict) else {}
               return {
-                  "snapshot_available": cache.get("snapshot_available"),
-                  "snapshot_fresh": cache.get("snapshot_fresh"),
-                  "snapshot_age_seconds": cache.get("snapshot_age_seconds"),
-                  "snapshot_stale_seconds": cache.get("snapshot_stale_seconds"),
-                  "snapshot_interval_seconds": cache.get("snapshot_interval_seconds"),
-                  "attempts": cache.get("attempts"),
-                  "successes": cache.get("successes"),
-                  "failures": cache.get("failures"),
-                  "last_started_at": cache.get("last_started_at"),
-                  "last_completed_at": cache.get("last_completed_at"),
-                  "last_duration_seconds": cache.get("last_duration_seconds"),
-                  "last_error_type": cache.get("last_error_type"),
+                  "installed": f.get("installed"),
+                  "sampler_running": f.get("sampler_running"),
+                  "persist_writes": f.get("persist_writes"),
+                  "last_persist_error": f.get("last_persist_error"),
+                  "bounded_persistence": f.get("bounded_persistence"),
+                  "process_epoch": f.get("process_epoch"),
+                  "active_phases": snap.get("active_phases"),
+                  "memory_current_bytes": snap.get("memory_current_bytes"),
+                  "memory_max_bytes": snap.get("memory_max_bytes"),
+                  "memory_peak_bytes": snap.get("memory_peak_bytes"),
+                  "memory_fraction": snap.get("memory_fraction"),
+                  "memory_events": snap.get("memory_events"),
+                  "process_rss_bytes": snap.get("process_rss_bytes"),
+                  "database_bytes": snap.get("database_bytes"),
+                  "wal_bytes": snap.get("wal_bytes"),
+                  "shm_bytes": snap.get("shm_bytes"),
               }
 
           samples = []
-          time.sleep(25)
-          for index in range(3):
+          time.sleep(20)
+          for index in range(5):
               sample_dir = out / f"sample-{index + 1}"
               sample_dir.mkdir(parents=True, exist_ok=True)
-              surfaces = {name: get(name, path, sample_dir) for name, path in endpoints.items()}
-              e2e = payload(surfaces, "e2e-status")
-              composition = payload(surfaces, "production-composition")
-              proof = payload(surfaces, "production-proof")
+              rows = {name: get(name, path, sample_dir) for name, path in endpoints.items()}
+              health = payload(rows, "health")
+              composition = payload(rows, "composition")
+              coordinator = payload(rows, "coordinator")
+              e2e = payload(rows, "e2e")
+              proof = payload(rows, "proof")
+              forward = payload(rows, "forward")
+              releases = []
+              for value in (health.get("release_commit"), e2e.get("release_commit"), forward.get("release_commit")):
+                  if value:
+                      releases.append(str(value))
+              proof_release = proof.get("release")
+              if isinstance(proof_release, dict) and proof_release.get("release_commit"):
+                  releases.append(str(proof_release["release_commit"]))
+              overall = e2e.get("overall") if isinstance(e2e.get("overall"), dict) else {}
               sample = {
                   "sample": index + 1,
-                  "captured_monotonic": time.monotonic(),
-                  "releases": release_values(surfaces),
-                  "http": {k: {x: v.get(x) for x in ("http_status", "latency_ms", "error", "json_error")} for k, v in surfaces.items()},
-                  "e2e_cache": cache_brief(surfaces, "e2e-status-cache"),
-                  "proof_cache": cache_brief(surfaces, "production-proof-cache"),
-                  "e2e_state": e2e.get("overall"),
+                  "releases": releases,
+                  "http": {name: {k: row.get(k) for k in ("http_status", "latency_ms", "error", "json_error")} for name, row in rows.items()},
+                  "composition": {k: composition.get(k) for k in (
+                      "composition_version", "certification_generation_single_flight",
+                      "certification_generation_runtime_repair_version",
+                      "forward_certification_http_deep_builder_disabled", "paper_only",
+                      "live_money_authority", "signing_available", "transaction_submission_available",
+                  )},
+                  "coordinator": {k: coordinator.get(k) for k in (
+                      "coordinator_version", "active", "active_surface", "acquisitions", "contentions",
+                      "nested_acquisitions", "guard_rejections", "last_surface", "last_generation_id",
+                      "last_wait_seconds", "last_duration_seconds", "last_guard_reason",
+                      "cross_process_single_flight", "nested_builds_reuse_outer_generation",
+                      "resource_guard_enabled", "memory_start_limit_fraction", "disk_reserve_bytes",
+                      "wal_start_max_bytes", "paper_only", "live_money_authority", "signing_available",
+                      "transaction_submission_available", "certification_thresholds_changed",
+                      "economic_thresholds_changed", "canonical_evidence_reset",
+                  )},
+                  "e2e_cache": brief_cache(payload(rows, "e2e_cache")),
+                  "proof_cache": brief_cache(payload(rows, "proof_cache")),
+                  "forward_cache": brief_cache(payload(rows, "forward_cache")),
+                  "e2e_overall": overall,
                   "solana": e2e.get("solana"),
                   "fomo": e2e.get("fomo"),
                   "robinhood": e2e.get("robinhood"),
-                  "composition_version": composition.get("composition_version"),
-                  "health_semantics": composition.get("health_semantics"),
-                  "paper_execution_lifecycle": composition.get("paper_execution_lifecycle"),
-                  "storage_maintenance_lock_isolation": composition.get("storage_maintenance_lock_isolation"),
-                  "runtime_memory_capacity_repair": composition.get("runtime_memory_capacity_repair"),
-                  "runtime_memory_capacity": composition.get("runtime_memory_capacity"),
-                  "rpc_task_ownership_repair": composition.get("rpc_task_ownership_repair"),
-                  "rpc_task_ownership_repair_version": composition.get("rpc_task_ownership_repair_version"),
-                  "rpc_task_ownership": composition.get("rpc_task_ownership"),
                   "proof_state": proof.get("state"),
                   "proof_blockers": proof.get("blockers"),
-                  "resource_pressure": proof.get("resource_pressure"),
-                  "batch9_continuity": payload(surfaces, "batch9-continuity"),
+                  "forward_state": forward.get("state"),
+                  "forward_certified": forward.get("system_forward_certified"),
+                  "forward_blockers": forward.get("blockers"),
+                  "continuity": payload(rows, "continuity"),
+                  "forensics": forensic_brief(composition),
+                  "authority": {
+                      "paper_only": overall.get("paper_only", composition.get("paper_only")),
+                      "live_money_authority": overall.get("live_money_authority", composition.get("live_money_authority")),
+                      "signing_available": overall.get("signing_available", composition.get("signing_available")),
+                      "transaction_submission_available": overall.get("transaction_submission_available", composition.get("transaction_submission_available")),
+                  },
               }
               samples.append(sample)
-              (sample_dir / "sample-summary.json").write_text(json.dumps(sample, indent=2, sort_keys=True), encoding="utf-8")
-              if index < 2:
-                  time.sleep(25)
+              (sample_dir / "summary.json").write_text(json.dumps(sample, indent=2, sort_keys=True), encoding="utf-8")
+              print(f"PR264_OBSERVER_SAMPLE_{index + 1}")
+              print(json.dumps(sample, indent=2, sort_keys=True))
+              if index < 4:
+                  time.sleep(20)
 
-          def monotonic_non_decreasing(values):
-              clean = [int(value) for value in values if isinstance(value, (int, float))]
-              return len(clean) == len(values) and all(b >= a for a, b in zip(clean, clean[1:]))
+          def series(section, key):
+              values = []
+              for sample in samples:
+                  value = sample[section].get(key)
+                  values.append(int(value) if isinstance(value, (int, float)) else None)
+              return values
 
-          e2e_attempts = [sample["e2e_cache"].get("attempts") for sample in samples]
-          e2e_successes = [sample["e2e_cache"].get("successes") for sample in samples]
-          proof_attempts = [sample["proof_cache"].get("attempts") for sample in samples]
-          proof_successes = [sample["proof_cache"].get("successes") for sample in samples]
-          all_releases = [value for sample in samples for value in sample["releases"]]
-          release_exact = bool(all_releases) and all(value == expected for value in all_releases)
-          e2e_advancing = monotonic_non_decreasing(e2e_attempts) and monotonic_non_decreasing(e2e_successes) and e2e_attempts[-1] > e2e_attempts[0] and e2e_successes[-1] > e2e_successes[0]
-          proof_advancing = monotonic_non_decreasing(proof_attempts) and monotonic_non_decreasing(proof_successes) and proof_attempts[-1] > proof_attempts[0] and proof_successes[-1] > proof_successes[0]
-          e2e_fresh = all(sample["e2e_cache"].get("snapshot_fresh") is True for sample in samples)
-          proof_fresh = all(sample["proof_cache"].get("snapshot_fresh") is True for sample in samples)
-          memory_repair_live = all(sample.get("runtime_memory_capacity_repair") is True for sample in samples)
-          ownership = [sample.get("rpc_task_ownership") or {} for sample in samples]
-          task_ownership_live = all(sample.get("rpc_task_ownership_repair") is True for sample in samples)
-          task_ownership_version = all(sample.get("rpc_task_ownership_repair_version") == expected_rpc_version for sample in samples)
-          task_ownership_installed = all(item.get("installed") is True for item in ownership)
-          active_root_owned = all(item.get("active_call_endpoint_terminally_owned") is True for item in ownership)
-          capacity_root_owned = all(item.get("capacity_call_endpoint_terminally_owned") is True for item in ownership)
-          late_capacity_guarded = all(item.get("late_capacity_composition_guarded") is True for item in ownership)
-          captured_rebind_capability = all(item.get("preowned_capacity_module_captures_rebound") is True for item in ownership)
-          captured_rebound = all(int(item.get("captured_capacity_references_rebound", 0) or 0) >= 1 for item in ownership)
+          def nondecreasing(values):
+              return all(isinstance(v, int) for v in values) and all(b >= a for a, b in zip(values, values[1:]))
+
+          def advancing(values):
+              return nondecreasing(values) and values[-1] > values[0]
+
+          all_releases = [r for sample in samples for r in sample["releases"]]
+          cache_sections = ("e2e_cache", "proof_cache", "forward_cache")
+          cache_state = {}
+          no_new_cache_failures = True
+          for section in cache_sections:
+              attempts = series(section, "attempts")
+              successes = series(section, "successes")
+              failures = series(section, "failures")
+              cache_state[section] = {
+                  "attempts": attempts, "successes": successes, "failures": failures,
+                  "attempts_advancing": advancing(attempts), "successes_advancing": advancing(successes),
+              }
+              if not nondecreasing(failures) or failures[-1] != failures[0]:
+                  no_new_cache_failures = False
+              if any(sample[section].get("consecutive_failures") not in (0, None) or sample[section].get("last_error_type") not in (None, "") for sample in samples):
+                  no_new_cache_failures = False
+
+          memory_events = [sample["forensics"].get("memory_events") for sample in samples]
+          def ev(key):
+              return [int(e.get(key, 0) or 0) if isinstance(e, dict) else None for e in memory_events]
+          oom_kill = ev("oom_kill")
+          oom = ev("oom")
+          memmax = ev("max")
+          no_new_oom = all(v is not None for v in oom_kill + oom) and oom_kill[-1] == oom_kill[0] and oom[-1] == oom[0]
+          no_new_memmax = all(v is not None for v in memmax) and memmax[-1] == memmax[0]
 
           summary = {
-              "observer_version": "live-production-certification-observer-pr-v8-captured-capacity-ownership",
+              "observer_version": "live-production-observer-pr-v9-pr264-single-flight",
               "read_only": True,
               "expected_release": expected,
-              "release_exact": release_exact,
-              "e2e_attempts": e2e_attempts,
-              "e2e_successes": e2e_successes,
-              "proof_attempts": proof_attempts,
-              "proof_successes": proof_successes,
-              "e2e_repeated_refresh_advancing": e2e_advancing,
-              "production_proof_repeated_refresh_advancing": proof_advancing,
-              "e2e_all_samples_fresh": e2e_fresh,
-              "production_proof_all_samples_fresh": proof_fresh,
-              "runtime_memory_capacity_repair_live": memory_repair_live,
-              "rpc_task_ownership_repair_live": task_ownership_live,
-              "rpc_task_ownership_version_exact": task_ownership_version,
-              "rpc_task_ownership_installed": task_ownership_installed,
-              "active_endpoint_root_terminally_owned": active_root_owned,
-              "capacity_endpoint_root_terminally_owned": capacity_root_owned,
-              "late_capacity_composition_guarded": late_capacity_guarded,
-              "captured_capacity_rebind_capability_live": captured_rebind_capability,
-              "captured_capacity_reference_rebound": captured_rebound,
+              "release_exact": bool(all_releases) and all(r == expected for r in all_releases),
+              "all_http_200": all(row.get("http_status") == 200 for sample in samples for row in sample["http"].values()),
+              "five_samples": len(samples) == 5,
+              "all_caches_fresh": all(sample[s].get("snapshot_available") is True and sample[s].get("snapshot_fresh") is True for sample in samples for s in cache_sections),
+              "cache_state": cache_state,
+              "no_new_cache_failures": no_new_cache_failures,
+              "coordinator_safe": all(
+                  sample["coordinator"].get("cross_process_single_flight") is True
+                  and sample["coordinator"].get("nested_builds_reuse_outer_generation") is True
+                  and sample["coordinator"].get("resource_guard_enabled") is True
+                  and sample["coordinator"].get("certification_thresholds_changed") is False
+                  and sample["coordinator"].get("economic_thresholds_changed") is False
+                  and sample["coordinator"].get("canonical_evidence_reset") is False
+                  for sample in samples
+              ),
+              "single_flight_runtime_live": all(
+                  sample["composition"].get("certification_generation_single_flight") is True
+                  and sample["composition"].get("forward_certification_http_deep_builder_disabled") is True
+                  for sample in samples
+              ),
+              "paper_only_authority_safe": all(
+                  sample["authority"].get("paper_only") is True
+                  and sample["authority"].get("live_money_authority") is False
+                  and sample["authority"].get("signing_available") is False
+                  and sample["authority"].get("transaction_submission_available") is False
+                  for sample in samples
+              ),
+              "forensics_live": all(sample["forensics"].get("installed") is True and sample["forensics"].get("sampler_running") is True for sample in samples),
+              "forensics_persist_clean": all(not sample["forensics"].get("last_persist_error") for sample in samples),
+              "memory_fractions": [sample["forensics"].get("memory_fraction") for sample in samples],
+              "wal_bytes": [sample["forensics"].get("wal_bytes") for sample in samples],
+              "oom_kill_events": oom_kill,
+              "oom_events": oom,
+              "memory_max_events": memmax,
+              "no_new_oom_events": no_new_oom,
+              "no_new_memory_max_events": no_new_memmax,
               "samples": samples,
           }
           (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -189,20 +256,21 @@ jobs:
           print("LIVE_CERTIFICATION_OBSERVER_END")
 
           blockers = []
-          if not release_exact: blockers.append("live_release_mismatch")
-          if not e2e_advancing: blockers.append("e2e_background_refresh_not_advancing")
-          if not proof_advancing: blockers.append("production_proof_background_refresh_not_advancing")
-          if not e2e_fresh: blockers.append("e2e_snapshot_not_fresh_across_samples")
-          if not proof_fresh: blockers.append("production_proof_snapshot_not_fresh_across_samples")
-          if not memory_repair_live: blockers.append("runtime_memory_capacity_repair_not_live")
-          if not task_ownership_live: blockers.append("rpc_task_ownership_repair_not_live")
-          if not task_ownership_version: blockers.append("rpc_task_ownership_version_mismatch")
-          if not task_ownership_installed: blockers.append("rpc_task_ownership_not_installed")
-          if not active_root_owned: blockers.append("active_rpc_endpoint_root_not_terminally_owned")
-          if not capacity_root_owned: blockers.append("capacity_rpc_endpoint_root_not_terminally_owned")
-          if not late_capacity_guarded: blockers.append("late_capacity_composition_not_guarded")
-          if not captured_rebind_capability: blockers.append("captured_capacity_rebind_capability_not_live")
-          if not captured_rebound: blockers.append("captured_capacity_reference_not_rebound")
+          if not summary["release_exact"]: blockers.append("live_release_mismatch")
+          if not summary["all_http_200"]: blockers.append("production_surface_not_all_200")
+          if not summary["five_samples"]: blockers.append("five_sample_observation_incomplete")
+          if not summary["all_caches_fresh"]: blockers.append("certification_cache_not_fresh")
+          for section, state in cache_state.items():
+              if not state["attempts_advancing"] or not state["successes_advancing"]:
+                  blockers.append(section + "_refresh_not_advancing")
+          if not summary["no_new_cache_failures"]: blockers.append("certification_refresh_failure_during_observation")
+          if not summary["coordinator_safe"]: blockers.append("single_flight_coordinator_contract_failed")
+          if not summary["single_flight_runtime_live"]: blockers.append("single_flight_runtime_not_live")
+          if not summary["paper_only_authority_safe"]: blockers.append("paper_only_authority_boundary_failed")
+          if not summary["forensics_live"]: blockers.append("cgroup_forensics_not_live")
+          if not summary["forensics_persist_clean"]: blockers.append("cgroup_forensics_persist_error")
+          if not summary["no_new_oom_events"]: blockers.append("new_cgroup_oom_event")
+          if not summary["no_new_memory_max_events"]: blockers.append("new_cgroup_memory_max_event")
           if blockers:
               raise SystemExit("observer blockers: " + ",".join(blockers))
           PY
