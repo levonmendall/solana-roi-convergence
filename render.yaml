@@ -17,8 +17,8 @@ services:
     disk:
       name: roi-convergence-data
       mountPath: /var/data
-      # Match the already-upgraded production disk; do not regress the live size.
-      sizeGB: 10
+      # Restore durable write headroom without deleting or rewriting canonical evidence.
+      sizeGB: 20
     envVars:
       - key: PAPER_ONLY
         value: "true"
