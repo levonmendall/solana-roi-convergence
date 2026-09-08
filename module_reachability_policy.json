@@ -9,6 +9,7 @@
   "migration_only": [
     "solana_roi.cli",
     "solana_roi.split_webhooks",
+    "solana_roi.storage_inventory",
     "solana_roi.v51_architecture_retirement"
   ],
   "archived_fixture_roots": [
