@@ -263,6 +263,7 @@ def build_production_system() -> ProductionSystem:
     from . import render_runtime_bootstrap_repair as _render_runtime_bootstrap
     from .batch9_finalization_repair import install_batch9_finalization_repair
     from .certification_generation_runtime_repair import install_certification_generation_runtime_repair
+    from .certification_proof_memory_repair import install_certification_proof_memory_repair
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
     from .production_proof_read_boundary_repair import install_production_proof_read_boundary_repair
     from .rpc_task_ownership_repair import (
@@ -311,6 +312,7 @@ def build_production_system() -> ProductionSystem:
     install_e2e_status_read_boundary_repair(app, ingestion_runtime)
     install_production_proof_read_boundary_repair(app)
     install_certification_generation_runtime_repair(app)
+    install_certification_proof_memory_repair(app)
 
     # The certification worker wraps a chain that already owns both E2E and
     # production-proof snapshot publishers. Preserve those marker contracts on
