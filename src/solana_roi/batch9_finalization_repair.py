@@ -12,6 +12,7 @@ from . import poll_watermark_repair as watermark
 from . import render_runtime_bootstrap_repair as render_bootstrap
 from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_production_ws_transport as prod_ws
+from . import robinhood_proof_snapshot_lifecycle_repair as proof_snapshot_lifecycle
 from . import robinhood_usage_bounded_transport as bounded_ws
 from . import robinhood_worker_isolation_repair as robinhood_isolation
 from .direct_solana import DirectSolanaIngestionPlane, WatchTarget
@@ -263,6 +264,7 @@ def install_batch9_finalization_repair(app: Any) -> None:
 
     _install_solana_scout_recovery()
     _install_robinhood_proof_snapshot()
+    proof_snapshot_lifecycle.install_robinhood_proof_snapshot_lifecycle_repair(app)
     _install_robinhood_generation_anchor()
     _install_proof_precompute()
 
