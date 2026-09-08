@@ -18,12 +18,25 @@ _ENDPOINT = RpcEndpoint(
 
 
 @pytest.fixture(autouse=True)
-def _reset(monkeypatch):
-    original = SolanaRpcPool._call_endpoint
+def _reset():
+    # The composed regression suite imports production before reaching this file, so
+    # preserve the exact live-style wrapper/delegate/state around every test.  These
+    # tests deliberately replace the class method and installer delegate; leaking
+    # either mutation would make later canonical SolanaRpcPool tests exercise a
+    # wrapper whose delegated endpoint call belongs to this test module.
+    original_method = SolanaRpcPool._call_endpoint
+    original_delegate = repair._ORIGINAL_CALL_ENDPOINT
+    with repair._STATE_LOCK:
+        original_state = dict(repair._STATE)
     repair._reset_state_for_tests()
-    yield
-    SolanaRpcPool._call_endpoint = original
-    repair._reset_state_for_tests()
+    try:
+        yield
+    finally:
+        SolanaRpcPool._call_endpoint = original_method
+        repair._ORIGINAL_CALL_ENDPOINT = original_delegate
+        with repair._STATE_LOCK:
+            repair._STATE.clear()
+            repair._STATE.update(original_state)
 
 
 def test_detached_hedge_endpoint_failure_is_terminally_observed(monkeypatch) -> None:
