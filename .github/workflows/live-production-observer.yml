@@ -16,7 +16,7 @@ jobs:
       - name: Read live production certification surfaces
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: fb660df1d98a43029380a6e5f2e56a22b6a94284
+          EXPECTED_RELEASE: a590df54c17d6d9ab9d201412b23dad48e1dfc30
         run: |
           python - <<'PY'
           import json
@@ -45,7 +45,7 @@ jobs:
               started = time.monotonic()
               req = urllib.request.Request(
                   base + path,
-                  headers={"User-Agent": "solana-roi-certification-observer/2"},
+                  headers={"User-Agent": "solana-roi-certification-observer/3"},
                   method="GET",
               )
               result = {"name": name, "path": path, "method": "GET"}
@@ -76,7 +76,6 @@ jobs:
               )
               return result
 
-          # Allow the existing background publishers to settle; this observer is read-only.
           time.sleep(20)
           surfaces = {name: fetch(name, path) for name, path in endpoints.items()}
 
@@ -103,7 +102,7 @@ jobs:
                   release_candidates.append({"source": source_name, "release_commit": direct})
 
           summary = {
-              "observer_version": "live-production-certification-observer-v2-artifact",
+              "observer_version": "live-production-certification-observer-v3-current-release",
               "read_only": True,
               "expected_release": expected,
               "observed_release_candidates": release_candidates,
@@ -133,11 +132,14 @@ jobs:
               "expected_release": expected,
               "observed_release_candidates": release_candidates,
               "http": summary["http"],
-              "e2e_state": e2e.get("state"),
-              "e2e_blockers": e2e.get("blockers"),
-              "continuity_state": continuity.get("state"),
+              "solana": e2e.get("solana"),
+              "fomo": e2e.get("fomo"),
+              "robinhood": e2e.get("robinhood"),
+              "composition_health_semantics": composition.get("health_semantics"),
+              "paper_execution_lifecycle": composition.get("paper_execution_lifecycle"),
               "proof_state": proof.get("state"),
               "proof_blockers": proof.get("blockers"),
+              "resource_pressure": proof.get("resource_pressure"),
           }, indent=2, sort_keys=True))
           print("LIVE_CERTIFICATION_OBSERVER_END")
 
@@ -145,6 +147,8 @@ jobs:
           mismatches = sorted(commit for commit in observed_commits if commit != expected)
           if mismatches:
               raise SystemExit(f"live release mismatch: {mismatches} != {expected}")
+          if not observed_commits:
+              raise SystemExit("no live release commit observed")
           PY
 
       - name: Upload exact live observer evidence
