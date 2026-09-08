@@ -1,0 +1,1 @@
+Read-only observer trigger after correcting independent candidate and continuation-alpha release attestations for production SHA 555ad1bec7566986c5e6efc0aae9b73f56338f9f. Diagnostic branch only; do not merge.
