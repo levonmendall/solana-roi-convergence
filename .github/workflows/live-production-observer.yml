@@ -16,7 +16,7 @@ jobs:
       - name: Read live production certification surfaces
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: a590df54c17d6d9ab9d201412b23dad48e1dfc30
+          EXPECTED_RELEASE: 1ac8ff584476b73c0801e788e8bb11881b84599c
         run: |
           python - <<'PY'
           import json
