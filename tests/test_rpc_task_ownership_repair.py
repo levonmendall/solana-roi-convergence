@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import gc
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from solana_roi import production_capacity_repair as capacity
 from solana_roi import rpc_task_ownership_repair as repair
 from solana_roi.solana_rpc import RpcEndpoint, SolanaRpcPool
 
@@ -20,12 +22,13 @@ _ENDPOINT = RpcEndpoint(
 @pytest.fixture(autouse=True)
 def _reset():
     # The composed regression suite imports production before reaching this file, so
-    # preserve the exact live-style wrapper/delegate/state around every test.  These
-    # tests deliberately replace the class method and installer delegate; leaking
-    # either mutation would make later canonical SolanaRpcPool tests exercise a
-    # wrapper whose delegated endpoint call belongs to this test module.
+    # preserve the exact live-style wrapper/delegate/state around every test. These
+    # tests deliberately replace class/module callables and installer delegates;
+    # leaking either mutation would poison later canonical SolanaRpcPool tests.
     original_method = SolanaRpcPool._call_endpoint
     original_delegate = repair._ORIGINAL_CALL_ENDPOINT
+    original_capacity_delegate = repair._ORIGINAL_CAPACITY_CALL_ENDPOINT
+    original_capacity_method = capacity._capacity_call_endpoint
     with repair._STATE_LOCK:
         original_state = dict(repair._STATE)
     repair._reset_state_for_tests()
@@ -34,6 +37,9 @@ def _reset():
     finally:
         SolanaRpcPool._call_endpoint = original_method
         repair._ORIGINAL_CALL_ENDPOINT = original_delegate
+        repair._ORIGINAL_CAPACITY_CALL_ENDPOINT = original_capacity_delegate
+        capacity._capacity_call_endpoint = original_capacity_method
+        sys.modules.pop("solana_roi._captured_capacity_probe", None)
         with repair._STATE_LOCK:
             repair._STATE.clear()
             repair._STATE.update(original_state)
@@ -149,6 +155,69 @@ def test_installer_composes_after_existing_capacity_wrapper(monkeypatch) -> None
     assert calls == ["getSlot"]
     state = repair.status()
     assert state["terminal_successes_observed"] == 1
+    assert state["paper_only"] is True
+    assert state["live_money_authority"] is False
+    assert state["signing_available"] is False
+    assert state["transaction_submission_available"] is False
+    assert state["certification_thresholds_changed"] is False
+    assert state["economic_thresholds_changed"] is False
+    assert state["canonical_evidence_reset"] is False
+
+
+def test_preowned_capacity_module_capture_is_rebound_and_terminally_observed(monkeypatch) -> None:
+    class SimulatedConnectTimeout(RuntimeError):
+        pass
+
+    async def stale_capacity_endpoint(self, endpoint, method, params):
+        del self, endpoint, method, params
+        raise SimulatedConnectTimeout("ConnectTimeout")
+
+    setattr(stale_capacity_endpoint, "_roi_production_capacity_repair", True)
+    monkeypatch.setattr(capacity, "_capacity_call_endpoint", stale_capacity_endpoint)
+    monkeypatch.setattr(SolanaRpcPool, "_call_endpoint", stale_capacity_endpoint)
+    repair._ORIGINAL_CAPACITY_CALL_ENDPOINT = None
+
+    # Model the live topology PR #259 missed: an already-loaded repair module holds
+    # the original capacity function object before the ownership installer runs.
+    captured = ModuleType("solana_roi._captured_capacity_probe")
+    captured.CAPTURED_ENDPOINT_CALL = stale_capacity_endpoint
+    sys.modules[captured.__name__] = captured
+
+    repair.install_rpc_task_ownership_repair()
+
+    assert captured.CAPTURED_ENDPOINT_CALL is repair._owned_capacity_call_endpoint
+    assert capacity._capacity_call_endpoint is repair._owned_capacity_call_endpoint
+    assert SolanaRpcPool._call_endpoint is repair._owned_call_endpoint
+
+    async def run() -> list[dict[str, object]]:
+        loop = asyncio.get_running_loop()
+        unhandled: list[dict[str, object]] = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(dict(context)))
+        try:
+            task = asyncio.create_task(
+                captured.CAPTURED_ENDPOINT_CALL(
+                    SimpleNamespace(),
+                    _ENDPOINT,
+                    "getSignaturesForAddress",
+                    [],
+                )
+            )
+            await asyncio.sleep(0)
+            assert task.done()
+            del task
+            gc.collect()
+            await asyncio.sleep(0)
+            return unhandled
+        finally:
+            loop.set_exception_handler(previous)
+
+    assert asyncio.run(run()) == []
+    state = repair.status()
+    assert state["captured_capacity_references_rebound"] >= 1
+    assert state["owned_capacity_root_tasks"] == 1
+    assert state["terminal_failures_observed"] == 1
+    assert state["preowned_capacity_module_captures_rebound"] is True
     assert state["paper_only"] is True
     assert state["live_money_authority"] is False
     assert state["signing_available"] is False
