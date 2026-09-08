@@ -1,20 +1,14 @@
-name: Production Forward Proof
+name: Live Read-Only Certification Probe
 
-# Render deploys main only after commit checks pass. A push/pull_request/workflow_run
-# verifier that waits for Render can therefore deadlock the deployment. Keep manual
-# strict verification, and add a scheduled post-deploy verifier that is deliberately
-# non-blocking when the exact release is still converging. The next scheduled pass
-# retries automatically and still binds every successful proof to github.sha.
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '7,22,37,52 * * * *'
+  push:
+    branches: [certification/live-bf1def-readonly]
 
 permissions:
   contents: read
 
 concurrency:
-  group: production-forward-proof
+  group: live-readonly-certification-bf1def
   cancel-in-progress: true
 
 jobs:
@@ -26,20 +20,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Verify exact Render release and paper transports
-        id: production-proof
-        continue-on-error: ${{ github.event_name == 'schedule' }}
+      - name: Verify exact live release and paper transports
         env:
-          EXPECTED_RELEASE_COMMIT: ${{ github.sha }}
+          EXPECTED_RELEASE_COMMIT: bf1def89ca02e21b0e8f23c076c932dcbe796752
           SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
-          # One bounded deep-read attempt per run. The 15-minute schedule is the retry
-          # mechanism, so a single run cannot overrun its own eight-minute job budget.
           FORWARD_PROOF_PROBE_ATTEMPTS: '1'
           FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
           FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
           PYTHONUNBUFFERED: '1'
         run: python tests/production_forward_proof_probe.py
-      - name: Record scheduled retry state
-        if: ${{ github.event_name == 'schedule' && steps.production-proof.outcome == 'failure' }}
-        run: |
-          echo '::warning::Exact-live production proof has not converged for the current main SHA. This scheduled run is non-blocking so Render checksPass cannot deadlock; the next scheduled run will retry automatically.'
