@@ -1,0 +1,316 @@
+name: Live PR264 Certification Observer
+
+on:
+  push:
+    branches:
+      - certification/live-production-observer-fb660df
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Observe exact-live single-flight certification epoch
+        env:
+          BASE_URL: https://solana-roi-convergence.onrender.com
+          EXPECTED_RELEASE: 0475b6d9cb98032566c1519b4282104157e3b70d
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, time, urllib.error, urllib.request
+
+          base = os.environ["BASE_URL"].rstrip("/")
+          expected = os.environ["EXPECTED_RELEASE"]
+          out = pathlib.Path("pr264-observer-output")
+          out.mkdir(parents=True, exist_ok=True)
+          endpoints = {
+              "health": "/health",
+              "composition": "/v1/operations/production-composition",
+              "coordinator": "/v1/operations/certification-generation-coordinator",
+              "e2e": "/v1/strategy/e2e-status",
+              "e2e_cache": "/v1/strategy/e2e-status/cache",
+              "proof": "/v1/strategy/production-proof",
+              "proof_cache": "/v1/strategy/production-proof/cache",
+              "forward": "/v1/strategy/forward-certification",
+              "forward_cache": "/v1/strategy/forward-certification/cache",
+              "continuity": "/v1/strategy/batch9-continuity",
+          }
+
+          def get(name, path, sample_dir):
+              started = time.monotonic()
+              row = {"name": name, "path": path, "http_status": None, "json": None}
+              body = b""
+              try:
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-pr264-certification-observer/1"})
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      row["http_status"] = response.status
+                      body = response.read()
+              except urllib.error.HTTPError as exc:
+                  row["http_status"] = exc.code
+                  row["error"] = f"HTTPError:{exc.code}"
+                  body = exc.read()
+              except Exception as exc:
+                  row["error"] = f"{type(exc).__name__}:{exc}"
+              row["latency_ms"] = round((time.monotonic() - started) * 1000.0, 3)
+              text = body.decode("utf-8", errors="replace")
+              try:
+                  row["json"] = json.loads(text) if text else None
+              except Exception as exc:
+                  row["json_error"] = f"{type(exc).__name__}:{exc}"
+                  row["body_prefix"] = text[:1000]
+              (sample_dir / f"{name}.json").write_text(json.dumps(row, indent=2, sort_keys=True), encoding="utf-8")
+              return row
+
+          def payload(rows, name):
+              value = rows[name].get("json")
+              return value if isinstance(value, dict) else {}
+
+          def cache_brief(cache):
+              return {k: cache.get(k) for k in (
+                  "snapshot_available", "snapshot_fresh", "snapshot_age_seconds",
+                  "snapshot_interval_seconds", "snapshot_stale_seconds", "attempts",
+                  "successes", "failures", "guard_rejections", "consecutive_failures",
+                  "last_started_at", "last_completed_at", "last_duration_seconds",
+                  "last_error_type", "last_generation_id", "single_flight",
+                  "http_request_executes_deep_forward_builder",
+              )}
+
+          def forensics(composition):
+              runtime = composition.get("runtime_memory_capacity")
+              runtime = runtime if isinstance(runtime, dict) else {}
+              f = runtime.get("cgroup_oom_forensics")
+              f = f if isinstance(f, dict) else {}
+              snap = f.get("current_snapshot")
+              snap = snap if isinstance(snap, dict) else {}
+              return {
+                  "installed": f.get("installed"),
+                  "sampler_running": f.get("sampler_running"),
+                  "persist_writes": f.get("persist_writes"),
+                  "last_persist_error": f.get("last_persist_error"),
+                  "bounded_persistence": f.get("bounded_persistence"),
+                  "process_epoch": f.get("process_epoch"),
+                  "reason": snap.get("reason"),
+                  "active_phases": snap.get("active_phases"),
+                  "memory_current_bytes": snap.get("memory_current_bytes"),
+                  "memory_max_bytes": snap.get("memory_max_bytes"),
+                  "memory_peak_bytes": snap.get("memory_peak_bytes"),
+                  "memory_headroom_bytes": snap.get("memory_headroom_bytes"),
+                  "memory_fraction": snap.get("memory_fraction"),
+                  "memory_events": snap.get("memory_events"),
+                  "process_rss_bytes": snap.get("process_rss_bytes"),
+                  "database_bytes": snap.get("database_bytes"),
+                  "wal_bytes": snap.get("wal_bytes"),
+                  "shm_bytes": snap.get("shm_bytes"),
+              }
+
+          samples = []
+          time.sleep(20)
+          for index in range(5):
+              sample_dir = out / f"sample-{index + 1}"
+              sample_dir.mkdir(parents=True, exist_ok=True)
+              rows = {name: get(name, path, sample_dir) for name, path in endpoints.items()}
+              health = payload(rows, "health")
+              composition = payload(rows, "composition")
+              coordinator = payload(rows, "coordinator")
+              e2e = payload(rows, "e2e")
+              e2e_cache = payload(rows, "e2e_cache")
+              proof = payload(rows, "proof")
+              proof_cache = payload(rows, "proof_cache")
+              forward = payload(rows, "forward")
+              forward_cache = payload(rows, "forward_cache")
+              continuity = payload(rows, "continuity")
+
+              releases = []
+              for value in (health.get("release_commit"), e2e.get("release_commit"), forward.get("release_commit")):
+                  if value:
+                      releases.append(str(value))
+              proof_release = proof.get("release")
+              if isinstance(proof_release, dict) and proof_release.get("release_commit"):
+                  releases.append(str(proof_release["release_commit"]))
+
+              overall = e2e.get("overall") if isinstance(e2e.get("overall"), dict) else {}
+              sample = {
+                  "sample": index + 1,
+                  "releases": releases,
+                  "http": {name: {k: row.get(k) for k in ("http_status", "latency_ms", "error", "json_error")} for name, row in rows.items()},
+                  "composition": {
+                      "composition_version": composition.get("composition_version"),
+                      "certification_generation_single_flight": composition.get("certification_generation_single_flight"),
+                      "certification_generation_runtime_repair_version": composition.get("certification_generation_runtime_repair_version"),
+                      "forward_certification_http_deep_builder_disabled": composition.get("forward_certification_http_deep_builder_disabled"),
+                      "paper_only": composition.get("paper_only"),
+                      "live_money_authority": composition.get("live_money_authority"),
+                      "signing_available": composition.get("signing_available"),
+                      "transaction_submission_available": composition.get("transaction_submission_available"),
+                  },
+                  "coordinator": {k: coordinator.get(k) for k in (
+                      "coordinator_version", "active", "active_surface", "active_generation_id",
+                      "acquisitions", "contentions", "nested_acquisitions", "guard_rejections",
+                      "last_surface", "last_generation_id", "last_wait_seconds", "last_duration_seconds",
+                      "last_guard_reason", "cross_process_single_flight", "nested_builds_reuse_outer_generation",
+                      "resource_guard_enabled", "memory_start_limit_fraction", "disk_reserve_bytes",
+                      "wal_start_max_bytes", "paper_only", "live_money_authority", "signing_available",
+                      "transaction_submission_available", "certification_thresholds_changed",
+                      "economic_thresholds_changed", "canonical_evidence_reset",
+                  )},
+                  "e2e_cache": cache_brief(e2e_cache),
+                  "proof_cache": cache_brief(proof_cache),
+                  "forward_cache": cache_brief(forward_cache),
+                  "e2e_overall": overall,
+                  "solana": e2e.get("solana"),
+                  "fomo": e2e.get("fomo"),
+                  "robinhood": e2e.get("robinhood"),
+                  "proof_state": proof.get("state"),
+                  "proof_blockers": proof.get("blockers"),
+                  "forward_state": forward.get("state"),
+                  "forward_certified": forward.get("system_forward_certified"),
+                  "forward_blockers": forward.get("blockers"),
+                  "continuity": continuity,
+                  "forensics": forensics(composition),
+                  "authority": {
+                      "paper_only": overall.get("paper_only", composition.get("paper_only")),
+                      "live_money_authority": overall.get("live_money_authority", composition.get("live_money_authority")),
+                      "signing_available": overall.get("signing_available", composition.get("signing_available")),
+                      "transaction_submission_available": overall.get("transaction_submission_available", composition.get("transaction_submission_available")),
+                  },
+              }
+              samples.append(sample)
+              (sample_dir / "summary.json").write_text(json.dumps(sample, indent=2, sort_keys=True), encoding="utf-8")
+              print(f"PR264_OBSERVER_SAMPLE_{index + 1}")
+              print(json.dumps(sample, indent=2, sort_keys=True))
+              if index < 4:
+                  time.sleep(20)
+
+          def series(section, key):
+              values = []
+              for sample in samples:
+                  value = sample[section].get(key)
+                  values.append(int(value) if isinstance(value, (int, float)) else None)
+              return values
+
+          def nondecreasing(values):
+              return all(isinstance(v, int) for v in values) and all(b >= a for a, b in zip(values, values[1:]))
+
+          def advancing(values):
+              return nondecreasing(values) and values[-1] > values[0]
+
+          all_releases = [r for sample in samples for r in sample["releases"]]
+          release_exact = bool(all_releases) and all(r == expected for r in all_releases)
+          all_http_200 = all(row.get("http_status") == 200 for sample in samples for row in sample["http"].values())
+
+          cache_sections = ("e2e_cache", "proof_cache", "forward_cache")
+          caches_fresh = all(sample[s].get("snapshot_available") is True and sample[s].get("snapshot_fresh") is True for sample in samples for s in cache_sections)
+          cache_advancing = {}
+          no_new_cache_failures = True
+          for s in cache_sections:
+              attempts = series(s, "attempts")
+              successes = series(s, "successes")
+              failures = series(s, "failures")
+              cache_advancing[s] = {
+                  "attempts": attempts,
+                  "successes": successes,
+                  "failures": failures,
+                  "attempts_advancing": advancing(attempts),
+                  "successes_advancing": advancing(successes),
+                  "failures_nondecreasing": nondecreasing(failures),
+              }
+              if not nondecreasing(failures) or failures[-1] != failures[0]:
+                  no_new_cache_failures = False
+              if any(sample[s].get("consecutive_failures") not in (0, None) or sample[s].get("last_error_type") not in (None, "") for sample in samples):
+                  no_new_cache_failures = False
+
+          coordinator_safe = all(
+              sample["coordinator"].get("cross_process_single_flight") is True
+              and sample["coordinator"].get("nested_builds_reuse_outer_generation") is True
+              and sample["coordinator"].get("resource_guard_enabled") is True
+              and sample["coordinator"].get("certification_thresholds_changed") is False
+              and sample["coordinator"].get("economic_thresholds_changed") is False
+              and sample["coordinator"].get("canonical_evidence_reset") is False
+              for sample in samples
+          )
+          composition_live = all(
+              sample["composition"].get("certification_generation_single_flight") is True
+              and sample["composition"].get("forward_certification_http_deep_builder_disabled") is True
+              for sample in samples
+          )
+          authority_safe = all(
+              sample["authority"].get("paper_only") is True
+              and sample["authority"].get("live_money_authority") is False
+              and sample["authority"].get("signing_available") is False
+              and sample["authority"].get("transaction_submission_available") is False
+              for sample in samples
+          )
+
+          forensics_live = all(sample["forensics"].get("installed") is True and sample["forensics"].get("sampler_running") is True for sample in samples)
+          persist_clean = all(not sample["forensics"].get("last_persist_error") for sample in samples)
+          memory_fractions = [sample["forensics"].get("memory_fraction") for sample in samples]
+          wal_bytes = [sample["forensics"].get("wal_bytes") for sample in samples]
+          memory_events = [sample["forensics"].get("memory_events") for sample in samples]
+
+          def event_value(events, key):
+              return int(events.get(key, 0) or 0) if isinstance(events, dict) else None
+          oom_kills = [event_value(e, "oom_kill") for e in memory_events]
+          ooms = [event_value(e, "oom") for e in memory_events]
+          max_events = [event_value(e, "max") for e in memory_events]
+          no_new_oom = all(v is not None for v in oom_kills + ooms) and oom_kills[-1] == oom_kills[0] and ooms[-1] == ooms[0]
+          no_new_memory_max = all(v is not None for v in max_events) and max_events[-1] == max_events[0]
+
+          summary = {
+              "observer_version": "live-pr264-certification-observer-v1",
+              "read_only": True,
+              "expected_release": expected,
+              "release_exact": release_exact,
+              "all_http_200": all_http_200,
+              "five_samples": len(samples) == 5,
+              "all_caches_fresh": caches_fresh,
+              "cache_advancing": cache_advancing,
+              "no_new_cache_failures": no_new_cache_failures,
+              "coordinator_safe": coordinator_safe,
+              "composition_single_flight_live": composition_live,
+              "paper_only_authority_safe": authority_safe,
+              "forensics_live": forensics_live,
+              "forensics_persist_clean": persist_clean,
+              "memory_fractions": memory_fractions,
+              "wal_bytes": wal_bytes,
+              "oom_kill_events": oom_kills,
+              "oom_events": ooms,
+              "memory_max_events": max_events,
+              "no_new_oom_events": no_new_oom,
+              "no_new_memory_max_events": no_new_memory_max,
+              "samples": samples,
+          }
+          (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+          print("LIVE_PR264_CERTIFICATION_OBSERVER_BEGIN")
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          print("LIVE_PR264_CERTIFICATION_OBSERVER_END")
+
+          blockers = []
+          if not summary["release_exact"]: blockers.append("live_release_mismatch")
+          if not summary["all_http_200"]: blockers.append("production_status_surface_not_all_200")
+          if not summary["five_samples"]: blockers.append("five_sample_observation_incomplete")
+          if not summary["all_caches_fresh"]: blockers.append("certification_cache_not_fresh")
+          for section, state in cache_advancing.items():
+              if not state["attempts_advancing"] or not state["successes_advancing"]:
+                  blockers.append(section + "_refresh_not_advancing")
+          if not summary["no_new_cache_failures"]: blockers.append("certification_refresh_failure_during_observation")
+          if not summary["coordinator_safe"]: blockers.append("single_flight_coordinator_contract_failed")
+          if not summary["composition_single_flight_live"]: blockers.append("single_flight_runtime_not_live")
+          if not summary["paper_only_authority_safe"]: blockers.append("paper_only_authority_boundary_failed")
+          if not summary["forensics_live"]: blockers.append("cgroup_forensics_not_live")
+          if not summary["forensics_persist_clean"]: blockers.append("cgroup_forensics_persist_error")
+          if not summary["no_new_oom_events"]: blockers.append("new_cgroup_oom_event")
+          if not summary["no_new_memory_max_events"]: blockers.append("new_cgroup_memory_max_event")
+          if blockers:
+              raise SystemExit("observer blockers: " + ",".join(blockers))
+          PY
+
+      - name: Upload PR264 exact-live evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-pr264-certification-observer
+          path: pr264-observer-output/
+          if-no-files-found: error
+          retention-days: 7
