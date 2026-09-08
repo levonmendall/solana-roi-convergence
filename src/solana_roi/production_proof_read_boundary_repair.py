@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import render_runtime_bootstrap_repair as render_bootstrap
+from .cgroup_oom_forensics import phase as memory_forensics_phase
 
 
 REPAIR_VERSION = "production-proof-read-boundary-v2-stable-worker-chain"
@@ -185,7 +186,8 @@ def _snapshot_thread_main(builder: Callable[[], dict[str, Any]], stop: threading
             _SNAPSHOT_STATS["last_started_at"] = _utcnow()
         error_type: str | None = None
         try:
-            payload = builder()
+            with memory_forensics_phase("production_proof_build"):
+                payload = builder()
             if not isinstance(payload, dict):
                 raise TypeError("production proof builder returned non-dict payload")
             _publish_snapshot(payload)

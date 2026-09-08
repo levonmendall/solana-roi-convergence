@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import unified_strategy_status as unified
+from .cgroup_oom_forensics import phase as memory_forensics_phase
 
 
 REPAIR_VERSION = "e2e-status-read-boundary-v2-precomputed-nonblocking"
@@ -270,7 +271,8 @@ def _snapshot_thread_main(
             _SNAPSHOT_STATS["last_started_at"] = started_at
         error_type: str | None = None
         try:
-            payload = build_bounded_e2e_status(lambda: runtime, robinhood_status_provider)
+            with memory_forensics_phase("e2e_status_build"):
+                payload = build_bounded_e2e_status(lambda: runtime, robinhood_status_provider)
             _publish_snapshot(payload)
         except BaseException as exc:
             error_type = type(exc).__name__
