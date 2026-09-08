@@ -13,146 +13,95 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Read live production certification surfaces
+      - name: Read exact live production release
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: 1ac8ff584476b73c0801e788e8bb11881b84599c
+          EXPECTED_RELEASE: 075079b125491a69cf3ae29ae32912a226c99107
+          EXPECTED_RPC_OWNERSHIP_VERSION: rpc-endpoint-task-terminal-ownership-v3-captured-capacity-reference
         run: |
           python - <<'PY'
-          import json
-          import os
-          import pathlib
-          import time
-          import urllib.error
-          import urllib.request
+          import json, os, pathlib, urllib.error, urllib.request
 
           base = os.environ["BASE_URL"].rstrip("/")
           expected = os.environ["EXPECTED_RELEASE"]
+          expected_rpc_version = os.environ["EXPECTED_RPC_OWNERSHIP_VERSION"]
           out = pathlib.Path("observer-output")
           out.mkdir(parents=True, exist_ok=True)
-
           endpoints = {
               "health": "/health",
-              "runtime-bootstrap": "/v1/runtime-bootstrap/status",
               "e2e-status": "/v1/strategy/e2e-status",
-              "e2e-status-cache": "/v1/strategy/e2e-status/cache",
               "production-composition": "/v1/operations/production-composition",
               "production-proof": "/v1/strategy/production-proof",
-              "production-proof-cache": "/v1/strategy/production-proof/cache",
               "batch9-continuity": "/v1/strategy/batch9-continuity",
           }
 
           def fetch(name, path):
-              started = time.monotonic()
-              req = urllib.request.Request(
-                  base + path,
-                  headers={"User-Agent": "solana-roi-certification-observer/4"},
-                  method="GET",
-              )
-              result = {"name": name, "path": path, "method": "GET"}
+              result = {"name": name, "path": path}
               body = b""
               try:
-                  with urllib.request.urlopen(req, timeout=20) as resp:
-                      body = resp.read()
-                      result["http_status"] = int(resp.status)
-                      result["content_type"] = resp.headers.get("Content-Type")
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/9"})
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      result["http_status"] = response.status
+                      body = response.read()
               except urllib.error.HTTPError as exc:
-                  result["http_status"] = int(exc.code)
-                  result["content_type"] = exc.headers.get("Content-Type") if exc.headers else None
-                  body = exc.read()
+                  result["http_status"] = exc.code
                   result["error"] = f"HTTPError:{exc.code}"
+                  body = exc.read()
               except Exception as exc:
                   result["error"] = f"{type(exc).__name__}:{exc}"
-              result["latency_ms"] = round((time.monotonic() - started) * 1000, 3)
               text = body.decode("utf-8", errors="replace")
-              (out / f"{name}.body.txt").write_text(text, encoding="utf-8")
               try:
-                  parsed = json.loads(text) if text else None
+                  result["json"] = json.loads(text) if text else None
               except Exception as exc:
-                  parsed = None
+                  result["json"] = None
                   result["json_error"] = f"{type(exc).__name__}:{exc}"
-              result["json"] = parsed
-              (out / f"{name}.json").write_text(
-                  json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
-              )
+              (out / f"{name}.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
               return result
 
-          time.sleep(5)
           surfaces = {name: fetch(name, path) for name, path in endpoints.items()}
-
           def payload(name):
-              value = surfaces.get(name, {})
-              data = value.get("json") if isinstance(value, dict) else None
-              return data if isinstance(data, dict) else {}
+              value = surfaces[name].get("json")
+              return value if isinstance(value, dict) else {}
 
           health = payload("health")
-          bootstrap = payload("runtime-bootstrap")
           e2e = payload("e2e-status")
-          composition = payload("production-composition")
           proof = payload("production-proof")
-          continuity = payload("batch9-continuity")
+          composition = payload("production-composition")
+          releases = []
+          for value in (health.get("release_commit"), e2e.get("release_commit")):
+              if value: releases.append(str(value))
+          proof_release = proof.get("release")
+          if isinstance(proof_release, dict) and proof_release.get("release_commit"):
+              releases.append(str(proof_release["release_commit"]))
 
-          release_candidates = []
-          for source_name, source in (("health", health), ("e2e", e2e), ("proof", proof)):
-              release = source.get("release") if isinstance(source, dict) else None
-              if isinstance(release, dict):
-                  commit = release.get("release_commit") or release.get("commit")
-                  if commit:
-                      release_candidates.append({"source": source_name, "release_commit": commit})
-              direct = source.get("release_commit") if isinstance(source, dict) else None
-              if direct:
-                  release_candidates.append({"source": source_name, "release_commit": direct})
-
+          ownership = composition.get("rpc_task_ownership") or {}
           summary = {
-              "observer_version": "live-production-certification-observer-v4-bootstrap",
+              "observer_version": "live-production-certification-observer-v5-exact-v3-ownership",
               "read_only": True,
               "expected_release": expected,
-              "observed_release_candidates": release_candidates,
-              "http": {
-                  name: {
-                      "status": value.get("http_status"),
-                      "latency_ms": value.get("latency_ms"),
-                      "error": value.get("error"),
-                      "json_error": value.get("json_error"),
-                  }
-                  for name, value in surfaces.items()
-              },
-              "health": health,
-              "runtime_bootstrap": bootstrap,
-              "e2e_status": e2e,
-              "production_composition": composition,
-              "production_proof": proof,
-              "batch9_continuity": continuity,
-              "e2e_status_cache": payload("e2e-status-cache"),
-              "production_proof_cache": payload("production-proof-cache"),
-          }
-          (out / "summary.json").write_text(
-              json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
-          )
-
-          print("LIVE_CERTIFICATION_OBSERVER_BEGIN")
-          print(json.dumps({
-              "expected_release": expected,
-              "observed_release_candidates": release_candidates,
-              "http": summary["http"],
-              "runtime_bootstrap": bootstrap,
-              "solana": e2e.get("solana"),
-              "fomo": e2e.get("fomo"),
-              "robinhood": e2e.get("robinhood"),
-              "composition_health_semantics": composition.get("health_semantics"),
-              "paper_execution_lifecycle": composition.get("paper_execution_lifecycle"),
+              "observed_releases": releases,
+              "release_exact": bool(releases) and all(value == expected for value in releases),
+              "rpc_task_ownership_repair_version": composition.get("rpc_task_ownership_repair_version"),
+              "rpc_task_ownership": ownership,
+              "http": {name: {k: value.get(k) for k in ("http_status", "error", "json_error")} for name, value in surfaces.items()},
+              "e2e_state": e2e.get("overall"),
               "proof_state": proof.get("state"),
               "proof_blockers": proof.get("blockers"),
-              "resource_pressure": proof.get("resource_pressure"),
-          }, indent=2, sort_keys=True))
+              "batch9_continuity": payload("batch9-continuity"),
+          }
+          (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+          print("LIVE_CERTIFICATION_OBSERVER_BEGIN")
+          print(json.dumps(summary, indent=2, sort_keys=True))
           print("LIVE_CERTIFICATION_OBSERVER_END")
 
-          observed_commits = {item["release_commit"] for item in release_candidates}
-          mismatches = sorted(commit for commit in observed_commits if commit != expected)
-          if mismatches:
-              raise SystemExit(f"live release mismatch: {mismatches} != {expected}")
-          if not observed_commits:
-              raise SystemExit("no live release commit observed")
+          blockers = []
+          if not summary["release_exact"]: blockers.append("live_release_mismatch")
+          if composition.get("rpc_task_ownership_repair_version") != expected_rpc_version: blockers.append("rpc_task_ownership_version_mismatch")
+          if ownership.get("installed") is not True: blockers.append("rpc_task_ownership_not_installed")
+          if ownership.get("preowned_capacity_module_captures_rebound") is not True: blockers.append("captured_capacity_rebind_capability_not_live")
+          if int(ownership.get("captured_capacity_references_rebound", 0) or 0) < 1: blockers.append("captured_capacity_reference_not_rebound")
+          if blockers:
+              raise SystemExit("observer blockers: " + ",".join(blockers))
           PY
 
       - name: Upload exact live observer evidence
