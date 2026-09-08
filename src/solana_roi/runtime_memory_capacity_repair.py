@@ -257,6 +257,10 @@ async def _bounded_prefill_launch_context(self: Any, candidate: Any) -> bool:
 
 
 setattr(_bounded_prefill_launch_context, "_roi_bounded_context_runtime", True)
+# Preserve the pre-existing production guard contract used by architecture and
+# legacy-entrypoint regressions. This repair is stricter than the older memory
+# boundary, but downstream guard checks still use this marker as the invariant.
+setattr(_bounded_prefill_launch_context, "_roi_memory_bounded", True)
 
 
 def install_runtime_memory_capacity_repair() -> None:
