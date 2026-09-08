@@ -6,7 +6,8 @@
     "solana_roi.v51_seeded_e2e",
     "solana_roi.v51_synthetic_provenance",
     "solana_roi.v52_candidate_continuity",
-    "solana_roi.v52_continuation_capture"
+    "solana_roi.v52_continuation_capture",
+    "solana_roi.v52_lossless_candidate_accounting"
   ],
   "migration_only": [
     "solana_roi.cli",
