@@ -23,9 +23,19 @@ class _Journal:
         self.hydrated.append(str(payload["signature"]))
 
 
+class _Registry:
+    def get(self, wallet: str):
+        return object() if str(wallet).startswith("candidate-") else None
+
+
+class _Service:
+    registry = _Registry()
+
+
 class _Plane:
     def __init__(self, rows: list[dict[str, object]], *, deadline: float = 2.0) -> None:
         self.journal = _Journal(rows)
+        self.service = _Service()
         self.candidate_context_max_signatures = max(50, len(rows))
         self.candidate_context_deadline_seconds = deadline
         self.persisted: list[str] = []
@@ -52,12 +62,14 @@ class _Plane:
         self.persisted.append(str(swap.signature))
 
 
-def _candidate(signature: str = "candidate"):
+def _candidate(signature: str = "candidate", *, wallet: str | None = None):
     return SimpleNamespace(
         source="ws:PUMPFUN:program",
         token_mint="mint-1",
         signature=signature,
         received_at=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=30),
+        wallet=wallet or f"candidate-{signature}",
+        side="buy",
     )
 
 
@@ -110,6 +122,37 @@ def test_concurrent_prefills_share_one_global_fetch_budget() -> None:
     assert plane.fetch_peak <= repair.CONTEXT_FETCH_CONCURRENCY
     assert plane.fetch_peak > 1
     assert repair.status()["peak_fetches"] <= repair.CONTEXT_FETCH_CONCURRENCY
+
+
+def test_outer_candidate_and_background_context_gates_remain_exactly_bounded() -> None:
+    async def run() -> tuple[list[bool], _Plane]:
+        plane = _Plane(_rows(48), deadline=3.0)
+        plane.fetch_delay = 0.01
+        jobs = [
+            repair._bounded_prefill_launch_context(
+                plane,
+                _candidate(f"critical-{index}", wallet=f"candidate-{index}"),
+            )
+            for index in range(7)
+        ]
+        jobs += [
+            repair._bounded_prefill_launch_context(
+                plane,
+                _candidate(f"background-{index}", wallet=f"background-{index}"),
+            )
+            for index in range(5)
+        ]
+        return list(await asyncio.gather(*jobs)), plane
+
+    results, plane = asyncio.run(run())
+    state = repair.status()
+    assert all(results)
+    assert state["peak_candidate_prefills"] == repair.LEGACY_CANDIDATE_CONTEXT_SLOTS == 3
+    assert state["peak_background_prefills"] == repair.LEGACY_BACKGROUND_CONTEXT_SLOTS == 1
+    assert state["active_candidate_prefills"] == 0
+    assert state["active_background_prefills"] == 0
+    assert plane.fetch_peak <= repair.CONTEXT_FETCH_CONCURRENCY
+    assert state["legacy_outer_memory_gate_preserved"] is True
 
 
 def test_timeout_cancels_and_drains_every_worker() -> None:
@@ -191,8 +234,10 @@ def test_install_is_idempotent_and_preserves_paper_only_authority() -> None:
 
     assert first is second
     assert getattr(second, "_roi_bounded_context_runtime", False) is True
+    assert getattr(second, "_roi_memory_bounded", False) is True
     assert status["installed"] is True
     assert status["candidate_context_one_task_per_signature"] is False
+    assert status["legacy_outer_memory_gate_preserved"] is True
     assert status["certification_thresholds_changed"] is False
     assert status["economic_thresholds_changed"] is False
     assert status["canonical_evidence_reset"] is False
