@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import runpy
 from pathlib import Path
 
-from solana_roi.storage_inventory import inventory_storage
+_inventory_module = runpy.run_path(
+    str(Path(__file__).resolve().parents[1] / "scripts" / "storage_inventory.py")
+)
+inventory_storage = _inventory_module["inventory_storage"]
 
 
 def test_inventory_reports_sizes_and_top_level_consumers(tmp_path: Path) -> None:
