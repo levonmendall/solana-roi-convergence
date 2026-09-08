@@ -15,8 +15,8 @@ jobs:
       - name: Observe repeated exact-live certification state
         env:
           BASE_URL: https://solana-roi-convergence.onrender.com
-          EXPECTED_RELEASE: 555ad1bec7566986c5e6efc0aae9b73f56338f9f
-          EXPECTED_RPC_OWNERSHIP_VERSION: rpc-endpoint-task-terminal-ownership-v2-capacity-root
+          EXPECTED_RELEASE: 075079b125491a69cf3ae29ae32912a226c99107
+          EXPECTED_RPC_OWNERSHIP_VERSION: rpc-endpoint-task-terminal-ownership-v3-captured-capacity-reference
         run: |
           python - <<'PY'
           import json, os, pathlib, time, urllib.error, urllib.request
@@ -41,7 +41,7 @@ jobs:
               result = {"name": name, "path": path}
               body = b""
               try:
-                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/7"})
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/8"})
                   with urllib.request.urlopen(req, timeout=20) as response:
                       result["http_status"] = response.status
                       body = response.read()
@@ -156,9 +156,11 @@ jobs:
           active_root_owned = all(item.get("active_call_endpoint_terminally_owned") is True for item in ownership)
           capacity_root_owned = all(item.get("capacity_call_endpoint_terminally_owned") is True for item in ownership)
           late_capacity_guarded = all(item.get("late_capacity_composition_guarded") is True for item in ownership)
+          captured_rebind_capability = all(item.get("preowned_capacity_module_captures_rebound") is True for item in ownership)
+          captured_rebound = all(int(item.get("captured_capacity_references_rebound", 0) or 0) >= 1 for item in ownership)
 
           summary = {
-              "observer_version": "live-production-certification-observer-pr-v7-rpc-capacity-root-ownership",
+              "observer_version": "live-production-certification-observer-pr-v8-captured-capacity-ownership",
               "read_only": True,
               "expected_release": expected,
               "release_exact": release_exact,
@@ -177,6 +179,8 @@ jobs:
               "active_endpoint_root_terminally_owned": active_root_owned,
               "capacity_endpoint_root_terminally_owned": capacity_root_owned,
               "late_capacity_composition_guarded": late_capacity_guarded,
+              "captured_capacity_rebind_capability_live": captured_rebind_capability,
+              "captured_capacity_reference_rebound": captured_rebound,
               "samples": samples,
           }
           (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -197,6 +201,8 @@ jobs:
           if not active_root_owned: blockers.append("active_rpc_endpoint_root_not_terminally_owned")
           if not capacity_root_owned: blockers.append("capacity_rpc_endpoint_root_not_terminally_owned")
           if not late_capacity_guarded: blockers.append("late_capacity_composition_not_guarded")
+          if not captured_rebind_capability: blockers.append("captured_capacity_rebind_capability_not_live")
+          if not captured_rebound: blockers.append("captured_capacity_reference_not_rebound")
           if blockers:
               raise SystemExit("observer blockers: " + ",".join(blockers))
           PY
