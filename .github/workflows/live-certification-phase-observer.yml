@@ -1,0 +1,254 @@
+name: Live Certification Phase Observer
+
+on:
+  push:
+    branches:
+      - certification/live-production-observer-fb660df
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Observe exact-live certification and resource pressure
+        env:
+          BASE_URL: https://solana-roi-convergence.onrender.com
+          EXPECTED_RELEASE: 820c65ec70db56edaf004fc9d17713d9e7d36ff5
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, time, urllib.error, urllib.request
+
+          base = os.environ["BASE_URL"].rstrip("/")
+          expected = os.environ["EXPECTED_RELEASE"]
+          out = pathlib.Path("phase-observer-output")
+          out.mkdir(parents=True, exist_ok=True)
+
+          def get(name, path, sample_dir, timeout=25):
+              started = time.monotonic()
+              row = {"name": name, "path": path, "http_status": None, "json": None}
+              body = b""
+              try:
+                  req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-phase-observer/1"})
+                  with urllib.request.urlopen(req, timeout=timeout) as response:
+                      row["http_status"] = response.status
+                      body = response.read()
+              except urllib.error.HTTPError as exc:
+                  row["http_status"] = exc.code
+                  row["error"] = f"HTTPError:{exc.code}"
+                  body = exc.read()
+              except Exception as exc:
+                  row["error"] = f"{type(exc).__name__}:{exc}"
+              row["latency_ms"] = round((time.monotonic() - started) * 1000.0, 3)
+              text = body.decode("utf-8", errors="replace")
+              try:
+                  row["json"] = json.loads(text) if text else None
+              except Exception as exc:
+                  row["json_error"] = f"{type(exc).__name__}:{exc}"
+                  row["body_prefix"] = text[:1000]
+              (sample_dir / f"{name}.json").write_text(json.dumps(row, indent=2, sort_keys=True), encoding="utf-8")
+              return row
+
+          def payload(row):
+              value = row.get("json")
+              return value if isinstance(value, dict) else {}
+
+          def forensics_from(composition):
+              memory = composition.get("runtime_memory_capacity")
+              memory = memory if isinstance(memory, dict) else {}
+              forensic = memory.get("cgroup_oom_forensics")
+              if not isinstance(forensic, dict):
+                  forensic = composition.get("cgroup_oom_forensics")
+              return forensic if isinstance(forensic, dict) else {}
+
+          def forensic_brief(composition):
+              forensic = forensics_from(composition)
+              snap = forensic.get("current_snapshot")
+              snap = snap if isinstance(snap, dict) else {}
+              previous = forensic.get("previous_epoch_snapshot")
+              previous = previous if isinstance(previous, dict) else {}
+              return {
+                  "installed": forensic.get("installed"),
+                  "sampler_running": forensic.get("sampler_running"),
+                  "persist_writes": forensic.get("persist_writes"),
+                  "last_persist_error": forensic.get("last_persist_error"),
+                  "bounded_persistence": forensic.get("bounded_persistence"),
+                  "history_files_max": forensic.get("history_files_max"),
+                  "process_epoch": forensic.get("process_epoch"),
+                  "current_reason": snap.get("reason"),
+                  "current_active_phases": snap.get("active_phases"),
+                  "memory_current_bytes": snap.get("memory_current_bytes"),
+                  "memory_max_bytes": snap.get("memory_max_bytes"),
+                  "memory_peak_bytes": snap.get("memory_peak_bytes"),
+                  "memory_headroom_bytes": snap.get("memory_headroom_bytes"),
+                  "memory_fraction": snap.get("memory_fraction"),
+                  "memory_events": snap.get("memory_events"),
+                  "process_rss_bytes": snap.get("process_rss_bytes"),
+                  "database_bytes": snap.get("database_bytes"),
+                  "wal_bytes": snap.get("wal_bytes"),
+                  "shm_bytes": snap.get("shm_bytes"),
+                  "previous_reason": previous.get("reason"),
+                  "previous_active_phases": previous.get("active_phases"),
+                  "previous_memory_current_bytes": previous.get("memory_current_bytes"),
+                  "previous_memory_peak_bytes": previous.get("memory_peak_bytes"),
+                  "previous_memory_events": previous.get("memory_events"),
+              }
+
+          samples = []
+          time.sleep(20)
+          for index in range(3):
+              sample_dir = out / f"sample-{index + 1}"
+              sample_dir.mkdir(parents=True, exist_ok=True)
+
+              health_row = get("health", "/health", sample_dir)
+              e2e_row = get("e2e-status", "/v1/strategy/e2e-status", sample_dir)
+              e2e_cache_row = get("e2e-status-cache", "/v1/strategy/e2e-status/cache", sample_dir)
+              proof_row = get("production-proof", "/v1/strategy/production-proof", sample_dir)
+              proof_cache_row = get("production-proof-cache", "/v1/strategy/production-proof/cache", sample_dir)
+              composition_pre_row = get("production-composition-pre", "/v1/operations/production-composition", sample_dir)
+              forward_row = get("forward-certification", "/v1/strategy/forward-certification", sample_dir, timeout=30)
+              composition_post_row = get("production-composition-post", "/v1/operations/production-composition", sample_dir)
+              continuity_row = get("batch9-continuity", "/v1/strategy/batch9-continuity", sample_dir)
+
+              health = payload(health_row)
+              e2e = payload(e2e_row)
+              e2e_cache = payload(e2e_cache_row)
+              proof = payload(proof_row)
+              proof_cache = payload(proof_cache_row)
+              composition_pre = payload(composition_pre_row)
+              composition_post = payload(composition_post_row)
+              forward = payload(forward_row)
+              continuity = payload(continuity_row)
+
+              releases = []
+              for value in (health.get("release_commit"), e2e.get("release_commit"), forward.get("release_commit")):
+                  if value:
+                      releases.append(str(value))
+              proof_release = proof.get("release")
+              if isinstance(proof_release, dict) and proof_release.get("release_commit"):
+                  releases.append(str(proof_release.get("release_commit")))
+
+              sample = {
+                  "sample": index + 1,
+                  "releases": releases,
+                  "http": {
+                      "health": {"status": health_row.get("http_status"), "latency_ms": health_row.get("latency_ms"), "error": health_row.get("error")},
+                      "e2e_status": {"status": e2e_row.get("http_status"), "latency_ms": e2e_row.get("latency_ms"), "error": e2e_row.get("error")},
+                      "production_proof": {"status": proof_row.get("http_status"), "latency_ms": proof_row.get("latency_ms"), "error": proof_row.get("error")},
+                      "forward_certification": {"status": forward_row.get("http_status"), "latency_ms": forward_row.get("latency_ms"), "error": forward_row.get("error"), "json_error": forward_row.get("json_error")},
+                  },
+                  "e2e_cache": {k: e2e_cache.get(k) for k in ("snapshot_available", "snapshot_fresh", "snapshot_age_seconds", "attempts", "successes", "failures", "consecutive_failures", "last_duration_seconds", "last_error_type")},
+                  "proof_cache": {k: proof_cache.get(k) for k in ("snapshot_available", "snapshot_fresh", "snapshot_age_seconds", "attempts", "successes", "failures", "consecutive_failures", "last_duration_seconds", "last_error_type")},
+                  "e2e_overall": e2e.get("overall"),
+                  "solana": e2e.get("solana"),
+                  "fomo": e2e.get("fomo"),
+                  "robinhood": e2e.get("robinhood"),
+                  "proof_state": proof.get("state"),
+                  "proof_blockers": proof.get("blockers"),
+                  "forward_state": forward.get("state"),
+                  "forward_certified": forward.get("system_forward_certified"),
+                  "forward_blockers": forward.get("blockers"),
+                  "forward_checks": forward.get("checks"),
+                  "continuity": continuity,
+                  "forensics_pre_forward": forensic_brief(composition_pre),
+                  "forensics_post_forward": forensic_brief(composition_post),
+                  "runtime_memory_capacity_repair": composition_post.get("runtime_memory_capacity_repair"),
+                  "paper_only": (e2e.get("overall") or {}).get("paper_only") if isinstance(e2e.get("overall"), dict) else None,
+                  "live_money_authority": (e2e.get("overall") or {}).get("live_money_authority") if isinstance(e2e.get("overall"), dict) else None,
+                  "signing_available": (e2e.get("overall") or {}).get("signing_available") if isinstance(e2e.get("overall"), dict) else None,
+                  "transaction_submission_available": (e2e.get("overall") or {}).get("transaction_submission_available") if isinstance(e2e.get("overall"), dict) else None,
+              }
+              samples.append(sample)
+              (sample_dir / "summary.json").write_text(json.dumps(sample, indent=2, sort_keys=True), encoding="utf-8")
+              print(f"PHASE_OBSERVER_SAMPLE_{index + 1}")
+              print(json.dumps(sample, indent=2, sort_keys=True))
+              if index < 2:
+                  time.sleep(20)
+
+          def nums(key, section):
+              values = []
+              for sample in samples:
+                  value = sample[section].get(key)
+                  values.append(int(value) if isinstance(value, (int, float)) else None)
+              return values
+
+          e2e_attempts = nums("attempts", "e2e_cache")
+          e2e_successes = nums("successes", "e2e_cache")
+          proof_attempts = nums("attempts", "proof_cache")
+          proof_successes = nums("successes", "proof_cache")
+          forensic_writes = [sample["forensics_post_forward"].get("persist_writes") for sample in samples]
+          all_releases = [release for sample in samples for release in sample["releases"]]
+
+          def advancing(values):
+              return all(isinstance(v, int) for v in values) and values[-1] > values[0] and all(b >= a for a, b in zip(values, values[1:]))
+
+          release_exact = bool(all_releases) and all(value == expected for value in all_releases)
+          e2e_fresh = all(sample["e2e_cache"].get("snapshot_fresh") is True for sample in samples)
+          proof_fresh = all(sample["proof_cache"].get("snapshot_fresh") is True for sample in samples)
+          forward_http_ok = all(sample["http"]["forward_certification"].get("status") == 200 for sample in samples)
+          forensics_live = all(sample["forensics_post_forward"].get("installed") is True and sample["forensics_post_forward"].get("sampler_running") is True for sample in samples)
+          forensics_bounded = all(sample["forensics_post_forward"].get("bounded_persistence") is True and sample["forensics_post_forward"].get("history_files_max") == 2 for sample in samples)
+          forensics_clean = all(not sample["forensics_post_forward"].get("last_persist_error") for sample in samples)
+          authority_safe = all(
+              sample.get("paper_only") is True
+              and sample.get("live_money_authority") is False
+              and sample.get("signing_available") is False
+              and sample.get("transaction_submission_available") is False
+              for sample in samples
+          )
+
+          summary = {
+              "observer_version": "live-certification-phase-observer-v1",
+              "read_only": True,
+              "expected_release": expected,
+              "release_exact": release_exact,
+              "e2e_attempts": e2e_attempts,
+              "e2e_successes": e2e_successes,
+              "proof_attempts": proof_attempts,
+              "proof_successes": proof_successes,
+              "forensic_persist_writes": forensic_writes,
+              "e2e_refresh_advancing": advancing(e2e_attempts) and advancing(e2e_successes),
+              "proof_refresh_advancing": advancing(proof_attempts) and advancing(proof_successes),
+              "e2e_all_samples_fresh": e2e_fresh,
+              "proof_all_samples_fresh": proof_fresh,
+              "forward_http_all_200": forward_http_ok,
+              "forensics_live": forensics_live,
+              "forensics_bounded": forensics_bounded,
+              "forensics_persist_clean": forensics_clean,
+              "forensics_writes_advancing": advancing([int(v) if isinstance(v, (int, float)) else None for v in forensic_writes]),
+              "paper_only_authority_safe": authority_safe,
+              "forward_states": [sample.get("forward_state") for sample in samples],
+              "forward_certified": [sample.get("forward_certified") for sample in samples],
+              "forward_blockers": [sample.get("forward_blockers") for sample in samples],
+              "samples": samples,
+          }
+          (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+          print("LIVE_CERTIFICATION_PHASE_OBSERVER_BEGIN")
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          print("LIVE_CERTIFICATION_PHASE_OBSERVER_END")
+
+          blockers = []
+          if not release_exact: blockers.append("live_release_mismatch")
+          if not summary["e2e_refresh_advancing"]: blockers.append("e2e_refresh_not_advancing")
+          if not summary["proof_refresh_advancing"]: blockers.append("production_proof_refresh_not_advancing")
+          if not e2e_fresh: blockers.append("e2e_snapshot_not_fresh")
+          if not proof_fresh: blockers.append("production_proof_snapshot_not_fresh")
+          if not forward_http_ok: blockers.append("forward_certification_http_not_200")
+          if not forensics_live: blockers.append("cgroup_forensics_not_live")
+          if not forensics_bounded: blockers.append("cgroup_forensics_not_bounded")
+          if not forensics_clean: blockers.append("cgroup_forensics_persist_error")
+          if not authority_safe: blockers.append("paper_only_authority_boundary_failed")
+          if blockers:
+              raise SystemExit("observer blockers: " + ",".join(blockers))
+          PY
+
+      - name: Upload phase observer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-certification-phase-observer
+          path: phase-observer-output/
+          if-no-files-found: error
+          retention-days: 7
