@@ -1,0 +1,123 @@
+name: Live Production Certification Observer
+
+on:
+  push:
+    branches:
+      - certification/live-production-observer-fb660df
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read live production certification surfaces
+        env:
+          BASE_URL: https://solana-roi-convergence.onrender.com
+          EXPECTED_RELEASE: fb660df1d98a43029380a6e5f2e56a22b6a94284
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+          import urllib.error
+
+          base = os.environ["BASE_URL"].rstrip("/")
+          expected = os.environ["EXPECTED_RELEASE"]
+
+          def fetch(path):
+              req = urllib.request.Request(base + path, headers={"User-Agent": "solana-roi-certification-observer/1"})
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      body = resp.read().decode("utf-8")
+                      return {"http_status": resp.status, "json": json.loads(body)}
+              except Exception as exc:
+                  return {"error": f"{type(exc).__name__}:{exc}"}
+
+          # Give background snapshot publishers enough time to publish after the new instance starts.
+          time.sleep(20)
+
+          surfaces = {
+              "health": fetch("/health"),
+              "e2e": fetch("/v1/strategy/e2e-status"),
+              "e2e_cache": fetch("/v1/strategy/e2e-status/cache"),
+              "composition": fetch("/v1/operations/production-composition"),
+              "production_proof": fetch("/v1/strategy/production-proof"),
+              "production_proof_cache": fetch("/v1/strategy/production-proof/cache"),
+              "batch9_continuity": fetch("/v1/strategy/batch9-continuity"),
+          }
+
+          def data(name):
+              value = surfaces.get(name, {})
+              return value.get("json") if isinstance(value, dict) else None
+
+          e2e = data("e2e") or {}
+          comp = data("composition") or {}
+          proof = data("production_proof") or {}
+
+          report = {
+              "expected_release": expected,
+              "http": {k: ({"http_status": v.get("http_status")} if isinstance(v, dict) and "http_status" in v else v) for k, v in surfaces.items()},
+              "health": data("health"),
+              "e2e": {
+                  "release": e2e.get("release"),
+                  "state": e2e.get("state"),
+                  "service_state": e2e.get("service_state"),
+                  "blockers": e2e.get("blockers"),
+                  "worker_readiness": e2e.get("worker_readiness"),
+                  "strategy_continuity": e2e.get("strategy_continuity"),
+                  "pipeline_counts": e2e.get("pipeline_counts"),
+                  "lifecycle": e2e.get("lifecycle"),
+                  "paper_only": e2e.get("paper_only"),
+                  "live_money_authority": e2e.get("live_money_authority"),
+                  "signing_available": e2e.get("signing_available"),
+                  "transaction_submission_available": e2e.get("transaction_submission_available"),
+              },
+              "e2e_cache": data("e2e_cache"),
+              "composition": {
+                  "composition_version": comp.get("composition_version"),
+                  "healthy": comp.get("healthy"),
+                  "health_semantics": comp.get("health_semantics"),
+                  "paper_execution_lifecycle": comp.get("paper_execution_lifecycle"),
+                  "e2e_status_read_boundary": comp.get("e2e_status_read_boundary"),
+                  "e2e_status_read_boundary_version": comp.get("e2e_status_read_boundary_version"),
+                  "production_proof_read_boundary": comp.get("production_proof_read_boundary"),
+                  "production_proof_read_boundary_version": comp.get("production_proof_read_boundary_version"),
+                  "same_release_continuity_epoch_repair": comp.get("same_release_continuity_epoch_repair"),
+                  "same_release_continuity_epoch_repair_version": comp.get("same_release_continuity_epoch_repair_version"),
+                  "paper_only": comp.get("paper_only"),
+                  "live_money_authority": comp.get("live_money_authority"),
+                  "signing_available": comp.get("signing_available"),
+                  "transaction_submission_available": comp.get("transaction_submission_available"),
+              },
+              "production_proof": {
+                  "release": proof.get("release"),
+                  "state": proof.get("state"),
+                  "ready_for_forward_proof": proof.get("ready_for_forward_proof"),
+                  "production_proof_pass": proof.get("production_proof_pass"),
+                  "blockers": proof.get("blockers"),
+                  "authority": proof.get("authority"),
+                  "worker_readiness": proof.get("worker_readiness"),
+                  "candidate_accounting": proof.get("candidate_accounting"),
+                  "forward_certification": proof.get("forward_certification"),
+                  "final_certification": proof.get("final_certification"),
+                  "batch6_release_gate": proof.get("batch6_release_gate"),
+                  "read_boundary": proof.get("read_boundary"),
+              },
+              "production_proof_cache": data("production_proof_cache"),
+              "batch9_continuity": data("batch9_continuity"),
+          }
+
+          print("LIVE_CERTIFICATION_OBSERVER_BEGIN")
+          print(json.dumps(report, sort_keys=True, indent=2))
+          print("LIVE_CERTIFICATION_OBSERVER_END")
+
+          # This observer never creates economic authority. It only rejects a mismatched release.
+          release = e2e.get("release") if isinstance(e2e, dict) else None
+          release_commit = release.get("release_commit") if isinstance(release, dict) else None
+          if release_commit not in (None, expected):
+              raise SystemExit(f"live release mismatch: {release_commit} != {expected}")
+          PY
