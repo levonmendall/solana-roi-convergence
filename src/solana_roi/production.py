@@ -22,14 +22,6 @@ from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 # bootstrap: it grants no strategy, signing, submission, or live-money authority.
 configure_robinhood_drpc_backup()
 
-# Install the certification export memory boundary before the explicit production
-# composition mounts its snapshot routes. This alters only temporary SQLite export
-# cache residency and fail-closed resource protection; strategy/economic authority
-# remains owned by production_system below.
-from .certification_snapshot_memory_repair import install_certification_snapshot_memory_repair
-
-install_certification_snapshot_memory_repair()
-
 from .production_system import (
     COMPOSITION_STATUS_PATH,
     COMPOSITION_VERSION,
