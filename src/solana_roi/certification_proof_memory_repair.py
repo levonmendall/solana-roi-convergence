@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import random
 import threading
-from typing import Any, Callable
+from statistics import mean
+from typing import Any, Callable, Iterator, Sequence
 
 from . import production_proof_read_boundary_repair as proof
 from . import v51_economic_certification as economic
+from . import v51_economic_core as economic_core
 from . import v51_phase14_profitability_certification as phase14
 from . import v51_phase17_context_certification as phase17
 from . import v51_cross_surface_proof as cross_surface
@@ -14,6 +19,7 @@ from .strategy_v51_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH
 
 
 REPAIR_VERSION = "certification-proof-memory-v1-bounded-shadow-shared-promotion"
+BOOTSTRAP_MEMORY_REPAIR_VERSION = "certification-bootstrap-memory-v1-weighted-cluster-resampling"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -29,6 +35,7 @@ _ORIGINAL_ECONOMIC_RECORDS: Callable[[Any], list[dict[str, Any]]] = economic._re
 _ORIGINAL_COMBINED_PROMOTION_RECORDS: Callable[[Any], list[dict[str, Any]]] = (
     cross_surface.combined_promotion_records
 )
+_ORIGINAL_BOOTSTRAP_DISTRIBUTIONS = economic_core._bootstrap_distributions
 _ORIGINAL_PROOF_BUILDER: Callable[[], dict[str, Any]] | None = None
 _STATE: dict[str, Any] = {
     "bounded_record_builds": 0,
@@ -36,12 +43,20 @@ _STATE: dict[str, Any] = {
     "promotion_cache_hits": 0,
     "promotion_cache_misses": 0,
     "proof_generations": 0,
+    "bounded_bootstrap_calls": 0,
+    "bounded_bootstrap_samples": 0,
+    "bounded_bootstrap_max_source_values": 0,
 }
 
 
 def _inc(name: str, amount: int = 1) -> None:
     with _LOCK:
         _STATE[name] = int(_STATE.get(name, 0) or 0) + int(amount)
+
+
+def _max_state(name: str, value: int) -> None:
+    with _LOCK:
+        _STATE[name] = max(int(_STATE.get(name, 0) or 0), int(value))
 
 
 def _bounded_records(store: Any) -> list[dict[str, Any]]:
@@ -167,6 +182,123 @@ def _bounded_records(store: Any) -> list[dict[str, Any]]:
     return records
 
 
+def _iter_weighted_groups(
+    groups: Sequence[Sequence[float]], multiplicities: Sequence[int]
+) -> Iterator[float]:
+    for index, group in enumerate(groups):
+        count = int(multiplicities[index])
+        for _ in range(count):
+            for value in group:
+                yield float(value)
+
+
+def _weighted_median(
+    ordered_items: Sequence[tuple[float, int]], multiplicities: Sequence[int], total_count: int
+) -> float:
+    if total_count <= 0:
+        raise ValueError("weighted median requires observations")
+    left_rank = (total_count - 1) // 2
+    right_rank = total_count // 2
+    left: float | None = None
+    right: float | None = None
+    seen = 0
+    for value, group_index in ordered_items:
+        weight = int(multiplicities[group_index])
+        if weight <= 0:
+            continue
+        next_seen = seen + weight
+        if left is None and left_rank < next_seen:
+            left = float(value)
+        if right_rank < next_seen:
+            right = float(value)
+            break
+        seen = next_seen
+    if left is None or right is None:
+        raise RuntimeError("weighted median rank accounting failed")
+    return (left + right) / 2.0 if left_rank != right_rank else right
+
+
+def _weighted_expected_shortfall(
+    ordered_items: Sequence[tuple[float, int]], multiplicities: Sequence[int], total_count: int
+) -> float:
+    tail_n = max(1, int(math.ceil(total_count * 0.20)))
+
+    def tail_values() -> Iterator[float]:
+        remaining = tail_n
+        for value, group_index in ordered_items:
+            if remaining <= 0:
+                break
+            weight = min(remaining, int(multiplicities[group_index]))
+            for _ in range(max(0, weight)):
+                yield float(value)
+            remaining -= max(0, weight)
+
+    return mean(tail_values())
+
+
+def _bounded_bootstrap_distributions(
+    values: Sequence[float],
+    *,
+    fraction: float,
+    cluster_ids: Sequence[str] | None = None,
+    samples: int = economic_core.BOOTSTRAP_SAMPLES,
+) -> dict[str, list[float]]:
+    """Canonical cluster bootstrap without materializing one full resampled draw per iteration.
+
+    The RNG seed, number of cluster selections, sample count, and all reported statistics
+    remain identical to the incumbent algorithm. A multiplicity vector represents the
+    selected clusters; scalar statistics iterate those weights and median/shortfall use
+    weighted order statistics over the same resampled multiset.
+    """
+    groups = economic_core._cluster_groups(values, cluster_ids)
+    if not groups:
+        return {"mean": [], "median": [], "log_growth": [], "expected_shortfall_20": []}
+    normalized_groups = [tuple(float(value) for value in group) for group in groups]
+    ordered_items = sorted(
+        (float(value), group_index)
+        for group_index, group in enumerate(normalized_groups)
+        for value in group
+    )
+    rng = random.Random(economic_core.BOOTSTRAP_SEED + len(values) * 131 + len(groups) * 17)
+    distributions: dict[str, list[float]] = {
+        "mean": [],
+        "median": [],
+        "log_growth": [],
+        "expected_shortfall_20": [],
+    }
+    count = max(1, int(samples))
+    _inc("bounded_bootstrap_calls")
+    _inc("bounded_bootstrap_samples", count)
+    _max_state("bounded_bootstrap_max_source_values", len(values))
+    group_count = len(normalized_groups)
+    for _ in range(count):
+        multiplicities = [0] * group_count
+        for _index in range(group_count):
+            multiplicities[rng.randrange(group_count)] += 1
+        total_count = sum(
+            multiplicities[index] * len(group)
+            for index, group in enumerate(normalized_groups)
+        )
+        if total_count <= 0:
+            continue
+        distributions["mean"].append(mean(_iter_weighted_groups(normalized_groups, multiplicities)))
+        distributions["median"].append(_weighted_median(ordered_items, multiplicities, total_count))
+
+        def log_values() -> Iterator[float]:
+            for value in _iter_weighted_groups(normalized_groups, multiplicities):
+                terminal = 1.0 + fraction * value
+                if terminal <= 0.0:
+                    yield float("-inf")
+                else:
+                    yield math.log(terminal)
+
+        distributions["log_growth"].append(mean(log_values()))
+        distributions["expected_shortfall_20"].append(
+            _weighted_expected_shortfall(ordered_items, multiplicities, total_count)
+        )
+    return distributions
+
+
 def _shared_combined_promotion_records(store: Any) -> list[dict[str, Any]]:
     cache = getattr(_LOCAL, "promotion_cache", None)
     if not isinstance(cache, dict):
@@ -202,16 +334,34 @@ def _proof_with_shared_promotion_population() -> dict[str, Any]:
 setattr(_proof_with_shared_promotion_population, "_roi_certification_proof_memory_bounded", True)
 
 
+def _process_thread_count() -> int | None:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("Threads:"):
+                    return int(line.split(":", 1)[1].strip())
+    except Exception:
+        return None
+    return None
+
+
 def status() -> dict[str, Any]:
     with _LOCK:
         state = dict(_STATE)
     return {
         "repair_version": REPAIR_VERSION,
+        "bootstrap_memory_repair_version": BOOTSTRAP_MEMORY_REPAIR_VERSION,
         "installed": _INSTALLED,
         **state,
         "fomo_shadow_lookup": "freeze_epoch_outcome_keyed_left_join",
         "unbounded_fomo_shadow_scan": False,
         "promotion_population_shared_within_production_proof": True,
+        "bootstrap_materialized_resample_draw_lists": False,
+        "bootstrap_seed_changed": False,
+        "bootstrap_sample_count_changed": False,
+        "bootstrap_cluster_resampling_changed": False,
+        "process_thread_count": _process_thread_count(),
+        "python_thread_count": threading.active_count(),
         "resource_guard_relaxed": False,
         "stale_gate_relaxed": False,
         "continuity_gate_relaxed": False,
@@ -231,6 +381,7 @@ def install_certification_proof_memory_repair(app: Any) -> None:
         return
 
     economic._records = _bounded_records  # type: ignore[assignment]
+    economic_core._bootstrap_distributions = _bounded_bootstrap_distributions  # type: ignore[assignment]
     phase14.combined_promotion_records = _shared_combined_promotion_records  # type: ignore[assignment]
     phase17.combined_promotion_records = _shared_combined_promotion_records  # type: ignore[assignment]
 
@@ -247,12 +398,16 @@ def install_certification_proof_memory_repair(app: Any) -> None:
 
     app.state.roi_certification_proof_memory_repair = True
     app.state.roi_certification_proof_memory_repair_version = REPAIR_VERSION
+    app.state.roi_certification_bootstrap_memory_repair_version = BOOTSTRAP_MEMORY_REPAIR_VERSION
     _INSTALLED = True
 
 
 __all__ = [
+    "BOOTSTRAP_MEMORY_REPAIR_VERSION",
     "REPAIR_VERSION",
+    "_bounded_bootstrap_distributions",
     "_bounded_records",
+    "_process_thread_count",
     "_proof_with_shared_promotion_population",
     "_shared_combined_promotion_records",
     "install_certification_proof_memory_repair",
