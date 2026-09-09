@@ -1,6 +1,10 @@
 {
-  "policy_version": "v51-module-reachability-130-v4-explicit-compatibility",
+  "policy_version": "v51-module-reachability-130-v5-non-authoritative-service-roots",
   "production_root": "solana_roi.production",
+  "non_authoritative_service_roots": [
+    "solana_roi.certifier_service",
+    "solana_roi.certifier_job"
+  ],
   "test_only": [
     "solana_roi.v51_lane_capability_e2e",
     "solana_roi.v51_seeded_e2e",
@@ -25,6 +29,7 @@
   "rules": {
     "tests_do_not_grant_production_reachability": true,
     "migration_only_is_never_production_authority": true,
+    "non_authoritative_service_roots_never_grant_trading_authority": true,
     "unclassified_unreachable_modules_fail_ci": true,
     "package_import_installer_calls_fail_ci": true,
     "production_root_installer_registry_fails_ci": true,
