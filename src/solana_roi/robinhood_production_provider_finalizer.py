@@ -14,6 +14,10 @@ from .robinhood_adaptive_lane_controller import (
     install_robinhood_adaptive_lane_controller,
     status as adaptive_lane_controller_status,
 )
+from .robinhood_alchemy_budget_guard import (
+    install_robinhood_alchemy_budget_guard,
+    status as alchemy_budget_guard_status,
+)
 from .robinhood_event_driven_settlement import (
     install_robinhood_event_driven_settlement,
     status as event_driven_settlement_status,
@@ -32,7 +36,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v7-private-https-wss-derivation"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v8-hard-alchemy-budget"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -122,12 +126,12 @@ def install_robinhood_production_provider_finalizer(
     research-only public plane, known factories stay continuously discoverable, and
     Alchemy is reserved for a small prospective live shortlist plus open positions.
     Event-driven settlement removes redundant exact provider quotes. The adaptive lane
-    controller then varies only prospective Alchemy capacity from 1-4 lanes according
-    to locally metered provider load and ranked simultaneous demand; all open positions
-    remain forced live outside that cap. The HTTP getLogs provider guard is installed
-    before those transports so Alchemy never receives a range beyond its validated
-    safe limit. Strategy economics and frozen v5.1 entry authority remain downstream
-    and unchanged.
+    controller varies prospective Alchemy capacity according to locally metered load.
+    The hard Alchemy guard is installed last: duplicate ``eth_call`` reads are coalesced,
+    sustained noncritical HTTP work is budgeted, open-position settlement is reserved as
+    critical, and an emergency can drive prospective subscriptions to zero without
+    removing factory discovery or forced-live open positions. The HTTP getLogs provider
+    guard remains independent. Strategy economics and v5.2 authority are unchanged.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
@@ -149,6 +153,7 @@ def install_robinhood_production_provider_finalizer(
     production_transport.install_robinhood_production_ws_transport(plane_cls)
     install_robinhood_event_driven_settlement(plane_cls)
     install_robinhood_adaptive_lane_controller(plane_cls)
+    install_robinhood_alchemy_budget_guard(plane_cls)
 
     current_run = plane_cls.run
     if not bool(getattr(current_run, "_roi_robinhood_production_provider_finalizer", False)):
@@ -174,6 +179,7 @@ def status() -> dict[str, Any]:
         "provider_transport": usage_bounded_transport_status(),
         "event_driven_settlement": event_driven_settlement_status(),
         "adaptive_lane_controller": adaptive_lane_controller_status(),
+        "alchemy_budget_guard": alchemy_budget_guard_status(),
         "canonical_latency_hard_max_seconds": production_transport.canonical_latency_hard_max_seconds(),
         "legacy_two_block_gate_has_production_authority": False,
         "paper_only": True,
