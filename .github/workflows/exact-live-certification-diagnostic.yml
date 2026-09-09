@@ -1,0 +1,28 @@
+name: Exact Live Certification Diagnostic
+
+on:
+  push:
+    branches:
+      - diagnostic/live-cert-3e18f4e
+
+permissions:
+  contents: read
+
+jobs:
+  exact-live-certification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Probe exact live certification surfaces
+        env:
+          EXPECTED_RELEASE_COMMIT: 3e18f4e0625f4e37386a694fbbb747b8ded0bc12
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          FORWARD_PROOF_PROBE_ATTEMPTS: '3'
+          FORWARD_PROOF_PROBE_SLEEP_SECONDS: '10'
+          FORWARD_PROOF_HTTP_TIMEOUT_SECONDS: '60'
+          PYTHONUNBUFFERED: '1'
+        run: python tests/production_forward_proof_probe.py
