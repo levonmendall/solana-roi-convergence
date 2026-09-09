@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from . import v52_robinhood_position_lifecycle as robinhood_lifecycle
 from .strategy_v52_authority import (
     AUTHORITY_ID,
     ECONOMIC_FREEZE_EPOCH,
@@ -31,6 +32,34 @@ COMPOSITION_VERSION = "v52-explicit-production-authority-v4-robinhood-position-l
 _INSTALLED = False
 
 
+def _preserve_robinhood_wrapper_contracts() -> None:
+    """Keep predecessor reachability markers visible on the final v5.2 wrapper.
+
+    The lifecycle layer deliberately wraps the fully composed Robinhood plane.
+    Preserve the predecessor chain for architecture introspection so final v5.2
+    ownership cannot hide the already-proven pre-lane coverage wrappers beneath it.
+    """
+    from .robinhood_chain_paper import RobinhoodChainPaperPlane
+
+    pairs = (
+        (
+            RobinhoodChainPaperPlane._maybe_open_v3,
+            getattr(robinhood_lifecycle, "_BASE_MAYBE_V3", None),
+        ),
+        (
+            RobinhoodChainPaperPlane._maybe_open_v2,
+            getattr(robinhood_lifecycle, "_BASE_MAYBE_V2", None),
+        ),
+    )
+    for wrapper, predecessor in pairs:
+        if not callable(predecessor):
+            raise RuntimeError("v52 Robinhood lifecycle predecessor unavailable")
+        setattr(wrapper, "__wrapped__", predecessor)
+        for name, value in vars(predecessor).items():
+            if name.startswith("_roi_") and not hasattr(wrapper, name):
+                setattr(wrapper, name, value)
+
+
 def install_v52_production_authority(
     app: Any,
     runtime_provider: Callable[[], Any] | Any,
@@ -53,6 +82,7 @@ def install_v52_production_authority(
     install_v52_robinhood_storage_compatibility()
     install_v52_robinhood_exit_authority()
     install_v52_robinhood_position_lifecycle()
+    _preserve_robinhood_wrapper_contracts()
     install_v52_strategy_api(app)
     app.state.roi_v51_final_economic_authority = False
     app.state.roi_v51_shadow_control = True
