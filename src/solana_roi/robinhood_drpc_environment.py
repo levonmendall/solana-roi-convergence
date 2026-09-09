@@ -83,6 +83,12 @@ def configure_robinhood_drpc_backup() -> bool:
     return True
 
 
+# The production facade imports this module before the composition root. Running
+# the bridge here keeps all remaining production imports at module scope while
+# ensuring provider failover sees the dRPC pair during its first configuration.
+configure_robinhood_drpc_backup()
+
+
 __all__ = [
     "DRPC_KEY_ENV_NAMES",
     "DRPC_NETWORK",
