@@ -11,7 +11,8 @@
     "solana_roi.v52_five_lane_e2e_isolation",
     "solana_roi.v52_upside_capture",
     "solana_roi.v52_detection_intelligence",
-    "solana_roi.v52_measurement_governance"
+    "solana_roi.v52_measurement_governance",
+    "solana_roi.v52_final_refinement"
   ],
   "migration_only": [
     "solana_roi.cli",
