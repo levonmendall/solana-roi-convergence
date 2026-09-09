@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,11 +20,12 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 
 
-SERVICE_VERSION = "isolated-certifier-service-v2-failure-diagnostics"
+SERVICE_VERSION = "isolated-certifier-service-v3-transfer-integrity"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
+DEFAULT_SNAPSHOT_HTTP_TIMEOUT_SECONDS = 90.0
 
 _LOCK = threading.Lock()
 _ARTIFACTS: dict[str, dict[str, Any]] = {}
@@ -80,6 +82,21 @@ def _child_timeout_seconds() -> float:
         return max(30.0, float(os.getenv("SOLANA_ROI_CERTIFIER_CHILD_TIMEOUT_SECONDS", "300")))
     except ValueError:
         return 300.0
+
+
+def _snapshot_http_timeout_seconds() -> float:
+    try:
+        return max(
+            30.0,
+            float(
+                os.getenv(
+                    "SOLANA_ROI_CERTIFIER_SNAPSHOT_HTTP_TIMEOUT_SECONDS",
+                    str(DEFAULT_SNAPSHOT_HTTP_TIMEOUT_SECONDS),
+                )
+            ),
+        )
+    except ValueError:
+        return DEFAULT_SNAPSHOT_HTTP_TIMEOUT_SECONDS
 
 
 def _safe_error_message(exc: BaseException) -> str:
@@ -186,6 +203,47 @@ def _publish_file(surface: str, path: Path, expected_release: str) -> bool:
     return True
 
 
+def _declared_snapshot_bytes(headers: Any) -> int:
+    raw = str(headers.get("X-Certification-Snapshot-Bytes") or headers.get("Content-Length") or "").strip()
+    if not raw:
+        raise RuntimeError("runtime snapshot missing byte-length binding")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("runtime snapshot invalid byte-length binding") from exc
+    if value <= 0:
+        raise RuntimeError("runtime snapshot invalid byte-length binding")
+    return value
+
+
+def _validate_downloaded_snapshot(destination: Path, expected_bytes: int) -> None:
+    actual = int(destination.stat().st_size)
+    if actual != int(expected_bytes):
+        raise RuntimeError(f"runtime snapshot size mismatch:{actual}:{expected_bytes}")
+
+    with destination.open("rb") as handle:
+        header = handle.read(100)
+    if len(header) < 100 or header[:16] != b"SQLite format 3\x00":
+        raise RuntimeError("runtime snapshot invalid SQLite header")
+    raw_page_size = int.from_bytes(header[16:18], "big")
+    page_size = 65536 if raw_page_size == 1 else raw_page_size
+    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+        raise RuntimeError("runtime snapshot invalid SQLite page size")
+    if actual % page_size != 0:
+        raise RuntimeError(f"runtime snapshot truncated page boundary:{actual}:{page_size}")
+
+    uri = f"file:{destination.resolve()}?mode=ro&immutable=1"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(f"runtime snapshot SQLite validation failed:{type(exc).__name__}") from exc
+
+
 def _download_snapshot(destination: Path) -> str:
     base = _runtime_url()
     token = _token()
@@ -200,8 +258,9 @@ def _download_snapshot(destination: Path) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=60.0) as response:
+        with urllib.request.urlopen(request, timeout=_snapshot_http_timeout_seconds()) as response:
             release = str(response.headers.get("X-Release-Commit") or "")
+            expected_bytes = _declared_snapshot_bytes(response.headers)
             with destination.open("wb") as handle:
                 shutil.copyfileobj(response, handle, length=1024 * 1024)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -210,8 +269,7 @@ def _download_snapshot(destination: Path) -> str:
         raise RuntimeError("runtime snapshot missing release binding")
     if release != _release_commit():
         raise RuntimeError(f"runtime snapshot release mismatch:{release}:{_release_commit()}")
-    if destination.stat().st_size <= 0:
-        raise RuntimeError("runtime snapshot is empty")
+    _validate_downloaded_snapshot(destination, expected_bytes)
     return release
 
 
@@ -370,6 +428,10 @@ def health() -> dict[str, Any]:
         "release_commit": _release_commit(),
         "runtime_url_configured": bool(_runtime_url()),
         "shared_auth_configured": bool(_token()),
+        "snapshot_http_timeout_seconds": _snapshot_http_timeout_seconds(),
+        "snapshot_transfer_byte_length_required": True,
+        "snapshot_transfer_sqlite_header_validated": True,
+        "snapshot_transfer_schema_open_validated": True,
         "artifacts": freshness,
         "state": state,
         "child_process_isolation": True,
