@@ -26,9 +26,13 @@ from .v52_robinhood_position_lifecycle import (
     install_v52_robinhood_position_lifecycle,
     lifecycle_status as robinhood_lifecycle_status,
 )
+from .v52_robinhood_candidate_reconciliation import (
+    install_v52_robinhood_candidate_reconciliation,
+    status as robinhood_candidate_reconciliation_status,
+)
 from .v52_strategy_api import install_v52_strategy_api, status as api_status
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v4-robinhood-position-lifecycle"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v5-robinhood-lifecycle-reconciliation"
 _INSTALLED = False
 
 
@@ -96,7 +100,8 @@ def install_v52_production_authority(
     position-lifecycle layer is installed after the final Robinhood storage and
     exit-policy wrappers so it owns aggregate lot accounting, scale validation,
     staged de-risking, runner retention and second-leg re-entry without changing
-    transport, identity or exact-quote semantics.
+    transport, identity or exact-quote semantics. Candidate accounting is then
+    reconciled only after the validated lifecycle commit exists.
     """
     global _INSTALLED
     _ = runtime_provider
@@ -105,6 +110,7 @@ def install_v52_production_authority(
     install_v52_robinhood_exit_authority()
     install_v52_robinhood_position_lifecycle()
     _bind_concrete_robinhood_lifecycle_owner()
+    install_v52_robinhood_candidate_reconciliation()
     _preserve_robinhood_wrapper_contracts()
     install_v52_strategy_api(app)
     app.state.roi_v51_final_economic_authority = False
@@ -115,6 +121,7 @@ def install_v52_production_authority(
     app.state.roi_v52_robinhood_storage_compatibility = True
     app.state.roi_v52_robinhood_exit_authority = True
     app.state.roi_v52_robinhood_position_lifecycle = True
+    app.state.roi_v52_robinhood_candidate_reconciliation = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
     app.state.roi_authority_fingerprint = authority_fingerprint()
@@ -127,6 +134,7 @@ def status() -> dict[str, Any]:
     storage = robinhood_storage_status()
     robinhood_exit = robinhood_exit_status()
     lifecycle = robinhood_lifecycle_status()
+    reconciliation = robinhood_candidate_reconciliation_status()
     # Robinhood preserves its compatibility table strategy label. Economic
     # authority and forward-learning scope come from the registered v5.2 epoch.
     runtime["robinhood_rows_use_compatibility_storage_version"] = True
@@ -157,6 +165,7 @@ def status() -> dict[str, Any]:
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
         "robinhood_position_lifecycle": lifecycle,
+        "robinhood_candidate_reconciliation": reconciliation,
         "strategy_api": api_status(),
         "all_decision_surfaces_v52_owned": bool(
             runtime.get("solana_final_owner")
@@ -168,6 +177,7 @@ def status() -> dict[str, Any]:
             and storage.get("v52_authority_from_release_epoch")
             and robinhood_exit.get("final_exit_policy_owner") == "v52"
             and lifecycle.get("installed")
+            and reconciliation.get("installed")
         ),
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
