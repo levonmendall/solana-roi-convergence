@@ -8,7 +8,7 @@ from .robinhood_chain_profit_maximizer import RobinhoodProfitMaximizerMixin
 from .strategy_v52_authority import AUTHORITY_ID, ECONOMIC_FREEZE_EPOCH, STRATEGY_VERSION
 
 
-EXIT_AUTHORITY_VERSION = "v52-robinhood-forward-exit-authority-1"
+EXIT_AUTHORITY_VERSION = "v52-robinhood-forward-exit-authority-2-release-epoch"
 _INSTALLED = False
 _ORIGINAL_EXIT_POLICY: Callable[..., Any] | None = None
 
@@ -26,7 +26,12 @@ def _bootstrap() -> dict[str, Any]:
 
 
 def _v52_learned_exit_policy(self: Any, trial: dict[str, Any]) -> dict[str, Any]:
-    """Learn exit timing only from settled v5.2 forward trials in this authority epoch."""
+    """Learn exits only from outcomes settled in a registered v5.2 release epoch.
+
+    Robinhood's durable trial/context strategy labels remain the v5.1-compatible
+    storage schema. They are not authority evidence. The release/authority epoch is
+    the sole filter deciding which forward outcomes can train this v5.2 exit owner.
+    """
     trial_id = int(trial["id"])
     try:
         with self.store._lock:
@@ -44,13 +49,10 @@ def _v52_learned_exit_policy(self: Any, trial: dict[str, Any]) -> dict[str, Any]
                 "JOIN robinhood_v5_trial_context c ON c.trial_id=o.trial_id "
                 "JOIN v52_economic_freeze_releases e ON e.release_commit=o.release_commit "
                 "WHERE e.economic_freeze_epoch=? AND e.authority_id=? AND e.strategy_version=? "
-                "AND t.strategy_version=? AND c.strategy_version=? AND c.lane=? "
-                "AND t.venue=? AND t.lifecycle=? ORDER BY o.id",
+                "AND c.lane=? AND t.venue=? AND t.lifecycle=? ORDER BY o.id",
                 (
                     ECONOMIC_FREEZE_EPOCH,
                     AUTHORITY_ID,
-                    STRATEGY_VERSION,
-                    STRATEGY_VERSION,
                     STRATEGY_VERSION,
                     lane,
                     str(trial["venue"]),
@@ -58,8 +60,6 @@ def _v52_learned_exit_policy(self: Any, trial: dict[str, Any]) -> dict[str, Any]
                 ),
             ).fetchall()
     except Exception:
-        # A fresh authority epoch intentionally has no prior learning table/state.
-        # Fail to the frozen ex-ante exit policy rather than falling back to v5.1.
         return _bootstrap()
 
     ids = [int(row["trial_id"]) for row in closed]
@@ -136,6 +136,7 @@ def status() -> dict[str, Any]:
         "version": EXIT_AUTHORITY_VERSION,
         "installed": _INSTALLED,
         "final_exit_policy_owner": "v52",
+        "authority_filter": "v52_release_epoch",
         "v51_evidence_used": False,
         "fresh_v52_forward_learning_only": True,
         "paper_only": True,
