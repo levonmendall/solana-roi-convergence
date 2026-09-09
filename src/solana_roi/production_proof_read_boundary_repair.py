@@ -199,18 +199,18 @@ def _snapshot_thread_main(builder: Callable[[], dict[str, Any]], stop: threading
             _SNAPSHOT_STATS["last_started_at"] = _utcnow()
         error_type: str | None = None
         try:
-            with memory_forensics_phase("production_proof:base_build"):
+            # Preserve the existing canonical phase-attribution contract. The cgroup
+            # forensic sampler records the active phase throughout the heavy builder.
+            with memory_forensics_phase("production_proof_build"):
                 payload = builder()
             if not isinstance(payload, dict):
                 raise TypeError("production proof builder returned non-dict payload")
-            # The same canonical 90% resource guard is checked again after the build.
-            # A generation admitted below the threshold may have grown materially while
-            # composing its proof. Rejecting here retains the last known-good snapshot
+            # Re-run the exact canonical resource guard after the build. A generation
+            # admitted below the 90% threshold may have grown materially while
+            # composing its proof; rejecting here retains the last known-good snapshot
             # instead of entering publication under unsafe cgroup/disk/WAL pressure.
-            with memory_forensics_phase("production_proof:post_build_guard"):
-                resource_guard("production_proof_post_build_pre_publish")
-            with memory_forensics_phase("production_proof:publish_owned_snapshot"):
-                _publish_snapshot(payload)
+            resource_guard("production_proof_post_build_pre_publish")
+            _publish_snapshot(payload)
         except BaseException as exc:
             error_type = type(exc).__name__
         duration = max(0.0, time.monotonic() - started)
