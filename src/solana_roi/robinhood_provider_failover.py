@@ -12,7 +12,9 @@ from urllib.parse import urlparse
 
 import httpx
 
+from . import robinhood_alchemy_budget_guard as alchemy_guard
 from . import robinhood_chain_runtime as runtime
+from . import robinhood_getlogs_provider_guard as getlogs_guard
 from . import robinhood_production_ws_transport as transport
 
 
@@ -372,13 +374,27 @@ def _is_retriable_http_error(exc: BaseException) -> tuple[bool, bool]:
         return False, False
     if isinstance(exc, (httpx.TimeoutException, httpx.TransportError, httpx.NetworkError)):
         return True, False
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        if any(
+            marker in message
+            for marker in (
+                "rate limit",
+                "rate-limit",
+                "too many requests",
+                "quota exceeded",
+                "quota limit",
+                "request limit",
+                "capacity exceeded",
+            )
+        ):
+            return True, True
     return False, False
 
 
 def _critical_priority() -> bool:
     try:
-        from . import robinhood_alchemy_budget_guard as guard
-        return guard._PRIORITY.get() == "critical"
+        return alchemy_guard._PRIORITY.get() == "critical"
     except Exception:
         return False
 
@@ -463,9 +479,9 @@ def _rpc_wrapper(original: Callable[..., Awaitable[Any]]) -> Callable[..., Await
 
 def _init_wrapper(original: Callable[..., None]) -> Callable[..., None]:
     @wraps(original)
-    def wrapped(self: Any, rpc_url_arg: str | None = None, *, timeout_seconds: float = 4.0) -> None:
-        original(self, rpc_url_arg, timeout_seconds=timeout_seconds)
-        if rpc_url_arg is None:
+    def wrapped(self: Any, rpc_url: str | None = None, *, timeout_seconds: float = 4.0) -> None:
+        original(self, rpc_url, timeout_seconds=timeout_seconds)
+        if rpc_url is None:
             provider = active_provider()
             if provider is not None:
                 self.rpc_url = provider.http
@@ -564,6 +580,12 @@ def install_robinhood_provider_failover() -> None:
     if _INSTALLED:
         return
 
+    # The hard budget is Alchemy-specific, not a generic production-provider
+    # throttle. Reuse the already-tested hostname classifier from the getLogs guard
+    # so a Chainstack/QuickNode backup can carry normal provider traffic while an
+    # Alchemy endpoint still receives CU budgeting/caching/singleflight protection.
+    alchemy_guard._production_rpc_url = getlogs_guard._is_alchemy_endpoint
+
     _ORIGINAL_INIT = runtime.RobinhoodRpc.__init__
     if not bool(getattr(runtime.RobinhoodRpc.__init__, "_roi_robinhood_provider_failover_init", False)):
         runtime.RobinhoodRpc.__init__ = _init_wrapper(runtime.RobinhoodRpc.__init__)  # type: ignore[method-assign]
@@ -619,6 +641,7 @@ def status() -> dict[str, Any]:
         "public_rpc_can_be_decision_authoritative": False,
         "public_sequencer_can_be_decision_authoritative": False,
         "provider_endpoints_exposed_in_status": False,
+        "alchemy_budget_applies_by_provider_hostname": True,
         "failure_threshold": _failure_threshold(),
         "cooldown_seconds": _cooldown_seconds(),
         "paper_only": True,
