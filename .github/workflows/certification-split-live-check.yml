@@ -1,0 +1,30 @@
+name: Certification Split Live Check
+
+on:
+  push:
+    branches:
+      - diagnostic/certification-split-live-check
+
+permissions:
+  contents: read
+
+jobs:
+  live-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe authoritative runtime split status
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 20 \
+            https://solana-roi-convergence.onrender.com/health
+          echo
+          curl --fail --silent --show-error --max-time 20 \
+            https://solana-roi-convergence.onrender.com/v1/operations/certification-service-split
+          echo
+      - name: Probe isolated certifier health
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 20 \
+            https://solana-roi-certifier.onrender.com/health
+          echo
