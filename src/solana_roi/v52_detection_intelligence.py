@@ -252,9 +252,10 @@ def detect_wallet_cascade(
         reasons.append("insufficient_independent_skilled_wallet_sequence")
     if len(broad) < minimum_broad_independent_clusters:
         reasons.append("insufficient_broad_independent_follow_through")
-    if not reasons:
+    detected = not reasons
+    if detected:
         reasons.append("independent_wallet_cascade_observed")
-    return WalletCascade(not reasons[:-1], len(skilled), len(broad), tuple(skilled), tuple(reasons))
+    return WalletCascade(detected, len(skilled), len(broad), tuple(skilled), tuple(reasons))
 
 
 @dataclass(frozen=True)
