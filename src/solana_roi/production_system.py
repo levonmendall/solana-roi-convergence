@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight-v21-certification-service-split"
+COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight-v21-certification-service-split-v22-certification-snapshot-cgroup-memory"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -217,6 +217,12 @@ class ProductionSystem:
             "certification_snapshot_chunk_transfer_version": getattr(
                 self.app.state, "roi_certification_snapshot_chunk_transfer_version", None
             ),
+            "certification_snapshot_cgroup_memory_repair": bool(
+                getattr(self.app.state, "roi_certification_snapshot_cgroup_memory_repair", False)
+            ),
+            "certification_snapshot_cgroup_memory_repair_version": getattr(
+                self.app.state, "roi_certification_snapshot_cgroup_memory_repair_version", None
+            ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -292,6 +298,10 @@ def build_production_system() -> ProductionSystem:
     from .certification_generation_runtime_repair import install_certification_generation_runtime_repair
     from .certification_proof_memory_repair import install_certification_proof_memory_repair
     from .certification_service_split import install_certification_service_split
+    from .certification_snapshot_memory_repair import (
+        REPAIR_VERSION as CERTIFICATION_SNAPSHOT_CGROUP_MEMORY_REPAIR_VERSION,
+        install_certification_snapshot_memory_repair,
+    )
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
     from .production_proof_read_boundary_repair import install_production_proof_read_boundary_repair
     from .rpc_task_ownership_repair import (
@@ -358,8 +368,13 @@ def build_production_system() -> ProductionSystem:
         setattr(certification_workers, "_roi_production_proof_snapshot_worker", True)
 
     # Certification isolation belongs to this explicit composition root, never to
-    # the thin production facade. Split mode changes only certification execution
-    # and read routing; v5.2 strategy/economic authority remains untouched.
+    # the thin production facade. The cgroup memory repair changes only temporary
+    # snapshot-export cache residency and fail-closed resource protection.
+    install_certification_snapshot_memory_repair()
+    app.state.roi_certification_snapshot_cgroup_memory_repair = True
+    app.state.roi_certification_snapshot_cgroup_memory_repair_version = (
+        CERTIFICATION_SNAPSHOT_CGROUP_MEMORY_REPAIR_VERSION
+    )
     install_certification_service_split(app, ingestion_runtime)
     install_authoritative_snapshot_chunk_transfer(app, ingestion_runtime)
     app.state.roi_certification_snapshot_chunk_transfer = True
