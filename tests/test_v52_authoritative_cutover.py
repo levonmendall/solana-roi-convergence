@@ -31,7 +31,7 @@ class _Store:
         self._lock = threading.RLock()
 
 
-def test_v52_authority_is_frozen_paper_only_and_five_lane() -> None:
+def test_v52_authority_keeps_baseline_paper_only_and_five_lane() -> None:
     payload = authority()
     assert AUTHORITY_ID == "roi-convergence-v5.2-authoritative-1"
     assert STRATEGY_VERSION == "roi-convergence-v5.2-continuation-capture-1"
@@ -50,7 +50,10 @@ def test_v52_authority_is_frozen_paper_only_and_five_lane() -> None:
     assert canonical_lane_for_surface("RAYDIUM") == "raydium"
     assert canonical_lane_for_surface("FOMO") == "fomo"
     assert canonical_lane_for_surface("ROBINHOOD_CHAIN") == "robinhood"
-    assert payload["policy_freeze_origin"] == "operator_directed_ex_ante_cutover"
+    assert payload["policy_freeze_origin"] == "legacy_baseline_epoch_identifier_continuous_evolution_enabled"
+    assert payload["governance"]["continuous_strategy_evolution_enabled"] is True
+    assert payload["governance"]["protected_strategy_change_requires_forward_validation"] is True
+    assert payload["governance"]["prospective_tournament_promotion_authority"] is True
     assert payload["economic_superiority_claim"] is False
     assert payload["paper_only"] is True
     assert payload["live_money_authority"] is False
@@ -59,7 +62,7 @@ def test_v52_authority_is_frozen_paper_only_and_five_lane() -> None:
     assert len(authority_fingerprint()) == 64
 
 
-def test_v52_safety_capture_detection_and_forward_evidence_policy_are_frozen() -> None:
+def test_v52_baseline_safety_capture_detection_and_forward_evidence_policy() -> None:
     payload = authority()
     execution = payload["execution"]
     position = payload["position_management"]
@@ -96,6 +99,8 @@ def test_v52_safety_capture_detection_and_forward_evidence_policy_are_frozen() -
     assert safety["v51_control_has_final_decision_authority"] is False
     assert safety["v51_control_is_read_only"] is True
     assert safety["averaging_down_allowed"] is False
+    assert safety["continuous_strategy_evolution_enabled"] is True
+    assert safety["protected_strategy_change_requires_forward_validation"] is True
 
 
 def test_v52_solana_fractional_starter_and_execution_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -246,5 +251,8 @@ def test_v52_authority_contract_keeps_v51_as_zero_authority_control() -> None:
     assert governance["historical_promotion_authority"] is False
     assert governance["automatic_parameter_mutation_authority"] is False
     assert governance["automatic_signal_promotion_authority"] is False
+    assert governance["continuous_strategy_evolution_enabled"] is True
+    assert governance["protected_strategy_change_requires_forward_validation"] is True
+    assert governance["prospective_tournament_promotion_authority"] is True
     assert governance["v51_control_has_final_decision_authority"] is False
     assert governance["v51_control_is_read_only"] is True
