@@ -16,11 +16,12 @@ from .certification_generation_coordinator import (
     CertificationResourceGuardError,
     exclusive_generation,
     install_status_route,
+    resource_guard,
 )
 from .strategy_v51_authority import AUTHORITY_ID, STRATEGY_VERSION
 
 
-REPAIR_VERSION = "certification-generation-runtime-v1-single-flight-forward-cache"
+REPAIR_VERSION = "certification-generation-runtime-v2-owned-forward-publication-postbuild-guard"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -137,6 +138,9 @@ def _forward_cache_state() -> dict[str, Any]:
         "snapshot_interval_seconds": FORWARD_SNAPSHOT_INTERVAL_SECONDS,
         "snapshot_stale_seconds": FORWARD_SNAPSHOT_STALE_SECONDS,
         "http_request_executes_deep_forward_builder": False,
+        "publication_uses_owned_builder_payload": True,
+        "post_build_resource_guard": True,
+        "post_build_memory_limit_fraction": 0.90,
         "attempts": int(stats.get("attempts", 0) or 0),
         "successes": int(stats.get("successes", 0) or 0),
         "failures": int(stats.get("failures", 0) or 0),
@@ -178,16 +182,19 @@ def _fail_closed_forward(reason: str) -> dict[str, Any]:
             "single_flight": True,
             "state": "failed_closed",
             "reason": blocker,
+            "publication_uses_owned_builder_payload": True,
+            "post_build_resource_guard": True,
+            "post_build_memory_limit_fraction": 0.90,
             "cache": _forward_cache_state(),
         },
     }
 
 
 def _publish_forward(payload: dict[str, Any]) -> None:
+    """Publish the builder-owned forward payload without a second whole-proof copy."""
     global _FORWARD_SNAPSHOT, _FORWARD_PUBLISHED_MONOTONIC
-    copied = copy.deepcopy(payload)
     with _FORWARD_LOCK:
-        _FORWARD_SNAPSHOT = copied
+        _FORWARD_SNAPSHOT = payload
         _FORWARD_PUBLISHED_MONOTONIC = time.monotonic()
 
 
@@ -203,6 +210,9 @@ def _cached_forward_endpoint() -> dict[str, Any]:
     generation = payload.setdefault("certification_generation", {})
     if isinstance(generation, dict):
         generation["snapshot_age_seconds"] = age
+        generation["publication_uses_owned_builder_payload"] = True
+        generation["post_build_resource_guard"] = True
+        generation["post_build_memory_limit_fraction"] = 0.90
         generation["cache"] = _forward_cache_state()
     return payload
 
@@ -228,6 +238,7 @@ def _forward_thread_main(stop: threading.Event) -> None:
             generation = payload.get("certification_generation")
             if isinstance(generation, dict):
                 generation_id = str(generation.get("generation_id") or "") or None
+            resource_guard("forward_certification_post_build_pre_publish")
             _publish_forward(payload)
         except BaseException as exc:
             error_type = type(exc).__name__
@@ -330,5 +341,6 @@ __all__ = [
     "REPAIR_VERSION",
     "_cached_forward_endpoint",
     "_forward_cache_state",
+    "_publish_forward",
     "install_certification_generation_runtime_repair",
 ]
