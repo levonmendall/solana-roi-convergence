@@ -1,1 +1,1 @@
-Read-only observer retrigger on 2026-09-09 for current production certification boundary 2ab2437583894452fec0cbb79877361910cc895c. Diagnostic branch only; HTTP GET observation only; do not merge.
+Read-only observer retrigger on 2026-09-09 for exact live production certification boundary 638dca9442be039d1785dd0bf1f3876eb5de2251. Diagnostic branch only; HTTP GET observation only; do not merge.
