@@ -215,18 +215,15 @@ def test_certifier_download_validates_advertised_bytes_and_sqlite_geometry(tmp_p
     monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
     monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
     monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
-    monkeypatch.setattr(
-        certifier_service.urllib.request,
-        "urlopen",
-        lambda request, timeout: _SnapshotResponse(
-            body,
-            {
-                "X-Release-Commit": "exact-release",
-                "X-Certification-Snapshot-Bytes": str(len(body)),
-                "Content-Length": str(len(body)),
-            },
-        ),
-    )
+
+    def download(destination, *, base, token, expected_release):
+        assert base == "https://runtime.invalid"
+        assert token == "test-token"
+        assert expected_release == "exact-release"
+        destination.write_bytes(body)
+        return "exact-release", len(body)
+
+    monkeypatch.setattr(certifier_service, "download_snapshot_chunked", download)
     destination = tmp_path / "download.sqlite3"
 
     release = certifier_service._download_snapshot(destination)
@@ -245,18 +242,13 @@ def test_certifier_download_rejects_truncated_snapshot_before_child(tmp_path, mo
     monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
     monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
     monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
-    monkeypatch.setattr(
-        certifier_service.urllib.request,
-        "urlopen",
-        lambda request, timeout: _SnapshotResponse(
-            truncated,
-            {
-                "X-Release-Commit": "exact-release",
-                "X-Certification-Snapshot-Bytes": str(len(body)),
-                "Content-Length": str(len(body)),
-            },
-        ),
-    )
+
+    def download(destination, *, base, token, expected_release):
+        _ = base, token, expected_release
+        destination.write_bytes(truncated)
+        return "exact-release", len(body)
+
+    monkeypatch.setattr(certifier_service, "download_snapshot_chunked", download)
     destination = tmp_path / "truncated.sqlite3"
 
     try:
@@ -270,30 +262,25 @@ def test_certifier_download_rejects_truncated_snapshot_before_child(tmp_path, mo
         assert certifier_service._STATE["last_snapshot_received_bytes"] == len(truncated)
 
 
-def test_certifier_download_rejects_header_length_disagreement(tmp_path, monkeypatch) -> None:
+def test_certifier_download_rejects_advertised_byte_disagreement(tmp_path, monkeypatch) -> None:
     body = _sqlite_payload(tmp_path)
     monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
     monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
     monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
-    monkeypatch.setattr(
-        certifier_service.urllib.request,
-        "urlopen",
-        lambda request, timeout: _SnapshotResponse(
-            body,
-            {
-                "X-Release-Commit": "exact-release",
-                "X-Certification-Snapshot-Bytes": str(len(body)),
-                "Content-Length": str(len(body) - 1),
-            },
-        ),
-    )
+
+    def download(destination, *, base, token, expected_release):
+        _ = base, token, expected_release
+        destination.write_bytes(body)
+        return "exact-release", len(body) - 1
+
+    monkeypatch.setattr(certifier_service, "download_snapshot_chunked", download)
 
     try:
         certifier_service._download_snapshot(tmp_path / "mismatch.sqlite3")
     except RuntimeError as exc:
-        assert "header-length mismatch" in str(exc)
+        assert "byte-count mismatch" in str(exc)
     else:
-        raise AssertionError("inconsistent snapshot transport headers must fail closed")
+        raise AssertionError("inconsistent snapshot transport byte binding must fail closed")
 
 
 def test_remote_certification_fails_closed_on_exact_release_mismatch(monkeypatch) -> None:
