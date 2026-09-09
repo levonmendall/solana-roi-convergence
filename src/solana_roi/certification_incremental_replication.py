@@ -2,14 +2,14 @@ from __future__ import annotations
 
 """Bounded exact-state replication for the isolated certification service.
 
-The authoritative process owns the canonical SQLite database.  A compact trigger
-journal records only row identities that changed.  The certifier keeps its own
-replica and requests all committed mutations after its last durable watermark.
-Rows are resolved from one pinned read transaction, so one response describes one
-point-in-time logical database state.
+The authoritative process remains the sole owner of the canonical SQLite database.
+A compact transactional journal records only stable row identities that change.  The
+certifier owns a replica and asks for all mutations after its durable watermark.
+Each response resolves those identities from one pinned read transaction, giving the
+certifier one exact point-in-time logical database state.
 
-A full SQLite snapshot remains available only for replica bootstrap, recovery, or
-explicit reconciliation.  Normal certification cycles use the bounded delta path.
+Full SQLite copies are retained only for bootstrap/recovery/reconciliation.  Normal
+certification cycles use bounded deltas.
 """
 
 import hashlib
@@ -23,7 +23,6 @@ from typing import Any, Callable
 from fastapi import Header, HTTPException, Query
 
 from . import certification_service_split as split
-
 
 REPLICATION_VERSION = "certification-incremental-replica-v2-monotonic-watermark"
 CHANGE_TABLE = "certification_replication_changes"
@@ -69,53 +68,47 @@ def _columns(connection: sqlite3.Connection, table: str) -> list[dict[str, Any]]
         rows = connection.execute(f"PRAGMA table_xinfo({_qliteral(table)})").fetchall()
     except sqlite3.DatabaseError:
         rows = connection.execute(f"PRAGMA table_info({_qliteral(table)})").fetchall()
-    columns: list[dict[str, Any]] = []
-    for row in rows:
-        hidden = int(row[6]) if len(row) > 6 else 0
-        columns.append(
-            {
-                "cid": int(row[0]),
-                "name": str(row[1]),
-                "type": str(row[2] or ""),
-                "notnull": int(row[3]),
-                "default": row[4],
-                "pk": int(row[5]),
-                "hidden": hidden,
-            }
-        )
-    return columns
+    return [
+        {
+            "cid": int(row[0]),
+            "name": str(row[1]),
+            "type": str(row[2] or ""),
+            "notnull": int(row[3]),
+            "default": row[4],
+            "pk": int(row[5]),
+            "hidden": int(row[6]) if len(row) > 6 else 0,
+        }
+        for row in rows
+    ]
 
 
 def _ordinary_tables(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+    tables: list[dict[str, Any]] = []
     try:
         listed = connection.execute("PRAGMA table_list").fetchall()
-        for raw in listed:
-            schema, name, kind, _ncol, without_rowid, _strict = raw
+        for schema, name, kind, _ncol, without_rowid, _strict in listed:
             name = str(name)
             if str(schema) != "main" or str(kind) != "table":
                 continue
             if name.startswith("sqlite_") or name in {CHANGE_TABLE, META_TABLE}:
                 continue
-            sql_row = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-                (name,),
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)
             ).fetchone()
-            sql = str(sql_row[0] or "") if sql_row is not None else ""
+            sql = str(row[0] or "") if row is not None else ""
             if sql:
-                rows.append({"name": name, "sql": sql, "without_rowid": bool(without_rowid)})
+                tables.append({"name": name, "sql": sql, "without_rowid": bool(without_rowid)})
     except sqlite3.DatabaseError:
         listed = connection.execute(
             "SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
         ).fetchall()
         for name, sql in listed:
-            name = str(name)
-            text = str(sql or "")
+            name, text = str(name), str(sql or "")
             if name in {CHANGE_TABLE, META_TABLE} or not text or "VIRTUAL TABLE" in text.upper():
                 continue
-            rows.append({"name": name, "sql": text, "without_rowid": "WITHOUT ROWID" in text.upper()})
-    rows.sort(key=lambda item: str(item["name"]))
-    return rows
+            tables.append({"name": name, "sql": text, "without_rowid": "WITHOUT ROWID" in text.upper()})
+    tables.sort(key=lambda row: str(row["name"]))
+    return tables
 
 
 def _schema_fingerprint(connection: sqlite3.Connection) -> str:
@@ -139,12 +132,14 @@ def _schema_fingerprint(connection: sqlite3.Connection) -> str:
                     )
                 )
             )
-    return hashlib.sha256("\n".join(payload).encode("utf-8")).hexdigest()
+    return hashlib.sha256("\n".join(payload).encode()).hexdigest()
 
 
 def _meta(connection: sqlite3.Connection) -> dict[str, str]:
-    rows = connection.execute(f"SELECT key,value FROM {_qident(META_TABLE)}").fetchall()
-    return {str(row[0]): str(row[1]) for row in rows}
+    return {
+        str(row[0]): str(row[1])
+        for row in connection.execute(f"SELECT key,value FROM {_qident(META_TABLE)}").fetchall()
+    }
 
 
 def _set_meta(connection: sqlite3.Connection, key: str, value: str) -> None:
@@ -156,21 +151,8 @@ def _set_meta(connection: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def _current_watermark(connection: sqlite3.Connection) -> int:
-    """Return the AUTOINCREMENT high-watermark even after acknowledged rows prune."""
-    row = connection.execute(
-        "SELECT seq FROM sqlite_sequence WHERE name=?",
-        (CHANGE_TABLE,),
-    ).fetchone()
+    row = connection.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (CHANGE_TABLE,)).fetchone()
     return max(0, int(row[0])) if row is not None and row[0] is not None else 0
-
-
-def _drop_tracking_triggers(connection: sqlite3.Connection) -> None:
-    rows = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE ?",
-        (TRIGGER_PREFIX + "%",),
-    ).fetchall()
-    for row in rows:
-        connection.execute(f"DROP TRIGGER IF EXISTS {_qident(str(row[0]))}")
 
 
 def _primary_columns(columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -183,15 +165,23 @@ def _primary_columns(columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _key_expression(table: dict[str, Any], columns: list[dict[str, Any]], alias: str) -> str:
     primary = _primary_columns(columns)
     if primary:
-        parts: list[str] = []
+        pieces: list[str] = []
         for index, column in enumerate(primary):
             prefix = "" if index == 0 else " AND "
             label = prefix + _qident(str(column["name"])) + " IS "
-            parts.append(_qliteral(label) + f" || quote({alias}.{_qident(str(column['name']))})")
-        return " || ".join(parts)
+            pieces.append(_qliteral(label) + f" || quote({alias}.{_qident(str(column['name']))})")
+        return " || ".join(pieces)
     if bool(table["without_rowid"]):
         raise RuntimeError(f"WITHOUT ROWID table lacks stable primary key:{table['name']}")
     return f"'rowid IS ' || quote({alias}.rowid)"
+
+
+def _drop_tracking_triggers(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE ?", (TRIGGER_PREFIX + "%",)
+    ).fetchall()
+    for row in rows:
+        connection.execute(f"DROP TRIGGER IF EXISTS {_qident(str(row[0]))}")
 
 
 def _install_table_triggers(connection: sqlite3.Connection, table: dict[str, Any]) -> None:
@@ -199,22 +189,21 @@ def _install_table_triggers(connection: sqlite3.Connection, table: dict[str, Any
     columns = _columns(connection, name)
     if not columns:
         raise RuntimeError(f"certification replication table has no columns:{name}")
-    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(name.encode()).hexdigest()[:16]
     new_key = _key_expression(table, columns, "NEW")
     old_key = _key_expression(table, columns, "OLD")
-    quoted = _qident(name)
-    literal = _qliteral(name)
+    quoted, literal = _qident(name), _qliteral(name)
     now = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
-    connection.execute(
-        f"CREATE TRIGGER IF NOT EXISTS {_qident(TRIGGER_PREFIX + digest + '_ai')} AFTER INSERT ON {quoted} BEGIN "
-        f"INSERT INTO {_qident(CHANGE_TABLE)}(table_name,key_sql,operation,changed_at) "
-        f"VALUES ({literal},{new_key},'upsert',{now}); END"
-    )
-    connection.execute(
-        f"CREATE TRIGGER IF NOT EXISTS {_qident(TRIGGER_PREFIX + digest + '_ad')} AFTER DELETE ON {quoted} BEGIN "
-        f"INSERT INTO {_qident(CHANGE_TABLE)}(table_name,key_sql,operation,changed_at) "
-        f"VALUES ({literal},{old_key},'delete',{now}); END"
-    )
+    for suffix, event, key, operation in (
+        ("ai", "INSERT", new_key, "upsert"),
+        ("ad", "DELETE", old_key, "delete"),
+    ):
+        connection.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {_qident(TRIGGER_PREFIX + digest + '_' + suffix)} "
+            f"AFTER {event} ON {quoted} BEGIN "
+            f"INSERT INTO {_qident(CHANGE_TABLE)}(table_name,key_sql,operation,changed_at) "
+            f"VALUES ({literal},{key},'{operation}',{now}); END"
+        )
     connection.execute(
         f"CREATE TRIGGER IF NOT EXISTS {_qident(TRIGGER_PREFIX + digest + '_au')} AFTER UPDATE ON {quoted} BEGIN "
         f"INSERT INTO {_qident(CHANGE_TABLE)}(table_name,key_sql,operation,changed_at) "
@@ -233,18 +222,14 @@ def _ensure_tracking_locked(connection: sqlite3.Connection) -> tuple[dict[str, s
     connection.execute(
         f"CREATE INDEX IF NOT EXISTS ix_certification_replication_changes_id ON {_qident(CHANGE_TABLE)}(id)"
     )
-    connection.execute(
-        f"CREATE TABLE IF NOT EXISTS {_qident(META_TABLE)}(key TEXT PRIMARY KEY,value TEXT NOT NULL)"
-    )
-
+    connection.execute(f"CREATE TABLE IF NOT EXISTS {_qident(META_TABLE)}(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
     meta = _meta(connection)
-    observed_schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
-    configured_schema_version = int(meta.get("configured_schema_version", "-1"))
+    observed = int(connection.execute("PRAGMA schema_version").fetchone()[0])
     if (
         meta.get("replication_version") == REPLICATION_VERSION
         and meta.get("epoch")
         and meta.get("schema_fingerprint")
-        and configured_schema_version == observed_schema_version
+        and int(meta.get("configured_schema_version", "-1")) == observed
     ):
         return meta, False
 
@@ -260,16 +245,13 @@ def _ensure_tracking_locked(connection: sqlite3.Connection) -> tuple[dict[str, s
         _set_meta(connection, "epoch", secrets.token_urlsafe(24))
         _set_meta(connection, "schema_fingerprint", fingerprint)
         _set_meta(connection, "replication_version", REPLICATION_VERSION)
-
     for table in _ordinary_tables(connection):
         _install_table_triggers(connection, table)
-    final_schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
-    _set_meta(connection, "configured_schema_version", str(final_schema_version))
+    _set_meta(connection, "configured_schema_version", str(int(connection.execute("PRAGMA schema_version").fetchone()[0])))
     return _meta(connection), identity_changed
 
 
 def prepare_bootstrap(store: Any) -> dict[str, Any]:
-    """Refresh replication identity/triggers before any full bootstrap copy begins."""
     with store._lock, store.db:
         meta, changed = _ensure_tracking_locked(store.db)
         watermark = _current_watermark(store.db)
@@ -308,19 +290,13 @@ def _upsert_sql(connection: sqlite3.Connection, table: dict[str, Any], key_sql: 
     name = str(table["name"])
     columns = [column for column in _columns(connection, name) if int(column["hidden"]) == 0]
     names = [str(column["name"]) for column in columns]
-    primary = _primary_columns(columns)
-    if primary:
-        row = connection.execute(
-            "SELECT " + ",".join(_qident(column) for column in names)
-            + f" FROM {_qident(name)} WHERE {key_sql} LIMIT 1"
-        ).fetchone()
-        insert_names = names
+    if _primary_columns(columns):
+        projection, insert_names = ",".join(_qident(name) for name in names), names
     else:
-        row = connection.execute(
-            "SELECT rowid," + ",".join(_qident(column) for column in names)
-            + f" FROM {_qident(name)} WHERE {key_sql} LIMIT 1"
-        ).fetchone()
-        insert_names = ["rowid", *names]
+        projection, insert_names = "rowid," + ",".join(_qident(name) for name in names), ["rowid", *names]
+    row = connection.execute(
+        f"SELECT {projection} FROM {_qident(name)} WHERE {key_sql} LIMIT 1"
+    ).fetchone()
     if row is None:
         return None
     return (
@@ -340,13 +316,7 @@ def _require_shared_token(value: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid certification replication authorization")
 
 
-def _delta_payload(
-    store: Any,
-    *,
-    from_watermark: int,
-    epoch: str,
-    schema_fingerprint: str,
-) -> dict[str, Any]:
+def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_fingerprint: str) -> dict[str, Any]:
     with store._lock, store.db:
         meta, reconfigured = _ensure_tracking_locked(store.db)
     if reconfigured:
@@ -376,14 +346,12 @@ def _delta_payload(
         if count > _max_delta_rows():
             raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:delta_too_large")
         rows = reader.execute(
-            f"SELECT table_name,key_sql,operation FROM {_qident(CHANGE_TABLE)} "
-            "WHERE id>? AND id<=? ORDER BY id",
+            f"SELECT table_name,key_sql,operation FROM {_qident(CHANGE_TABLE)} WHERE id>? AND id<=? ORDER BY id",
             (from_watermark, to_watermark),
         ).fetchall()
         coalesced: dict[tuple[str, str], str] = {}
         for table_name, key_sql, operation in rows:
             coalesced[(str(table_name), str(key_sql))] = str(operation)
-
         tables = {str(table["name"]): table for table in _ordinary_tables(reader)}
         changes: list[dict[str, str]] = []
         payload_bytes = 0
@@ -391,26 +359,26 @@ def _delta_payload(
             table = tables.get(table_name)
             if table is None:
                 raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:table_missing")
-            if operation == "delete":
+            sql = (
+                f"DELETE FROM {_qident(table_name)} WHERE {key_sql}"
+                if operation == "delete"
+                else _upsert_sql(reader, table, key_sql)
+            )
+            if sql is None:
                 sql = f"DELETE FROM {_qident(table_name)} WHERE {key_sql}"
-            else:
-                sql = _upsert_sql(reader, table, key_sql)
-                if sql is None:
-                    sql = f"DELETE FROM {_qident(table_name)} WHERE {key_sql}"
-            payload_bytes += len(sql.encode("utf-8"))
+            payload_bytes += len(sql.encode())
             if payload_bytes > _max_delta_bytes():
                 raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:delta_bytes_exceeded")
             changes.append({"table": table_name, "sql": sql})
     finally:
         reader.close()
 
-    # The caller's from_watermark is an acknowledgement: its sidecar advances only
-    # after the previous response committed locally.  Prune only acknowledged rows.
-    # AUTOINCREMENT sqlite_sequence preserves the high-watermark through quiet cycles.
+    # from_watermark is a durable acknowledgement: the client advances it only
+    # after its prior transaction and state sidecar have committed.  Prune only
+    # rows already acknowledged.  sqlite_sequence keeps the watermark monotonic.
     if from_watermark > 0:
         with store._lock, store.db:
             store.db.execute(f"DELETE FROM {_qident(CHANGE_TABLE)} WHERE id<=?", (from_watermark,))
-
     return {
         "replication_version": REPLICATION_VERSION,
         "release_commit": split._release_commit(),
@@ -431,27 +399,31 @@ def _delta_payload(
 
 
 def _wrap_bootstrap_snapshot_builder() -> None:
-    """Make every exceptional full snapshot refresh replication metadata first."""
     current = split._snapshot_store_to_file
     if bool(getattr(current, "_roi_replication_bootstrap_prepare", False)):
         return
-
     def snapshot_with_replication_identity(store: Any, snapshot: Path) -> tuple[int, int]:
         prepare_bootstrap(store)
         return current(store, snapshot)
-
     setattr(snapshot_with_replication_identity, "_roi_replication_bootstrap_prepare", True)
     setattr(snapshot_with_replication_identity, "_roi_original_snapshot_store_to_file", current)
     split._snapshot_store_to_file = snapshot_with_replication_identity  # type: ignore[assignment]
 
 
 def install_certification_incremental_replication(app: Any, runtime_provider: Callable[[], Any]) -> None:
-    runtime = runtime_provider()
-    store = getattr(runtime, "store", None)
-    if store is None:
-        raise RuntimeError("certification replication canonical store unavailable")
-    prepare_bootstrap(store)
+    # Route composition must remain safe before the runtime store exists (several
+    # canonical tests intentionally compose a dummy runtime).  Actual replication
+    # requests remain fail-closed until a canonical store is present.  The full
+    # bootstrap builder is wrapped unconditionally so a later-available store gets
+    # tracking metadata before its first exceptional snapshot.
     _wrap_bootstrap_snapshot_builder()
+    try:
+        initial_runtime = runtime_provider()
+    except Exception:
+        initial_runtime = None
+    initial_store = getattr(initial_runtime, "store", None) if initial_runtime is not None else None
+    if initial_store is not None:
+        prepare_bootstrap(initial_store)
 
     path = "/v1/operations/certification-db-delta"
     status_path = "/v1/operations/certification-db-replication"
@@ -465,12 +437,15 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
             x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
         ) -> dict[str, Any]:
             _require_shared_token(x_certification_token)
-            current_runtime = runtime_provider()
-            current_store = getattr(current_runtime, "store", None)
-            if current_store is None:
+            try:
+                current_runtime = runtime_provider()
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="canonical certification runtime unavailable") from exc
+            store = getattr(current_runtime, "store", None)
+            if store is None:
                 raise HTTPException(status_code=503, detail="canonical certification store unavailable")
             return _delta_payload(
-                current_store,
+                store,
                 from_watermark=from_watermark,
                 epoch=epoch,
                 schema_fingerprint=schema_fingerprint,
@@ -479,17 +454,21 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
     if status_path not in existing:
         @app.get(status_path)
         def certification_db_replication_status() -> dict[str, Any]:
-            current_runtime = runtime_provider()
-            current_store = getattr(current_runtime, "store", None)
-            if current_store is None:
+            try:
+                current_runtime = runtime_provider()
+            except Exception:
+                current_runtime = None
+            store = getattr(current_runtime, "store", None) if current_runtime is not None else None
+            if store is None:
                 return {
                     "replication_version": REPLICATION_VERSION,
                     "ready": False,
                     "reason": "canonical_store_unavailable",
+                    "full_snapshot_normal_cycle": False,
                     "paper_only": True,
                     "live_money_authority": False,
                 }
-            state = prepare_bootstrap(current_store)
+            state = prepare_bootstrap(store)
             return {
                 **state,
                 "ready": True,
