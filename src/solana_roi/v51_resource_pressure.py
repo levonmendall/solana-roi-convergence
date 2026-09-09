@@ -62,6 +62,48 @@ def _memory_events(root: Path) -> dict[str, int]:
     return result
 
 
+def _memory_stat(root: Path) -> dict[str, int]:
+    """Return numeric cgroup memory.stat values when available.
+
+    cgroup v2 exposes ``inactive_file``. Some v1-compatible layouts expose
+    ``total_inactive_file`` instead, so callers may use either value without
+    weakening the fallback to raw ``memory.current`` when the stat file is
+    unavailable or malformed.
+    """
+    result: dict[str, int] = {}
+    raw = _read_text(root / "memory.stat")
+    if raw is None:
+        return result
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            result[parts[0]] = max(0, int(parts[1]))
+        except ValueError:
+            continue
+    return result
+
+
+def _working_set_bytes(current: int | None, memory_stat: dict[str, int]) -> tuple[int | None, int | None]:
+    """Return effective working set and the reclaimable inactive-file charge.
+
+    Linux cgroup ``memory.current`` includes reclaimable file-backed page cache.
+    During durable-state restoration that cache can be large even when the
+    process has substantial headroom. The standard cgroup working-set estimate
+    subtracts ``inactive_file`` while clamping at zero. If memory.stat cannot
+    provide the value, fail safely back to raw current usage.
+    """
+    inactive_file = memory_stat.get("inactive_file")
+    if inactive_file is None:
+        inactive_file = memory_stat.get("total_inactive_file")
+    if current is None:
+        return None, inactive_file
+    if inactive_file is None:
+        return current, None
+    return max(0, int(current) - int(inactive_file)), int(inactive_file)
+
+
 def _cpu_stat(root: Path) -> dict[str, int]:
     result: dict[str, int] = {}
     raw = _read_text(root / "cpu.stat")
@@ -116,6 +158,8 @@ def _raw_sample(*, cgroup_root: Path | None = None) -> dict[str, Any]:
     root = cgroup_root or Path(os.getenv("SOLANA_ROI_CGROUP_ROOT", "/sys/fs/cgroup"))
     current = _read_int(root / "memory.current")
     maximum = _read_int(root / "memory.max")
+    memory_stat = _memory_stat(root)
+    working_set, inactive_file = _working_set_bytes(current, memory_stat)
     events = _memory_events(root)
     cpu = _cpu_stat(root)
     monotonic = time.monotonic()
@@ -123,6 +167,8 @@ def _raw_sample(*, cgroup_root: Path | None = None) -> dict[str, Any]:
         "sampled_at": _utcnow(),
         "monotonic": monotonic,
         "memory_current_bytes": current,
+        "memory_working_set_bytes": working_set,
+        "memory_inactive_file_bytes": inactive_file,
         "memory_max_bytes": maximum,
         "process_rss_bytes": _proc_rss_bytes(),
         "memory_events": events,
@@ -174,6 +220,14 @@ def _ratio(numerator: int | None, denominator: int | None) -> float | None:
     return max(0.0, float(numerator) / float(denominator))
 
 
+def _sample_working_set(sample: dict[str, Any]) -> int | None:
+    working_set = sample.get("memory_working_set_bytes")
+    if working_set is not None:
+        return int(working_set)
+    current = sample.get("memory_current_bytes")
+    return int(current) if current is not None else None
+
+
 def _trend(samples: list[dict[str, Any]]) -> dict[str, Any]:
     if len(samples) < 2:
         return {
@@ -186,8 +240,8 @@ def _trend(samples: list[dict[str, Any]]) -> dict[str, Any]:
     first = samples[0]
     last = samples[-1]
     seconds = max(0.0, float(last.get("monotonic") or 0.0) - float(first.get("monotonic") or 0.0))
-    first_memory = first.get("memory_current_bytes")
-    last_memory = last.get("memory_current_bytes")
+    first_memory = _sample_working_set(first)
+    last_memory = _sample_working_set(last)
     growth = None
     if seconds > 0.0 and first_memory is not None and last_memory is not None:
         growth = (float(last_memory) - float(first_memory)) * 60.0 / seconds
@@ -221,8 +275,10 @@ def resource_pressure_snapshot() -> dict[str, Any]:
         samples = list(_samples)
     trend = _trend(samples)
     current = latest.get("memory_current_bytes")
+    working_set = _sample_working_set(latest)
+    inactive_file = latest.get("memory_inactive_file_bytes")
     maximum = latest.get("memory_max_bytes")
-    memory_fraction = _ratio(current, maximum)
+    memory_fraction = _ratio(working_set, maximum)
     events = dict(latest.get("memory_events") or {})
     warnings: list[str] = []
     critical: list[str] = []
@@ -254,6 +310,11 @@ def resource_pressure_snapshot() -> dict[str, Any]:
         state = "unavailable"
         warnings.append("cgroup_metrics_unavailable")
 
+    utilization_basis = (
+        "working_set_excluding_inactive_file"
+        if inactive_file is not None
+        else "raw_cgroup_usage_fallback"
+    )
     return {
         "resource_pressure_version": RESOURCE_PRESSURE_VERSION,
         "state": state,
@@ -261,8 +322,11 @@ def resource_pressure_snapshot() -> dict[str, Any]:
         "sample_count": len(samples),
         "memory": {
             "current_bytes": current,
+            "working_set_bytes": working_set,
+            "inactive_file_bytes": inactive_file,
             "max_bytes": maximum,
             "utilization_fraction": memory_fraction,
+            "utilization_basis": utilization_basis,
             "process_rss_bytes": latest.get("process_rss_bytes"),
             "events": events,
         },
