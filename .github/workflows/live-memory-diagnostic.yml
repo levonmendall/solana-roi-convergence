@@ -35,6 +35,7 @@ jobs:
           composition = get("/v1/operations/production-composition")
           memory = composition.get("runtime_memory_capacity") or {}
           print("PRODUCTION_COMPOSITION_MEMORY=" + json.dumps({
+              "release_commit": composition.get("release_commit"),
               "authoritative_strategy_version": composition.get("authoritative_strategy_version"),
               "authority_id": composition.get("authority_id"),
               "paper_only": composition.get("paper_only"),
@@ -47,6 +48,9 @@ jobs:
               ("/v1/strategy/e2e-status/cache", "E2E_CACHE"),
               ("/v1/strategy/forward-certification/cache", "FORWARD_CACHE"),
               ("/v1/strategy/production-proof/cache", "PRODUCTION_PROOF_CACHE"),
+              ("/v1/strategy/e2e-status", "PROXIED_E2E"),
+              ("/v1/strategy/forward-certification", "PROXIED_FORWARD"),
+              ("/v1/strategy/production-proof", "PROXIED_PRODUCTION_PROOF"),
           ):
               try:
                   print(label + "=" + json.dumps(get(path), sort_keys=True), flush=True)
