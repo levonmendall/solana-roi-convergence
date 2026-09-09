@@ -24,15 +24,6 @@ from .production_system import (
     production_system,
 )
 from . import legacy_production_composition as _legacy_production
-from .certification_service_split import install_certification_service_split
-
-# Install only after the complete canonical production system is composed, but
-# before Uvicorn enters FastAPI lifespan. When split mode is disabled this is
-# observability-only. When enabled it removes local heavy certification publishers,
-# exposes an authenticated point-in-time SQLite backup, and proxies proof reads to
-# the independently resource-bounded certifier. Strategy/economic authority is
-# unchanged.
-install_certification_service_split(app, ingestion_runtime)
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
