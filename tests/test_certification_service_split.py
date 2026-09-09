@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 
 from solana_roi import certification_service_split as split
 from solana_roi import certifier_service
@@ -21,6 +22,14 @@ class _Response:
 
     def read(self) -> bytes:
         return json.dumps(self.payload).encode("utf-8")
+
+
+class _ForbiddenLock:
+    def __enter__(self):
+        raise AssertionError("certification snapshot must not hold the live runtime store lock")
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
 def test_split_runtime_worker_bypasses_all_local_certification_publishers(monkeypatch) -> None:
@@ -49,6 +58,35 @@ def test_split_runtime_worker_bypasses_all_local_certification_publishers(monkey
     assert getattr(current, "_roi_e2e_status_snapshot_worker") is True
     assert getattr(current, "_roi_production_proof_snapshot_worker") is True
     assert getattr(current, "_roi_forward_certification_snapshot_worker") is True
+
+
+def test_snapshot_uses_separate_read_connection_without_runtime_store_lock(tmp_path) -> None:
+    source = tmp_path / "canonical.sqlite3"
+    target = tmp_path / "snapshot.sqlite3"
+    connection = sqlite3.connect(source)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE evidence(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("INSERT INTO evidence(value) VALUES ('canonical')")
+        connection.commit()
+    finally:
+        connection.close()
+
+    class Store:
+        path = source
+        _lock = _ForbiddenLock()
+
+    size = split._snapshot_store_to_file(Store(), target)
+    assert size > 0
+    copied = sqlite3.connect(target)
+    try:
+        row = copied.execute("SELECT value FROM evidence").fetchone()
+    finally:
+        copied.close()
+    assert row == ("canonical",)
+    status = split.status()
+    assert status["snapshot_holds_runtime_store_lock"] is False
+    assert status["snapshot_export"] == "sqlite_online_backup_point_in_time_read_only_connection"
 
 
 def test_remote_certification_fails_closed_on_exact_release_mismatch(monkeypatch) -> None:
