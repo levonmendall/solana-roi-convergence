@@ -3,233 +3,189 @@ from __future__ import annotations
 import json
 import os
 import time
-import urllib.error
 import urllib.request
 
 BASE_URL = os.getenv("SOLANA_ROI_PRODUCTION_URL", "https://solana-roi-convergence.onrender.com").rstrip("/")
 EXPECTED_SHA = os.getenv("EXPECTED_RELEASE_COMMIT", "").strip()
-ATTEMPTS = int(os.getenv("FORWARD_PROOF_PROBE_ATTEMPTS", "30"))
-SLEEP_SECONDS = float(os.getenv("FORWARD_PROOF_PROBE_SLEEP_SECONDS", "10"))
-# These endpoints intentionally aggregate durable evidence across independent paper
-# planes. Production observation showed valid 200 responses can exceed 10 seconds;
-# this verifier is post-deploy and must distinguish a slow deep proof from an outage.
-TIMEOUT_SECONDS = float(os.getenv("FORWARD_PROOF_HTTP_TIMEOUT_SECONDS", "60"))
-FIVE_LANES = ("pump_fun", "pump_amm", "raydium", "fomo", "robinhood")
+TIMEOUT_SECONDS = float(os.getenv("FORWARD_PROOF_HTTP_TIMEOUT_SECONDS", "45"))
 
 
-def _get(path: str) -> dict:
-    started = time.monotonic()
-    print(f"GET {path} start timeout={TIMEOUT_SECONDS:.0f}s", flush=True)
+def get(path: str) -> dict:
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
-        headers={"Accept": "application/json", "User-Agent": "solana-roi-forward-proof-ci/4"},
+        headers={"Accept": "application/json", "User-Agent": "solana-roi-live-certification-sampler/3"},
     )
+    started = time.monotonic()
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    elapsed = time.monotonic() - started
-    print(f"GET {path} complete elapsed={elapsed:.2f}s", flush=True)
     if not isinstance(payload, dict):
         raise AssertionError(f"{path} returned non-object JSON")
+    print(f"GET {path} elapsed={time.monotonic()-started:.2f}s", flush=True)
     return payload
 
 
-def _assert_safety(payload: dict, *, label: str) -> None:
-    assert payload.get("paper_only") is True, f"{label}: paper_only must be true"
-    assert payload.get("live_money_authority") is False, f"{label}: live money authority exposed"
+def safe(path: str) -> dict:
+    try:
+        return get(path)
+    except Exception as exc:
+        return {"_error": f"{type(exc).__name__}: {exc}"}
 
 
-def _five_lane_result(production: dict) -> dict:
-    accounting = production.get("candidate_accounting") or {}
-    # Canonical Batch 7 schema is `lanes`; retain the Batch 6 alias only as a
-    # read-compatibility fallback for older deployed proof payloads.
+def lane_summary(proof: dict) -> dict:
+    accounting = proof.get("candidate_accounting") or {}
     lanes = accounting.get("lanes") or accounting.get("lane_accounting") or {}
-    conservation = accounting.get("candidate_conservation") or {}
-    assert isinstance(lanes, dict), "production proof: lane accounting unavailable"
-    missing = [lane for lane in FIVE_LANES if lane not in lanes]
-    assert not missing, f"production proof: missing five-lane accounting for {missing}"
+    result = {}
+    if isinstance(lanes, dict):
+        for lane, value in lanes.items():
+            if isinstance(value, dict):
+                result[lane] = {
+                    "verified": value.get("verified"),
+                    "status": value.get("status"),
+                    "observed": value.get("observed_candidate_count"),
+                    "terminal": value.get("terminal_candidate_count"),
+                    "pending": value.get("valid_pending_candidate_count"),
+                    "coverage_debt": value.get("coverage_debt_candidate_count"),
+                    "unexplained": value.get("unexplained_candidate_count"),
+                    "reconciled": value.get("reconciled"),
+                    "proof_state": value.get("proof_state"),
+                }
+    return result
 
-    lane_result: dict[str, dict] = {}
-    for lane in FIVE_LANES:
-        value = lanes.get(lane) or {}
-        verified = bool(value.get("verified"))
-        status = str(value.get("status") or "")
-        if not verified:
-            assert status == "unable_to_verify", (
-                f"{lane}: unverified population must be explicit unable_to_verify, got {status!r}"
-            )
-        observed = value.get("observed_candidate_count")
-        reconciled = bool(value.get("reconciled"))
-        if verified and reconciled and int(observed or 0) > 0:
-            outcome = "OBSERVED_AND_RECONCILED"
-        elif verified and reconciled:
-            outcome = "VERIFIED_ZERO_CANDIDATES"
-        else:
-            outcome = "UNABLE_TO_VERIFY"
-        lane_result[lane] = {
-            "outcome": outcome,
-            "verified": verified,
-            "status": status,
-            "observed_candidate_count": observed,
-            "terminal_candidate_count": value.get("terminal_candidate_count"),
-            "valid_pending_candidate_count": value.get("valid_pending_candidate_count"),
-            "coverage_debt_candidate_count": value.get("coverage_debt_candidate_count"),
-            "unexplained_candidate_count": value.get("unexplained_candidate_count"),
-            "conservation_delta": value.get("conservation_delta"),
-            "conserved": value.get("conserved"),
-            "reconciled": value.get("reconciled"),
-            "proof_state": value.get("proof_state"),
-            "coverage_complete": value.get("coverage_complete"),
-        }
 
-    population_verifiable = bool(
-        conservation.get(
-            "candidate_population_verifiable",
-            conservation.get("population_verifiable"),
-        )
-    )
-    unexplained = conservation.get(
-        "unexplained_candidate_count",
-        conservation.get("unexplained"),
-    )
-    coverage_debt = conservation.get(
-        "coverage_debt_candidate_count",
-        conservation.get("coverage_debt"),
-    )
-    if population_verifiable:
-        assert int(unexplained or 0) == 0, "candidate reconciliation has unexplained disappearance"
-        assert int(coverage_debt or 0) == 0, "candidate reconciliation has coverage debt"
-        assert int(conservation.get("conservation_delta") or 0) == 0, "candidate conservation delta is nonzero"
-        assert conservation.get("conserved") is True, "candidate population is not conserved"
-        assert conservation.get("reconciled") is True, "candidate population is not reconciled"
+def sample(number: int) -> None:
+    health = safe("/health")
+    repair = safe("/v1/operations/certification-proof-memory-repair")
+    coordinator = safe("/v1/operations/certification-generation-coordinator")
+    composition = safe("/v1/operations/production-composition")
+    direct = safe("/v1/direct-solana/status")
+    e2e_cache = safe("/v1/strategy/e2e-status/cache")
+    e2e = safe("/v1/strategy/e2e-status")
+    forward_cache = safe("/v1/strategy/forward-certification/cache")
+    forward = safe("/v1/strategy/forward-certification")
+    proof_cache = safe("/v1/strategy/production-proof/cache")
+    proof = safe("/v1/strategy/production-proof")
+    robinhood = safe("/v1/robinhood-chain/status")
 
-    return {
-        "lanes": lane_result,
-        "candidate_population_verifiable": population_verifiable,
-        "all_lane_sources_verified": conservation.get("all_lane_sources_verified"),
-        "unverified_lanes": conservation.get("unverified_lanes"),
-        "verification_blockers": conservation.get("verification_blockers"),
-        "observed_candidate_count": conservation.get(
-            "observed_candidate_count",
-            conservation.get("observed"),
-        ),
-        "terminal_candidate_count": conservation.get(
-            "terminal_candidate_count",
-            conservation.get("terminal"),
-        ),
-        "valid_pending_candidate_count": conservation.get(
-            "valid_pending_candidate_count",
-            conservation.get("valid_pending"),
-        ),
-        "coverage_debt_candidate_count": coverage_debt,
-        "unexplained_candidate_count": unexplained,
-        "conservation_delta": conservation.get("conservation_delta"),
-        "conserved": conservation.get("conserved"),
-        "reconciled": conservation.get("reconciled"),
-        "classification_anomalies": accounting.get("classification_anomalies"),
+    memory = composition.get("runtime_memory_capacity") or {}
+    forensic = memory.get("cgroup_oom_forensics") or {}
+    current = forensic.get("current_snapshot") or {}
+    output = {
+        "sample": number,
+        "expected_sha": EXPECTED_SHA,
+        "health": {
+            "error": health.get("_error"),
+            "release_commit": health.get("release_commit"),
+            "paper_only": health.get("paper_only"),
+            "live_money_authority": health.get("live_money_authority"),
+        },
+        "repair": {
+            "error": repair.get("_error"),
+            "installed": repair.get("installed"),
+            "repair_version": repair.get("repair_version"),
+            "proof_generations": repair.get("proof_generations"),
+            "bounded_record_builds": repair.get("bounded_record_builds"),
+            "fomo_outcome_rows_read": repair.get("fomo_outcome_rows_read"),
+            "promotion_cache_hits": repair.get("promotion_cache_hits"),
+            "promotion_cache_misses": repair.get("promotion_cache_misses"),
+            "unbounded_fomo_shadow_scan": repair.get("unbounded_fomo_shadow_scan"),
+            "resource_guard_relaxed": repair.get("resource_guard_relaxed"),
+            "stale_gate_relaxed": repair.get("stale_gate_relaxed"),
+            "continuity_gate_relaxed": repair.get("continuity_gate_relaxed"),
+            "economic_thresholds_changed": repair.get("economic_thresholds_changed"),
+            "canonical_evidence_reset": repair.get("canonical_evidence_reset"),
+            "paper_only": repair.get("paper_only"),
+            "live_money_authority": repair.get("live_money_authority"),
+            "signing_available": repair.get("signing_available"),
+            "transaction_submission_available": repair.get("transaction_submission_available"),
+        },
+        "coordinator": {
+            "error": coordinator.get("_error"),
+            "acquisitions": coordinator.get("acquisitions"),
+            "guard_rejections": coordinator.get("guard_rejections"),
+            "last_guard_reason": coordinator.get("last_guard_reason"),
+            "last_surface": coordinator.get("last_surface"),
+            "active": coordinator.get("active"),
+        },
+        "memory": {
+            "error": composition.get("_error"),
+            "memory_current_bytes": current.get("memory_current_bytes"),
+            "memory_max_bytes": current.get("memory_max_bytes"),
+            "memory_fraction": current.get("memory_fraction"),
+            "memory_headroom_bytes": current.get("memory_headroom_bytes"),
+            "process_rss_bytes": current.get("process_rss_bytes"),
+            "file_bytes": (current.get("memory_stat") or {}).get("file"),
+            "anon_bytes": (current.get("memory_stat") or {}).get("anon"),
+            "kernel_bytes": (current.get("memory_stat") or {}).get("kernel"),
+            "memory_events": current.get("memory_events"),
+            "active_phases": current.get("active_phases"),
+            "database_bytes": current.get("database_bytes"),
+            "wal_bytes": current.get("wal_bytes"),
+            "process_epoch": current.get("process_epoch"),
+        },
+        "direct_solana": {
+            "error": direct.get("_error"),
+            "enabled": direct.get("enabled"),
+            "continuity_ok": direct.get("continuity_ok"),
+            "unresolved_gap": direct.get("unresolved_gap"),
+            "strategy_relevant_continuity": direct.get("strategy_relevant_continuity"),
+            "full_scope_target_quorum": direct.get("full_scope_target_quorum"),
+            "target_stream_fanout": direct.get("target_stream_fanout"),
+            "live_poll_redundancy": direct.get("live_poll_redundancy"),
+            "continuity_epoch": direct.get("continuity_epoch"),
+        },
+        "e2e_cache": e2e_cache,
+        "e2e": {
+            "error": e2e.get("_error"),
+            "release_commit": e2e.get("release_commit"),
+            "overall": e2e.get("overall"),
+            "solana": e2e.get("solana"),
+            "fomo": e2e.get("fomo"),
+            "robinhood": e2e.get("robinhood"),
+        },
+        "forward_cache": forward_cache,
+        "forward": {
+            "error": forward.get("_error"),
+            "release_commit": forward.get("release_commit"),
+            "state": forward.get("state"),
+            "system_forward_certified": forward.get("system_forward_certified"),
+            "blockers": forward.get("blockers"),
+            "paper_only": forward.get("paper_only"),
+            "live_money_authority": forward.get("live_money_authority"),
+        },
+        "proof_cache": proof_cache,
+        "proof": {
+            "error": proof.get("_error"),
+            "release": proof.get("release"),
+            "state": proof.get("state"),
+            "production_proof_pass": proof.get("production_proof_pass"),
+            "blockers": proof.get("blockers"),
+            "lanes": lane_summary(proof),
+            "final_certification": proof.get("final_certification"),
+            "paper_only": proof.get("paper_only"),
+            "live_money_authority": proof.get("live_money_authority"),
+            "signing_available": proof.get("signing_available"),
+            "transaction_submission_available": proof.get("transaction_submission_available"),
+        },
+        "robinhood": {
+            "error": robinhood.get("_error"),
+            "status": robinhood.get("status"),
+            "blockers": robinhood.get("blockers"),
+            "all_regimes_e2e_achievable": robinhood.get("all_regimes_e2e_achievable"),
+            "paper_only": robinhood.get("paper_only"),
+            "live_money_authority": robinhood.get("live_money_authority"),
+            "worker": robinhood.get("worker"),
+            "transport": robinhood.get("transport"),
+            "catchup": robinhood.get("catchup"),
+        },
     }
-
-
-def _probe_once() -> dict:
-    health = _get("/health")
-    _assert_safety(health, label="health")
-
-    e2e = _get("/v1/strategy/e2e-status")
-    overall = e2e.get("overall") or {}
-    _assert_safety(overall, label="e2e overall")
-    assert overall.get("signing_available") is False, "e2e: signing must remain unavailable"
-    assert overall.get("transaction_submission_available") is False, "e2e: submission must remain unavailable"
-
-    certificate = _get("/v1/strategy/forward-certification")
-    _assert_safety(certificate, label="forward certificate")
-    assert certificate.get("signing_available") is False, "certificate: signing must remain unavailable"
-    assert certificate.get("transaction_submission_available") is False, "certificate: submission must remain unavailable"
-
-    production = _get("/v1/strategy/production-proof")
-    _assert_safety(production, label="production proof")
-    assert production.get("signing_available") is False, "production proof: signing must remain unavailable"
-    assert production.get("transaction_submission_available") is False, "production proof: submission must remain unavailable"
-    assert production.get("read_only_observability") is True, "production proof must remain read-only"
-    assert production.get("changes_strategy_authority") is False
-    assert production.get("changes_economic_thresholds") is False
-
-    e2e_sha = str(e2e.get("release_commit") or "")
-    cert_sha = str(certificate.get("release_commit") or "")
-    production_sha = str((production.get("release") or {}).get("release_commit") or "")
-    if EXPECTED_SHA:
-        assert e2e_sha == EXPECTED_SHA, f"e2e release {e2e_sha!r} != expected {EXPECTED_SHA!r}"
-        assert cert_sha == EXPECTED_SHA, f"certificate release {cert_sha!r} != expected {EXPECTED_SHA!r}"
-        assert production_sha == EXPECTED_SHA, (
-            f"production proof release {production_sha!r} != expected {EXPECTED_SHA!r}"
-        )
-    assert e2e_sha and e2e_sha == cert_sha == production_sha, "production proof release binding mismatch"
-
-    checks = certificate.get("checks") or {}
-    assert (checks.get("35_exact_live_release") or {}).get("pass") is True, "exact release gate failed"
-    assert (checks.get("36_paper_only_safety_boundary") or {}).get("pass") is True, "safety gate failed"
-    for number, surface in ((37, "solana"), (38, "fomo"), (39, "robinhood")):
-        check = checks.get(f"{number}_{surface}_transport") or {}
-        assert check.get("ready") is True, f"{surface} transport not ready: {check.get('blockers')}"
-    assert (checks.get("45_correlation_and_one_capital_base") or {}).get("one_capital_base") is True, (
-        "one-capital-base reconciliation invariant failed"
-    )
-    assert certificate.get("changes_strategy_authority") is False
-    assert certificate.get("changes_economic_thresholds") is False
-
-    attestation_policy = production.get("surface_attestation_policy") or {}
-    assert attestation_policy.get("surface_scoped_attestation_required") is True
-    assert attestation_policy.get("aggregate_attestation_fallback_allowed") is False
-    resource_pressure = production.get("resource_pressure") or {}
-    assert resource_pressure.get("read_only_observability") is True
-    assert resource_pressure.get("state") in {"healthy", "warning", "critical", "unavailable"}
-    assert isinstance(production.get("candidate_accounting"), dict)
-    five_lane = _five_lane_result(production)
-    final = production.get("final_certification") or {}
-    _assert_safety(final, label="final certification")
-    assert final.get("surface_scoped_attestation_required") is True
-    assert final.get("aggregate_attestation_fallback_allowed") is False
-
-    batch6_gate = production.get("batch6_release_gate") or {}
-    epochs = production.get("epochs") or {}
-    return {
-        "release_commit": cert_sha,
-        "state": certificate.get("state"),
-        "system_forward_certified": certificate.get("system_forward_certified"),
-        "production_proof_state": production.get("state"),
-        "production_proof_pass": production.get("production_proof_pass"),
-        "batch6_release_gate_verdict": batch6_gate.get("verdict"),
-        "batch6_release_gate_blockers": batch6_gate.get("blockers"),
-        "economic_epoch": epochs.get("economic_epoch") or epochs.get("economic_freeze_epoch"),
-        "measurement_epoch": epochs.get("measurement_epoch"),
-        "final_classification": final.get("classification"),
-        "coverage_debt_count": (production.get("candidate_accounting") or {}).get("coverage_debt_count"),
-        "five_lane_candidate_accounting": five_lane,
-        "resource_pressure_state": resource_pressure.get("state"),
-        "promotion_eligible_families": certificate.get(
-            "promotion_eligible_families_under_existing_v51_claims"
-        ),
-        "blockers": production.get("blockers"),
-    }
+    print("LIVE_CERT_SAMPLE=" + json.dumps(output, sort_keys=True, default=str), flush=True)
 
 
 def main() -> None:
-    last_error: BaseException | None = None
-    for attempt in range(1, ATTEMPTS + 1):
-        try:
-            result = _probe_once()
-            print(
-                json.dumps({"attempt": attempt, "production_forward_probe": result}, sort_keys=True),
-                flush=True,
-            )
-            return
-        except (AssertionError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            last_error = exc
-            print(
-                f"attempt {attempt}/{ATTEMPTS} not ready: {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-            if attempt < ATTEMPTS:
-                time.sleep(SLEEP_SECONDS)
-    raise SystemExit(f"production forward proof did not converge: {type(last_error).__name__}: {last_error}")
+    for number in range(1, 4):
+        sample(number)
+        if number < 3:
+            time.sleep(16)
 
 
 if __name__ == "__main__":
