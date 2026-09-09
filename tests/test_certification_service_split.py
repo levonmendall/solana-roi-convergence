@@ -60,7 +60,7 @@ def test_split_runtime_worker_bypasses_all_local_certification_publishers(monkey
     assert getattr(current, "_roi_forward_certification_snapshot_worker") is True
 
 
-def test_snapshot_uses_separate_read_connection_without_runtime_store_lock(tmp_path) -> None:
+def test_snapshot_uses_pinned_read_transaction_without_runtime_store_lock(tmp_path) -> None:
     source = tmp_path / "canonical.sqlite3"
     target = tmp_path / "snapshot.sqlite3"
     connection = sqlite3.connect(source)
@@ -76,8 +76,9 @@ def test_snapshot_uses_separate_read_connection_without_runtime_store_lock(tmp_p
         path = source
         _lock = _ForbiddenLock()
 
-    size = split._snapshot_store_to_file(Store(), target)
+    size, estimated = split._snapshot_store_to_file(Store(), target)
     assert size > 0
+    assert estimated >= size
     copied = sqlite3.connect(target)
     try:
         row = copied.execute("SELECT value FROM evidence").fetchone()
@@ -86,7 +87,41 @@ def test_snapshot_uses_separate_read_connection_without_runtime_store_lock(tmp_p
     assert row == ("canonical",)
     status = split.status()
     assert status["snapshot_holds_runtime_store_lock"] is False
-    assert status["snapshot_export"] == "sqlite_online_backup_point_in_time_read_only_connection"
+    assert status["snapshot_export"] == "pinned_wal_read_transaction_bounded_online_backup"
+    assert status["snapshot_uses_runtime_persistent_disk"] is True
+    assert status["snapshot_shared_writable_disk"] is False
+    assert status["snapshot_single_flight"] is True
+
+
+def test_snapshot_deadline_aborts_instead_of_running_unbounded(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "canonical.sqlite3"
+    target = tmp_path / "snapshot.sqlite3"
+    connection = sqlite3.connect(source)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE evidence(id INTEGER PRIMARY KEY, value BLOB NOT NULL)")
+        connection.executemany(
+            "INSERT INTO evidence(value) VALUES (zeroblob(32768))",
+            [() for _ in range(128)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    class Store:
+        path = source
+
+    clock = iter([0.0, 0.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr(split.time, "monotonic", lambda: next(clock, 100.0))
+    monkeypatch.setattr(split, "_snapshot_deadline_seconds", lambda: 1.0)
+    monkeypatch.setattr(split, "_snapshot_pages_per_step", lambda: 1)
+
+    try:
+        split._snapshot_store_to_file(Store(), target)
+    except TimeoutError as exc:
+        assert "bounded deadline" in str(exc)
+    else:
+        raise AssertionError("snapshot backup should fail closed at its deadline")
 
 
 def test_remote_certification_fails_closed_on_exact_release_mismatch(monkeypatch) -> None:
@@ -188,3 +223,5 @@ def test_split_status_preserves_paper_only_authority(monkeypatch) -> None:
     assert status["transaction_submission_available"] is False
     assert status["strategy_thresholds_changed"] is False
     assert status["certification_thresholds_changed"] is False
+    assert status["snapshot_deadline_seconds"] > 0
+    assert status["snapshot_free_reserve_bytes"] > 0
