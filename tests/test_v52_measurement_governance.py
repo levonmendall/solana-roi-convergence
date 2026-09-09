@@ -88,13 +88,13 @@ def test_actionability_conversion_tracks_temporary_reject_reactivation_value() -
     result = actionability_conversion(
         (
             LifecycleOutcome(
-                "c1", "PUMP_FUN", developing=True, pre_actionable=True,
+                "c1", "pump_fun", developing=True, pre_actionable=True,
                 temporary_reject=True, reactivated=True, actionable=True,
                 entered=True, successful_position=True,
                 temporary_reject_later_profitable_actionable=True,
             ),
-            LifecycleOutcome("c2", "FOMO", developing=True, temporary_reject=True),
-            LifecycleOutcome("c3", "ROBINHOOD", developing=True, actionable=True),
+            LifecycleOutcome("c2", "fomo", developing=True, temporary_reject=True),
+            LifecycleOutcome("c3", "robinhood", developing=True, actionable=True),
         )
     )
 
@@ -111,9 +111,9 @@ def test_actionability_conversion_tracks_temporary_reject_reactivation_value() -
 def test_regret_decomposition_preserves_explicit_causes_and_correct_avoidance() -> None:
     result = regret_decomposition(
         (
-            RegretRecord("c1", "PUMP_FUN", 1.2, ("discovered_too_late", "undersizing")),
-            RegretRecord("c2", "PUMP_AMM", 0.4, ("premature_exit",)),
-            RegretRecord("c3", "FOMO", 0.0, ("correct_avoidance",)),
+            RegretRecord("c1", "pump_fun", 1.2, ("discovered_too_late", "undersizing")),
+            RegretRecord("c2", "pump_amm", 0.4, ("premature_exit",)),
+            RegretRecord("c3", "fomo", 0.0, ("correct_avoidance",)),
         )
     )
 
@@ -126,7 +126,7 @@ def test_regret_decomposition_preserves_explicit_causes_and_correct_avoidance() 
 
 def test_correct_avoidance_cannot_be_used_to_hide_positive_missed_alpha() -> None:
     with pytest.raises(ValueError, match="correct_avoidance_cannot_carry_regret"):
-        regret_decomposition((RegretRecord("c1", "RAYDIUM", 0.2, ("correct_avoidance",)),))
+        regret_decomposition((RegretRecord("c1", "raydium", 0.2, ("correct_avoidance",)),))
 
 
 def _outcome(
@@ -166,9 +166,9 @@ def _outcome(
 
 def test_strategy_summary_reports_required_governance_metrics() -> None:
     rows = (
-        _outcome("c1", "PUMP_FUN", 0, INCUMBENT_VERSION, ret=0.20, mfe=1.0, latency=12.0),
-        _outcome("c2", "PUMP_AMM", 1, INCUMBENT_VERSION, ret=-0.10, mfe=0.4, latency=18.0, exit_regret=0.2),
-        _outcome("c3", "FOMO", 2, INCUMBENT_VERSION, ret=0.0, mfe=0.8, latency=None, detected=False, entered=False, reject_regret=0.5),
+        _outcome("c1", "pump_fun", 0, INCUMBENT_VERSION, ret=0.20, mfe=1.0, latency=12.0),
+        _outcome("c2", "pump_amm", 1, INCUMBENT_VERSION, ret=-0.10, mfe=0.4, latency=18.0, exit_regret=0.2),
+        _outcome("c3", "fomo", 2, INCUMBENT_VERSION, ret=0.0, mfe=0.8, latency=None, detected=False, entered=False, reject_regret=0.5),
     )
     metrics = summarize_strategy(rows)
 
@@ -187,12 +187,12 @@ def test_strategy_summary_reports_required_governance_metrics() -> None:
 
 def test_frozen_challenger_comparison_requires_identical_candidate_stream_and_order() -> None:
     incumbent = (
-        _outcome("c1", "PUMP_FUN", 0, INCUMBENT_VERSION, ret=0.1, mfe=0.8, latency=15.0),
-        _outcome("c2", "ROBINHOOD", 1, INCUMBENT_VERSION, ret=0.0, mfe=1.0, latency=None, detected=False, entered=False, reject_regret=0.6),
+        _outcome("c1", "pump_fun", 0, INCUMBENT_VERSION, ret=0.1, mfe=0.8, latency=15.0),
+        _outcome("c2", "robinhood", 1, INCUMBENT_VERSION, ret=0.0, mfe=1.0, latency=None, detected=False, entered=False, reject_regret=0.6),
     )
     challenger = (
-        _outcome("c1", "PUMP_FUN", 0, CHALLENGER_VERSION, ret=0.4, mfe=0.8, latency=7.0),
-        _outcome("c2", "ROBINHOOD", 1, CHALLENGER_VERSION, ret=0.3, mfe=1.0, latency=9.0),
+        _outcome("c1", "pump_fun", 0, CHALLENGER_VERSION, ret=0.4, mfe=0.8, latency=7.0),
+        _outcome("c2", "robinhood", 1, CHALLENGER_VERSION, ret=0.3, mfe=1.0, latency=9.0),
     )
     comparison = compare_frozen_challenger(incumbent, challenger)
 
@@ -209,8 +209,8 @@ def test_frozen_challenger_comparison_requires_identical_candidate_stream_and_or
         compare_frozen_challenger(incumbent, challenger[:1])
 
     reordered = (
-        _outcome("c1", "PUMP_FUN", 1, CHALLENGER_VERSION, ret=0.4, mfe=0.8, latency=7.0),
-        _outcome("c2", "ROBINHOOD", 0, CHALLENGER_VERSION, ret=0.3, mfe=1.0, latency=9.0),
+        _outcome("c1", "pump_fun", 1, CHALLENGER_VERSION, ret=0.4, mfe=0.8, latency=7.0),
+        _outcome("c2", "robinhood", 0, CHALLENGER_VERSION, ret=0.3, mfe=1.0, latency=9.0),
     )
     with pytest.raises(ValueError, match="candidate_stream_order_or_lane_mismatch"):
         compare_frozen_challenger(incumbent, reordered)
