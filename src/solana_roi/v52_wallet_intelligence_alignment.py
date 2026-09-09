@@ -11,9 +11,9 @@ from .strategy_v52_authority import (
     strategy_evolution_snapshot,
     target_sizing_policy,
 )
-from .wallet_discovery import PROGRAM_SOURCES, ContinuousWalletDiscovery
+from .wallet_discovery import PROGRAM_SOURCES
 
-ALIGNMENT_VERSION = "v52-wallet-production-alignment-v1"
+ALIGNMENT_VERSION = "v52-wallet-production-alignment-v2-startup-isolation-aware"
 
 
 def _runtime(runtime_provider: Any) -> Any:
@@ -26,7 +26,48 @@ def _program_source(source: str) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def _ensure_state_column(discovery: ContinuousWalletDiscovery) -> None:
+def _authoritative_values() -> tuple[float, float, int]:
+    execution = execution_policy()
+    sizing = target_sizing_policy()
+    return (
+        float(execution["chase_observe_only_above_fraction"]),
+        float(execution["latency_hard_max_seconds"]),
+        int(sizing["minimum_forward_samples"]),
+    )
+
+
+def _refresh_policy_objects(policy: Any, intelligence: Any) -> tuple[Any, Any]:
+    chase, latency, minimum = _authoritative_values()
+    aligned_policy = replace(
+        policy,
+        max_chase_fraction=chase,
+        max_observation_lag_seconds=latency,
+    )
+    intelligence.policy = replace(
+        intelligence.policy,
+        min_forward_episodes=minimum,
+    )
+    return aligned_policy, intelligence
+
+
+def _refresh_authoritative_policy(discovery: Any) -> None:
+    policy, _intelligence = _refresh_policy_objects(discovery.policy, discovery.intelligence)
+    discovery.policy = policy
+
+
+def _refresh_deferred_policy(discovery: Any) -> None:
+    kwargs = getattr(discovery, "_kwargs", None)
+    if not isinstance(kwargs, dict):
+        raise RuntimeError("deferred wallet discovery kwargs unavailable")
+    policy = kwargs.get("policy")
+    intelligence = kwargs.get("intelligence")
+    if policy is None or intelligence is None:
+        raise RuntimeError("deferred wallet discovery policy/intelligence unavailable")
+    aligned_policy, _ = _refresh_policy_objects(policy, intelligence)
+    kwargs["policy"] = aligned_policy
+
+
+def _ensure_state_column(discovery: Any) -> None:
     with discovery.store._lock, discovery.store.db:
         columns = {
             str(row["name"])
@@ -38,21 +79,7 @@ def _ensure_state_column(discovery: ContinuousWalletDiscovery) -> None:
             )
 
 
-def _refresh_authoritative_policy(discovery: ContinuousWalletDiscovery) -> None:
-    execution = execution_policy()
-    sizing = target_sizing_policy()
-    discovery.policy = replace(
-        discovery.policy,
-        max_chase_fraction=float(execution["chase_observe_only_above_fraction"]),
-        max_observation_lag_seconds=float(execution["latency_hard_max_seconds"]),
-    )
-    discovery.intelligence.policy = replace(
-        discovery.intelligence.policy,
-        min_forward_episodes=int(sizing["minimum_forward_samples"]),
-    )
-
-
-def _normalized_batch(discovery: ContinuousWalletDiscovery) -> list[dict[str, Any]]:
+def _normalized_batch(discovery: Any) -> list[dict[str, Any]]:
     with discovery.store._lock:
         state = discovery.store.db.execute(
             "SELECT last_normalized_swap_id FROM wallet_discovery_state WHERE id=1"
@@ -67,7 +94,7 @@ def _normalized_batch(discovery: ContinuousWalletDiscovery) -> list[dict[str, An
     return [dict(row) for row in rows]
 
 
-async def _discover_from_normalized_swaps(self: ContinuousWalletDiscovery) -> int:
+async def _discover_from_normalized_swaps(self: Any) -> int:
     rows = _normalized_batch(self)
     if not rows:
         return 0
@@ -105,7 +132,7 @@ async def _discover_from_normalized_swaps(self: ContinuousWalletDiscovery) -> in
     return discovered
 
 
-def _maybe_propose_v52_cohort(self: ContinuousWalletDiscovery) -> dict[str, Any] | None:
+def _maybe_propose_v52_cohort(self: Any) -> dict[str, Any] | None:
     if self._proposal_exists():
         return None
     epoch = strategy_evolution_snapshot()
@@ -118,37 +145,50 @@ def _maybe_propose_v52_cohort(self: ContinuousWalletDiscovery) -> dict[str, Any]
     )
 
 
-def install_v52_wallet_intelligence_alignment(runtime_provider: Any) -> None:
-    runtime = _runtime(runtime_provider)
-    discovery = getattr(runtime, "wallet_discovery", None)
-    if not isinstance(discovery, ContinuousWalletDiscovery):
-        raise RuntimeError("canonical wallet discovery runtime unavailable")
+def _inner_contract_available(discovery: Any) -> bool:
+    required = (
+        "store",
+        "policy",
+        "intelligence",
+        "now_fn",
+        "_sample",
+        "_record_broad_sample",
+        "_proposal_exists",
+        "run_once",
+        "status",
+    )
+    return all(hasattr(discovery, name) for name in required)
+
+
+def _align_inner(discovery: Any) -> None:
+    if not _inner_contract_available(discovery):
+        raise RuntimeError("canonical wallet discovery inner contract unavailable")
     if bool(getattr(discovery, "_roi_v52_wallet_alignment", False)):
         _refresh_authoritative_policy(discovery)
         return
 
     _ensure_state_column(discovery)
     _refresh_authoritative_policy(discovery)
-
     original_run_once = discovery.run_once
     original_status = discovery.status
 
-    async def run_once_aligned(self: ContinuousWalletDiscovery) -> dict[str, Any]:
+    async def run_once_aligned(self: Any) -> dict[str, Any]:
         _refresh_authoritative_policy(self)
         return await original_run_once()
 
-    def status_aligned(self: ContinuousWalletDiscovery) -> dict[str, Any]:
+    def status_aligned(self: Any) -> dict[str, Any]:
         _refresh_authoritative_policy(self)
         payload = dict(original_status())
+        chase, latency, minimum = _authoritative_values()
         payload.update(
             {
                 "v52_wallet_alignment_version": ALIGNMENT_VERSION,
                 "authoritative_strategy_version": strategy_evolution_snapshot()["strategy_version"],
                 "normalized_ingestion_authoritative": True,
                 "duplicate_broad_discovery_transaction_hydration": False,
-                "minimum_forward_samples": int(self.intelligence.policy.min_forward_episodes),
-                "max_chase_fraction": float(self.policy.max_chase_fraction),
-                "max_observation_lag_seconds": float(self.policy.max_observation_lag_seconds),
+                "minimum_forward_samples": minimum,
+                "max_chase_fraction": chase,
+                "max_observation_lag_seconds": latency,
                 "future_cohort_parent_is_active_v52_epoch": True,
                 "paper_only": True,
                 "live_money_authority": False,
@@ -162,34 +202,50 @@ def install_v52_wallet_intelligence_alignment(runtime_provider: Any) -> None:
     discovery.run_once = MethodType(run_once_aligned, discovery)
     discovery.status = MethodType(status_aligned, discovery)
     setattr(discovery, "_roi_v52_wallet_alignment", True)
+
+
+def install_v52_wallet_intelligence_alignment(runtime_provider: Any) -> None:
+    runtime = _runtime(runtime_provider)
+    discovery = getattr(runtime, "wallet_discovery", None)
+    if discovery is None:
+        raise RuntimeError("canonical wallet discovery runtime unavailable")
+
+    register_hook = getattr(discovery, "register_post_bootstrap_hook", None)
+    if callable(register_hook) and isinstance(getattr(discovery, "_kwargs", None), dict):
+        _refresh_deferred_policy(discovery)
+        register_hook(_align_inner)
+        setattr(discovery, "_roi_v52_wallet_alignment", True)
+    elif _inner_contract_available(discovery):
+        _align_inner(discovery)
+    else:
+        raise RuntimeError("canonical wallet discovery runtime contract unavailable")
     setattr(runtime, "roi_v52_wallet_intelligence_alignment", True)
 
 
 def status(runtime_provider: Any) -> dict[str, Any]:
     runtime = _runtime(runtime_provider)
     discovery = getattr(runtime, "wallet_discovery", None)
-    if not isinstance(discovery, ContinuousWalletDiscovery):
-        return {
-            "installed": False,
-            "version": ALIGNMENT_VERSION,
-            "reason": "wallet_discovery_unavailable",
-            "paper_only": True,
-            "live_money_authority": False,
-        }
-    payload = discovery.status()
+    installed = bool(discovery is not None and getattr(discovery, "_roi_v52_wallet_alignment", False))
+    chase, latency, minimum = _authoritative_values()
+    inner = getattr(discovery, "_inner", None) if discovery is not None else None
+    if inner is not None and getattr(inner, "_roi_v52_wallet_alignment", False):
+        payload = inner.status()
+        chase = float(payload.get("max_chase_fraction", chase))
+        latency = float(payload.get("max_observation_lag_seconds", latency))
+        minimum = int(payload.get("minimum_forward_samples", minimum))
     return {
-        "installed": bool(getattr(discovery, "_roi_v52_wallet_alignment", False)),
+        "installed": installed,
         "version": ALIGNMENT_VERSION,
-        "normalized_ingestion_authoritative": bool(payload.get("normalized_ingestion_authoritative")),
-        "duplicate_broad_discovery_transaction_hydration": bool(
-            payload.get("duplicate_broad_discovery_transaction_hydration")
+        "startup_isolation_preserved": bool(
+            discovery is not None and callable(getattr(discovery, "register_post_bootstrap_hook", None))
         ),
-        "minimum_forward_samples": int(payload.get("minimum_forward_samples") or 0),
-        "max_chase_fraction": float(payload.get("max_chase_fraction") or 0.0),
-        "max_observation_lag_seconds": float(payload.get("max_observation_lag_seconds") or 0.0),
-        "future_cohort_parent_is_active_v52_epoch": bool(
-            payload.get("future_cohort_parent_is_active_v52_epoch")
-        ),
+        "inner_ready": inner is not None,
+        "normalized_ingestion_authoritative": installed,
+        "duplicate_broad_discovery_transaction_hydration": False if installed else None,
+        "minimum_forward_samples": minimum,
+        "max_chase_fraction": chase,
+        "max_observation_lag_seconds": latency,
+        "future_cohort_parent_is_active_v52_epoch": installed,
         "paper_only": True,
         "live_money_authority": False,
         "signing_available": False,
