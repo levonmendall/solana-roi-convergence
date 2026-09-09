@@ -10,8 +10,13 @@ from solana_roi.v52_wallet_alpha_refinement import (
     WalletAlphaRefinementLedger,
     WalletMarginalAlphaObservation,
 )
-from solana_roi.v52_wallet_intelligence_alignment import install_v52_wallet_intelligence_alignment
+from solana_roi.v52_wallet_intelligence_alignment import (
+    install_v52_wallet_intelligence_alignment,
+    status as wallet_alignment_status,
+)
 from solana_roi.wallet_discovery import ContinuousWalletDiscovery, WalletDiscoveryPolicy
+from solana_roi.wallet_discovery_startup_repair import StartupIsolatedWalletDiscovery
+from solana_roi.wallet_intelligence import ContinuousWalletIntelligence
 
 
 class _NoDuplicateHydrationRpc:
@@ -30,6 +35,22 @@ def _runtime(tmp_path):
         entity_resolver=object(),
         risk=object(),
         risk_collectors=object(),
+        policy=WalletDiscoveryPolicy(broad_sample_modulus=1),
+        enabled=True,
+    )
+    return SimpleNamespace(store=store, wallet_discovery=discovery)
+
+
+def _deferred_runtime(tmp_path):
+    store = ObservationEventStore(tmp_path / "wallet-deferred-alignment.sqlite3")
+    intelligence = ContinuousWalletIntelligence(store)
+    discovery = StartupIsolatedWalletDiscovery(
+        store=store,
+        rpc=_NoDuplicateHydrationRpc(),
+        entity_resolver=object(),
+        risk=object(),
+        risk_collectors=object(),
+        intelligence=intelligence,
         policy=WalletDiscoveryPolicy(broad_sample_modulus=1),
         enabled=True,
     )
@@ -95,6 +116,39 @@ def test_wallet_policy_refreshes_from_current_v52_authority_and_parent_epoch(tmp
     assert proposal is not None
     assert captured["parent_version"] == strategy_evolution_snapshot()["strategy_version"]
     assert captured["strategy_version"].startswith(captured["parent_version"] + "-wallet-adaptive-")
+
+
+def test_deferred_production_wrapper_preserves_startup_isolation_and_reapplies_alignment(tmp_path) -> None:
+    runtime = _deferred_runtime(tmp_path)
+    wrapper = runtime.wallet_discovery
+    assert wrapper._inner is None
+
+    install_v52_wallet_intelligence_alignment(runtime)
+    before = wallet_alignment_status(runtime)
+    assert before["installed"] is True
+    assert before["startup_isolation_preserved"] is True
+    assert before["inner_ready"] is False
+    assert before["minimum_forward_samples"] == 30
+    assert wrapper._inner is None
+
+    assert asyncio.run(wrapper._attempt_bootstrap()) is True
+    inner = wrapper._inner
+    assert inner is not None
+    assert getattr(inner, "_roi_v52_wallet_alignment") is True
+    status = inner.status()
+    assert status["normalized_ingestion_authoritative"] is True
+    assert status["duplicate_broad_discovery_transaction_hydration"] is False
+    assert status["max_chase_fraction"] == execution_policy()["chase_observe_only_above_fraction"]
+    assert status["max_observation_lag_seconds"] == execution_policy()["latency_hard_max_seconds"]
+    assert status["minimum_forward_samples"] == target_sizing_policy()["minimum_forward_samples"] == 30
+
+    # Rebuilding the deferred inner must retain the exact same governed alignment.
+    wrapper._inner = None
+    assert asyncio.run(wrapper._attempt_bootstrap()) is True
+    rebuilt = wrapper._inner
+    assert rebuilt is not None and rebuilt is not inner
+    assert getattr(rebuilt, "_roi_v52_wallet_alignment") is True
+    assert rebuilt.status()["normalized_ingestion_authoritative"] is True
 
 
 def test_paired_contextual_wallet_alpha_requires_authoritative_forward_gate(tmp_path) -> None:
