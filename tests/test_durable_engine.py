@@ -135,7 +135,7 @@ def test_restore_fails_closed_if_checkpoint_marker_is_not_engine_event(tmp_path)
         DurablePaperTradingEngine(store=reopened)
 
 
-def test_restore_uses_primary_key_tail_without_max_aggregate(tmp_path):
+def test_restore_tail_query_starts_after_verified_snapshot(tmp_path):
     path = tmp_path / "tail-query.sqlite3"
     store = ObservationEventStore(path)
     engine = DurablePaperTradingEngine(store=store)
@@ -152,4 +152,5 @@ def test_restore_uses_primary_key_tail_without_max_aggregate(tmp_path):
 
     normalized = [" ".join(statement.upper().split()) for statement in statements]
     assert not any("MAX(ID)" in statement for statement in normalized)
-    assert any("FROM EVENTS WHERE ID>" in statement for statement in normalized)
+    assert any("FROM EVENTS WHERE ID>2 AND EVENT_TYPE IN" in statement for statement in normalized)
+    assert not any("FROM EVENTS WHERE ID>1 AND EVENT_TYPE IN" in statement for statement in normalized)
