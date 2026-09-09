@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 
 
-SERVICE_VERSION = "isolated-certifier-service-v1"
+SERVICE_VERSION = "isolated-certifier-service-v2-failure-diagnostics"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -35,6 +36,7 @@ _STATE: dict[str, Any] = {
     "last_completed_at_monotonic": None,
     "last_error_type": None,
     "last_snapshot_release": None,
+    "last_published_surfaces": [],
     "active_child_pid": None,
 }
 
@@ -78,6 +80,20 @@ def _child_timeout_seconds() -> float:
         return max(30.0, float(os.getenv("SOLANA_ROI_CERTIFIER_CHILD_TIMEOUT_SECONDS", "300")))
     except ValueError:
         return 300.0
+
+
+def _safe_error_message(exc: BaseException) -> str:
+    """Return bounded operational diagnostics without leaking service credentials."""
+    text = str(exc).replace("\n", " ").replace("\r", " ")
+    token = _token()
+    if token:
+        text = text.replace(token, "[redacted]")
+    text = re.sub(
+        r"(?i)\b(authorization|password|secret|token)\b(\s*[:=]\s*)([^\s,;]+)",
+        r"\1\2[redacted]",
+        text,
+    )
+    return text[-1600:]
 
 
 def _require_token(value: str | None) -> None:
@@ -203,10 +219,11 @@ def _run_cycle_sync(stop_requested: threading.Event) -> None:
     with _LOCK:
         _STATE["cycles"] = int(_STATE.get("cycles", 0) or 0) + 1
         _STATE["last_started_at_monotonic"] = time.monotonic()
-        _STATE["last_error_type"] = None
 
     error_type: str | None = None
+    error_message: str | None = None
     success = False
+    published: set[str] = set()
     try:
         with tempfile.TemporaryDirectory(prefix="roi-isolated-certifier-") as raw_dir:
             directory = Path(raw_dir)
@@ -237,7 +254,6 @@ def _run_cycle_sync(stop_requested: threading.Event) -> None:
             )
             with _LOCK:
                 _STATE["active_child_pid"] = process.pid
-            published: set[str] = set()
             started = time.monotonic()
             while process.poll() is None:
                 if stop_requested.is_set():
@@ -264,14 +280,35 @@ def _run_cycle_sync(stop_requested: threading.Event) -> None:
             success = True
     except BaseException as exc:
         error_type = type(exc).__name__
+        error_message = _safe_error_message(exc)
+        diagnostic = {
+            "event": "isolated_certifier_cycle_failed",
+            "error_type": error_type,
+            "error_message": error_message,
+            "published_surfaces": sorted(published),
+            "release_commit": _release_commit(),
+            "paper_only": True,
+            "live_money_authority": False,
+            "signing_available": False,
+            "transaction_submission_available": False,
+        }
+        print(
+            "SOLANA_ROI_CERTIFIER_CYCLE_FAILED "
+            + json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
     finally:
         with _LOCK:
             _STATE["active_child_pid"] = None
             _STATE["last_completed_at_monotonic"] = time.monotonic()
-            _STATE["last_error_type"] = error_type
+            _STATE["last_published_surfaces"] = sorted(published)
+            # Preserve the last failure through the next cycle. It is cleared only
+            # by a complete successful e2e+forward+production cycle.
             if success:
+                _STATE["last_error_type"] = None
                 _STATE["successes"] = int(_STATE.get("successes", 0) or 0) + 1
             else:
+                _STATE["last_error_type"] = error_type
                 _STATE["failures"] = int(_STATE.get("failures", 0) or 0) + 1
 
 
