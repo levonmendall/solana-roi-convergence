@@ -17,9 +17,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Print safe exact-live certification evidence
+      - name: Print certifier health and safe exact-live evidence
         env:
           SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+          SOLANA_ROI_CERTIFIER_PUBLIC_URL: https://solana-roi-certifier.onrender.com
           PYTHONUNBUFFERED: '1'
         run: |
           python - <<'PY'
@@ -27,21 +28,24 @@ jobs:
           import os
           import urllib.request
 
-          base = os.environ['SOLANA_ROI_PRODUCTION_URL'].rstrip('/')
-          def get(path):
-              req = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'solana-roi-live-evidence-ci/1'})
+          def get(base, path):
+              req = urllib.request.Request(base.rstrip('/') + path, headers={'Accept':'application/json','User-Agent':'solana-roi-live-evidence-ci/2'})
               with urllib.request.urlopen(req, timeout=60) as r:
                   return json.loads(r.read().decode('utf-8'))
 
-          e2e = get('/v1/strategy/e2e-status')
-          forward = get('/v1/strategy/forward-certification')
-          production = get('/v1/strategy/production-proof')
+          runtime = os.environ['SOLANA_ROI_PRODUCTION_URL']
+          certifier = os.environ['SOLANA_ROI_CERTIFIER_PUBLIC_URL']
+          health = get(certifier, '/health')
+          e2e = get(runtime, '/v1/strategy/e2e-status')
+          forward = get(runtime, '/v1/strategy/forward-certification')
+          production = get(runtime, '/v1/strategy/production-proof')
           accounting = production.get('candidate_accounting') or {}
           lanes = accounting.get('lanes') or accounting.get('lane_accounting') or {}
           conservation = accounting.get('candidate_conservation') or {}
           checks = forward.get('checks') or {}
 
           summary = {
+              'certifier_health': health,
               'e2e': {
                   'release_commit': e2e.get('release_commit'),
                   'overall': e2e.get('overall'),
