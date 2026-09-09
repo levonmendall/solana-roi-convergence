@@ -125,8 +125,10 @@ services:
       # in Render only and is never committed or exposed through status telemetry.
       - key: BLOCKSCOUT_API_KEY
         sync: false
-      # Optional production RPC override. When absent, the implementation falls
-      # back to Robinhood's official rate-limited public read-only RPC and reports
-      # that condition in telemetry. No private key is ever configured.
+      # Primary private Robinhood provider remains Alchemy. dRPC is materialized
+      # from its Render-only key as the paired HTTPS/WSS backup before provider
+      # failover is installed; neither key nor endpoint is emitted in telemetry.
       - key: ROBINHOOD_RPC_URL
+        sync: false
+      - key: ROBINHOOD_DRPC_API_KEY
         sync: false
