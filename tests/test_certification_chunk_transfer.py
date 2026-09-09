@@ -209,3 +209,52 @@ def test_certifier_fails_closed_on_truncated_chunk_and_releases_snapshot(tmp_pat
     else:
         raise AssertionError("truncated certification chunk must fail closed")
     assert released
+
+
+def test_certifier_fails_closed_on_chunk_total_binding_disagreement(tmp_path, monkeypatch) -> None:
+    body = _sqlite_payload(tmp_path)
+    snapshot_id = "snapshot-3"
+    release = "exact-release"
+    released: list[str] = []
+
+    def urlopen(request, timeout):
+        url = request.full_url
+        if url.endswith("/v1/operations/certification-db-snapshot-manifest"):
+            payload = {
+                "snapshot_id": snapshot_id,
+                "release_commit": release,
+                "size_bytes": len(body),
+                "chunk_bytes": 4096,
+            }
+            return _Response(json.dumps(payload).encode("utf-8"))
+        if request.get_method() == "DELETE":
+            released.append(url)
+            return _Response(b"{}")
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        offset = int(query["offset"][0])
+        length = int(query["length"][0])
+        piece = body[offset : offset + length]
+        return _Response(
+            piece,
+            {
+                "X-Release-Commit": release,
+                "X-Certification-Snapshot-Id": snapshot_id,
+                "X-Certification-Snapshot-Offset": str(offset),
+                "X-Certification-Snapshot-Total-Bytes": str(len(body) + 1),
+            },
+        )
+
+    monkeypatch.setattr(chunk.urllib.request, "urlopen", urlopen)
+    try:
+        chunk.download_snapshot_chunked(
+            tmp_path / "wrong-total.sqlite3",
+            base="https://runtime.invalid",
+            token="test-token",
+            expected_release=release,
+        )
+    except RuntimeError as exc:
+        assert "chunk total mismatch" in str(exc)
+    else:
+        raise AssertionError("chunk total disagreement must fail closed")
+    assert released
