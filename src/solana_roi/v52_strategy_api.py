@@ -14,6 +14,7 @@ _INSTALLED = False
 
 def _payload() -> dict[str, Any]:
     policy = authority()
+    safety = safety_manifest()
     return {
         "authoritative_strategy": "v5.2",
         "strategy_version": policy["strategy_version"],
@@ -30,10 +31,12 @@ def _payload() -> dict[str, Any]:
         "detection_intelligence": dict(policy["detection_intelligence"]),
         "execution": dict(policy["execution"]),
         "strategy_runtime": strategy_status(),
-        "safety": safety_manifest(),
+        "safety": safety,
         "canonical": True,
-        "paper_only": True,
-        "live_money_authority": False,
+        "paper_only": bool(safety["paper_only"]),
+        "live_money_authority": bool(safety["live_money_authority"]),
+        "signing_available": bool(safety["signing_available"]),
+        "transaction_submission_available": bool(safety["transaction_submission_available"]),
     }
 
 
@@ -101,6 +104,8 @@ def status() -> dict[str, Any]:
         "v51_control_final_decision_authority": False,
         "paper_only": True,
         "live_money_authority": False,
+        "signing_available": False,
+        "transaction_submission_available": False,
     }
 
 
