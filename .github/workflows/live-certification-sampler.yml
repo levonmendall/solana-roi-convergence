@@ -1,0 +1,53 @@
+name: Live Certification Sampler
+
+on:
+  push:
+    branches:
+      - certification/live-dc0ca-readonly
+
+permissions:
+  contents: read
+
+jobs:
+  sample-live-status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sample exact live release without deep generation
+        env:
+          BASE_URL: https://solana-roi-convergence.onrender.com
+          EXPECTED_RELEASE: dc0ca09332bb30fa9f5c4ce6faeb1b4086cf1036
+        run: |
+          python - <<'PY'
+          import json, os, time, urllib.request, urllib.error
+          base = os.environ['BASE_URL'].rstrip('/')
+          expected = os.environ['EXPECTED_RELEASE']
+          paths = [
+              '/health',
+              '/v1/operations/production-composition',
+              '/v1/operations/certification-generation-coordinator',
+              '/v1/operations/certification-proof-memory-repair',
+              '/v1/strategy/e2e-status/cache',
+              '/v1/strategy/forward-certification/cache',
+              '/v1/strategy/production-proof/cache',
+          ]
+          for sample in range(1, 5):
+              print(json.dumps({'sample': sample, 'expected_release': expected}), flush=True)
+              for path in paths:
+                  started = time.monotonic()
+                  try:
+                      req = urllib.request.Request(base + path, headers={'Accept':'application/json','User-Agent':'roi-live-certification-sampler/1'})
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          raw = r.read().decode('utf-8', 'replace')
+                      elapsed = round(time.monotonic() - started, 3)
+                      try:
+                          payload = json.loads(raw)
+                      except Exception:
+                          payload = {'raw': raw[:4000]}
+                      print(json.dumps({'path': path, 'http': 200, 'elapsed_s': elapsed, 'payload': payload}, sort_keys=True), flush=True)
+                  except Exception as exc:
+                      elapsed = round(time.monotonic() - started, 3)
+                      print(json.dumps({'path': path, 'error': f'{type(exc).__name__}: {exc}', 'elapsed_s': elapsed}, sort_keys=True), flush=True)
+              if sample < 4:
+                  time.sleep(8)
+          PY
