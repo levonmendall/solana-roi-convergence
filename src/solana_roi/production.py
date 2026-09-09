@@ -15,12 +15,6 @@ the explicit composition root (not called from this facade):
 import asyncio
 
 from . import robinhood_drpc_environment as _robinhood_drpc_environment
-
-# Materialize the Render-held dRPC key into the existing Robinhood backup-pair
-# contract before the production composition imports and installs provider failover.
-# This changes transport redundancy only; it does not alter strategy authority.
-_robinhood_drpc_environment.configure_robinhood_drpc_backup()
-
 from .production_system import (
     COMPOSITION_STATUS_PATH,
     COMPOSITION_VERSION,
@@ -31,6 +25,10 @@ from .production_system import (
     production_system,
 )
 from . import legacy_production_composition as _legacy_production
+
+# Imported for its production bootstrap side effect before ``production_system``:
+# it materializes a Render-held dRPC key into the existing Robinhood backup pair.
+_ = _robinhood_drpc_environment
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
