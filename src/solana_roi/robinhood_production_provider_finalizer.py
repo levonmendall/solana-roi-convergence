@@ -118,6 +118,19 @@ def _enforcing_run(original: Callable[[Any, asyncio.Event], Awaitable[None]]) ->
     return wrapped
 
 
+def _preserve_bounded_transport_aliases() -> None:
+    """Keep the bounded module's canonical reader aliases on the final wrappers.
+
+    The bounded transport historically exposes the exact reader/readiness functions
+    installed on the production transport module. Provider failover adds one final
+    generation-aware wrapper around those functions. Mirror the final callables back
+    into the bounded module so callers and architecture checks see one canonical
+    reader identity while the generation fail-closed semantics remain intact.
+    """
+    bounded_transport._reader_async = production_transport._reader_async
+    bounded_transport._reader_ready = production_transport._reader_ready
+
+
 def install_robinhood_production_provider_finalizer(
     plane_cls: type[Any],
     *,
@@ -163,6 +176,7 @@ def install_robinhood_production_provider_finalizer(
     # Outermost provider wrapper: catches provider/budget failures emitted by the
     # guarded RPC path and coordinates the HTTP + WSS generation switch.
     install_robinhood_provider_failover()
+    _preserve_bounded_transport_aliases()
 
     current_run = plane_cls.run
     if not bool(getattr(current_run, "_roi_robinhood_production_provider_finalizer", False)):
@@ -203,6 +217,7 @@ __all__ = [
     "FINALIZER_VERSION",
     "_final_fresh_ready",
     "_install_private_https_wss_derivation",
+    "_preserve_bounded_transport_aliases",
     "_resolved_production_ws_url",
     "install_robinhood_production_provider_finalizer",
     "status",
