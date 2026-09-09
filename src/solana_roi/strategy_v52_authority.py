@@ -54,6 +54,7 @@ def authority() -> dict[str, Any]:
         raise RuntimeError("canonical v5.2 authority crossed the paper-only boundary")
     if bool(payload.get("signing_available")) or bool(payload.get("transaction_submission_available")):
         raise RuntimeError("canonical v5.2 authority exposed execution authority")
+
     execution = dict(payload.get("execution") or {})
     if float(execution.get("latency_hard_max_seconds") or 0.0) != 20.0:
         raise RuntimeError("canonical v5.2 latency hard max changed")
@@ -63,6 +64,17 @@ def authority() -> dict[str, Any]:
         raise RuntimeError("canonical v5.2 exact quote requirement disabled")
     if bool(execution.get("first_slot_pump_fun_sniping_allowed")):
         raise RuntimeError("canonical v5.2 first-slot sniping enabled")
+
+    sizing = dict(payload.get("target_sizing") or {})
+    if int(sizing.get("minimum_forward_samples") or 0) != 30:
+        raise RuntimeError("canonical v5.2 minimum forward sample boundary changed")
+    if not bool(sizing.get("fresh_v52_forward_evidence_required_for_promotion")):
+        raise RuntimeError("canonical v5.2 fresh-forward promotion requirement disabled")
+    if bool(sizing.get("v51_outcomes_may_grant_v52_promotion")):
+        raise RuntimeError("canonical v5.2 allowed v5.1 promotion evidence")
+    if bool(sizing.get("v51_outcomes_may_seed_target_selection_prior")):
+        raise RuntimeError("canonical v5.2 allowed v5.1 target-selection prior")
+
     position = dict(payload.get("position_management") or {})
     if bool(position.get("averaging_down_allowed")):
         raise RuntimeError("canonical v5.2 averaging down enabled")
@@ -70,13 +82,44 @@ def authority() -> dict[str, Any]:
         raise RuntimeError("canonical v5.2 scale evidence requirement disabled")
     if not bool(position.get("scale_requires_price_not_below_last_add")):
         raise RuntimeError("canonical v5.2 no-average-down guard disabled")
+    frozen_position = (
+        float(position.get("starter_fraction_of_target") or 0.0),
+        float(position.get("max_scale_fraction_of_target_per_add") or 0.0),
+        float(position.get("first_derisk_fraction_of_position") or 0.0),
+        float(position.get("second_derisk_fraction_of_position") or 0.0),
+        float(position.get("runner_fraction_of_target") or 0.0),
+        float(position.get("minimum_exit_depth_coverage_ratio") or 0.0),
+    )
+    if frozen_position != (0.25, 0.25, 0.25, 0.50, 0.10, 2.0):
+        raise RuntimeError("canonical v5.2 position policy changed")
+
+    detection = dict(payload.get("detection_intelligence") or {})
+    frozen_detection = (
+        float(detection.get("minimum_wallet_quality") or 0.0),
+        int(detection.get("minimum_skilled_independent_clusters") or 0),
+        int(detection.get("minimum_broad_independent_clusters") or 0),
+        int(detection.get("minimum_comparable_peer_count") or 0),
+        float(detection.get("anomaly_percentile_threshold") or 0.0),
+        float(detection.get("discovered_wallet_initial_signal_weight") or 0.0),
+    )
+    if frozen_detection != (0.70, 3, 5, 20, 0.995, 0.0):
+        raise RuntimeError("canonical v5.2 detection intelligence policy changed")
+    if not bool(detection.get("wallet_signal_requires_prospective_validation")):
+        raise RuntimeError("canonical v5.2 prospective wallet validation disabled")
+    if not bool(detection.get("creator_funder_propagation_requires_incremental_forward_alpha")):
+        raise RuntimeError("canonical v5.2 creator/funder incremental-alpha requirement disabled")
+
     governance = dict(payload.get("governance") or {})
     if bool(governance.get("historical_promotion_authority")):
         raise RuntimeError("canonical v5.2 historical promotion authority enabled")
     if bool(governance.get("automatic_parameter_mutation_authority")):
         raise RuntimeError("canonical v5.2 parameter mutation authority enabled")
+    if bool(governance.get("automatic_signal_promotion_authority")):
+        raise RuntimeError("canonical v5.2 signal auto-promotion authority enabled")
     if bool(governance.get("v51_control_has_final_decision_authority")):
         raise RuntimeError("canonical v5.2 authority left v5.1 final decision authority")
+    if not bool(governance.get("v51_control_is_read_only")):
+        raise RuntimeError("canonical v5.2 authority did not freeze v5.1 as read-only control")
     return payload
 
 
@@ -91,6 +134,14 @@ def position_policy() -> dict[str, Any]:
 
 def execution_policy() -> dict[str, Any]:
     return dict(authority()["execution"])
+
+
+def target_sizing_policy() -> dict[str, Any]:
+    return dict(authority()["target_sizing"])
+
+
+def detection_policy() -> dict[str, Any]:
+    return dict(authority()["detection_intelligence"])
 
 
 def safety_manifest() -> dict[str, Any]:
@@ -114,6 +165,9 @@ def safety_manifest() -> dict[str, Any]:
         "economic_superiority_claim": bool(payload["economic_superiority_claim"]),
         "control_strategy_version": CONTROL_STRATEGY_VERSION,
         "v51_control_has_final_decision_authority": bool(payload["governance"]["v51_control_has_final_decision_authority"]),
+        "v51_control_is_read_only": bool(payload["governance"]["v51_control_is_read_only"]),
+        "historical_promotion_authority": bool(payload["governance"]["historical_promotion_authority"]),
+        "fresh_v52_forward_evidence_required_for_promotion": bool(payload["target_sizing"]["fresh_v52_forward_evidence_required_for_promotion"]),
     }
 
 
@@ -129,7 +183,9 @@ __all__ = [
     "TRANSACTION_SUBMISSION_AVAILABLE",
     "authority",
     "authority_fingerprint",
+    "detection_policy",
     "execution_policy",
     "position_policy",
     "safety_manifest",
+    "target_sizing_policy",
 ]
