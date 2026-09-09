@@ -7,9 +7,8 @@ def test_render_preserves_certified_production_entrypoint() -> None:
     blueprint = Path("render.yaml").read_text()
     assert "startCommand: uvicorn solana_roi.production:app" in blueprint
     assert "SOLANA_ROI_ACTIVE_STRATEGY_AUTHORITY" in blueprint
-    # The environment key remains a compatibility/bootstrap input; canonical
-    # production authority is established by the final v5.2 composition below.
-    assert "roi-convergence-v5.1-consolidated-proof-1" in blueprint
+    assert "roi-convergence-v5.2-authoritative-1" in blueprint
+    assert "v52-authoritative-cutover-20260908" in blueprint
 
 
 def test_production_installs_explicit_final_v52_authority_and_v51_control_routes() -> None:
