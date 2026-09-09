@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
@@ -80,6 +81,51 @@ class DurablePaperTradingEngine(PaperTradingEngine):
         if row is None:
             raise RuntimeError("paper engine checkpoint blocked: appended engine event id unavailable")
         self._last_engine_event_id = int(row["id"])
+
+    def _verify_engine_snapshot(self) -> tuple[bool, int, int | None]:
+        """Verify the ledger and retain its paper-engine head in the same snapshot.
+
+        Restore already requires a complete hash-chain verification. Carrying the
+        primary-key high-watermark and latest relevant engine id out of that pass
+        avoids a second scan of an old checkpoint tail. Any append racing after
+        the verified snapshot is checked separately from the verified high-watermark.
+        """
+        with self.store._verify_lock:
+            previous: str | None = None
+            verified_through_event_id = 0
+            latest_engine_event_id: int | None = None
+            reader: sqlite3.Connection | None = None
+            try:
+                uri = f"{self.store.path.resolve().as_uri()}?mode=ro"
+                with self.store._lock:
+                    reader = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                    reader.execute("PRAGMA query_only=ON")
+                    reader.execute("PRAGMA busy_timeout=5000")
+                    reader.execute("BEGIN")
+                    cursor = reader.execute(
+                        "SELECT id, event_type, observed_at, payload_json, previous_hash, lineage_hash "
+                        "FROM events ORDER BY id"
+                    )
+                    row = cursor.fetchone()
+                while row is not None:
+                    event_id, event_type, observed_at, raw, recorded_previous, lineage = row
+                    if recorded_previous != previous:
+                        return False, 0, None
+                    expected = hashlib.sha256(
+                        f"{previous or ''}|{event_type}|{observed_at}|{raw}".encode()
+                    ).hexdigest()
+                    if expected != lineage:
+                        return False, 0, None
+                    previous = lineage
+                    verified_through_event_id = int(event_id)
+                    if str(event_type) in _ENGINE_EVENT_TYPES:
+                        latest_engine_event_id = int(event_id)
+                    row = cursor.fetchone()
+                return True, verified_through_event_id, latest_engine_event_id
+            finally:
+                if reader is not None:
+                    reader.close()
+                self.store._release_verification_file_cache()
 
     def _engine_event_after(self, event_id: int) -> int | None:
         placeholders = ",".join("?" for _ in _ENGINE_EVENT_TYPES)
@@ -197,21 +243,28 @@ class DurablePaperTradingEngine(PaperTradingEngine):
             )
 
     def _restore_or_fail_closed(self) -> None:
-        if not self.store.verify():
+        verified, verified_through_event_id, latest_verified_engine_event_id = self._verify_engine_snapshot()
+        if not verified:
             raise RuntimeError("paper engine restore blocked: event hash chain invalid")
         with self.store._lock:
             row = self.store.db.execute(
                 "SELECT last_engine_event_id, state_json, state_sha256 FROM paper_engine_checkpoint WHERE id=1"
             ).fetchone()
         if row is None:
-            if self._engine_event_after(0) is not None:
+            if latest_verified_engine_event_id is not None:
+                raise RuntimeError("paper engine restore blocked: engine history exists without a durable checkpoint")
+            if self._engine_event_after(verified_through_event_id) is not None:
                 raise RuntimeError("paper engine restore blocked: engine history exists without a durable checkpoint")
             return
 
         checkpoint_event_id = int(row["last_engine_event_id"])
+        if checkpoint_event_id > verified_through_event_id:
+            raise RuntimeError("paper engine restore blocked: checkpoint exceeds verified event ledger")
         if not self._checkpoint_event_marker_valid(checkpoint_event_id):
             raise RuntimeError("paper engine restore blocked: checkpoint engine event marker invalid")
-        if self._engine_event_after(checkpoint_event_id) is not None:
+        if latest_verified_engine_event_id is not None and latest_verified_engine_event_id > checkpoint_event_id:
+            raise RuntimeError("paper engine restore blocked: checkpoint does not cover latest engine event")
+        if self._engine_event_after(verified_through_event_id) is not None:
             raise RuntimeError("paper engine restore blocked: checkpoint does not cover latest engine event")
 
         raw = str(row["state_json"])
