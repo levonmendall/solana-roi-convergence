@@ -14,6 +14,10 @@ from .robinhood_adaptive_lane_controller import (
     install_robinhood_adaptive_lane_controller,
     status as adaptive_lane_controller_status,
 )
+from .robinhood_alchemy_budget_guard import (
+    install_robinhood_alchemy_budget_guard,
+    status as alchemy_budget_guard_status,
+)
 from .robinhood_event_driven_settlement import (
     install_robinhood_event_driven_settlement,
     status as event_driven_settlement_status,
@@ -26,13 +30,17 @@ from .robinhood_provider_budget_transport import (
     install_robinhood_provider_budget_transport,
     status as provider_budget_transport_status,
 )
+from .robinhood_provider_failover import (
+    install_robinhood_provider_failover,
+    status as provider_failover_status,
+)
 from .robinhood_usage_bounded_transport import (
     install_robinhood_usage_bounded_transport,
     status as usage_bounded_transport_status,
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v7-private-https-wss-derivation"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v9-provider-failover"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -84,7 +92,7 @@ async def _final_fresh_ready(self: Any) -> bool:
 
     Isolated unit/regression calls that never start the production worker retain the
     historical fresh-head helper. Once ``run()`` starts, every entry decision is
-    governed by the production RPC/WebSocket transport and frozen v5.1 event-age
+    governed by the production RPC/WebSocket transport and the canonical event-age
     ceiling. This keeps compatibility tests meaningful without allowing public
     research transport to authorize actual production paper entries.
     """
@@ -110,24 +118,39 @@ def _enforcing_run(original: Callable[[Any, asyncio.Event], Awaitable[None]]) ->
     return wrapped
 
 
+def _preserve_bounded_transport_aliases() -> None:
+    """Keep the bounded module's canonical reader aliases on the final wrappers.
+
+    The bounded transport historically exposes the exact reader/readiness functions
+    installed on the production transport module. Provider failover adds one final
+    generation-aware wrapper around those functions. Mirror the final callables back
+    into the bounded module so callers and architecture checks see one canonical
+    reader identity while the generation fail-closed semantics remain intact.
+    """
+    bounded_transport._reader_async = production_transport._reader_async
+    bounded_transport._reader_ready = production_transport._reader_ready
+
+
 def install_robinhood_production_provider_finalizer(
     plane_cls: type[Any],
     *,
     legacy_fresh_ready: Callable[[Any], Awaitable[bool]],
 ) -> None:
-    """Install the provider transport after every sequencer/legacy wrapper.
+    """Install the final production provider authority chain.
 
-    The provider-budget plane patches only acquisition mechanics before the bounded
-    production transport is installed: all persisted candidates are screened on a
-    research-only public plane, known factories stay continuously discoverable, and
-    Alchemy is reserved for a small prospective live shortlist plus open positions.
-    Event-driven settlement removes redundant exact provider quotes. The adaptive lane
-    controller then varies only prospective Alchemy capacity from 1-4 lanes according
-    to locally metered provider load and ranked simultaneous demand; all open positions
-    remain forced live outside that cap. The HTTP getLogs provider guard is installed
-    before those transports so Alchemy never receives a range beyond its validated
-    safe limit. Strategy economics and frozen v5.1 entry authority remain downstream
-    and unchanged.
+    Broad discovery remains on the research-only public plane while bounded private
+    WebSocket subscriptions carry only the prospective live shortlist and open
+    positions. The hard Alchemy budget guard coalesces duplicate ``eth_call`` work,
+    budgets noncritical reads, and reserves open-position settlement as critical.
+
+    Provider failover is deliberately installed *after* that guard so quota/budget
+    exhaustion, 429s, provider 5xx/transport failures, or repeated WebSocket failures
+    can move the complete private HTTP/WSS pair to a configured backup. A switch
+    invalidates the old provider generation immediately; paper-entry readiness stays
+    false until the replacement WebSocket has verified Robinhood chain id 4663 and
+    re-established the bounded subscription. Public RPC/sequencer transport never
+    enters the authoritative provider pool. Strategy economics and v5.2 authority are
+    unchanged, and signing/submission/live-money capability remains absent.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
@@ -149,6 +172,11 @@ def install_robinhood_production_provider_finalizer(
     production_transport.install_robinhood_production_ws_transport(plane_cls)
     install_robinhood_event_driven_settlement(plane_cls)
     install_robinhood_adaptive_lane_controller(plane_cls)
+    install_robinhood_alchemy_budget_guard(plane_cls)
+    # Outermost provider wrapper: catches provider/budget failures emitted by the
+    # guarded RPC path and coordinates the HTTP + WSS generation switch.
+    install_robinhood_provider_failover()
+    _preserve_bounded_transport_aliases()
 
     current_run = plane_cls.run
     if not bool(getattr(current_run, "_roi_robinhood_production_provider_finalizer", False)):
@@ -174,6 +202,8 @@ def status() -> dict[str, Any]:
         "provider_transport": usage_bounded_transport_status(),
         "event_driven_settlement": event_driven_settlement_status(),
         "adaptive_lane_controller": adaptive_lane_controller_status(),
+        "alchemy_budget_guard": alchemy_budget_guard_status(),
+        "provider_failover": provider_failover_status(),
         "canonical_latency_hard_max_seconds": production_transport.canonical_latency_hard_max_seconds(),
         "legacy_two_block_gate_has_production_authority": False,
         "paper_only": True,
@@ -187,6 +217,7 @@ __all__ = [
     "FINALIZER_VERSION",
     "_final_fresh_ready",
     "_install_private_https_wss_derivation",
+    "_preserve_bounded_transport_aliases",
     "_resolved_production_ws_url",
     "install_robinhood_production_provider_finalizer",
     "status",
