@@ -225,6 +225,44 @@ def _reachable_from(root: str, modules: set[str], edges: dict[str, set[str]]) ->
     return reachable
 
 
+def _literal_assignments(path: Path) -> dict[str, object]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError):
+        return {}
+    values: dict[str, object] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant):
+            values[target.id] = node.value.value
+    return values
+
+
+def _service_root_authority_violations(
+    roots: set[str], module_paths: dict[str, Path]
+) -> dict[str, list[str]]:
+    """Require every auxiliary service entrypoint to prove zero trading authority."""
+    required = {
+        "PAPER_ONLY": True,
+        "LIVE_MONEY_AUTHORITY": False,
+        "SIGNING_AVAILABLE": False,
+        "TRANSACTION_SUBMISSION_AVAILABLE": False,
+    }
+    violations: dict[str, list[str]] = {}
+    for root in sorted(roots):
+        path = module_paths.get(root)
+        if path is None:
+            violations[root] = ["missing_module"]
+            continue
+        values = _literal_assignments(path)
+        missing = [name for name, expected in required.items() if values.get(name) is not expected]
+        if missing:
+            violations[root] = missing
+    return violations
+
+
 def inventory() -> dict[str, object]:
     policy = load_policy()
     rules = policy.get("rules") if isinstance(policy.get("rules"), dict) else {}
@@ -248,31 +286,52 @@ def inventory() -> dict[str, object]:
     production_root = str(policy.get("production_root") or "solana_roi.production")
     production_reachable = _reachable_from(production_root, modules, edges)
 
+    declared_service_roots = {str(item) for item in policy.get("non_authoritative_service_roots", [])}
+    service_reachable: set[str] = set()
+    service_reachability: dict[str, list[str]] = {}
+    for root in sorted(declared_service_roots):
+        reachable = _reachable_from(root, modules, edges)
+        service_reachable.update(reachable)
+        service_reachability[root] = sorted(reachable)
+
     declared_test_only = {str(item) for item in policy.get("test_only", [])}
     declared_migration_only = {str(item) for item in policy.get("migration_only", [])}
-    unknown_policy_modules = sorted((declared_test_only | declared_migration_only) - modules)
-    classification_overlap = sorted(declared_test_only & declared_migration_only)
+    all_policy_modules = declared_service_roots | declared_test_only | declared_migration_only
+    unknown_policy_modules = sorted(all_policy_modules - modules)
+    classification_overlap = sorted(
+        (declared_test_only & declared_migration_only)
+        | (declared_service_roots & declared_test_only)
+        | (declared_service_roots & declared_migration_only)
+    )
     production_policy_conflicts = sorted(production_reachable & (declared_test_only | declared_migration_only))
+    service_root_authority_violations = _service_root_authority_violations(declared_service_roots, module_paths)
 
     main_guard_modules = sorted(module for module, path in module_paths.items() if has_main_guard(path))
-    test_only_observed = sorted((test_referenced - production_reachable) & declared_test_only)
-    migration_only_observed = sorted(declared_migration_only - production_reachable)
+    test_only_observed = sorted((test_referenced - production_reachable - service_reachable) & declared_test_only)
+    migration_only_observed = sorted(declared_migration_only - production_reachable - service_reachable)
 
-    classified = production_reachable | declared_test_only | declared_migration_only
+    classified = production_reachable | service_reachable | declared_service_roots | declared_test_only | declared_migration_only
     classified.add("solana_roi")
     unclassified_unreachable = sorted(
         module
         for module, path in module_paths.items()
         if path.name != "__init__.py" and module not in classified
     )
-    test_referenced_unclassified = sorted((test_referenced - production_reachable) - declared_test_only - declared_migration_only)
+    test_referenced_unclassified = sorted(
+        (test_referenced - production_reachable - service_reachable)
+        - declared_test_only
+        - declared_migration_only
+        - declared_service_roots
+    )
 
     orphan_modules = sorted(
         module
         for module, path in module_paths.items()
         if path.name != "__init__.py"
         and module not in production_reachable
+        and module not in service_reachable
         and not inbound_source.get(module)
+        and module not in declared_service_roots
         and module not in declared_test_only
         and module not in declared_migration_only
     )
@@ -286,6 +345,10 @@ def inventory() -> dict[str, object]:
         "production_root": production_root,
         "production_reachable_modules": sorted(production_reachable),
         "production_reachable_count": len(production_reachable),
+        "non_authoritative_service_roots": sorted(declared_service_roots),
+        "non_authoritative_service_reachability": service_reachability,
+        "non_authoritative_service_reachable_count": len(service_reachable),
+        "service_root_authority_violations": service_root_authority_violations,
         "test_only_declared": sorted(declared_test_only),
         "test_only_observed": test_only_observed,
         "migration_only_declared": sorted(declared_migration_only),
@@ -307,6 +370,7 @@ def inventory() -> dict[str, object]:
         "production_root_has_installer_debt": bool(production_installer_debt),
         "production_monkeypatch_migration_in_progress": migration_in_progress,
         "tests_grant_production_reachability": False,
+        "service_roots_grant_trading_authority": False,
         "unreachable_modules_fail_ci": True,
     }
 
@@ -329,6 +393,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         or bool(report["classification_overlap"])
         or bool(report["production_policy_conflicts"])
         or bool(report["test_referenced_unclassified"])
+        or bool(report["service_root_authority_violations"])
     ):
         return 1
     return 0
