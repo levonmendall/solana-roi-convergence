@@ -4,7 +4,7 @@ import asyncio
 import os
 from functools import wraps
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from . import robinhood_live_frontier_verification_repair as frontier
 from . import robinhood_production_ws_transport as production_transport
@@ -40,8 +40,16 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v9-provider-failover"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v10-drpc-secondary"
+DRPC_NETWORK_SLUG = "robinhood"
+DRPC_ENDPOINT_HOST = "lb.drpc.live"
+DRPC_KEY_ENV_NAMES = (
+    "DRPC_API_KEY",
+    "ROBINHOOD_DRPC_API_KEY",
+    "DRPC_KEY",
+)
 _INSTALLED = False
+_DRPC_BACKUP_BOOTSTRAPPED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
 
@@ -77,6 +85,79 @@ def _resolved_production_ws_url() -> str:
     if parsed.scheme.lower() != "https" or not parsed.netloc:
         return ""
     return parsed._replace(scheme="wss").geturl()
+
+
+def _drpc_api_key() -> str:
+    """Return the first configured dRPC credential without exposing it to telemetry."""
+    for name in DRPC_KEY_ENV_NAMES:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _drpc_backup_pair_urls() -> tuple[str, str] | None:
+    """Build a dRPC Robinhood pair only as a secondary to a valid private primary.
+
+    Explicit provider-pool JSON remains authoritative. Likewise, any explicit backup
+    setting (including a partial pair) is never overwritten: a half-configured backup
+    must remain visibly fail-closed instead of being silently repaired by a secret.
+    This helper only turns a dRPC key into the provider's documented paired HTTPS/WSS
+    endpoint when the existing Robinhood primary is already a valid private pair.
+    """
+    if (os.getenv("ROBINHOOD_RPC_ENDPOINTS_JSON") or "").strip():
+        return None
+
+    explicit_backup_http = (os.getenv("ROBINHOOD_BACKUP_RPC_URL") or "").strip()
+    explicit_backup_ws = (os.getenv("ROBINHOOD_BACKUP_WS_URL") or "").strip()
+    if explicit_backup_http or explicit_backup_ws:
+        return None
+
+    api_key = _drpc_api_key()
+    if not api_key:
+        return None
+
+    primary_http = (os.getenv("ROBINHOOD_RPC_URL") or "").strip()
+    primary_ws = _resolved_production_ws_url()
+    if not primary_http or not primary_ws:
+        return None
+    if _normalized_endpoint(primary_http) == _normalized_endpoint(
+        production_transport.runtime.ROBINHOOD_PUBLIC_RPC
+    ):
+        return None
+    if _normalized_endpoint(primary_ws) == _normalized_endpoint(
+        production_transport.PUBLIC_SEQUENCER_FEED
+    ):
+        return None
+
+    try:
+        http_parts = urlparse(primary_http)
+        ws_parts = urlparse(primary_ws)
+    except Exception:
+        return None
+    if http_parts.scheme.lower() != "https" or not http_parts.netloc:
+        return None
+    if ws_parts.scheme.lower() != "wss" or not ws_parts.netloc:
+        return None
+
+    key_path = quote(api_key, safe="")
+    path = f"{DRPC_NETWORK_SLUG}/{key_path}"
+    return (
+        f"https://{DRPC_ENDPOINT_HOST}/{path}",
+        f"wss://{DRPC_ENDPOINT_HOST}/{path}",
+    )
+
+
+def _install_drpc_backup_from_key() -> bool:
+    """Install a process-local dRPC backup pair without persisting or logging its key."""
+    global _DRPC_BACKUP_BOOTSTRAPPED
+    pair = _drpc_backup_pair_urls()
+    if pair is None:
+        return False
+    os.environ["ROBINHOOD_BACKUP_RPC_URL"] = pair[0]
+    os.environ["ROBINHOOD_BACKUP_WS_URL"] = pair[1]
+    _DRPC_BACKUP_BOOTSTRAPPED = True
+    return True
 
 
 def _install_private_https_wss_derivation() -> None:
@@ -169,6 +250,9 @@ def install_robinhood_production_provider_finalizer(
     # resolver only supplies the provider-equivalent WSS when a private HTTPS RPC was
     # explicitly configured and no explicit WSS override exists.
     _install_private_https_wss_derivation()
+    # A Render-held dRPC key may supply the secondary Robinhood pair, but only behind
+    # an already-valid private primary and never over explicit JSON/backup settings.
+    _install_drpc_backup_from_key()
     production_transport.install_robinhood_production_ws_transport(plane_cls)
     install_robinhood_event_driven_settlement(plane_cls)
     install_robinhood_adaptive_lane_controller(plane_cls)
@@ -197,6 +281,9 @@ def status() -> dict[str, Any]:
         "explicit_websocket_precedence": True,
         "public_rpc_wss_derivation_allowed": False,
         "plain_http_rpc_wss_derivation_allowed": False,
+        "drpc_secret_secondary_supported": True,
+        "drpc_secret_secondary_bootstrapped": _DRPC_BACKUP_BOOTSTRAPPED,
+        "drpc_secondary_network": DRPC_NETWORK_SLUG,
         "getlogs_provider_guard": getlogs_provider_guard_status(),
         "provider_budget_transport": provider_budget_transport_status(),
         "provider_transport": usage_bounded_transport_status(),
@@ -215,6 +302,9 @@ def status() -> dict[str, Any]:
 
 __all__ = [
     "FINALIZER_VERSION",
+    "_drpc_api_key",
+    "_drpc_backup_pair_urls",
+    "_install_drpc_backup_from_key",
     "_final_fresh_ready",
     "_install_private_https_wss_derivation",
     "_preserve_bounded_transport_aliases",
