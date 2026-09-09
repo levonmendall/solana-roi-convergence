@@ -17,7 +17,7 @@ def test_emergency_load_zeroes_single_prospective_lane(monkeypatch) -> None:
     assert result == 0
     state = guard.adaptive._state(plane)
     assert state["prospective_lane_cap"] == 0
-    assert state["last_change_reason"] == "provider_budget_emergency_zero_prospective"
+    assert state["last_change_reason"] == "provider_budget_emergency"
 
 
 def test_emergency_does_not_depend_on_open_position_count(monkeypatch) -> None:
