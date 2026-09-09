@@ -256,7 +256,11 @@ def _guarded_control(self: Any, *, demand: int, open_positions: int) -> int:
         state["open_position_count"] = max(0, int(open_positions))
         state["prospective_lane_cap"] = 0
         state["last_change_monotonic"] = now
-        state["last_change_reason"] = "provider_budget_emergency_zero_prospective"
+        # Preserve the pre-existing adaptive-controller telemetry contract. The
+        # stronger v1 guard behavior is captured separately by the zero cap and
+        # prospective_emergency_zeroes counter, so downstream diagnostics do not
+        # need a reason-string migration to recognize the same emergency state.
+        state["last_change_reason"] = "provider_budget_emergency"
         _bump("prospective_emergency_zeroes")
         return 0
 
