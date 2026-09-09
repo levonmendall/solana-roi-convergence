@@ -11,19 +11,38 @@ from solana_roi import robinhood_drpc_environment as drpc
 from solana_roi import robinhood_provider_failover as failover
 
 
+_TOUCHED_ENV = (
+    "ROBINHOOD_DRPC_API_KEY",
+    "DRPC_API_KEY",
+    "DRPC_KEY",
+    "SOLANA_ROI_DRPC_API_KEY",
+    "ROBINHOOD_RPC_ENDPOINTS_JSON",
+    "ROBINHOOD_RPC_URL",
+    "ROBINHOOD_WS_URL",
+    "ROBINHOOD_BACKUP_RPC_URL",
+    "ROBINHOOD_BACKUP_WS_URL",
+    "ROBINHOOD_PROVIDER_PRIMARY",
+    "ROBINHOOD_PROVIDER_FAILOVER_ERROR_THRESHOLD",
+    "ROBINHOOD_PROVIDER_FAILOVER_COOLDOWN_SECONDS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_robinhood_environment():
+    original = {name: os.environ.get(name) for name in _TOUCHED_ENV}
+    try:
+        yield
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        failover.reset_for_tests()
+
+
 def _clear(monkeypatch) -> None:
-    for name in (
-        "ROBINHOOD_DRPC_API_KEY",
-        "DRPC_API_KEY",
-        "DRPC_KEY",
-        "SOLANA_ROI_DRPC_API_KEY",
-        "ROBINHOOD_RPC_ENDPOINTS_JSON",
-        "ROBINHOOD_RPC_URL",
-        "ROBINHOOD_WS_URL",
-        "ROBINHOOD_BACKUP_RPC_URL",
-        "ROBINHOOD_BACKUP_WS_URL",
-        "ROBINHOOD_PROVIDER_PRIMARY",
-    ):
+    for name in _TOUCHED_ENV:
         monkeypatch.delenv(name, raising=False)
     failover.reset_for_tests()
 
