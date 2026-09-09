@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,8 @@ def _clear(monkeypatch) -> None:
         "DRPC_KEY",
         "SOLANA_ROI_DRPC_API_KEY",
         "ROBINHOOD_RPC_ENDPOINTS_JSON",
+        "ROBINHOOD_RPC_URL",
+        "ROBINHOOD_WS_URL",
         "ROBINHOOD_BACKUP_RPC_URL",
         "ROBINHOOD_BACKUP_WS_URL",
         "ROBINHOOD_PROVIDER_PRIMARY",
@@ -30,9 +33,8 @@ def test_drpc_key_materializes_private_https_and_wss_backup(monkeypatch) -> None
     monkeypatch.setenv("ROBINHOOD_DRPC_API_KEY", "secret-test-key")
 
     assert drpc.configure_robinhood_drpc_backup() is True
-    assert monkeypatch.getenv if False else True
-    assert failover.os.getenv("ROBINHOOD_BACKUP_RPC_URL") == "https://lb.drpc.live/robinhood/secret-test-key"
-    assert failover.os.getenv("ROBINHOOD_BACKUP_WS_URL") == "wss://lb.drpc.live/robinhood/secret-test-key"
+    assert os.getenv("ROBINHOOD_BACKUP_RPC_URL") == "https://lb.drpc.live/robinhood/secret-test-key"
+    assert os.getenv("ROBINHOOD_BACKUP_WS_URL") == "wss://lb.drpc.live/robinhood/secret-test-key"
 
 
 def test_drpc_key_alias_is_supported(monkeypatch) -> None:
@@ -40,8 +42,8 @@ def test_drpc_key_alias_is_supported(monkeypatch) -> None:
     monkeypatch.setenv("DRPC_KEY", "alias-key")
 
     assert drpc.configure_robinhood_drpc_backup() is True
-    assert failover.os.getenv("ROBINHOOD_BACKUP_RPC_URL") == "https://lb.drpc.live/robinhood/alias-key"
-    assert failover.os.getenv("ROBINHOOD_BACKUP_WS_URL") == "wss://lb.drpc.live/robinhood/alias-key"
+    assert os.getenv("ROBINHOOD_BACKUP_RPC_URL") == "https://lb.drpc.live/robinhood/alias-key"
+    assert os.getenv("ROBINHOOD_BACKUP_WS_URL") == "wss://lb.drpc.live/robinhood/alias-key"
 
 
 def test_explicit_backup_pair_retains_precedence(monkeypatch) -> None:
@@ -51,8 +53,8 @@ def test_explicit_backup_pair_retains_precedence(monkeypatch) -> None:
     monkeypatch.setenv("ROBINHOOD_BACKUP_WS_URL", "wss://backup.example/ws")
 
     assert drpc.configure_robinhood_drpc_backup() is True
-    assert failover.os.getenv("ROBINHOOD_BACKUP_RPC_URL") == "https://backup.example/rpc"
-    assert failover.os.getenv("ROBINHOOD_BACKUP_WS_URL") == "wss://backup.example/ws"
+    assert os.getenv("ROBINHOOD_BACKUP_RPC_URL") == "https://backup.example/rpc"
+    assert os.getenv("ROBINHOOD_BACKUP_WS_URL") == "wss://backup.example/ws"
 
 
 def test_drpc_appends_to_existing_json_pool_without_reordering_primary(monkeypatch) -> None:
@@ -72,7 +74,7 @@ def test_drpc_appends_to_existing_json_pool_without_reordering_primary(monkeypat
     )
 
     assert drpc.configure_robinhood_drpc_backup() is True
-    payload = json.loads(failover.os.getenv("ROBINHOOD_RPC_ENDPOINTS_JSON") or "[]")
+    payload = json.loads(os.getenv("ROBINHOOD_RPC_ENDPOINTS_JSON") or "[]")
     assert [item["name"] for item in payload] == ["alchemy", "drpc"]
 
 
