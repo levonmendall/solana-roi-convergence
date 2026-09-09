@@ -14,6 +14,13 @@ the explicit composition root (not called from this facade):
 
 import asyncio
 
+from . import robinhood_drpc_environment as _robinhood_drpc_environment
+
+# Materialize the Render-held dRPC key into the existing Robinhood backup-pair
+# contract before the production composition imports and installs provider failover.
+# This changes transport redundancy only; it does not alter strategy authority.
+_robinhood_drpc_environment.configure_robinhood_drpc_backup()
+
 from .production_system import (
     COMPOSITION_STATUS_PATH,
     COMPOSITION_VERSION,
