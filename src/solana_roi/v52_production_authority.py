@@ -41,6 +41,7 @@ from .v52_wallet_intelligence_alignment import (
 COMPOSITION_VERSION = "v52-explicit-production-authority-v7-wallet-aligned-continuous-evolution"
 _INSTALLED = False
 _RUNTIME: Any | None = None
+_WALLET_ALPHA: WalletAlphaRefinementLedger | None = None
 
 
 def _copy_robinhood_lineage(wrapper: Any, predecessor: Any) -> None:
@@ -99,6 +100,12 @@ def _resolve_runtime(runtime_provider: Callable[[], Any] | Any) -> Any:
     return runtime_provider() if callable(runtime_provider) else runtime_provider
 
 
+def wallet_alpha_refinement() -> WalletAlphaRefinementLedger:
+    if _WALLET_ALPHA is None:
+        raise RuntimeError("v5.2 wallet alpha refinement not installed")
+    return _WALLET_ALPHA
+
+
 def install_v52_production_authority(
     app: Any,
     runtime_provider: Callable[[], Any] | Any,
@@ -123,9 +130,10 @@ def install_v52_production_authority(
     wallet lane no longer re-fetches and re-normalizes transactions that canonical
     ingestion has already hydrated. Paired marginal-alpha and contextual decay
     remain forward-only research evidence and cannot independently authorize a
-    paper entry.
+    paper entry. The alpha ledger is owned by this authority module rather than
+    mutating the slotted canonical ingestion runtime.
     """
-    global _INSTALLED, _RUNTIME
+    global _INSTALLED, _RUNTIME, _WALLET_ALPHA
     runtime = _resolve_runtime(runtime_provider)
     install_v52_authoritative_strategy()
     install_v52_robinhood_storage_compatibility()
@@ -135,8 +143,8 @@ def install_v52_production_authority(
     install_v52_robinhood_candidate_reconciliation()
     _preserve_robinhood_wrapper_contracts()
     install_v52_wallet_intelligence_alignment(runtime)
-    if not isinstance(getattr(runtime, "wallet_alpha_refinement", None), WalletAlphaRefinementLedger):
-        runtime.wallet_alpha_refinement = WalletAlphaRefinementLedger(runtime.store)
+    if _WALLET_ALPHA is None or _WALLET_ALPHA.store is not runtime.store:
+        _WALLET_ALPHA = WalletAlphaRefinementLedger(runtime.store)
     install_v52_strategy_api(app)
     strategy_epoch = strategy_evolution_snapshot()
     app.state.roi_v51_final_economic_authority = False
@@ -176,6 +184,9 @@ def status() -> dict[str, Any]:
             "paper_only": True,
             "live_money_authority": False,
         }
+    else:
+        wallet_alignment = wallet_alignment_status(_RUNTIME)
+    if _WALLET_ALPHA is None:
         wallet_alpha = {
             "version": "v52-wallet-alpha-refinement-v1",
             "installed": False,
@@ -183,8 +194,7 @@ def status() -> dict[str, Any]:
             "live_money_authority": False,
         }
     else:
-        wallet_alignment = wallet_alignment_status(_RUNTIME)
-        wallet_alpha = dict(_RUNTIME.wallet_alpha_refinement.status())
+        wallet_alpha = dict(_WALLET_ALPHA.status())
         wallet_alpha["installed"] = True
     # Robinhood preserves its compatibility table strategy label. Economic
     # authority and forward-learning scope come from registered v5.2 lineage;
@@ -246,4 +256,9 @@ def status() -> dict[str, Any]:
     }
 
 
-__all__ = ["COMPOSITION_VERSION", "install_v52_production_authority", "status"]
+__all__ = [
+    "COMPOSITION_VERSION",
+    "install_v52_production_authority",
+    "status",
+    "wallet_alpha_refinement",
+]
