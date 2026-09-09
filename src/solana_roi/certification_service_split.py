@@ -20,13 +20,15 @@ from . import production_proof_read_boundary_repair as production_proof
 from . import render_runtime_bootstrap_repair as render_bootstrap
 
 
-SPLIT_VERSION = "certification-service-split-v1"
+SPLIT_VERSION = "certification-service-split-v2-nonblocking-snapshot"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
 DEFAULT_REMOTE_TIMEOUT_SECONDS = 5.0
 DEFAULT_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024 * 1024
+DEFAULT_SNAPSHOT_PAGES_PER_STEP = 512
+DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS = 0.01
 
 _ORIGINAL_RUNTIME_WORKERS: Callable[..., Any] | None = None
 
@@ -83,6 +85,36 @@ def _snapshot_max_bytes() -> int:
         )
     except ValueError:
         return DEFAULT_SNAPSHOT_MAX_BYTES
+
+
+def _snapshot_pages_per_step() -> int:
+    try:
+        return max(
+            64,
+            int(
+                os.getenv(
+                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_PAGES_PER_STEP",
+                    str(DEFAULT_SNAPSHOT_PAGES_PER_STEP),
+                )
+            ),
+        )
+    except ValueError:
+        return DEFAULT_SNAPSHOT_PAGES_PER_STEP
+
+
+def _snapshot_step_sleep_seconds() -> float:
+    try:
+        return max(
+            0.0,
+            float(
+                os.getenv(
+                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_STEP_SLEEP_SECONDS",
+                    str(DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS),
+                )
+            ),
+        )
+    except ValueError:
+        return DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS
 
 
 def _surface_release(path: str, payload: dict[str, Any]) -> str:
@@ -180,6 +212,40 @@ def _replace_get_route(app: Any, path: str) -> None:
         dependant.call = endpoint
 
 
+def _snapshot_store_to_file(store: Any, snapshot: Path) -> int:
+    """Create a point-in-time SQLite copy without holding the live writer lock.
+
+    The canonical runtime remains the only writer. A separate read-only connection
+    participates in SQLite WAL snapshot semantics while ``Connection.backup`` copies
+    bounded page batches and yields between them. This lets ingestion, paper lifecycle,
+    settlement and reconciliation continue while certification receives an immutable
+    copy. The certifier never mounts or writes the runtime disk.
+    """
+    source_path = getattr(store, "path", None)
+    if source_path is None:
+        raise RuntimeError("canonical runtime store path unavailable")
+    source_path = Path(source_path)
+    if not source_path.is_file():
+        raise RuntimeError("canonical runtime SQLite file unavailable")
+
+    source_uri = f"file:{source_path.resolve()}?mode=ro"
+    source = sqlite3.connect(source_uri, uri=True, timeout=5.0)
+    destination = sqlite3.connect(snapshot)
+    try:
+        source.execute("PRAGMA query_only=ON")
+        source.execute("PRAGMA busy_timeout=5000")
+        source.backup(
+            destination,
+            pages=_snapshot_pages_per_step(),
+            sleep=_snapshot_step_sleep_seconds(),
+        )
+        destination.commit()
+    finally:
+        destination.close()
+        source.close()
+    return int(snapshot.stat().st_size)
+
+
 def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> None:
     path = "/v1/operations/certification-db-snapshot"
     if path in {getattr(route, "path", None) for route in app.routes}:
@@ -200,21 +266,14 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
 
         runtime = runtime_provider()
         store = getattr(runtime, "store", None)
-        if store is None or not hasattr(store, "db") or not hasattr(store, "_lock"):
+        if store is None:
             raise HTTPException(status_code=503, detail="canonical runtime store unavailable")
 
         fd, raw_path = tempfile.mkstemp(prefix="roi-certification-", suffix=".sqlite3", dir="/tmp")
         os.close(fd)
         snapshot = Path(raw_path)
         try:
-            destination = sqlite3.connect(snapshot)
-            try:
-                with store._lock:
-                    store.db.backup(destination)
-                destination.execute("PRAGMA query_only=ON")
-            finally:
-                destination.close()
-            size = snapshot.stat().st_size
+            size = _snapshot_store_to_file(store, snapshot)
             if size > _snapshot_max_bytes():
                 snapshot.unlink(missing_ok=True)
                 raise HTTPException(
@@ -253,8 +312,9 @@ def _strip_local_certification_workers() -> None:
     async def runtime_workers_without_local_certification(runtime: Any, stop: Any) -> None:
         await base(runtime, stop)
 
-    # Preserve introspection markers while changing their meaning explicitly: the
-    # wrappers are intentionally bypassed because their work moved to another cgroup.
+    # Preserve introspection markers while making the transfer explicit. The
+    # certification wrappers are intentionally bypassed because their heavy work is
+    # now owned by another Render cgroup; the base real-time worker chain is retained.
     setattr(runtime_workers_without_local_certification, "_roi_e2e_status_snapshot_worker", True)
     setattr(runtime_workers_without_local_certification, "_roi_production_proof_snapshot_worker", True)
     setattr(runtime_workers_without_local_certification, "_roi_forward_certification_snapshot_worker", True)
@@ -272,7 +332,10 @@ def status() -> dict[str, Any]:
         "shared_auth_configured": bool(_shared_token()),
         "runtime_executes_local_certification_builders": False if split_runtime_enabled() else True,
         "canonical_sqlite_owner": "authoritative_runtime",
-        "snapshot_export": "sqlite_online_backup_point_in_time",
+        "snapshot_export": "sqlite_online_backup_point_in_time_read_only_connection",
+        "snapshot_holds_runtime_store_lock": False,
+        "snapshot_pages_per_step": _snapshot_pages_per_step(),
+        "snapshot_step_sleep_seconds": _snapshot_step_sleep_seconds(),
         "snapshot_max_bytes": _snapshot_max_bytes(),
         "shared_writable_disk": False,
         "paper_only": PAPER_ONLY,
