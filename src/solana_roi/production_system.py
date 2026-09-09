@@ -211,6 +211,12 @@ class ProductionSystem:
             "certification_service_split_version": getattr(
                 self.app.state, "roi_certification_service_split_version", None
             ),
+            "certification_snapshot_chunk_transfer": bool(
+                getattr(self.app.state, "roi_certification_snapshot_chunk_transfer", False)
+            ),
+            "certification_snapshot_chunk_transfer_version": getattr(
+                self.app.state, "roi_certification_snapshot_chunk_transfer_version", None
+            ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -282,6 +288,7 @@ def build_production_system() -> ProductionSystem:
     from . import legacy_production_composition as _legacy_production_composition
     from . import render_runtime_bootstrap_repair as _render_runtime_bootstrap
     from .batch9_finalization_repair import install_batch9_finalization_repair
+    from .certification_chunk_transfer import install_authoritative_snapshot_chunk_transfer
     from .certification_generation_runtime_repair import install_certification_generation_runtime_repair
     from .certification_proof_memory_repair import install_certification_proof_memory_repair
     from .certification_service_split import install_certification_service_split
@@ -354,6 +361,9 @@ def build_production_system() -> ProductionSystem:
     # the thin production facade. Split mode changes only certification execution
     # and read routing; v5.2 strategy/economic authority remains untouched.
     install_certification_service_split(app, ingestion_runtime)
+    install_authoritative_snapshot_chunk_transfer(app, ingestion_runtime)
+    app.state.roi_certification_snapshot_chunk_transfer = True
+    app.state.roi_certification_snapshot_chunk_transfer_version = "certification-snapshot-chunk-transfer-v1"
 
     components = _required_components()
     missing = [component.name for component in components if component.required and not component.available]

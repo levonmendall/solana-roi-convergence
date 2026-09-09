@@ -19,8 +19,10 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 
+from .certification_chunk_transfer import download_snapshot_chunked
 
-SERVICE_VERSION = "isolated-certifier-service-v3-snapshot-transfer-integrity"
+
+SERVICE_VERSION = "isolated-certifier-service-v4-resumable-snapshot-transfer"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -243,55 +245,12 @@ def _validate_sqlite_snapshot(path: Path, expected_bytes: int) -> int:
 
 
 def _download_snapshot(destination: Path) -> str:
-    base = _runtime_url()
-    token = _token()
-    if not base or not token:
-        raise RuntimeError("runtime snapshot source is not configured")
-    request = urllib.request.Request(
-        f"{base}/v1/operations/certification-db-snapshot",
-        headers={
-            "Accept": "application/vnd.sqlite3",
-            "X-Certification-Token": token,
-            "User-Agent": "solana-roi-isolated-certifier/1",
-        },
+    release, expected_bytes = download_snapshot_chunked(
+        destination,
+        base=_runtime_url(),
+        token=_token(),
+        expected_release=_release_commit(),
     )
-    release = ""
-    expected_bytes: int | None = None
-    content_length: int | None = None
-    try:
-        with urllib.request.urlopen(request, timeout=60.0) as response:
-            release = str(response.headers.get("X-Release-Commit") or "")
-            raw_expected = str(response.headers.get("X-Certification-Snapshot-Bytes") or "").strip()
-            if not raw_expected:
-                raise RuntimeError("runtime snapshot missing byte-count binding")
-            try:
-                expected_bytes = int(raw_expected)
-            except ValueError as exc:
-                raise RuntimeError("runtime snapshot byte-count binding invalid") from exc
-            raw_content_length = str(response.headers.get("Content-Length") or "").strip()
-            if raw_content_length:
-                try:
-                    content_length = int(raw_content_length)
-                except ValueError as exc:
-                    raise RuntimeError("runtime snapshot content-length invalid") from exc
-                if content_length != expected_bytes:
-                    raise RuntimeError(
-                        f"runtime snapshot header-length mismatch:{content_length}:{expected_bytes}"
-                    )
-            with destination.open("wb") as handle:
-                shutil.copyfileobj(response, handle, length=1024 * 1024)
-    except RuntimeError:
-        raise
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"runtime snapshot download failed:{type(exc).__name__}") from exc
-
-    if not release:
-        raise RuntimeError("runtime snapshot missing release binding")
-    if release != _release_commit():
-        raise RuntimeError(f"runtime snapshot release mismatch:{release}:{_release_commit()}")
-    if expected_bytes is None:
-        raise RuntimeError("runtime snapshot missing validated byte count")
-
     try:
         actual_bytes = _validate_sqlite_snapshot(destination, expected_bytes)
     except BaseException:
@@ -468,8 +427,10 @@ def health() -> dict[str, Any]:
         "artifacts": freshness,
         "state": state,
         "snapshot_transfer_integrity": {
+            "resumable_bounded_chunks": True,
+            "single_giant_http_body_required": False,
             "advertised_byte_count_required": True,
-            "content_length_cross_checked_when_present": True,
+            "per_chunk_release_id_offset_and_total_bound": True,
             "sqlite_header_and_page_geometry_checked": True,
             "read_only_schema_open_checked": True,
             "full_integrity_scan_duplicated_before_child": False,
