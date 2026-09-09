@@ -14,6 +14,14 @@ the explicit composition root (not called from this facade):
 
 import asyncio
 
+from .robinhood_drpc_environment import configure_robinhood_drpc_backup
+
+# Provider credentials must be materialized before importing the production
+# composition root because the legacy-compatible Robinhood ingestion substrate
+# reads its provider environment during construction. This is environment-only
+# bootstrap: it grants no strategy, signing, submission, or live-money authority.
+configure_robinhood_drpc_backup()
+
 from .production_system import (
     COMPOSITION_STATUS_PATH,
     COMPOSITION_VERSION,
