@@ -219,7 +219,6 @@ def install_v52_wallet_intelligence_alignment(runtime_provider: Any) -> None:
         _align_inner(discovery)
     else:
         raise RuntimeError("canonical wallet discovery runtime contract unavailable")
-    setattr(runtime, "roi_v52_wallet_intelligence_alignment", True)
 
 
 def status(runtime_provider: Any) -> dict[str, Any]:
