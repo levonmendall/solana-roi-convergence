@@ -10,21 +10,39 @@ from solana_roi.risk_conditioned_alpha_v51 import ROBINHOOD_V51_VERSION
 
 def test_v5_policy_overrides_legacy_entry_and_dispatches_settlement_by_evidence_version() -> None:
     assert issubclass(RobinhoodChainPaperPlane, RobinhoodProfitMaximizerMixin)
-    assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("robinhood_chain_profit_maximizer")
-    # V5.1 intentionally supersedes only the Pons V2 entry path when the fully
-    # composed production installer has already run in this process. Direct module
-    # imports still expose the immutable base-v5 implementation.
-    v2_module = RobinhoodChainPaperPlane._maybe_open_v2.__module__
-    assert v2_module.endswith(("robinhood_chain_profit_maximizer", "risk_conditioned_alpha_v51"))
-    # Settlement has a class-level compatibility dispatcher: v5/v5.1 trials use
-    # learned exits while pre-v5 trials retain their exact historical reason semantics.
-    assert RobinhoodChainPaperPlane._settle_one.__module__.endswith("robinhood_chain_paper")
+    # In fully composed v5.2 production, lifecycle validation is the final entry
+    # owner. The exact predecessor remains reachable for lineage/compatibility.
+    v3 = RobinhoodChainPaperPlane._maybe_open_v3
+    if v3.__module__.endswith("v52_robinhood_position_lifecycle"):
+        assert bool(getattr(v3, "_roi_v52_position_lifecycle", False)) is True
+        assert callable(getattr(v3, "__wrapped__", None))
+    else:
+        assert v3.__module__.endswith("robinhood_chain_profit_maximizer")
+
+    # V5.1 compatibility may supersede the Pons V2 substrate; v5.2 lifecycle may
+    # then wrap that composed path without changing its durable storage label.
+    v2 = RobinhoodChainPaperPlane._maybe_open_v2
+    assert v2.__module__.endswith(
+        ("robinhood_chain_profit_maximizer", "risk_conditioned_alpha_v51", "v52_robinhood_position_lifecycle")
+    )
+    if v2.__module__.endswith("v52_robinhood_position_lifecycle"):
+        assert bool(getattr(v2, "_roi_v52_position_lifecycle", False)) is True
+        assert callable(getattr(v2, "__wrapped__", None))
+
+    # Settlement keeps the compatibility dispatcher beneath the v5.2 lifecycle
+    # accounting owner; historical reason semantics remain available by evidence version.
+    settle = RobinhoodChainPaperPlane._settle_one
+    assert settle.__module__.endswith(("robinhood_chain_paper", "v52_robinhood_position_lifecycle"))
+    if settle.__module__.endswith("v52_robinhood_position_lifecycle"):
+        assert bool(getattr(settle, "_roi_v52_position_lifecycle", False)) is True
     assert RobinhoodProfitMaximizerMixin._settle_one.__module__.endswith("robinhood_chain_profit_maximizer")
 
 
 def test_active_robinhood_version_is_base_v5_or_explicit_v51_override() -> None:
     v2_module = RobinhoodChainPaperPlane._maybe_open_v2.__module__
-    if v2_module.endswith("risk_conditioned_alpha_v51"):
+    if v2_module.endswith(("risk_conditioned_alpha_v51", "v52_robinhood_position_lifecycle")):
+        # v5.2 intentionally retains the v5.1-compatible durable storage label;
+        # economic authority comes from the v5.2 release/authority epoch.
         assert ROBINHOOD_V5_VERSION == ROBINHOOD_V51_VERSION
     else:
         assert ROBINHOOD_V5_VERSION == "robinhood-chain-risk-conditioned-v2"

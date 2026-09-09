@@ -66,15 +66,26 @@ def test_final_strategy_functions_are_marked_as_v52_authoritative() -> None:
     assert bool(getattr(v5._choose_lane_and_fraction, "_roi_v52_final_authority", False)) is True
     assert fomo._paper_decision.__module__.endswith("v52_authoritative_strategy")
     assert bool(getattr(fomo._paper_decision, "_roi_v52_final_authority", False)) is True
-    assert RobinhoodProfitMaximizerMixin._v5_choose_lane_fraction.__module__.endswith("v52_authoritative_strategy")
-    assert bool(getattr(RobinhoodProfitMaximizerMixin._v5_choose_lane_fraction, "_roi_v52_final_authority", False)) is True
+
+    # Robinhood's frozen v5.2 economic chooser is now deliberately wrapped by
+    # the v5.2 position lifecycle so exact aggregate/stressed exitability and
+    # multi-lot accounting are part of the final authority boundary.
+    chooser = RobinhoodProfitMaximizerMixin._v5_choose_lane_fraction
+    assert chooser.__module__.endswith("v52_robinhood_position_lifecycle")
+    assert bool(getattr(chooser, "_roi_v52_final_authority", False)) is True
+    assert bool(getattr(chooser, "_roi_v52_position_lifecycle", False)) is True
+    assert callable(getattr(chooser, "__wrapped__", None))
+
     assert RobinhoodProfitMaximizerMixin._v5_profile.__module__.endswith("v52_robinhood_storage_compatibility")
     assert bool(getattr(RobinhoodProfitMaximizerMixin._v5_profile, "_roi_v52_forward_profile", False)) is True
     assert RobinhoodProfitMaximizerMixin._v5_learned_exit_policy.__module__.endswith("v52_robinhood_exit_authority")
     assert bool(getattr(RobinhoodProfitMaximizerMixin._v5_learned_exit_policy, "_roi_v52_exit_authority", False)) is True
 
-    # Pre-lane coverage composes around the already-certified final entry methods.
+    # Pre-lane coverage/frontier guards remain reachable underneath the final
+    # lifecycle entry wrappers; lifecycle ownership must not erase their markers.
     assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v2, "_roi_v51_prelane_coverage", False)) is True
     assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v3, "_roi_v51_prelane_coverage", False)) is True
     assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v3, "_roi_fresh_live_frontier_entry_guard", False)) is True
-    assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("robinhood_chain_profit_maximizer")
+    assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("v52_robinhood_position_lifecycle")
+    assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v3, "_roi_v52_position_lifecycle", False)) is True
+    assert callable(getattr(RobinhoodChainPaperPlane._maybe_open_v3, "__wrapped__", None))

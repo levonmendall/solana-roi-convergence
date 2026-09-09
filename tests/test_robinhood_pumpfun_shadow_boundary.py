@@ -312,8 +312,15 @@ def test_production_composition_installs_native_learning_without_breaking_v51_li
     assert bool(getattr(RobinhoodChainPaperPlane._v5_choose_lane_fraction, "_roi_robinhood_entity_universe", False))
     assert bool(getattr(RobinhoodChainPaperPlane._poll_once, "_roi_robinhood_entity_universe", False))
     assert bool(getattr(RobinhoodChainPaperPlane.status, "_roi_robinhood_entity_universe", False))
-    assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("robinhood_chain_profit_maximizer")
-    assert RobinhoodChainPaperPlane._maybe_open_v2.__module__.endswith("risk_conditioned_alpha_v51")
+
+    # v5.2 lifecycle is the final entry owner, while the already-proven PumpFun
+    # shadow/native-learning/entity-universe lineage remains visible underneath it.
+    assert RobinhoodChainPaperPlane._maybe_open_v3.__module__.endswith("v52_robinhood_position_lifecycle")
+    assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v3, "_roi_v52_position_lifecycle", False))
+    assert callable(getattr(RobinhoodChainPaperPlane._maybe_open_v3, "__wrapped__", None))
+    assert RobinhoodChainPaperPlane._maybe_open_v2.__module__.endswith("v52_robinhood_position_lifecycle")
+    assert bool(getattr(RobinhoodChainPaperPlane._maybe_open_v2, "_roi_v52_position_lifecycle", False))
+    assert callable(getattr(RobinhoodChainPaperPlane._maybe_open_v2, "__wrapped__", None))
     assert getattr(RobinhoodChainPaperPlane, "_roi_robinhood_strategy_alignment_composition_version") == (
         "robinhood-strategy-alignment-composition-v6-native-shadow-learning"
     )
