@@ -4,6 +4,9 @@ import asyncio
 import json
 import sqlite3
 
+from fastapi import FastAPI
+
+from solana_roi import certification_generation_runtime_repair as certification_runtime
 from solana_roi import certification_service_split as split
 from solana_roi import certifier_service
 from solana_roi import e2e_status_read_boundary_repair as e2e
@@ -32,7 +35,7 @@ class _ForbiddenLock:
         return False
 
 
-def test_split_runtime_worker_bypasses_all_local_certification_publishers(monkeypatch) -> None:
+def test_split_runtime_keeps_only_local_forward_publisher(monkeypatch) -> None:
     calls: list[str] = []
 
     async def base(runtime, stop):
@@ -45,19 +48,62 @@ def test_split_runtime_worker_bypasses_all_local_certification_publishers(monkey
         _ = stop
         calls.append("previous")
 
+    async def forward_only(runtime, stop):
+        calls.append("forward")
+        delegate = certification_runtime._ORIGINAL_RUNTIME_WORKERS
+        assert delegate is base
+        await delegate(runtime, stop)
+
     monkeypatch.setattr(e2e, "_ORIGINAL_RUNTIME_WORKERS", base)
     monkeypatch.setattr(render_bootstrap, "_run_runtime_workers", previous)
+    monkeypatch.setattr(certification_runtime, "_ORIGINAL_RUNTIME_WORKERS", previous)
+    monkeypatch.setattr(certification_runtime, "_runtime_workers_with_forward_snapshot", forward_only)
 
     split._strip_local_certification_workers()
     current = render_bootstrap._run_runtime_workers
     asyncio.run(current(object(), asyncio.Event()))
 
-    assert calls == ["base"]
+    assert calls == ["forward", "base"]
+    assert "previous" not in calls
     assert getattr(current, "_roi_certification_split_runtime") is True
-    assert getattr(current, "_roi_local_certification_builders_disabled") is True
+    assert getattr(current, "_roi_local_certification_builders_disabled") is False
+    assert getattr(current, "_roi_local_heavy_certification_builders_disabled") is True
+    assert getattr(current, "_roi_local_forward_publisher_retained") is True
     assert getattr(current, "_roi_e2e_status_snapshot_worker") is True
     assert getattr(current, "_roi_production_proof_snapshot_worker") is True
     assert getattr(current, "_roi_forward_certification_snapshot_worker") is True
+
+
+def test_split_keeps_forward_route_local_and_proxies_only_heavy_surfaces(monkeypatch) -> None:
+    monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SPLIT_RUNTIME", "true")
+    app = FastAPI()
+
+    @app.get("/v1/strategy/e2e-status")
+    def e2e_status() -> dict:
+        return {"surface": "e2e"}
+
+    @app.get("/v1/strategy/forward-certification")
+    def forward_status() -> dict:
+        return {"surface": "forward"}
+
+    @app.get("/v1/strategy/production-proof")
+    def production_status() -> dict:
+        return {"surface": "production"}
+
+    monkeypatch.setattr(split, "_install_snapshot_route", lambda app, runtime_provider: None)
+    monkeypatch.setattr(split, "_strip_local_certification_workers", lambda: None)
+
+    split.install_certification_service_split(app, lambda: object())
+
+    routes = {getattr(route, "path", None): route for route in app.routes}
+    assert routes["/v1/strategy/forward-certification"].endpoint is forward_status
+    assert getattr(routes["/v1/strategy/e2e-status"].endpoint, "_roi_remote_certification_proxy") is True
+    assert getattr(routes["/v1/strategy/production-proof"].endpoint, "_roi_remote_certification_proxy") is True
+    assert not bool(
+        getattr(routes["/v1/strategy/forward-certification"].endpoint, "_roi_remote_certification_proxy", False)
+    )
+    assert app.state.roi_certification_local_heavy_workers_disabled is True
+    assert app.state.roi_certification_local_forward_publisher is True
 
 
 def test_snapshot_uses_pinned_read_transaction_without_runtime_store_lock(tmp_path) -> None:
@@ -223,5 +269,10 @@ def test_split_status_preserves_paper_only_authority(monkeypatch) -> None:
     assert status["transaction_submission_available"] is False
     assert status["strategy_thresholds_changed"] is False
     assert status["certification_thresholds_changed"] is False
+    assert status["forward_stale_threshold_changed"] is False
+    assert status["runtime_executes_local_heavy_certification_builders"] is False
+    assert status["runtime_executes_local_forward_publisher"] is True
+    assert status["forward_publication_interval_seconds"] == 15.0
+    assert status["forward_publication_stale_seconds"] == 45.0
     assert status["snapshot_deadline_seconds"] > 0
     assert status["snapshot_free_reserve_bytes"] > 0
