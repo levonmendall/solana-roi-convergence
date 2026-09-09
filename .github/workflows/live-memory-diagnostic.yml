@@ -1,0 +1,55 @@
+name: Live Memory Diagnostic
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe-live-memory:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 3
+    steps:
+      - name: Read lightweight production memory evidence
+        env:
+          SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          base = os.environ["SOLANA_ROI_PRODUCTION_URL"].rstrip("/")
+
+          def get(path):
+              req = urllib.request.Request(
+                  base + path,
+                  headers={"Accept": "application/json", "User-Agent": "solana-roi-memory-diagnostic/1"},
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          composition = get("/v1/operations/production-composition")
+          memory = composition.get("runtime_memory_capacity") or {}
+          print("PRODUCTION_COMPOSITION_MEMORY=" + json.dumps({
+              "authoritative_strategy_version": composition.get("authoritative_strategy_version"),
+              "authority_id": composition.get("authority_id"),
+              "paper_only": composition.get("paper_only"),
+              "live_money_authority": composition.get("live_money_authority"),
+              "cgroup_memory": memory.get("cgroup_memory"),
+              "cgroup_oom_forensics": memory.get("cgroup_oom_forensics"),
+          }, sort_keys=True), flush=True)
+
+          for path, label in (
+              ("/v1/strategy/e2e-status/cache", "E2E_CACHE"),
+              ("/v1/strategy/forward-certification/cache", "FORWARD_CACHE"),
+              ("/v1/strategy/production-proof/cache", "PRODUCTION_PROOF_CACHE"),
+          ):
+              try:
+                  print(label + "=" + json.dumps(get(path), sort_keys=True), flush=True)
+              except Exception as exc:
+                  print(label + "_ERROR=" + type(exc).__name__ + ":" + str(exc), flush=True)
+          PY
