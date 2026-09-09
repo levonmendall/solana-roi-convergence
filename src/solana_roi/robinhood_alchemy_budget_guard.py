@@ -14,7 +14,7 @@ from . import robinhood_chain_runtime as runtime
 from . import robinhood_provider_meter as meter
 
 
-GUARD_VERSION = "robinhood-alchemy-budget-guard-v1"
+GUARD_VERSION = "robinhood-alchemy-budget-guard-v2-provider-pool-aware"
 DEFAULT_TARGET_CU_PER_MINUTE = 600.0
 DEFAULT_BURST_CU = 500.0
 DEFAULT_BILLING_SAFETY_MULTIPLIER = 4.0
@@ -37,6 +37,7 @@ _STATS: dict[str, int | float | str | None] = {
     "budget_rejections": 0,
     "critical_bypasses": 0,
     "prospective_emergency_zeroes": 0,
+    "pool_failover_preserved_coverage": 0,
     "last_rejection_at": None,
 }
 
@@ -101,10 +102,35 @@ def _production_rpc_url(value: str) -> bool:
     return bool(configured and candidate == configured and candidate != public)
 
 
+def _healthy_backup_available() -> bool:
+    """Return True when a non-primary private provider is available for Robinhood.
+
+    Import lazily to avoid an import cycle: the provider-failover module imports this
+    guard to identify critical settlement priority. This helper is advisory only;
+    actual provider selection, chain-id verification, WSS generation re-anchoring,
+    and fail-closed authority remain owned by the failover layer.
+    """
+    try:
+        from . import robinhood_provider_failover as failover
+
+        providers = tuple(failover.providers())
+        active = failover.active_provider()
+        if active is None or len(providers) < 2:
+            return False
+        now = time.monotonic()
+        for item in providers:
+            if item.name == active.name:
+                continue
+            state = failover._PROVIDER_STATE.get(item.name, {})
+            cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
+            if cooldown_until <= now:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _estimated_billing_cu(method: str, params: list[Any]) -> float:
-    # Reuse the existing local estimator, then apply a second explicit calibration
-    # margin because production evidence proved that the estimator is not billing
-    # authoritative. This is deliberately configurable without changing strategy.
     byte_count = meter._json_size({"method": method, "params": params})
     local = meter._estimate_cu(byte_count=byte_count, base_cu=meter._http_base_cu())
     return max(1.0, local * _billing_safety_multiplier())
@@ -207,7 +233,6 @@ def _guarded_rpc(original: Callable[..., Awaitable[Any]]) -> Callable[..., Await
         async def execute() -> Any:
             result = await _perform_network_call(original, rpc_self, method, params)
             cache[key] = (time.monotonic(), result)
-            # Bound memory without relying on a background cleanup loop.
             if len(cache) > 512:
                 cutoff = time.monotonic() - max(1.0, ttl * 4.0)
                 for cache_key, item in list(cache.items()):
@@ -230,13 +255,7 @@ def _guarded_rpc(original: Callable[..., Awaitable[Any]]) -> Callable[..., Await
 
 
 def _guarded_control(self: Any, *, demand: int, open_positions: int) -> int:
-    """Emergency provider load always removes prospective live-market subscriptions.
-
-    The previous controller checked the quiet/single-candidate branch before its
-    emergency branch, so one hot prospective market could remain subscribed forever
-    while the provider was already over budget. Factory discovery is independent of
-    this cap, and open positions are still forced live by the selection layer.
-    """
+    """Protect Alchemy without suppressing Robinhood when another private provider exists."""
     if _ORIGINAL_CONTROL is None:
         return 0
     short_rate, long_rate, effective = adaptive._rates()
@@ -246,6 +265,18 @@ def _guarded_control(self: Any, *, demand: int, open_positions: int) -> int:
     emergency_until = float(getattr(self, "_roi_alchemy_emergency_until", 0.0) or 0.0)
 
     if effective >= target:
+        # In a healthy provider pool, Alchemy saturation is a provider-routing event,
+        # not a Robinhood opportunity-coverage event. Keep candidate capacity at the
+        # normal controller decision while the RPC failover layer moves requests to
+        # the backup provider and reanchors WSS authority. If no backup exists, retain
+        # the original fail-closed zero-cap behavior.
+        if _healthy_backup_available():
+            setattr(self, "_roi_alchemy_emergency_until", 0.0)
+            cap = int(_ORIGINAL_CONTROL(self, demand=demand, open_positions=open_positions))
+            state["last_change_reason"] = "provider_pool_preserved_coverage"
+            _bump("pool_failover_preserved_coverage")
+            return cap
+
         setattr(self, "_roi_alchemy_emergency_until", now + _emergency_cooldown_seconds())
         state["last_control_monotonic"] = now
         state["short_estimated_cu_per_minute"] = short_rate
@@ -256,15 +287,11 @@ def _guarded_control(self: Any, *, demand: int, open_positions: int) -> int:
         state["open_position_count"] = max(0, int(open_positions))
         state["prospective_lane_cap"] = 0
         state["last_change_monotonic"] = now
-        # Preserve the pre-existing adaptive-controller telemetry contract. The
-        # stronger v1 guard behavior is captured separately by the zero cap and
-        # prospective_emergency_zeroes counter, so downstream diagnostics do not
-        # need a reason-string migration to recognize the same emergency state.
         state["last_change_reason"] = "provider_budget_emergency"
         _bump("prospective_emergency_zeroes")
         return 0
 
-    if now < emergency_until:
+    if now < emergency_until and not _healthy_backup_available():
         state["prospective_lane_cap"] = 0
         state["last_change_reason"] = "provider_budget_emergency_cooldown"
         return 0
@@ -323,6 +350,7 @@ def status() -> dict[str, Any]:
         "critical_open_position_settlement_bypasses_budget": True,
         "factory_market_discovery_constrained": False,
         "prospective_live_market_emergency_zero_supported": True,
+        "provider_pool_preserves_coverage_when_backup_healthy": True,
         "public_research_rpc_governed": False,
         "strategy_authority_changed": False,
         "paper_only": True,
