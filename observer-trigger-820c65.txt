@@ -1,1 +1,1 @@
-Read-only observer trigger for exact live release 820c65ec70db56edaf004fc9d17713d9e7d36ff5. Diagnostic branch only; do not merge.
+Read-only observer retrigger on 2026-09-09 for current production certification boundary 2ab2437583894452fec0cbb79877361910cc895c. Diagnostic branch only; HTTP GET observation only; do not merge.
