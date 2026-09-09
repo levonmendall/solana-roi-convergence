@@ -14,13 +14,15 @@ from . import robinhood_chain_runtime as runtime
 from . import robinhood_provider_meter as meter
 
 
-GUARD_VERSION = "robinhood-alchemy-budget-guard-v1"
+GUARD_VERSION = "robinhood-alchemy-budget-guard-v2-provider-pool-aware"
 DEFAULT_TARGET_CU_PER_MINUTE = 600.0
 DEFAULT_BURST_CU = 500.0
 DEFAULT_BILLING_SAFETY_MULTIPLIER = 4.0
 DEFAULT_MAX_NONCRITICAL_WAIT_SECONDS = 1.5
 DEFAULT_ETH_CALL_CACHE_TTL_SECONDS = 0.75
 DEFAULT_EMERGENCY_COOLDOWN_SECONDS = 10.0
+DEFAULT_PROVIDER_POOL_LIVE_MARKET_CAP = 8
+MAX_PROVIDER_POOL_LIVE_MARKET_CAP = 16
 
 _INSTALLED = False
 _ORIGINAL_RPC: Callable[..., Awaitable[Any]] | None = None
@@ -37,6 +39,8 @@ _STATS: dict[str, int | float | str | None] = {
     "budget_rejections": 0,
     "critical_bypasses": 0,
     "prospective_emergency_zeroes": 0,
+    "provider_pool_capacity_decisions": 0,
+    "provider_pool_failovers_requested": 0,
     "last_rejection_at": None,
 }
 
@@ -94,17 +98,86 @@ def _emergency_cooldown_seconds() -> float:
     )
 
 
+def _provider_pool_live_market_cap() -> int:
+    raw = os.getenv("ROBINHOOD_PROVIDER_POOL_LIVE_MARKET_CAP")
+    if raw is None:
+        raw = str(DEFAULT_PROVIDER_POOL_LIVE_MARKET_CAP)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_PROVIDER_POOL_LIVE_MARKET_CAP
+    return max(1, min(MAX_PROVIDER_POOL_LIVE_MARKET_CAP, value))
+
+
+def _normalized(value: str) -> str:
+    return str(value or "").strip().rstrip("/").lower()
+
+
 def _production_rpc_url(value: str) -> bool:
-    configured = (os.getenv("ROBINHOOD_RPC_URL") or "").strip().rstrip("/").lower()
-    candidate = str(value or "").strip().rstrip("/").lower()
-    public = str(runtime.ROBINHOOD_PUBLIC_RPC).strip().rstrip("/").lower()
+    configured = _normalized(os.getenv("ROBINHOOD_RPC_URL") or "")
+    candidate = _normalized(value)
+    public = _normalized(runtime.ROBINHOOD_PUBLIC_RPC)
     return bool(configured and candidate == configured and candidate != public)
 
 
+def _provider_pool_capacity_mode() -> tuple[bool, bool]:
+    """Return (pool_available, active_is_non_alchemy).
+
+    The failover module imports this guard, so import it lazily.  A healthy active
+    non-Alchemy provider is sufficient even while Alchemy itself is cooling down.
+    When Alchemy is active, at least one eligible alternate private provider must
+    exist before its provider-specific meter is allowed to stop governing candidate
+    capacity.  Actual chain-id verification, HTTP/WSS generation switching and
+    paper-readiness remain owned by the failover/transport layers.
+    """
+    try:
+        from . import robinhood_provider_failover as failover
+
+        active = failover.active_provider()
+        items = tuple(failover.providers())
+        if active is None:
+            return False, False
+
+        alchemy_http = _normalized(os.getenv("ROBINHOOD_RPC_URL") or "")
+        active_is_non_alchemy = bool(alchemy_http and _normalized(active.http) != alchemy_http)
+        if active_is_non_alchemy:
+            return True, True
+
+        now = time.monotonic()
+        for item in items:
+            if item.name == active.name:
+                continue
+            state = failover._PROVIDER_STATE.get(item.name, {})
+            if float(state.get("cooldown_until", 0.0) or 0.0) <= now:
+                return True, False
+    except Exception:
+        return False, False
+    return False, False
+
+
+def _request_provider_failover_for_alchemy_pressure() -> bool:
+    """Move off Alchemy when its provider-specific meter is at the hard target."""
+    try:
+        from . import robinhood_provider_failover as failover
+
+        active = failover.active_provider()
+        if active is None or not _production_rpc_url(active.http):
+            return False
+        replacement = failover._switch_from(
+            active.name,
+            failure_type="AlchemyBudgetPressure",
+            immediate=True,
+            transport_kind="http",
+        )
+        if replacement is None or replacement.name == active.name:
+            return False
+        _bump("provider_pool_failovers_requested")
+        return True
+    except Exception:
+        return False
+
+
 def _estimated_billing_cu(method: str, params: list[Any]) -> float:
-    # Reuse the existing local estimator, then apply a second explicit calibration
-    # margin because production evidence proved that the estimator is not billing
-    # authoritative. This is deliberately configurable without changing strategy.
     byte_count = meter._json_size({"method": method, "params": params})
     local = meter._estimate_cu(byte_count=byte_count, base_cu=meter._http_base_cu())
     return max(1.0, local * _billing_safety_multiplier())
@@ -207,7 +280,6 @@ def _guarded_rpc(original: Callable[..., Awaitable[Any]]) -> Callable[..., Await
         async def execute() -> Any:
             result = await _perform_network_call(original, rpc_self, method, params)
             cache[key] = (time.monotonic(), result)
-            # Bound memory without relying on a background cleanup loop.
             if len(cache) > 512:
                 cutoff = time.monotonic() - max(1.0, ttl * 4.0)
                 for cache_key, item in list(cache.items()):
@@ -230,21 +302,46 @@ def _guarded_rpc(original: Callable[..., Awaitable[Any]]) -> Callable[..., Await
 
 
 def _guarded_control(self: Any, *, demand: int, open_positions: int) -> int:
-    """Emergency provider load always removes prospective live-market subscriptions.
-
-    The previous controller checked the quiet/single-candidate branch before its
-    emergency branch, so one hot prospective market could remain subscribed forever
-    while the provider was already over budget. Factory discovery is independent of
-    this cap, and open positions are still forced live by the selection layer.
-    """
+    """Protect Alchemy without making its budget a Robinhood opportunity bottleneck."""
     if _ORIGINAL_CONTROL is None:
         return 0
+
     short_rate, long_rate, effective = adaptive._rates()
     target = adaptive._target_cu_per_minute()
     state = adaptive._state(self)
     now = time.monotonic()
-    emergency_until = float(getattr(self, "_roi_alchemy_emergency_until", 0.0) or 0.0)
+    pool_available, active_is_non_alchemy = _provider_pool_capacity_mode()
 
+    if pool_available:
+        failover_requested = False
+        if effective >= target and not active_is_non_alchemy:
+            failover_requested = _request_provider_failover_for_alchemy_pressure()
+
+        total_cap = _provider_pool_live_market_cap()
+        prospective_cap = max(0, total_cap - max(0, int(open_positions)))
+        desired = min(max(0, int(demand)), prospective_cap)
+        previous = int(state.get("prospective_lane_cap", 0) or 0)
+        state["last_control_monotonic"] = now
+        state["short_estimated_cu_per_minute"] = short_rate
+        state["long_estimated_cu_per_minute"] = long_rate
+        state["effective_estimated_cu_per_minute"] = effective
+        state["estimated_headroom_cu_per_minute"] = max(0.0, target - effective)
+        state["ranked_demand"] = max(0, int(demand))
+        state["open_position_count"] = max(0, int(open_positions))
+        state["prospective_lane_cap"] = desired
+        state["provider_pool_total_live_market_cap"] = total_cap
+        state["provider_pool_capacity_mode"] = True
+        if desired != previous:
+            state["last_change_monotonic"] = now
+        state["last_change_reason"] = (
+            "provider_pool_alchemy_pressure_failover" if failover_requested else "provider_pool_capacity"
+        )
+        setattr(self, "_roi_alchemy_emergency_until", 0.0)
+        _bump("provider_pool_capacity_decisions")
+        return desired
+
+    state["provider_pool_capacity_mode"] = False
+    emergency_until = float(getattr(self, "_roi_alchemy_emergency_until", 0.0) or 0.0)
     if effective >= target:
         setattr(self, "_roi_alchemy_emergency_until", now + _emergency_cooldown_seconds())
         state["last_control_monotonic"] = now
@@ -256,10 +353,6 @@ def _guarded_control(self: Any, *, demand: int, open_positions: int) -> int:
         state["open_position_count"] = max(0, int(open_positions))
         state["prospective_lane_cap"] = 0
         state["last_change_monotonic"] = now
-        # Preserve the pre-existing adaptive-controller telemetry contract. The
-        # stronger v1 guard behavior is captured separately by the zero cap and
-        # prospective_emergency_zeroes counter, so downstream diagnostics do not
-        # need a reason-string migration to recognize the same emergency state.
         state["last_change_reason"] = "provider_budget_emergency"
         _bump("prospective_emergency_zeroes")
         return 0
@@ -311,6 +404,7 @@ def status() -> dict[str, Any]:
         _refill_locked(now)
         stats = dict(_STATS)
         tokens = float(_TOKENS)
+    pool_available, active_is_non_alchemy = _provider_pool_capacity_mode()
     return {
         "version": GUARD_VERSION,
         "installed": _INSTALLED,
@@ -320,9 +414,13 @@ def status() -> dict[str, Any]:
         "max_noncritical_wait_seconds": _max_wait_seconds(),
         "eth_call_cache_ttl_seconds": _cache_ttl_seconds(),
         "available_budget_tokens": tokens,
+        "provider_pool_live_market_cap": _provider_pool_live_market_cap(),
+        "provider_pool_capacity_available": pool_available,
+        "active_provider_is_non_alchemy": active_is_non_alchemy,
         "critical_open_position_settlement_bypasses_budget": True,
         "factory_market_discovery_constrained": False,
         "prospective_live_market_emergency_zero_supported": True,
+        "alchemy_budget_restricts_robinhood_when_pool_available": False,
         "public_research_rpc_governed": False,
         "strategy_authority_changed": False,
         "paper_only": True,
