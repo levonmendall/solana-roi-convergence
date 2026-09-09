@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sqlite3
 
@@ -27,12 +28,39 @@ class _Response:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class _SnapshotResponse:
+    def __init__(self, body: bytes, headers: dict[str, str]):
+        self._body = io.BytesIO(body)
+        self.headers = headers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body.read(size)
+
+
 class _ForbiddenLock:
     def __enter__(self):
         raise AssertionError("certification snapshot must not hold the live runtime store lock")
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+
+def _sqlite_payload(tmp_path) -> bytes:
+    path = tmp_path / "payload.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE evidence(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("INSERT INTO evidence(value) VALUES ('canonical')")
+        connection.commit()
+    finally:
+        connection.close()
+    return path.read_bytes()
 
 
 def test_split_runtime_keeps_only_local_forward_publisher(monkeypatch) -> None:
@@ -139,6 +167,18 @@ def test_snapshot_uses_pinned_read_transaction_without_runtime_store_lock(tmp_pa
     assert status["snapshot_single_flight"] is True
 
 
+def test_snapshot_disposal_advises_cache_release_before_unlink(tmp_path, monkeypatch) -> None:
+    snapshot = tmp_path / "snapshot.sqlite3"
+    snapshot.write_bytes(b"snapshot")
+    calls: list[str] = []
+    monkeypatch.setattr(split, "_drop_file_cache", lambda path: calls.append(path.name) or True)
+
+    split._dispose_snapshot(snapshot)
+
+    assert calls == ["snapshot.sqlite3"]
+    assert not snapshot.exists()
+
+
 def test_snapshot_deadline_aborts_instead_of_running_unbounded(tmp_path, monkeypatch) -> None:
     source = tmp_path / "canonical.sqlite3"
     target = tmp_path / "snapshot.sqlite3"
@@ -168,6 +208,92 @@ def test_snapshot_deadline_aborts_instead_of_running_unbounded(tmp_path, monkeyp
         assert "bounded deadline" in str(exc)
     else:
         raise AssertionError("snapshot backup should fail closed at its deadline")
+
+
+def test_certifier_download_validates_advertised_bytes_and_sqlite_geometry(tmp_path, monkeypatch) -> None:
+    body = _sqlite_payload(tmp_path)
+    monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
+    monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
+    monkeypatch.setattr(
+        certifier_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: _SnapshotResponse(
+            body,
+            {
+                "X-Release-Commit": "exact-release",
+                "X-Certification-Snapshot-Bytes": str(len(body)),
+                "Content-Length": str(len(body)),
+            },
+        ),
+    )
+    destination = tmp_path / "download.sqlite3"
+
+    release = certifier_service._download_snapshot(destination)
+
+    assert release == "exact-release"
+    assert destination.read_bytes() == body
+    with certifier_service._LOCK:
+        assert certifier_service._STATE["last_snapshot_expected_bytes"] == len(body)
+        assert certifier_service._STATE["last_snapshot_received_bytes"] == len(body)
+        assert certifier_service._STATE["last_snapshot_validation"] == "passed"
+
+
+def test_certifier_download_rejects_truncated_snapshot_before_child(tmp_path, monkeypatch) -> None:
+    body = _sqlite_payload(tmp_path)
+    truncated = body[:-4096]
+    monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
+    monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
+    monkeypatch.setattr(
+        certifier_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: _SnapshotResponse(
+            truncated,
+            {
+                "X-Release-Commit": "exact-release",
+                "X-Certification-Snapshot-Bytes": str(len(body)),
+                "Content-Length": str(len(body)),
+            },
+        ),
+    )
+    destination = tmp_path / "truncated.sqlite3"
+
+    try:
+        certifier_service._download_snapshot(destination)
+    except RuntimeError as exc:
+        assert "byte-count mismatch" in str(exc)
+    else:
+        raise AssertionError("truncated certification snapshot must fail closed")
+    with certifier_service._LOCK:
+        assert certifier_service._STATE["last_snapshot_validation"] == "failed"
+        assert certifier_service._STATE["last_snapshot_received_bytes"] == len(truncated)
+
+
+def test_certifier_download_rejects_header_length_disagreement(tmp_path, monkeypatch) -> None:
+    body = _sqlite_payload(tmp_path)
+    monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
+    monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
+    monkeypatch.setattr(
+        certifier_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: _SnapshotResponse(
+            body,
+            {
+                "X-Release-Commit": "exact-release",
+                "X-Certification-Snapshot-Bytes": str(len(body)),
+                "Content-Length": str(len(body) - 1),
+            },
+        ),
+    )
+
+    try:
+        certifier_service._download_snapshot(tmp_path / "mismatch.sqlite3")
+    except RuntimeError as exc:
+        assert "header-length mismatch" in str(exc)
+    else:
+        raise AssertionError("inconsistent snapshot transport headers must fail closed")
 
 
 def test_remote_certification_fails_closed_on_exact_release_mismatch(monkeypatch) -> None:
@@ -274,5 +400,7 @@ def test_split_status_preserves_paper_only_authority(monkeypatch) -> None:
     assert status["runtime_executes_local_forward_publisher"] is True
     assert status["forward_publication_interval_seconds"] == 15.0
     assert status["forward_publication_stale_seconds"] == 45.0
+    assert status["snapshot_file_cache_release_advisory"] is True
+    assert status["snapshot_response_cleanup_releases_cache"] is True
     assert status["snapshot_deadline_seconds"] > 0
     assert status["snapshot_free_reserve_bytes"] > 0

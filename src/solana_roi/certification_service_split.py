@@ -24,7 +24,7 @@ from . import production_proof_read_boundary_repair as production_proof
 from . import render_runtime_bootstrap_repair as render_bootstrap
 
 
-SPLIT_VERSION = "certification-service-split-v4-local-forward-freshness"
+SPLIT_VERSION = "certification-service-split-v5-snapshot-cache-release"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -276,6 +276,34 @@ def _snapshot_directory(store: Any) -> Path:
     return directory
 
 
+def _drop_file_cache(path: Path) -> bool:
+    """Best-effort file-specific cache release; never a correctness dependency."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    advice = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or advice is None:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fadvise(fd, 0, 0, advice)
+            return True
+        except OSError:
+            return False
+    finally:
+        os.close(fd)
+
+
+def _dispose_snapshot(path: Path) -> None:
+    _drop_file_cache(path)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _cleanup_stale_exports(directory: Path) -> int:
     removed = 0
     now = time.time()
@@ -289,7 +317,7 @@ def _cleanup_stale_exports(directory: Path) -> int:
                 continue
             if now - candidate.stat().st_mtime < DEFAULT_STALE_EXPORT_SECONDS:
                 continue
-            candidate.unlink(missing_ok=True)
+            _dispose_snapshot(candidate)
             removed += 1
         except OSError:
             continue
@@ -304,6 +332,8 @@ def _snapshot_store_to_file(store: Any, snapshot: Path) -> tuple[int, int]:
     moving source forever. Writes remain available; WAL growth is bounded by the
     explicit backup deadline. The destination is a temporary file on the runtime's
     existing persistent disk, not ``/tmp`` and never a certifier-mounted disk.
+    File-specific cache advice is issued after the copy so the 1+ GB proof export
+    does not unnecessarily remain charged to the authoritative runtime cgroup.
     """
     source_path = getattr(store, "path", None)
     if source_path is None:
@@ -351,6 +381,9 @@ def _snapshot_store_to_file(store: Any, snapshot: Path) -> tuple[int, int]:
             pass
         destination.close()
         source.close()
+        _drop_file_cache(source_path)
+        if snapshot.exists():
+            _drop_file_cache(snapshot)
 
 
 def _record_snapshot_result(
@@ -442,7 +475,7 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
             )
         except HTTPException:
             if snapshot is not None:
-                snapshot.unlink(missing_ok=True)
+                _dispose_snapshot(snapshot)
             _record_snapshot_result(
                 success=False,
                 started=started,
@@ -452,7 +485,7 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
             raise
         except Exception as exc:
             if snapshot is not None:
-                snapshot.unlink(missing_ok=True)
+                _dispose_snapshot(snapshot)
             _record_snapshot_result(
                 success=False,
                 started=started,
@@ -482,7 +515,7 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
                 "X-Certification-Snapshot-Bytes": str(size),
                 "X-Certification-Split-Version": SPLIT_VERSION,
             },
-            background=BackgroundTask(snapshot.unlink, missing_ok=True),
+            background=BackgroundTask(_dispose_snapshot, snapshot),
         )
 
 
@@ -539,6 +572,8 @@ def status() -> dict[str, Any]:
         "snapshot_uses_runtime_persistent_disk": True,
         "snapshot_shared_writable_disk": False,
         "snapshot_single_flight": True,
+        "snapshot_file_cache_release_advisory": True,
+        "snapshot_response_cleanup_releases_cache": True,
         "snapshot_deadline_seconds": _snapshot_deadline_seconds(),
         "snapshot_pages_per_step": _snapshot_pages_per_step(),
         "snapshot_step_sleep_seconds": _snapshot_step_sleep_seconds(),
@@ -593,6 +628,8 @@ def install_certification_service_split(app: Any, runtime_provider: Callable[[],
 __all__ = [
     "SPLIT_VERSION",
     "_cleanup_stale_exports",
+    "_dispose_snapshot",
+    "_drop_file_cache",
     "_snapshot_store_to_file",
     "install_certification_service_split",
     "split_runtime_enabled",

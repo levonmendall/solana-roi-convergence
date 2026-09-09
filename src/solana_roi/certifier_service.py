@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,7 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 
 
-SERVICE_VERSION = "isolated-certifier-service-v2-failure-diagnostics"
+SERVICE_VERSION = "isolated-certifier-service-v3-snapshot-transfer-integrity"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -36,6 +37,9 @@ _STATE: dict[str, Any] = {
     "last_completed_at_monotonic": None,
     "last_error_type": None,
     "last_snapshot_release": None,
+    "last_snapshot_expected_bytes": None,
+    "last_snapshot_received_bytes": None,
+    "last_snapshot_validation": None,
     "last_published_surfaces": [],
     "active_child_pid": None,
 }
@@ -50,6 +54,7 @@ _STALE_SECONDS = {
     "forward": 45.0,
     "production": 300.0,
 }
+_SQLITE_MAGIC = b"SQLite format 3\x00"
 
 
 def _release_commit() -> str:
@@ -186,6 +191,57 @@ def _publish_file(surface: str, path: Path, expected_release: str) -> bool:
     return True
 
 
+def _validate_sqlite_snapshot(path: Path, expected_bytes: int) -> int:
+    """Validate transfer completeness before a snapshot can reach the child process.
+
+    The runtime already creates the snapshot with SQLite's online-backup API. The
+    certifier therefore validates transport integrity here: exact advertised byte
+    count, SQLite header/page geometry, and a read-only schema open. This prevents a
+    truncated HTTP body from being mistaken for a valid point-in-time database while
+    avoiding a second full-database integrity scan before the bounded child starts.
+    """
+    actual_bytes = int(path.stat().st_size)
+    if expected_bytes <= 0:
+        raise RuntimeError("runtime snapshot advertised invalid byte count")
+    if actual_bytes != expected_bytes:
+        raise RuntimeError(
+            f"runtime snapshot byte-count mismatch:{actual_bytes}:{expected_bytes}"
+        )
+
+    with path.open("rb") as handle:
+        header = handle.read(100)
+    if len(header) < 100 or not header.startswith(_SQLITE_MAGIC):
+        raise RuntimeError("runtime snapshot SQLite header invalid")
+
+    page_size_raw = int.from_bytes(header[16:18], "big")
+    page_size = 65536 if page_size_raw == 1 else page_size_raw
+    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+        raise RuntimeError("runtime snapshot SQLite page size invalid")
+    header_page_count = int.from_bytes(header[28:32], "big")
+    if header_page_count <= 0:
+        raise RuntimeError("runtime snapshot SQLite page count invalid")
+    geometry_bytes = page_size * header_page_count
+    if geometry_bytes != actual_bytes:
+        raise RuntimeError(
+            f"runtime snapshot SQLite geometry mismatch:{actual_bytes}:{geometry_bytes}"
+        )
+
+    uri = f"file:{path.resolve()}?mode=ro&immutable=1"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(
+            f"runtime snapshot SQLite open failed:{type(exc).__name__}"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    return actual_bytes
+
+
 def _download_snapshot(destination: Path) -> str:
     base = _runtime_url()
     token = _token()
@@ -199,19 +255,58 @@ def _download_snapshot(destination: Path) -> str:
             "User-Agent": "solana-roi-isolated-certifier/1",
         },
     )
+    release = ""
+    expected_bytes: int | None = None
+    content_length: int | None = None
     try:
         with urllib.request.urlopen(request, timeout=60.0) as response:
             release = str(response.headers.get("X-Release-Commit") or "")
+            raw_expected = str(response.headers.get("X-Certification-Snapshot-Bytes") or "").strip()
+            if not raw_expected:
+                raise RuntimeError("runtime snapshot missing byte-count binding")
+            try:
+                expected_bytes = int(raw_expected)
+            except ValueError as exc:
+                raise RuntimeError("runtime snapshot byte-count binding invalid") from exc
+            raw_content_length = str(response.headers.get("Content-Length") or "").strip()
+            if raw_content_length:
+                try:
+                    content_length = int(raw_content_length)
+                except ValueError as exc:
+                    raise RuntimeError("runtime snapshot content-length invalid") from exc
+                if content_length != expected_bytes:
+                    raise RuntimeError(
+                        f"runtime snapshot header-length mismatch:{content_length}:{expected_bytes}"
+                    )
             with destination.open("wb") as handle:
                 shutil.copyfileobj(response, handle, length=1024 * 1024)
+    except RuntimeError:
+        raise
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise RuntimeError(f"runtime snapshot download failed:{type(exc).__name__}") from exc
+
     if not release:
         raise RuntimeError("runtime snapshot missing release binding")
     if release != _release_commit():
         raise RuntimeError(f"runtime snapshot release mismatch:{release}:{_release_commit()}")
-    if destination.stat().st_size <= 0:
-        raise RuntimeError("runtime snapshot is empty")
+    if expected_bytes is None:
+        raise RuntimeError("runtime snapshot missing validated byte count")
+
+    try:
+        actual_bytes = _validate_sqlite_snapshot(destination, expected_bytes)
+    except BaseException:
+        with _LOCK:
+            _STATE["last_snapshot_expected_bytes"] = expected_bytes
+            _STATE["last_snapshot_received_bytes"] = (
+                int(destination.stat().st_size) if destination.exists() else None
+            )
+            _STATE["last_snapshot_validation"] = "failed"
+        raise
+
+    with _LOCK:
+        _STATE["last_snapshot_expected_bytes"] = expected_bytes
+        _STATE["last_snapshot_received_bytes"] = actual_bytes
+        _STATE["last_snapshot_validation"] = "passed"
     return release
 
 
@@ -372,6 +467,13 @@ def health() -> dict[str, Any]:
         "shared_auth_configured": bool(_token()),
         "artifacts": freshness,
         "state": state,
+        "snapshot_transfer_integrity": {
+            "advertised_byte_count_required": True,
+            "content_length_cross_checked_when_present": True,
+            "sqlite_header_and_page_geometry_checked": True,
+            "read_only_schema_open_checked": True,
+            "full_integrity_scan_duplicated_before_child": False,
+        },
         "child_process_isolation": True,
         "shared_writable_disk": False,
         "paper_only": True,
@@ -413,4 +515,10 @@ def isolated_certifier_status(
     return health()
 
 
-__all__ = ["SERVICE_VERSION", "app", "health"]
+__all__ = [
+    "SERVICE_VERSION",
+    "_download_snapshot",
+    "_validate_sqlite_snapshot",
+    "app",
+    "health",
+]
