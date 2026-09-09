@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from solana_roi.robinhood_chain_paper import RobinhoodChainPaperPlane
 from solana_roi import robinhood_pumpfun_shadow_boundary as shadow
 from solana_roi.strategy_v51_authority import ECONOMIC_FREEZE_EPOCH
 from solana_roi.v51_robinhood_consolidation import refresh_robinhood_candidate_learning
+from solana_roi.v52_robinhood_position_lifecycle import STRESSED_EXIT_COVERAGE_RATIO
 
 
 def _plane(tmp_path, monkeypatch) -> RobinhoodChainPaperPlane:
@@ -189,7 +191,25 @@ def test_real_production_robinhood_path_reaches_entry_settlement_and_learning(tm
     )
     plane._quote_v3_round_trip = AsyncMock(return_value=_quote())
 
+    # v5.2 now requires exact aggregate-position exitability and the frozen
+    # stressed-capacity proof before a Robinhood paper lot can be persisted. The
+    # E2E therefore supplies the same exact sell-quote seam the live runtime uses;
+    # it does not bypass or weaken either gate.
+    plane.rpc.gas_price = AsyncMock(return_value=1)
+    plane.rpc.v3_quote_exact_input = AsyncMock(
+        side_effect=lambda **kwargs: (max(1, int(kwargs["amount_in"]) // 100), 1)
+    )
+
     asyncio.run(plane._maybe_open_v3(pool, current_block=100))
+
+    entry_quote_amounts = [
+        int(call.kwargs["amount_in"])
+        for call in plane.rpc.v3_quote_exact_input.await_args_list
+    ]
+    aggregate_raw = int(_quote()["token_out"])
+    stress_raw = int(math.ceil(aggregate_raw * STRESSED_EXIT_COVERAGE_RATIO))
+    assert entry_quote_amounts[:2] == [aggregate_raw, stress_raw]
+    assert stress_raw > 2 * aggregate_raw
 
     with plane.store._lock, plane.store.db:
         trial_row = plane.store.db.execute(
@@ -205,17 +225,39 @@ def test_real_production_robinhood_path_reaches_entry_settlement_and_learning(tm
         assert int(ledger["trial_id"]) == trial_id
         assert ledger["economic_freeze_epoch"] == ECONOMIC_FREEZE_EPOCH
 
+        position = plane.store.db.execute(
+            "SELECT * FROM v52_robinhood_positions WHERE token=? LIMIT 1",
+            (pool.token,),
+        ).fetchone()
+        lot = plane.store.db.execute(
+            "SELECT * FROM v52_robinhood_position_lots WHERE trial_id=? LIMIT 1",
+            (trial_id,),
+        ).fetchone()
+        entry_event = plane.store.db.execute(
+            "SELECT * FROM v52_robinhood_position_events WHERE event_type='starter' LIMIT 1"
+        ).fetchone()
+        assert position is not None
+        assert lot is not None
+        assert entry_event is not None
+        assert int(position["paper_only"]) == 1
+        assert int(position["live_money_authority"]) == 0
+        assert int(lot["remaining_token_raw"]) == aggregate_raw
+
         opened = (datetime.now(timezone.utc) - timedelta(seconds=MAX_HOLD_SECONDS + 1)).isoformat()
         plane.store.db.execute(
             "UPDATE robinhood_paper_trials SET opened_at=? WHERE id=?",
             (opened, trial_id),
         )
+        plane.store.db.execute(
+            "UPDATE v52_robinhood_positions SET opened_at=?,updated_at=? WHERE id=?",
+            (opened, opened, int(position["id"])),
+        )
         trial = dict(
             plane.store.db.execute("SELECT * FROM robinhood_paper_trials WHERE id=?", (trial_id,)).fetchone()
         )
 
-    plane.rpc.gas_price = AsyncMock(return_value=1)
-    plane.rpc.v3_quote_exact_input = AsyncMock(side_effect=RuntimeError("forced max-hold no-route"))
+    # Keep exact routing available through settlement. Max-hold is an economic
+    # exit trigger, not permission to settle without an executable quote.
     asyncio.run(plane._settle_one(trial))
     refresh_robinhood_candidate_learning(plane.store)
 
@@ -223,7 +265,21 @@ def test_real_production_robinhood_path_reaches_entry_settlement_and_learning(tm
         outcome = plane.store.db.execute(
             "SELECT * FROM robinhood_paper_outcomes WHERE trial_id=? LIMIT 1", (trial_id,)
         ).fetchone()
+        position_after = plane.store.db.execute(
+            "SELECT status,remaining_fraction,remaining_token_raw,close_reason "
+            "FROM v52_robinhood_positions WHERE token=? ORDER BY id DESC LIMIT 1",
+            (pool.token,),
+        ).fetchone()
+        exit_event = plane.store.db.execute(
+            "SELECT event_type,state_after FROM v52_robinhood_position_events "
+            "WHERE event_type='full_exit' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
         assert outcome is not None
+        assert position_after is not None
+        assert position_after["status"] == "closed"
+        assert float(position_after["remaining_fraction"]) == 0.0
+        assert int(position_after["remaining_token_raw"]) == 0
+        assert exit_event is not None and exit_event["state_after"] == "closed"
         stages = {
             str(row["stage"]): str(row["status"])
             for row in plane.store.db.execute(
