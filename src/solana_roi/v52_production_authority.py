@@ -36,6 +36,16 @@ COMPOSITION_VERSION = "v52-explicit-production-authority-v5-robinhood-lifecycle-
 _INSTALLED = False
 
 
+def _copy_robinhood_lineage(wrapper: Any, predecessor: Any) -> None:
+    """Expose only real predecessor lineage on the final production wrapper."""
+    if not callable(predecessor):
+        raise RuntimeError("v52 Robinhood lifecycle predecessor unavailable")
+    setattr(wrapper, "__wrapped__", predecessor)
+    for name, value in vars(predecessor).items():
+        if name.startswith("_roi_") and not hasattr(wrapper, name):
+            setattr(wrapper, name, value)
+
+
 def _bind_concrete_robinhood_lifecycle_owner() -> None:
     """Bind the final chooser at the concrete composed production class.
 
@@ -43,8 +53,9 @@ def _bind_concrete_robinhood_lifecycle_owner() -> None:
     composed. Patching only the source mixin is therefore insufficient: the
     concrete class can legitimately shadow the mixin and continue resolving its
     previously composed chooser. Capture that exact predecessor and put the v5.2
-    lifecycle wrapper at the concrete boundary as well. If normal MRO lookup
-    already resolves the lifecycle wrapper, this is a no-op.
+    lifecycle wrapper at the concrete boundary as well. The predecessor's real
+    reachability markers remain visible for architecture introspection; no marker
+    is manufactured by this layer.
     """
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
@@ -53,18 +64,14 @@ def _bind_concrete_robinhood_lifecycle_owner() -> None:
     if current is final_wrapper:
         return
     setattr(robinhood_lifecycle, "_BASE_CHOOSE", current)
+    _copy_robinhood_lineage(final_wrapper, current)
     RobinhoodChainPaperPlane._v5_choose_lane_fraction = final_wrapper  # type: ignore[method-assign]
     setattr(RobinhoodChainPaperPlane._v5_choose_lane_fraction, "_roi_v52_final_authority", True)
     setattr(RobinhoodChainPaperPlane._v5_choose_lane_fraction, "_roi_v52_position_lifecycle", True)
 
 
 def _preserve_robinhood_wrapper_contracts() -> None:
-    """Keep predecessor reachability markers visible on the final v5.2 wrapper.
-
-    The lifecycle layer deliberately wraps the fully composed Robinhood plane.
-    Preserve the predecessor chain for architecture introspection so final v5.2
-    ownership cannot hide the already-proven pre-lane coverage wrappers beneath it.
-    """
+    """Keep predecessor reachability markers visible on final v5.2 entry wrappers."""
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
     pairs = (
@@ -78,12 +85,7 @@ def _preserve_robinhood_wrapper_contracts() -> None:
         ),
     )
     for wrapper, predecessor in pairs:
-        if not callable(predecessor):
-            raise RuntimeError("v52 Robinhood lifecycle predecessor unavailable")
-        setattr(wrapper, "__wrapped__", predecessor)
-        for name, value in vars(predecessor).items():
-            if name.startswith("_roi_") and not hasattr(wrapper, name):
-                setattr(wrapper, name, value)
+        _copy_robinhood_lineage(wrapper, predecessor)
 
 
 def install_v52_production_authority(
