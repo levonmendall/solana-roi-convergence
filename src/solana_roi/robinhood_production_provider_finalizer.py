@@ -30,13 +30,17 @@ from .robinhood_provider_budget_transport import (
     install_robinhood_provider_budget_transport,
     status as provider_budget_transport_status,
 )
+from .robinhood_provider_failover import (
+    install_robinhood_provider_failover,
+    status as provider_failover_status,
+)
 from .robinhood_usage_bounded_transport import (
     install_robinhood_usage_bounded_transport,
     status as usage_bounded_transport_status,
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v8-hard-alchemy-budget"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v9-provider-failover"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -88,7 +92,7 @@ async def _final_fresh_ready(self: Any) -> bool:
 
     Isolated unit/regression calls that never start the production worker retain the
     historical fresh-head helper. Once ``run()`` starts, every entry decision is
-    governed by the production RPC/WebSocket transport and frozen v5.1 event-age
+    governed by the production RPC/WebSocket transport and the canonical event-age
     ceiling. This keeps compatibility tests meaningful without allowing public
     research transport to authorize actual production paper entries.
     """
@@ -119,19 +123,21 @@ def install_robinhood_production_provider_finalizer(
     *,
     legacy_fresh_ready: Callable[[Any], Awaitable[bool]],
 ) -> None:
-    """Install the provider transport after every sequencer/legacy wrapper.
+    """Install the final production provider authority chain.
 
-    The provider-budget plane patches only acquisition mechanics before the bounded
-    production transport is installed: all persisted candidates are screened on a
-    research-only public plane, known factories stay continuously discoverable, and
-    Alchemy is reserved for a small prospective live shortlist plus open positions.
-    Event-driven settlement removes redundant exact provider quotes. The adaptive lane
-    controller varies prospective Alchemy capacity according to locally metered load.
-    The hard Alchemy guard is installed last: duplicate ``eth_call`` reads are coalesced,
-    sustained noncritical HTTP work is budgeted, open-position settlement is reserved as
-    critical, and an emergency can drive prospective subscriptions to zero without
-    removing factory discovery or forced-live open positions. The HTTP getLogs provider
-    guard remains independent. Strategy economics and v5.2 authority are unchanged.
+    Broad discovery remains on the research-only public plane while bounded private
+    WebSocket subscriptions carry only the prospective live shortlist and open
+    positions. The hard Alchemy budget guard coalesces duplicate ``eth_call`` work,
+    budgets noncritical reads, and reserves open-position settlement as critical.
+
+    Provider failover is deliberately installed *after* that guard so quota/budget
+    exhaustion, 429s, provider 5xx/transport failures, or repeated WebSocket failures
+    can move the complete private HTTP/WSS pair to a configured backup. A switch
+    invalidates the old provider generation immediately; paper-entry readiness stays
+    false until the replacement WebSocket has verified Robinhood chain id 4663 and
+    re-established the bounded subscription. Public RPC/sequencer transport never
+    enters the authoritative provider pool. Strategy economics and v5.2 authority are
+    unchanged, and signing/submission/live-money capability remains absent.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
@@ -154,6 +160,9 @@ def install_robinhood_production_provider_finalizer(
     install_robinhood_event_driven_settlement(plane_cls)
     install_robinhood_adaptive_lane_controller(plane_cls)
     install_robinhood_alchemy_budget_guard(plane_cls)
+    # Outermost provider wrapper: catches provider/budget failures emitted by the
+    # guarded RPC path and coordinates the HTTP + WSS generation switch.
+    install_robinhood_provider_failover()
 
     current_run = plane_cls.run
     if not bool(getattr(current_run, "_roi_robinhood_production_provider_finalizer", False)):
@@ -180,6 +189,7 @@ def status() -> dict[str, Any]:
         "event_driven_settlement": event_driven_settlement_status(),
         "adaptive_lane_controller": adaptive_lane_controller_status(),
         "alchemy_budget_guard": alchemy_budget_guard_status(),
+        "provider_failover": provider_failover_status(),
         "canonical_latency_hard_max_seconds": production_transport.canonical_latency_hard_max_seconds(),
         "legacy_two_block_gate_has_production_authority": False,
         "paper_only": True,
