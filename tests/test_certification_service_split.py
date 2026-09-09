@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sqlite3
 
@@ -25,6 +26,24 @@ class _Response:
 
     def read(self) -> bytes:
         return json.dumps(self.payload).encode("utf-8")
+
+
+class _BinaryResponse:
+    def __init__(self, payload: bytes, *, release: str, declared_bytes: int | None = None):
+        self._stream = io.BytesIO(payload)
+        self.headers = {
+            "X-Release-Commit": release,
+            "X-Certification-Snapshot-Bytes": str(len(payload) if declared_bytes is None else declared_bytes),
+        }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
 
 
 class _ForbiddenLock:
@@ -255,6 +274,79 @@ def test_isolated_certifier_publishes_only_exact_release_artifact(tmp_path, monk
     assert payload["release_commit"] == "exact-release"
     assert payload["isolated_certifier"]["child_process_isolation"] is True
     assert payload["isolated_certifier"]["shared_writable_disk"] is False
+
+
+def _valid_sqlite_bytes(tmp_path) -> bytes:
+    source = tmp_path / "valid-transfer.sqlite3"
+    connection = sqlite3.connect(source)
+    try:
+        connection.execute("CREATE TABLE evidence(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("INSERT INTO evidence(value) VALUES ('valid')")
+        connection.commit()
+    finally:
+        connection.close()
+    return source.read_bytes()
+
+
+def test_certifier_download_requires_exact_byte_length_and_valid_sqlite(tmp_path, monkeypatch) -> None:
+    payload = _valid_sqlite_bytes(tmp_path)
+    monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
+    monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
+    monkeypatch.setenv("SOLANA_ROI_CERTIFIER_SNAPSHOT_HTTP_TIMEOUT_SECONDS", "88")
+    monkeypatch.setattr(
+        certifier_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: _BinaryResponse(payload, release="exact-release"),
+    )
+
+    destination = tmp_path / "download.sqlite3"
+    release = certifier_service._download_snapshot(destination)
+    assert release == "exact-release"
+    assert destination.read_bytes() == payload
+    assert certifier_service._snapshot_http_timeout_seconds() == 88.0
+
+
+def test_certifier_download_rejects_truncated_transfer_before_child_start(tmp_path, monkeypatch) -> None:
+    payload = _valid_sqlite_bytes(tmp_path)
+    monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
+    monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
+    monkeypatch.setattr(
+        certifier_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: _BinaryResponse(
+            payload[:-4096],
+            release="exact-release",
+            declared_bytes=len(payload),
+        ),
+    )
+
+    try:
+        certifier_service._download_snapshot(tmp_path / "truncated.sqlite3")
+    except RuntimeError as exc:
+        assert "snapshot size mismatch" in str(exc)
+    else:
+        raise AssertionError("truncated certification snapshot must fail closed")
+
+
+def test_certifier_download_rejects_non_sqlite_payload(tmp_path, monkeypatch) -> None:
+    payload = b"x" * 4096
+    monkeypatch.setenv("SOLANA_ROI_RUNTIME_URL", "https://runtime.invalid")
+    monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "exact-release")
+    monkeypatch.setattr(
+        certifier_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: _BinaryResponse(payload, release="exact-release"),
+    )
+
+    try:
+        certifier_service._download_snapshot(tmp_path / "invalid.sqlite3")
+    except RuntimeError as exc:
+        assert "invalid SQLite header" in str(exc)
+    else:
+        raise AssertionError("non-SQLite certification snapshot must fail closed")
 
 
 def test_split_status_preserves_paper_only_authority(monkeypatch) -> None:
