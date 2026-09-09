@@ -164,23 +164,25 @@ def test_future_cohort_lineage_uses_v52_not_legacy_baseline(tmp_path) -> None:
         store.close()
 
 
-def test_context_accessibility_reads_current_v52_policy() -> None:
-    # The installer replaces the legacy BASELINE chase dependency with the active
-    # governed v5.2 execution policy. The row is exactly on the live authority
-    # boundary, so it must not be rejected as outside_max_chase.
-    active = execution_policy()
-    max_chase = float(active["chase_observe_only_above_fraction"])
-    max_latency = float(active["latency_hard_max_seconds"])
-    result = wallet_context_router.classify_observation_accessibility(
-        {
-            "venue": "PUMP_FUN",
-            "lifecycle_stage": wallet_context_router.PUMP_BONDING_CURVE,
-            "copyable": True,
-            "observation_lag_ms": min(max_latency, 1.0) * 1000.0,
-            "processing_delay_ms": 0.0,
-            "chase_fraction": max_chase,
-        }
-    )
-    assert result["structurally_accessible"] is True
-    assert result["authority_max_chase_fraction"] == max_chase
-    assert "outside_max_chase" not in result["reasons"]
+def test_context_accessibility_reads_current_v52_policy(tmp_path) -> None:
+    store, _rpc, runtime = _runtime(tmp_path)
+    try:
+        install_v52_wallet_production_alignment(runtime)
+        active = execution_policy()
+        max_chase = float(active["chase_observe_only_above_fraction"])
+        max_latency = float(active["latency_hard_max_seconds"])
+        result = wallet_context_router.classify_observation_accessibility(
+            {
+                "venue": "PUMP_FUN",
+                "lifecycle_stage": wallet_context_router.PUMP_BONDING_CURVE,
+                "copyable": True,
+                "observation_lag_ms": min(max_latency, 1.0) * 1000.0,
+                "processing_delay_ms": 0.0,
+                "chase_fraction": max_chase,
+            }
+        )
+        assert result["structurally_accessible"] is True
+        assert result["authority_max_chase_fraction"] == max_chase
+        assert "outside_max_chase" not in result["reasons"]
+    finally:
+        store.close()
