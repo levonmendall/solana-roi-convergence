@@ -99,6 +99,23 @@ def test_alchemy_budget_exhaustion_immediately_fails_over_and_verifies_chain(mon
     ]
 
 
+def test_provider_json_rpc_quota_error_immediately_fails_over(monkeypatch) -> None:
+    _pool(monkeypatch)
+
+    async def original(rpc_self, method, params):
+        if "alchemy.com" in rpc_self.rpc_url:
+            raise RuntimeError("eth_call: request limit exceeded for current quota")
+        if method == "eth_chainId":
+            return hex(failover.runtime.ROBINHOOD_CHAIN_ID)
+        return "0xcafe"
+
+    wrapped = failover._rpc_wrapper(original)
+    rpc = SimpleNamespace(rpc_url=failover.active_provider().http)
+
+    assert asyncio.run(wrapped(rpc, "eth_call", [])) == "0xcafe"
+    assert failover.active_name() == "chainstack"
+
+
 def test_application_error_does_not_trigger_provider_failover(monkeypatch) -> None:
     _pool(monkeypatch)
 
@@ -166,24 +183,40 @@ def test_reader_ready_requires_active_provider_generation(monkeypatch) -> None:
     assert wrapped(plane) is False
 
 
-def test_default_rpc_uses_private_pool_while_explicit_public_rpc_remains_research(monkeypatch) -> None:
+def test_rpc_constructor_preserves_keyword_contract_and_public_research(monkeypatch) -> None:
     _pool(monkeypatch)
 
     class FakeRpc:
         def __init__(self) -> None:
             self.rpc_url = ""
 
-    def original(self, rpc_url_arg=None, *, timeout_seconds=4.0):
-        self.rpc_url = rpc_url_arg or failover.runtime.ROBINHOOD_PUBLIC_RPC
+    def original(self, rpc_url=None, *, timeout_seconds=4.0):
+        self.rpc_url = rpc_url or failover.runtime.ROBINHOOD_PUBLIC_RPC
 
     wrapped = failover._init_wrapper(original)
     default = FakeRpc()
-    wrapped(default, None)
+    wrapped(default, rpc_url=None, timeout_seconds=3.0)
     public = FakeRpc()
-    wrapped(public, failover.runtime.ROBINHOOD_PUBLIC_RPC)
+    wrapped(
+        public,
+        rpc_url=failover.runtime.ROBINHOOD_PUBLIC_RPC,
+        timeout_seconds=3.0,
+    )
 
     assert default.rpc_url == "https://robinhood-mainnet.g.alchemy.com/v2/redacted"
     assert public.rpc_url == failover.runtime.ROBINHOOD_PUBLIC_RPC
+
+
+def test_alchemy_budget_classifier_does_not_throttle_chainstack_backup(monkeypatch) -> None:
+    _pool(monkeypatch)
+    failover.install_robinhood_provider_failover()
+
+    assert failover.alchemy_guard._production_rpc_url(
+        "https://robinhood-mainnet.g.alchemy.com/v2/redacted"
+    ) is True
+    assert failover.alchemy_guard._production_rpc_url(
+        "https://nd-123-456.p2pify.com/redacted"
+    ) is False
 
 
 def test_status_redacts_provider_endpoints_and_preserves_paper_only_authority(monkeypatch) -> None:
@@ -202,5 +235,6 @@ def test_status_redacts_provider_endpoints_and_preserves_paper_only_authority(mo
     assert status["live_money_authority"] is False
     assert status["signing_available"] is False
     assert status["transaction_submission_available"] is False
+    assert status["alchemy_budget_applies_by_provider_hostname"] is True
     assert "redacted" not in encoded
     assert "p2pify.com" not in encoded
