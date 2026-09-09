@@ -24,7 +24,7 @@ from . import production_proof_read_boundary_repair as production_proof
 from . import render_runtime_bootstrap_repair as render_bootstrap
 
 
-SPLIT_VERSION = "certification-service-split-v5-snapshot-cache-release"
+SPLIT_VERSION = "certification-service-split-v6-incremental-replica"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -82,90 +82,42 @@ def _shared_token() -> str:
 
 def _remote_timeout() -> float:
     try:
-        return max(
-            0.5,
-            float(
-                os.getenv(
-                    "SOLANA_ROI_CERTIFIER_HTTP_TIMEOUT_SECONDS",
-                    str(DEFAULT_REMOTE_TIMEOUT_SECONDS),
-                )
-            ),
-        )
+        return max(0.5, float(os.getenv("SOLANA_ROI_CERTIFIER_HTTP_TIMEOUT_SECONDS", str(DEFAULT_REMOTE_TIMEOUT_SECONDS))))
     except ValueError:
         return DEFAULT_REMOTE_TIMEOUT_SECONDS
 
 
 def _snapshot_max_bytes() -> int:
     try:
-        return max(
-            64 * 1024 * 1024,
-            int(
-                os.getenv(
-                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_MAX_BYTES",
-                    str(DEFAULT_SNAPSHOT_MAX_BYTES),
-                )
-            ),
-        )
+        return max(64 * 1024 * 1024, int(os.getenv("SOLANA_ROI_CERTIFICATION_SNAPSHOT_MAX_BYTES", str(DEFAULT_SNAPSHOT_MAX_BYTES))))
     except ValueError:
         return DEFAULT_SNAPSHOT_MAX_BYTES
 
 
 def _snapshot_pages_per_step() -> int:
     try:
-        return max(
-            64,
-            int(
-                os.getenv(
-                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_PAGES_PER_STEP",
-                    str(DEFAULT_SNAPSHOT_PAGES_PER_STEP),
-                )
-            ),
-        )
+        return max(64, int(os.getenv("SOLANA_ROI_CERTIFICATION_SNAPSHOT_PAGES_PER_STEP", str(DEFAULT_SNAPSHOT_PAGES_PER_STEP))))
     except ValueError:
         return DEFAULT_SNAPSHOT_PAGES_PER_STEP
 
 
 def _snapshot_step_sleep_seconds() -> float:
     try:
-        return max(
-            0.0,
-            float(
-                os.getenv(
-                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_STEP_SLEEP_SECONDS",
-                    str(DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS),
-                )
-            ),
-        )
+        return max(0.0, float(os.getenv("SOLANA_ROI_CERTIFICATION_SNAPSHOT_STEP_SLEEP_SECONDS", str(DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS))))
     except ValueError:
         return DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS
 
 
 def _snapshot_deadline_seconds() -> float:
     try:
-        return max(
-            5.0,
-            float(
-                os.getenv(
-                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_DEADLINE_SECONDS",
-                    str(DEFAULT_SNAPSHOT_DEADLINE_SECONDS),
-                )
-            ),
-        )
+        return max(5.0, float(os.getenv("SOLANA_ROI_CERTIFICATION_SNAPSHOT_DEADLINE_SECONDS", str(DEFAULT_SNAPSHOT_DEADLINE_SECONDS))))
     except ValueError:
         return DEFAULT_SNAPSHOT_DEADLINE_SECONDS
 
 
 def _snapshot_free_reserve_bytes() -> int:
     try:
-        return max(
-            64 * 1024 * 1024,
-            int(
-                os.getenv(
-                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_FREE_RESERVE_BYTES",
-                    str(DEFAULT_SNAPSHOT_FREE_RESERVE_BYTES),
-                )
-            ),
-        )
+        return max(64 * 1024 * 1024, int(os.getenv("SOLANA_ROI_CERTIFICATION_SNAPSHOT_FREE_RESERVE_BYTES", str(DEFAULT_SNAPSHOT_FREE_RESERVE_BYTES))))
     except ValueError:
         return DEFAULT_SNAPSHOT_FREE_RESERVE_BYTES
 
@@ -186,19 +138,17 @@ def _failed_closed(path: str, reason: str) -> dict[str, Any]:
         payload = production_proof._fail_closed_payload(reason)
     boundary = payload.setdefault("certification_service_split", {})
     if isinstance(boundary, dict):
-        boundary.update(
-            {
-                "split_version": SPLIT_VERSION,
-                "state": "failed_closed",
-                "reason": str(reason),
-                "runtime_executes_local_certification_builders": False,
-                "remote_certifier_required": True,
-                "paper_only": True,
-                "live_money_authority": False,
-                "signing_available": False,
-                "transaction_submission_available": False,
-            }
-        )
+        boundary.update({
+            "split_version": SPLIT_VERSION,
+            "state": "failed_closed",
+            "reason": str(reason),
+            "runtime_executes_local_certification_builders": False,
+            "remote_certifier_required": True,
+            "paper_only": True,
+            "live_money_authority": False,
+            "signing_available": False,
+            "transaction_submission_available": False,
+        })
     return payload
 
 
@@ -207,14 +157,9 @@ def _remote_surface(path: str) -> dict[str, Any]:
     token = _shared_token()
     if not base or not token:
         return _failed_closed(path, "certification_service_split_not_configured")
-
     request = urllib.request.Request(
         f"{base}{path}",
-        headers={
-            "Accept": "application/json",
-            "X-Certification-Token": token,
-            "User-Agent": "solana-roi-authoritative-runtime/1",
-        },
+        headers={"Accept": "application/json", "X-Certification-Token": token, "User-Agent": "solana-roi-authoritative-runtime/1"},
     )
     try:
         with urllib.request.urlopen(request, timeout=_remote_timeout()) as response:
@@ -223,30 +168,23 @@ def _remote_surface(path: str) -> dict[str, Any]:
         return _failed_closed(path, "remote_certification_service_unavailable")
     if not isinstance(payload, dict):
         return _failed_closed(path, "remote_certification_service_invalid_payload")
-
     expected = _release_commit()
     observed = _surface_release(path, payload)
     if not observed or observed != expected:
-        return _failed_closed(
-            path,
-            f"remote_certification_release_mismatch:{observed or 'missing'}:{expected}",
-        )
-
+        return _failed_closed(path, f"remote_certification_release_mismatch:{observed or 'missing'}:{expected}")
     boundary = payload.setdefault("certification_service_split", {})
     if isinstance(boundary, dict):
-        boundary.update(
-            {
-                "split_version": SPLIT_VERSION,
-                "state": "ready",
-                "release_commit": expected,
-                "runtime_executes_local_certification_builders": False,
-                "remote_certifier_required": True,
-                "paper_only": True,
-                "live_money_authority": False,
-                "signing_available": False,
-                "transaction_submission_available": False,
-            }
-        )
+        boundary.update({
+            "split_version": SPLIT_VERSION,
+            "state": "ready",
+            "release_commit": expected,
+            "runtime_executes_local_certification_builders": False,
+            "remote_certifier_required": True,
+            "paper_only": True,
+            "live_money_authority": False,
+            "signing_available": False,
+            "transaction_submission_available": False,
+        })
     return payload
 
 
@@ -254,10 +192,8 @@ def _replace_get_route(app: Any, path: str) -> None:
     route = next((candidate for candidate in app.routes if getattr(candidate, "path", None) == path), None)
     if route is None:
         raise RuntimeError(f"certification split route not found: {path}")
-
     def endpoint() -> dict[str, Any]:
         return _remote_surface(path)
-
     setattr(endpoint, "_roi_remote_certification_proxy", True)
     route.endpoint = endpoint
     dependant = getattr(route, "dependant", None)
@@ -277,7 +213,6 @@ def _snapshot_directory(store: Any) -> Path:
 
 
 def _drop_file_cache(path: Path) -> bool:
-    """Best-effort file-specific cache release; never a correctness dependency."""
     fadvise = getattr(os, "posix_fadvise", None)
     advice = getattr(os, "POSIX_FADV_DONTNEED", None)
     if fadvise is None or advice is None:
@@ -313,9 +248,7 @@ def _cleanup_stale_exports(directory: Path) -> int:
         return 0
     for candidate in candidates:
         try:
-            if not candidate.is_file():
-                continue
-            if now - candidate.stat().st_mtime < DEFAULT_STALE_EXPORT_SECONDS:
+            if not candidate.is_file() or now - candidate.stat().st_mtime < DEFAULT_STALE_EXPORT_SECONDS:
                 continue
             _dispose_snapshot(candidate)
             removed += 1
@@ -325,23 +258,12 @@ def _cleanup_stale_exports(directory: Path) -> int:
 
 
 def _snapshot_store_to_file(store: Any, snapshot: Path) -> tuple[int, int]:
-    """Create one bounded, immutable SQLite certification snapshot.
-
-    A dedicated read-only connection pins a WAL read transaction before backup so
-    a continuously mutating production database cannot force the backup to chase a
-    moving source forever. Writes remain available; WAL growth is bounded by the
-    explicit backup deadline. The destination is a temporary file on the runtime's
-    existing persistent disk, not ``/tmp`` and never a certifier-mounted disk.
-    File-specific cache advice is issued after the copy so the 1+ GB proof export
-    does not unnecessarily remain charged to the authoritative runtime cgroup.
-    """
     source_path = getattr(store, "path", None)
     if source_path is None:
         raise RuntimeError("canonical runtime store path unavailable")
     source_path = Path(source_path)
     if not source_path.is_file():
         raise RuntimeError("canonical runtime SQLite file unavailable")
-
     source_uri = f"file:{source_path.resolve()}?mode=ro"
     source = sqlite3.connect(source_uri, uri=True, timeout=5.0)
     destination = sqlite3.connect(snapshot)
@@ -356,22 +278,13 @@ def _snapshot_store_to_file(store: Any, snapshot: Path) -> tuple[int, int]:
         estimated_bytes = page_count * page_size
         if estimated_bytes > _snapshot_max_bytes():
             raise RuntimeError("canonical certification snapshot exceeds configured bounded export")
-
         free_bytes = int(shutil.disk_usage(snapshot.parent).free)
-        required_free = estimated_bytes + _snapshot_free_reserve_bytes()
-        if free_bytes < required_free:
+        if free_bytes < estimated_bytes + _snapshot_free_reserve_bytes():
             raise OSError("insufficient bounded certification snapshot disk headroom")
-
         def progress(_status: int, _remaining: int, _total: int) -> None:
             if time.monotonic() - started > _snapshot_deadline_seconds():
                 raise TimeoutError("canonical certification snapshot exceeded bounded deadline")
-
-        source.backup(
-            destination,
-            pages=_snapshot_pages_per_step(),
-            progress=progress,
-            sleep=_snapshot_step_sleep_seconds(),
-        )
+        source.backup(destination, pages=_snapshot_pages_per_step(), progress=progress, sleep=_snapshot_step_sleep_seconds())
         destination.commit()
         return int(snapshot.stat().st_size), estimated_bytes
     finally:
@@ -386,15 +299,7 @@ def _snapshot_store_to_file(store: Any, snapshot: Path) -> tuple[int, int]:
             _drop_file_cache(snapshot)
 
 
-def _record_snapshot_result(
-    *,
-    success: bool,
-    started: float,
-    size: int | None = None,
-    estimated: int | None = None,
-    error_type: str | None = None,
-    source_name: str | None = None,
-) -> None:
+def _record_snapshot_result(*, success: bool, started: float, size: int | None = None, estimated: int | None = None, error_type: str | None = None, source_name: str | None = None) -> None:
     with _STATE_LOCK:
         _SNAPSHOT_STATE["last_completed_monotonic"] = time.monotonic()
         _SNAPSHOT_STATE["last_duration_seconds"] = max(0.0, time.monotonic() - started)
@@ -410,25 +315,17 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
     path = "/v1/operations/certification-db-snapshot"
     if path in {getattr(route, "path", None) for route in app.routes}:
         return
-
     @app.get(path)
-    def certification_db_snapshot(
-        x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
-    ) -> FileResponse:
+    def certification_db_snapshot(x_certification_token: str | None = Header(default=None, alias="X-Certification-Token")) -> FileResponse:
         expected = _shared_token()
         if not expected:
-            raise HTTPException(
-                status_code=503,
-                detail="certification snapshot authentication is not configured",
-            )
+            raise HTTPException(status_code=503, detail="certification snapshot authentication is not configured")
         if not hmac.compare_digest(x_certification_token or "", expected):
             raise HTTPException(status_code=401, detail="invalid certification snapshot authorization")
-
         if not _SNAPSHOT_EXPORT_LOCK.acquire(blocking=False):
             with _STATE_LOCK:
                 _SNAPSHOT_STATE["busy_rejections"] = int(_SNAPSHOT_STATE.get("busy_rejections", 0) or 0) + 1
             raise HTTPException(status_code=503, detail="certification snapshot export already in progress")
-
         started = time.monotonic()
         snapshot: Path | None = None
         source_name: str | None = None
@@ -437,7 +334,6 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
                 _SNAPSHOT_STATE["attempts"] = int(_SNAPSHOT_STATE.get("attempts", 0) or 0) + 1
                 _SNAPSHOT_STATE["last_started_monotonic"] = started
                 _SNAPSHOT_STATE["last_error_type"] = None
-
             runtime = runtime_provider()
             store = getattr(runtime, "store", None)
             if store is None:
@@ -446,88 +342,31 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
             source_name = source_path.name or None
             directory = _snapshot_directory(store)
             _cleanup_stale_exports(directory)
-            fd, raw_path = tempfile.mkstemp(
-                prefix=".certification-export-",
-                suffix=".sqlite3",
-                dir=str(directory),
-            )
+            fd, raw_path = tempfile.mkstemp(prefix=".certification-export-", suffix=".sqlite3", dir=str(directory))
             os.close(fd)
             snapshot = Path(raw_path)
-
-            _LOGGER.info(
-                "SOLANA_ROI_CERTIFICATION_SNAPSHOT_START release=%s source=%s",
-                _release_commit(),
-                source_name or "unknown",
-            )
+            _LOGGER.info("SOLANA_ROI_CERTIFICATION_SNAPSHOT_START release=%s source=%s", _release_commit(), source_name or "unknown")
             size, estimated = _snapshot_store_to_file(store, snapshot)
-            _record_snapshot_result(
-                success=True,
-                started=started,
-                size=size,
-                estimated=estimated,
-                source_name=source_name,
-            )
-            _LOGGER.info(
-                "SOLANA_ROI_CERTIFICATION_SNAPSHOT_COMPLETE release=%s bytes=%s duration_seconds=%.3f",
-                _release_commit(),
-                size,
-                max(0.0, time.monotonic() - started),
-            )
+            _record_snapshot_result(success=True, started=started, size=size, estimated=estimated, source_name=source_name)
+            _LOGGER.info("SOLANA_ROI_CERTIFICATION_SNAPSHOT_COMPLETE release=%s bytes=%s duration_seconds=%.3f", _release_commit(), size, max(0.0, time.monotonic() - started))
         except HTTPException:
             if snapshot is not None:
                 _dispose_snapshot(snapshot)
-            _record_snapshot_result(
-                success=False,
-                started=started,
-                error_type="HTTPException",
-                source_name=source_name,
-            )
+            _record_snapshot_result(success=False, started=started, error_type="HTTPException", source_name=source_name)
             raise
         except Exception as exc:
             if snapshot is not None:
                 _dispose_snapshot(snapshot)
-            _record_snapshot_result(
-                success=False,
-                started=started,
-                error_type=type(exc).__name__,
-                source_name=source_name,
-            )
-            _LOGGER.warning(
-                "SOLANA_ROI_CERTIFICATION_SNAPSHOT_FAILED release=%s error_type=%s duration_seconds=%.3f",
-                _release_commit(),
-                type(exc).__name__,
-                max(0.0, time.monotonic() - started),
-            )
-            raise HTTPException(
-                status_code=503,
-                detail=f"canonical certification snapshot failed closed:{type(exc).__name__}",
-            ) from exc
+            _record_snapshot_result(success=False, started=started, error_type=type(exc).__name__, source_name=source_name)
+            _LOGGER.warning("SOLANA_ROI_CERTIFICATION_SNAPSHOT_FAILED release=%s error_type=%s duration_seconds=%.3f", _release_commit(), type(exc).__name__, max(0.0, time.monotonic() - started))
+            raise HTTPException(status_code=503, detail=f"canonical certification snapshot failed closed:{type(exc).__name__}") from exc
         finally:
             _SNAPSHOT_EXPORT_LOCK.release()
-
         assert snapshot is not None
-        return FileResponse(
-            snapshot,
-            media_type="application/vnd.sqlite3",
-            filename="solana-roi-certification.sqlite3",
-            headers={
-                "X-Release-Commit": _release_commit(),
-                "X-Certification-Snapshot-Bytes": str(size),
-                "X-Certification-Split-Version": SPLIT_VERSION,
-            },
-            background=BackgroundTask(_dispose_snapshot, snapshot),
-        )
+        return FileResponse(snapshot, media_type="application/vnd.sqlite3", filename="solana-roi-certification.sqlite3", headers={"X-Release-Commit": _release_commit(), "X-Certification-Snapshot-Bytes": str(size), "X-Certification-Split-Version": SPLIT_VERSION}, background=BackgroundTask(_dispose_snapshot, snapshot))
 
 
 def _strip_local_certification_workers() -> None:
-    """Keep only the bounded 15-second forward publisher in the runtime process.
-
-    E2E and production-proof builders remain isolated in the certifier cgroup. The
-    forward publisher is intentionally retained because its existing 45-second stale
-    contract cannot be satisfied behind a full-database export whose bounded deadline
-    is 55 seconds. It reads the authoritative live store, remains single-flight and
-    resource-guarded, and still cannot sign, submit or grant live-money authority.
-    """
     global _ORIGINAL_RUNTIME_WORKERS
     base = e2e._ORIGINAL_RUNTIME_WORKERS
     if not callable(base):
@@ -537,10 +376,8 @@ def _strip_local_certification_workers() -> None:
         raise RuntimeError("certification split cannot resolve bounded forward publisher")
     _ORIGINAL_RUNTIME_WORKERS = render_bootstrap._run_runtime_workers
     certification_runtime._ORIGINAL_RUNTIME_WORKERS = base
-
     async def runtime_workers_with_local_forward_only(runtime: Any, stop: Any) -> None:
         await forward_worker(runtime, stop)
-
     setattr(runtime_workers_with_local_forward_only, "_roi_e2e_status_snapshot_worker", True)
     setattr(runtime_workers_with_local_forward_only, "_roi_production_proof_snapshot_worker", True)
     setattr(runtime_workers_with_local_forward_only, "_roi_forward_certification_snapshot_worker", True)
@@ -568,6 +405,9 @@ def status() -> dict[str, Any]:
         "forward_stale_threshold_changed": False,
         "canonical_sqlite_owner": "authoritative_runtime",
         "snapshot_export": "pinned_wal_read_transaction_bounded_online_backup",
+        "snapshot_normal_cycle": False,
+        "snapshot_role": "bootstrap_recovery_reconciliation_only",
+        "incremental_replica_normal_cycle": bool(split_runtime_enabled()),
         "snapshot_holds_runtime_store_lock": False,
         "snapshot_uses_runtime_persistent_disk": True,
         "snapshot_shared_writable_disk": False,
@@ -595,43 +435,18 @@ def install_certification_service_split(app: Any, runtime_provider: Callable[[],
     path = "/v1/operations/certification-service-split"
     if path not in {getattr(route, "path", None) for route in app.routes}:
         app.add_api_route(path, status, methods=["GET"], name="certification_service_split")
-
     app.state.roi_certification_service_split_version = SPLIT_VERSION
     app.state.roi_certification_service_split_enabled = split_runtime_enabled()
     if not split_runtime_enabled():
         return
-
+    from .certification_incremental_replication import install_certification_incremental_replication
+    install_certification_incremental_replication(app, runtime_provider)
     _install_snapshot_route(app, runtime_provider)
-    # E2E and production proof stay remote. Forward keeps the precomputed local
-    # endpoint so its existing 15s publication / 45s stale contract remains viable.
-    for surface in (
-        "/v1/strategy/e2e-status",
-        "/v1/strategy/production-proof",
-    ):
+    for surface in ("/v1/strategy/e2e-status", "/v1/strategy/production-proof"):
         _replace_get_route(app, surface)
-
     _strip_local_certification_workers()
-
     app.state.roi_v51_system_proof_precompute = None
     app.state.roi_v51_system_proof_precompute_worker_enabled = False
-
     app.state.roi_certification_local_heavy_workers_disabled = True
     app.state.roi_certification_local_forward_publisher = True
     app.state.roi_certification_remote_proxy = True
-    app.state.roi_certification_snapshot_export = True
-    app.state.roi_certification_shared_writable_disk = False
-    app.state.roi_certification_strategy_contract_relaxed = False
-    app.state.roi_certification_paper_only = True
-    app.state.roi_certification_live_money_authority = False
-
-
-__all__ = [
-    "SPLIT_VERSION",
-    "_cleanup_stale_exports",
-    "_dispose_snapshot",
-    "_drop_file_cache",
-    "_snapshot_store_to_file",
-    "install_certification_service_split",
-    "split_runtime_enabled",
-    "status",
-]
