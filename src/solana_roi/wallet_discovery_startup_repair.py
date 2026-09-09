@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from .wallet_discovery import ContinuousWalletDiscovery as _OriginalWalletDiscovery
 
@@ -22,16 +22,30 @@ class StartupIsolatedWalletDiscovery:
     bootstrap is therefore deferred until after FastAPI has started. A bootstrap
     failure is exposed in status and retried, but it can never terminate the core
     ingestion/certification service.
+
+    Governed production layers may register idempotent post-bootstrap hooks. Those
+    hooks run after every successful construction of the inner discovery engine,
+    including recovery after a runtime failure, so policy alignment is not lost
+    when the research lane is recreated.
     """
 
     def __init__(self, **kwargs: Any):
         self._kwargs = dict(kwargs)
         self._inner: Any | None = None
+        self._post_bootstrap_hooks: list[Callable[[Any], None]] = []
         self._startup_state = "deferred"
         self._startup_attempts = 0
         self._startup_error_type: str | None = None
         self._startup_error_message: str | None = None
         self._enabled_requested = bool(kwargs.get("enabled", True))
+
+    def register_post_bootstrap_hook(self, hook: Callable[[Any], None]) -> None:
+        if not callable(hook):
+            raise TypeError("wallet discovery post-bootstrap hook must be callable")
+        if hook not in self._post_bootstrap_hooks:
+            self._post_bootstrap_hooks.append(hook)
+        if self._inner is not None:
+            hook(self._inner)
 
     def _record_failure(self, exc: BaseException, *, state: str) -> None:
         self._startup_state = state
@@ -59,6 +73,8 @@ class StartupIsolatedWalletDiscovery:
         self._startup_attempts += 1
         try:
             inner = _ORIGINAL_DISCOVERY(**self._kwargs)
+            for hook in tuple(self._post_bootstrap_hooks):
+                hook(inner)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -128,6 +144,7 @@ class StartupIsolatedWalletDiscovery:
                             "startup_attempts": self._startup_attempts,
                             "startup_error_type": None,
                             "startup_error_message": None,
+                            "post_bootstrap_hook_count": len(self._post_bootstrap_hooks),
                         }
                     )
                     return payload
@@ -156,6 +173,7 @@ class StartupIsolatedWalletDiscovery:
             "startup_attempts": self._startup_attempts,
             "startup_error_type": self._startup_error_type,
             "startup_error_message": self._startup_error_message,
+            "post_bootstrap_hook_count": len(self._post_bootstrap_hooks),
             "wallet_intelligence": self._intelligence_status(),
         }
 

@@ -32,9 +32,16 @@ from .v52_robinhood_candidate_reconciliation import (
     status as robinhood_candidate_reconciliation_status,
 )
 from .v52_strategy_api import install_v52_strategy_api, status as api_status
+from .v52_wallet_alpha_refinement import WalletAlphaRefinementLedger
+from .v52_wallet_intelligence_alignment import (
+    install_v52_wallet_intelligence_alignment,
+    status as wallet_alignment_status,
+)
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v6-continuous-strategy-evolution"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v7-wallet-aligned-continuous-evolution"
 _INSTALLED = False
+_RUNTIME: Any | None = None
+_WALLET_ALPHA: WalletAlphaRefinementLedger | None = None
 
 
 def _copy_robinhood_lineage(wrapper: Any, predecessor: Any) -> None:
@@ -89,6 +96,16 @@ def _preserve_robinhood_wrapper_contracts() -> None:
         _copy_robinhood_lineage(wrapper, predecessor)
 
 
+def _resolve_runtime(runtime_provider: Callable[[], Any] | Any) -> Any:
+    return runtime_provider() if callable(runtime_provider) else runtime_provider
+
+
+def wallet_alpha_refinement() -> WalletAlphaRefinementLedger:
+    if _WALLET_ALPHA is None:
+        raise RuntimeError("v5.2 wallet alpha refinement not installed")
+    return _WALLET_ALPHA
+
+
 def install_v52_production_authority(
     app: Any,
     runtime_provider: Callable[[], Any] | Any,
@@ -107,9 +124,17 @@ def install_v52_production_authority(
     staged de-risking, runner retention and second-leg re-entry without changing
     transport, identity or exact-quote semantics. Candidate accounting is then
     reconciled only after the validated lifecycle commit exists.
+
+    Wallet discovery is bound last to the active v5.2 policy epoch. Its broad
+    discovery input is the already-normalized append-only swap journal, so the
+    wallet lane no longer re-fetches and re-normalizes transactions that canonical
+    ingestion has already hydrated. Paired marginal-alpha and contextual decay
+    remain forward-only research evidence and cannot independently authorize a
+    paper entry. The alpha ledger is owned by this authority module rather than
+    mutating the slotted canonical ingestion runtime.
     """
-    global _INSTALLED
-    _ = runtime_provider
+    global _INSTALLED, _RUNTIME, _WALLET_ALPHA
+    runtime = _resolve_runtime(runtime_provider)
     install_v52_authoritative_strategy()
     install_v52_robinhood_storage_compatibility()
     install_v52_robinhood_exit_authority()
@@ -117,6 +142,9 @@ def install_v52_production_authority(
     _bind_concrete_robinhood_lifecycle_owner()
     install_v52_robinhood_candidate_reconciliation()
     _preserve_robinhood_wrapper_contracts()
+    install_v52_wallet_intelligence_alignment(runtime)
+    if _WALLET_ALPHA is None or _WALLET_ALPHA.store is not runtime.store:
+        _WALLET_ALPHA = WalletAlphaRefinementLedger(runtime.store)
     install_v52_strategy_api(app)
     strategy_epoch = strategy_evolution_snapshot()
     app.state.roi_v51_final_economic_authority = False
@@ -129,6 +157,8 @@ def install_v52_production_authority(
     app.state.roi_v52_robinhood_position_lifecycle = True
     app.state.roi_v52_robinhood_candidate_reconciliation = True
     app.state.roi_v52_continuous_strategy_evolution = True
+    app.state.roi_v52_wallet_intelligence_alignment = True
+    app.state.roi_v52_wallet_alpha_refinement = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
     app.state.roi_authority_fingerprint = authority_fingerprint()
@@ -136,6 +166,7 @@ def install_v52_production_authority(
     app.state.roi_economic_freeze_epoch = ECONOMIC_FREEZE_EPOCH
     app.state.roi_strategy_baseline_epoch = ECONOMIC_FREEZE_EPOCH
     app.state.roi_active_strategy_epoch = strategy_epoch
+    _RUNTIME = runtime
     _INSTALLED = True
 
 
@@ -146,6 +177,25 @@ def status() -> dict[str, Any]:
     lifecycle = robinhood_lifecycle_status()
     reconciliation = robinhood_candidate_reconciliation_status()
     strategy_epoch = strategy_evolution_snapshot()
+    if _RUNTIME is None:
+        wallet_alignment = {
+            "installed": False,
+            "reason": "runtime_not_installed",
+            "paper_only": True,
+            "live_money_authority": False,
+        }
+    else:
+        wallet_alignment = wallet_alignment_status(_RUNTIME)
+    if _WALLET_ALPHA is None:
+        wallet_alpha = {
+            "version": "v52-wallet-alpha-refinement-v1",
+            "installed": False,
+            "paper_only": True,
+            "live_money_authority": False,
+        }
+    else:
+        wallet_alpha = dict(_WALLET_ALPHA.status())
+        wallet_alpha["installed"] = True
     # Robinhood preserves its compatibility table strategy label. Economic
     # authority and forward-learning scope come from registered v5.2 lineage;
     # live policy values come from the current governed strategy epoch.
@@ -179,6 +229,8 @@ def status() -> dict[str, Any]:
         "v51_shadow_control": True,
         "v51_named_substrate_role": "transport_evidence_exact_execution_paper_capital_settlement_and_read_only_control",
         "strategy_runtime": runtime,
+        "wallet_intelligence_alignment": wallet_alignment,
+        "wallet_alpha_refinement": wallet_alpha,
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
         "robinhood_position_lifecycle": lifecycle,
@@ -191,6 +243,7 @@ def status() -> dict[str, Any]:
             and runtime.get("robinhood_forward_profile_owner")
             and runtime.get("robinhood_scale_in_authority")
             and runtime.get("staged_derisk_runner_authority")
+            and wallet_alignment.get("installed")
             and storage.get("v52_authority_from_release_epoch")
             and robinhood_exit.get("final_exit_policy_owner") == "v52"
             and lifecycle.get("installed")
@@ -203,4 +256,9 @@ def status() -> dict[str, Any]:
     }
 
 
-__all__ = ["COMPOSITION_VERSION", "install_v52_production_authority", "status"]
+__all__ = [
+    "COMPOSITION_VERSION",
+    "install_v52_production_authority",
+    "status",
+    "wallet_alpha_refinement",
+]
