@@ -32,8 +32,12 @@ from .v52_robinhood_candidate_reconciliation import (
     status as robinhood_candidate_reconciliation_status,
 )
 from .v52_strategy_api import install_v52_strategy_api, status as api_status
+from .v52_wallet_production_alignment import (
+    install_v52_wallet_production_alignment,
+    status as wallet_alignment_status,
+)
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v6-continuous-strategy-evolution"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v7-wallet-production-alignment"
 _INSTALLED = False
 
 
@@ -101,6 +105,11 @@ def install_v52_production_authority(
     ``economic_freeze_epoch`` remains a compatibility key for persisted release
     lineage only; strategy policy may advance through append-only governed epochs.
 
+    Wallet discovery is bound here, at the final authority boundary, so copyability
+    rules cannot remain anchored to a stale baseline after a governed v5.2 strategy
+    epoch advances. Broad discovery consumes the already-persisted normalized Solana
+    journal rather than re-fetching and re-normalizing the same transaction.
+
     Robinhood's durable storage version remains compatibility metadata only. The
     position-lifecycle layer is installed after the final Robinhood storage and
     exit-policy wrappers so it owns aggregate lot accounting, scale validation,
@@ -109,8 +118,8 @@ def install_v52_production_authority(
     reconciled only after the validated lifecycle commit exists.
     """
     global _INSTALLED
-    _ = runtime_provider
     install_v52_authoritative_strategy()
+    install_v52_wallet_production_alignment(runtime_provider)
     install_v52_robinhood_storage_compatibility()
     install_v52_robinhood_exit_authority()
     install_v52_robinhood_position_lifecycle()
@@ -124,6 +133,7 @@ def install_v52_production_authority(
     app.state.roi_v52_final_economic_authority = True
     app.state.roi_v52_economic_composition = COMPOSITION_VERSION
     app.state.roi_v52_economic_composition_explicit = True
+    app.state.roi_v52_wallet_production_alignment = True
     app.state.roi_v52_robinhood_storage_compatibility = True
     app.state.roi_v52_robinhood_exit_authority = True
     app.state.roi_v52_robinhood_position_lifecycle = True
@@ -141,6 +151,7 @@ def install_v52_production_authority(
 
 def status() -> dict[str, Any]:
     runtime = dict(strategy_status())
+    wallet_alignment = wallet_alignment_status()
     storage = robinhood_storage_status()
     robinhood_exit = robinhood_exit_status()
     lifecycle = robinhood_lifecycle_status()
@@ -179,6 +190,7 @@ def status() -> dict[str, Any]:
         "v51_shadow_control": True,
         "v51_named_substrate_role": "transport_evidence_exact_execution_paper_capital_settlement_and_read_only_control",
         "strategy_runtime": runtime,
+        "wallet_production_alignment": wallet_alignment,
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
         "robinhood_position_lifecycle": lifecycle,
@@ -191,6 +203,8 @@ def status() -> dict[str, Any]:
             and runtime.get("robinhood_forward_profile_owner")
             and runtime.get("robinhood_scale_in_authority")
             and runtime.get("staged_derisk_runner_authority")
+            and wallet_alignment.get("installed")
+            and wallet_alignment.get("zero_duplicate_normalized_handoff")
             and storage.get("v52_authority_from_release_epoch")
             and robinhood_exit.get("final_exit_policy_owner") == "v52"
             and lifecycle.get("installed")
