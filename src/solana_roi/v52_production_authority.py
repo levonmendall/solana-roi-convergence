@@ -13,9 +13,13 @@ from .strategy_v52_authority import (
     authority_fingerprint,
 )
 from .v52_authoritative_strategy import install_v52_authoritative_strategy, status as strategy_status
+from .v52_robinhood_exit_authority import (
+    install_v52_robinhood_exit_authority,
+    status as robinhood_exit_status,
+)
 from .v52_strategy_api import install_v52_strategy_api, status as api_status
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v1"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v2-robinhood-exit-owner"
 _INSTALLED = False
 
 
@@ -27,17 +31,19 @@ def install_v52_production_authority(
 
     v5.1-named transport, evidence, exact-quote, paper-capital and settlement
     modules remain reusable infrastructure. This call replaces their final
-    economic-decision ownership with the frozen v5.2 authority.
+    economic-decision and learned-exit ownership with the frozen v5.2 authority.
     """
     global _INSTALLED
     _ = runtime_provider
     install_v52_authoritative_strategy()
+    install_v52_robinhood_exit_authority()
     install_v52_strategy_api(app)
     app.state.roi_v51_final_economic_authority = False
     app.state.roi_v51_shadow_control = True
     app.state.roi_v52_final_economic_authority = True
     app.state.roi_v52_economic_composition = COMPOSITION_VERSION
     app.state.roi_v52_economic_composition_explicit = True
+    app.state.roi_v52_robinhood_exit_authority = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
     app.state.roi_authority_fingerprint = authority_fingerprint()
@@ -47,6 +53,7 @@ def install_v52_production_authority(
 
 def status() -> dict[str, Any]:
     runtime = strategy_status()
+    robinhood_exit = robinhood_exit_status()
     return {
         "composition_version": COMPOSITION_VERSION,
         "installed": _INSTALLED,
@@ -59,11 +66,13 @@ def status() -> dict[str, Any]:
         "v51_shadow_control": True,
         "v51_named_substrate_role": "transport_evidence_exact_execution_paper_capital_settlement_and_read_only_control",
         "strategy_runtime": runtime,
+        "robinhood_exit_authority": robinhood_exit,
         "strategy_api": api_status(),
         "all_decision_surfaces_v52_owned": bool(
             runtime.get("solana_final_owner")
             and runtime.get("fomo_final_owner")
             and runtime.get("robinhood_final_owner")
+            and robinhood_exit.get("final_exit_policy_owner") == "v52"
         ),
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
