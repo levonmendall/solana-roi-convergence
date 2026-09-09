@@ -19,7 +19,9 @@ from solana_roi.v51_robinhood_consolidation import refresh_robinhood_candidate_l
 
 
 def _plane(tmp_path, monkeypatch) -> RobinhoodChainPaperPlane:
-    assert production_runtime.app.state.roi_v51_final_economic_authority is True
+    assert production_runtime.app.state.roi_v52_final_economic_authority is True
+    assert production_runtime.app.state.roi_v51_final_economic_authority is False
+    assert production_runtime.app.state.roi_v51_shadow_control is True
     assert production_runtime.app.state.roi_v51_economic_composition_explicit is True
     monkeypatch.setenv("ROBINHOOD_ENTITY_RESOLUTION_REQUIRED", "true")
     monkeypatch.setenv("ROBINHOOD_RWA_FILTER_REQUIRED", "true")

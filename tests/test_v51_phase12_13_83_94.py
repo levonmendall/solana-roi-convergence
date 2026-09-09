@@ -15,7 +15,8 @@ import pytest
 from solana_roi import api
 from solana_roi.observation_store import ObservationEventStore
 from solana_roi.storage import AppendOnlyEventStore
-from solana_roi.strategy_v51_authority import ECONOMIC_FREEZE_EPOCH, authority
+from solana_roi.strategy_v51_authority import ECONOMIC_FREEZE_EPOCH
+from solana_roi.strategy_v52_authority import authority
 from solana_roi.v51_candidate_ledger import record_solana_candidate, record_stage_event
 from solana_roi.v51_phase12_13_operations import build_operations_proof, normalize_subsystem
 from solana_roi.v51_seeded_e2e import run_seeded_equivalence_case
@@ -74,7 +75,10 @@ def test_84_final_production_import_exposes_expected_final_graph() -> None:
     from solana_roi.direct_solana import DirectSolanaIngestionPlane
     from solana_roi.robinhood_chain_paper import RobinhoodChainPaperPlane
 
-    assert production.app.state.roi_v51_final_economic_authority is True
+    assert production.app.state.roi_v52_final_economic_authority is True
+    assert production.app.state.roi_v51_final_economic_authority is False
+    assert production.app.state.roi_v51_shadow_control is True
+    assert production.app.state.roi_v52_economic_composition_explicit is True
     assert production.app.state.roi_v51_economic_composition_explicit is True
     assert production.app.state.roi_v51_system_proof_70_74 is True
     assert production.app.state.roi_v51_phase12_13_83_94 is True
@@ -86,7 +90,8 @@ def test_84_final_production_import_exposes_expected_final_graph() -> None:
 def test_85_black_box_final_contract_for_solana_and_fomo_after_production_composition() -> None:
     import solana_roi.production as production
 
-    assert production.app.state.roi_v51_final_economic_authority is True
+    assert production.app.state.roi_v52_final_economic_authority is True
+    assert production.app.state.roi_v51_final_economic_authority is False
     store = MemoryStore()
     for surface, venue, candidate in (
         ("SOLANA", "PUMP_AMM", "bb-solana"),

@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v51-production-composition-root-125-130-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight"
+COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -114,6 +114,20 @@ class ProductionSystem:
                 "lifecycle_proven": lifecycle_proven,
                 "state": lifecycle_state,
             },
+            "authoritative_strategy": "v5.2",
+            "authoritative_strategy_version": getattr(
+                self.app.state, "roi_authoritative_strategy_version", None
+            ),
+            "authority_id": getattr(self.app.state, "roi_authority_id", None),
+            "authority_fingerprint": getattr(self.app.state, "roi_authority_fingerprint", None),
+            "economic_freeze_epoch": getattr(self.app.state, "roi_economic_freeze_epoch", None),
+            "v52_final_economic_authority": bool(
+                getattr(self.app.state, "roi_v52_final_economic_authority", False)
+            ),
+            "v51_final_economic_authority": bool(
+                getattr(self.app.state, "roi_v51_final_economic_authority", False)
+            ),
+            "v51_shadow_control": bool(getattr(self.app.state, "roi_v51_shadow_control", False)),
             "paper_execution_lifecycle": lifecycle,
             "runtime_memory_capacity": runtime_memory_capacity,
             "rpc_task_ownership": rpc_task_ownership,
@@ -212,7 +226,7 @@ def _required_components() -> tuple[ComponentHealth, ...]:
         _component("ingestion", "solana_roi.direct_solana", "DirectSolanaIngestionPlane"),
         _component("evidence", "solana_roi.v51_evidence_analytics", "build_evidence_validity_bundle"),
         _component("candidate", "solana_roi.v51_candidate_ledger", "refresh_candidate_pipeline"),
-        _component("strategy", "solana_roi.strategy_v51_authority", "authority"),
+        _component("strategy", "solana_roi.strategy_v52_authority", "authority"),
         _component("execution", "solana_roi.v51_exact_exit_execution", "observe_exact_exit_order"),
         _component("settlement", "solana_roi.profit_first_entity_final_research", "FinalProfitFirstResearchAdapter"),
         _component("learning", "solana_roi.v51_evidence_analytics", "build_hazard_calibration"),
@@ -286,6 +300,7 @@ def build_production_system() -> ProductionSystem:
         REPAIR_VERSION as TARGET_SCOPED_SUCCESSOR_EVIDENCE_REPAIR_VERSION,
         install_target_scoped_successor_evidence_repair,
     )
+    from .v52_production_authority import install_v52_production_authority
 
     _ = _legacy_package_runtime_composition
     app = _legacy_production_composition.app
@@ -314,6 +329,11 @@ def build_production_system() -> ProductionSystem:
     install_certification_generation_runtime_repair(app)
     install_certification_proof_memory_repair(app)
 
+    # v5.1-named modules above remain proven compatibility infrastructure. Install
+    # the frozen v5.2 economic authority only after that substrate is complete so
+    # Solana, FOMO and Robinhood all have exactly one final decision owner.
+    install_v52_production_authority(app, ingestion_runtime)
+
     # The certification worker wraps a chain that already owns both E2E and
     # production-proof snapshot publishers. Preserve those marker contracts on
     # the new outer worker so later app/test composition remains idempotent and
@@ -335,6 +355,11 @@ def build_production_system() -> ProductionSystem:
     )
     if not system.healthy:
         raise RuntimeError("production composition failed closed")
+
+    if not bool(getattr(app.state, "roi_v52_final_economic_authority", False)):
+        raise RuntimeError("v5.2 final economic authority not installed")
+    if bool(getattr(app.state, "roi_v51_final_economic_authority", False)):
+        raise RuntimeError("v5.1 retained final economic authority after v5.2 cutover")
 
     app.state.roi_production_system = system
     app.state.roi_production_composition_status = system.status

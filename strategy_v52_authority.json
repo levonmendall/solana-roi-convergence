@@ -1,0 +1,79 @@
+{
+  "authority_id": "roi-convergence-v5.2-authoritative-1",
+  "strategy_version": "roi-convergence-v5.2-continuation-capture-1",
+  "economic_freeze_epoch": "v52-authoritative-cutover-20260908",
+  "policy_freeze_origin": "operator_directed_ex_ante_cutover",
+  "economic_superiority_claim": false,
+  "control_strategy_version": "roi-convergence-v5.1-context-exactness-1",
+  "paper_only": true,
+  "live_money_authority": false,
+  "signing_available": false,
+  "transaction_submission_available": false,
+  "objective": "maximize_forward_executable_percentage_roi_and_compounded_paper_growth_after_costs_with_continuation_capture",
+  "change_policy": "economic_rules_frozen_during_forward_authority_epoch; reliability_repairs_allowed_only_when_they_do_not_change_selection_sizing_exit_or_promotion_economics",
+  "pipeline_stages": ["ingestion", "candidate", "context", "execution_evidence", "decision", "position", "settlement", "learning"],
+  "canonical_lanes": ["pump_fun", "pump_amm", "raydium", "fomo", "robinhood"],
+  "lane_contract": {
+    "pump_fun": {"economic_surface": "SOLANA", "venue": "PUMP_FUN", "lifecycle": "bonding_curve", "strategy_lane": "elite_wallet_continuation", "family": "PUMP_FUN", "surface_aliases": ["PUMP_FUN"]},
+    "pump_amm": {"economic_surface": "SOLANA", "venue": "PUMP_AMM", "lifecycle": "early_post_graduation", "strategy_lane": "graduation_continuation", "family": "PUMP_AMM", "surface_aliases": ["PUMP_AMM", "PUMPSWAP"]},
+    "raydium": {"economic_surface": "SOLANA", "venue": "RAYDIUM", "lifecycle": "post_migration", "strategy_lane": "raydium_cross_venue_persistence", "family": "RAYDIUM", "surface_aliases": ["RAYDIUM"]},
+    "fomo": {"economic_surface": "FOMO", "venue": "PUMP_AMM", "lifecycle": "early_post_graduation", "strategy_lane": "fomo_continuation", "family": "FOMO_CLEAN", "surface_aliases": ["FOMO"]},
+    "robinhood": {"economic_surface": "ROBINHOOD_CHAIN", "venue": "UNISWAP_V3", "lifecycle": "new_weth_pool", "strategy_lane": "robinhood_entity_continuation", "family": "ROBINHOOD_ENTITY", "surface_aliases": ["ROBINHOOD_CHAIN"]}
+  },
+  "mechanical_hard_stops": ["unavailable_sell_route", "transfer_restriction", "unexitable_liquidity", "unavailable_exact_entry_or_exit_quote", "authority_can_block_transfer_or_exit", "linked_entity_can_remove_required_exit_liquidity"],
+  "hazards_are_not_blanket_vetoes": ["bundled_launch", "sniper_concentration", "common_funding", "creator_linkage_or_distribution", "mint_authority", "early_holder_distribution", "quote_or_slippage_deterioration", "late_lifecycle", "high_snipe_tax"],
+  "execution": {
+    "latency_hard_max_seconds": 20.0,
+    "chase_observe_only_above_fraction": 0.40,
+    "amount_specific_entry_and_exit_quotes_required": true,
+    "first_slot_pump_fun_sniping_allowed": false,
+    "maximum_sizing_requotes": 2
+  },
+  "target_sizing": {
+    "fresh_v52_forward_evidence_required_for_promotion": true,
+    "minimum_forward_samples": 30,
+    "bootstrap_fraction_clean": 0.01,
+    "bootstrap_fraction_hazard_or_high_severity": 0.005,
+    "solana_lane_caps": {"elite_wallet_continuation": 0.20, "entity_flow_momentum": 0.10, "graduation_continuation": 0.10, "raydium_cross_venue_persistence": 0.10, "creator_insider_continuation": 0.05, "hazard_continuation": 0.02},
+    "fomo_max_target_fraction": 0.05,
+    "robinhood_max_target_fraction": 0.05,
+    "robinhood_max_open_exposure_fraction": 0.20,
+    "v51_outcomes_may_seed_target_selection_prior": false,
+    "v51_outcomes_may_grant_v52_promotion": false
+  },
+  "position_management": {
+    "starter_fraction_of_target": 0.25,
+    "max_scale_fraction_of_target_per_add": 0.25,
+    "first_derisk_fraction_of_position": 0.25,
+    "second_derisk_fraction_of_position": 0.50,
+    "runner_fraction_of_target": 0.10,
+    "minimum_exit_depth_coverage_ratio": 2.0,
+    "scale_requires_new_forward_evidence": true,
+    "scale_requires_price_not_below_last_add": true,
+    "averaging_down_allowed": false,
+    "staged_derisk_enabled": true,
+    "runner_enabled": true,
+    "second_leg_reentry_enabled": true
+  },
+  "detection_intelligence": {
+    "minimum_wallet_quality": 0.70,
+    "minimum_skilled_independent_clusters": 3,
+    "minimum_broad_independent_clusters": 5,
+    "minimum_comparable_peer_count": 20,
+    "anomaly_percentile_threshold": 0.995,
+    "discovered_wallet_initial_signal_weight": 0.0,
+    "wallet_signal_requires_prospective_validation": true,
+    "creator_funder_propagation_requires_incremental_forward_alpha": true,
+    "common_funding_is_not_independent_participation": true,
+    "cohort_anomaly_requires_exact_comparability": true
+  },
+  "governance": {
+    "forward_only_measurement": true,
+    "same_candidate_stream_control_comparison": true,
+    "historical_promotion_authority": false,
+    "automatic_parameter_mutation_authority": false,
+    "automatic_signal_promotion_authority": false,
+    "v51_control_has_final_decision_authority": false,
+    "v51_control_is_read_only": true
+  }
+}
