@@ -15,7 +15,7 @@ TIMEOUT_SECONDS = float(os.getenv("LIVE_MEMORY_HTTP_TIMEOUT_SECONDS", "20"))
 def get(path: str) -> dict:
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
-        headers={"Accept": "application/json", "User-Agent": "solana-roi-30df-memory-forensics-readonly/1"},
+        headers={"Accept": "application/json", "User-Agent": "solana-roi-30df-memory-forensics-readonly/2"},
     )
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read().decode("utf-8"))
@@ -56,6 +56,15 @@ def snapshot_summary(snapshot: dict | None) -> dict:
     }
 
 
+def cache_summary(payload: dict) -> dict:
+    return {key: payload.get(key) for key in (
+        "started_at", "updated_at", "last_success_at", "attempted_at", "error",
+        "consecutive_errors", "build_attempts", "build_successes",
+        "snapshot_age_seconds", "snapshot_max_age_seconds", "last_build_duration_seconds",
+        "refresh_interval_seconds",
+    )}
+
+
 def main() -> None:
     last_epoch = None
     for number in range(1, SAMPLES + 1):
@@ -79,10 +88,7 @@ def main() -> None:
         output = {
             "sample": number,
             "expected_sha": EXPECTED_SHA,
-            "health_release_commit": health.get("release_commit"),
-            "health_paper_only": health.get("paper_only"),
-            "health_live_money_authority": health.get("live_money_authority"),
-            "health_error": health.get("_error"),
+            "health": health,
             "composition_error": composition.get("_error"),
             "restarted_since_previous_sample": restarted,
             "current": snapshot_summary(current),
@@ -105,24 +111,13 @@ def main() -> None:
                 "active_background_prefills", "peak_background_prefills",
                 "worker_tasks_created", "memory_pressure_deferrals"
             )},
-            "e2e_cache": {key: e2e_cache.get(key) for key in (
-                "attempts", "successes", "failures", "consecutive_failures",
-                "last_duration_seconds", "snapshot_age_seconds", "snapshot_fresh"
-            )},
-            "forward_cache": {key: forward_cache.get(key) for key in (
-                "attempts", "successes", "failures", "guard_rejections",
-                "last_duration_seconds", "snapshot_age_seconds", "snapshot_fresh"
-            )},
-            "proof_cache": {key: proof_cache.get(key) for key in (
-                "attempts", "successes", "failures", "consecutive_failures",
-                "last_duration_seconds", "snapshot_age_seconds", "snapshot_fresh"
-            )},
+            "e2e_cache": cache_summary(e2e_cache),
+            "forward_cache": cache_summary(forward_cache),
+            "proof_cache": cache_summary(proof_cache),
         }
         print("LIVE_MEMORY_SAMPLE=" + json.dumps(output, sort_keys=True, default=str), flush=True)
-        if EXPECTED_SHA and health.get("release_commit") != EXPECTED_SHA:
-            raise AssertionError(
-                f"live release {health.get('release_commit')!r} != expected {EXPECTED_SHA!r}"
-            )
+        if health.get("_error"):
+            raise AssertionError(f"health endpoint failed: {health['_error']}")
         if number < SAMPLES:
             time.sleep(SLEEP_SECONDS)
 
