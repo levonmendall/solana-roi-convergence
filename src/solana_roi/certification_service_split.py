@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
+import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -20,17 +24,36 @@ from . import production_proof_read_boundary_repair as production_proof
 from . import render_runtime_bootstrap_repair as render_bootstrap
 
 
-SPLIT_VERSION = "certification-service-split-v2-nonblocking-snapshot"
+SPLIT_VERSION = "certification-service-split-v3-pinned-bounded-disk-snapshot"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
 DEFAULT_REMOTE_TIMEOUT_SECONDS = 5.0
 DEFAULT_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024 * 1024
-DEFAULT_SNAPSHOT_PAGES_PER_STEP = 512
-DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS = 0.01
+DEFAULT_SNAPSHOT_PAGES_PER_STEP = 4096
+DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS = 0.002
+DEFAULT_SNAPSHOT_DEADLINE_SECONDS = 55.0
+DEFAULT_SNAPSHOT_FREE_RESERVE_BYTES = 512 * 1024 * 1024
+DEFAULT_STALE_EXPORT_SECONDS = 3600.0
 
 _ORIGINAL_RUNTIME_WORKERS: Callable[..., Any] | None = None
+_SNAPSHOT_EXPORT_LOCK = threading.Lock()
+_STATE_LOCK = threading.Lock()
+_LOGGER = logging.getLogger(__name__)
+_SNAPSHOT_STATE: dict[str, Any] = {
+    "attempts": 0,
+    "successes": 0,
+    "failures": 0,
+    "busy_rejections": 0,
+    "last_started_monotonic": None,
+    "last_completed_monotonic": None,
+    "last_duration_seconds": None,
+    "last_size_bytes": None,
+    "last_estimated_bytes": None,
+    "last_error_type": None,
+    "last_source_name": None,
+}
 
 
 def _truthy(value: str | None) -> bool:
@@ -115,6 +138,36 @@ def _snapshot_step_sleep_seconds() -> float:
         )
     except ValueError:
         return DEFAULT_SNAPSHOT_STEP_SLEEP_SECONDS
+
+
+def _snapshot_deadline_seconds() -> float:
+    try:
+        return max(
+            5.0,
+            float(
+                os.getenv(
+                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_DEADLINE_SECONDS",
+                    str(DEFAULT_SNAPSHOT_DEADLINE_SECONDS),
+                )
+            ),
+        )
+    except ValueError:
+        return DEFAULT_SNAPSHOT_DEADLINE_SECONDS
+
+
+def _snapshot_free_reserve_bytes() -> int:
+    try:
+        return max(
+            64 * 1024 * 1024,
+            int(
+                os.getenv(
+                    "SOLANA_ROI_CERTIFICATION_SNAPSHOT_FREE_RESERVE_BYTES",
+                    str(DEFAULT_SNAPSHOT_FREE_RESERVE_BYTES),
+                )
+            ),
+        )
+    except ValueError:
+        return DEFAULT_SNAPSHOT_FREE_RESERVE_BYTES
 
 
 def _surface_release(path: str, payload: dict[str, Any]) -> str:
@@ -212,14 +265,45 @@ def _replace_get_route(app: Any, path: str) -> None:
         dependant.call = endpoint
 
 
-def _snapshot_store_to_file(store: Any, snapshot: Path) -> int:
-    """Create a point-in-time SQLite copy without holding the live writer lock.
+def _snapshot_directory(store: Any) -> Path:
+    source_path = getattr(store, "path", None)
+    if source_path is None:
+        raise RuntimeError("canonical runtime store path unavailable")
+    source_path = Path(source_path)
+    override = os.getenv("SOLANA_ROI_CERTIFICATION_SNAPSHOT_DIR", "").strip()
+    directory = Path(override) if override else source_path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
-    The canonical runtime remains the only writer. A separate read-only connection
-    participates in SQLite WAL snapshot semantics while ``Connection.backup`` copies
-    bounded page batches and yields between them. This lets ingestion, paper lifecycle,
-    settlement and reconciliation continue while certification receives an immutable
-    copy. The certifier never mounts or writes the runtime disk.
+
+def _cleanup_stale_exports(directory: Path) -> int:
+    removed = 0
+    now = time.time()
+    try:
+        candidates = tuple(directory.glob(".certification-export-*.sqlite3"))
+    except OSError:
+        return 0
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            if now - candidate.stat().st_mtime < DEFAULT_STALE_EXPORT_SECONDS:
+                continue
+            candidate.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _snapshot_store_to_file(store: Any, snapshot: Path) -> tuple[int, int]:
+    """Create one bounded, immutable SQLite certification snapshot.
+
+    A dedicated read-only connection pins a WAL read transaction before backup so
+    a continuously mutating production database cannot force the backup to chase a
+    moving source forever. Writes remain available; WAL growth is bounded by the
+    explicit backup deadline. The destination is a temporary file on the runtime's
+    existing persistent disk, not ``/tmp`` and never a certifier-mounted disk.
     """
     source_path = getattr(store, "path", None)
     if source_path is None:
@@ -231,19 +315,62 @@ def _snapshot_store_to_file(store: Any, snapshot: Path) -> int:
     source_uri = f"file:{source_path.resolve()}?mode=ro"
     source = sqlite3.connect(source_uri, uri=True, timeout=5.0)
     destination = sqlite3.connect(snapshot)
+    started = time.monotonic()
     try:
         source.execute("PRAGMA query_only=ON")
         source.execute("PRAGMA busy_timeout=5000")
+        source.execute("BEGIN")
+        source.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
+        estimated_bytes = page_count * page_size
+        if estimated_bytes > _snapshot_max_bytes():
+            raise RuntimeError("canonical certification snapshot exceeds configured bounded export")
+
+        free_bytes = int(shutil.disk_usage(snapshot.parent).free)
+        required_free = estimated_bytes + _snapshot_free_reserve_bytes()
+        if free_bytes < required_free:
+            raise OSError("insufficient bounded certification snapshot disk headroom")
+
+        def progress(_status: int, _remaining: int, _total: int) -> None:
+            if time.monotonic() - started > _snapshot_deadline_seconds():
+                raise TimeoutError("canonical certification snapshot exceeded bounded deadline")
+
         source.backup(
             destination,
             pages=_snapshot_pages_per_step(),
+            progress=progress,
             sleep=_snapshot_step_sleep_seconds(),
         )
         destination.commit()
+        return int(snapshot.stat().st_size), estimated_bytes
     finally:
+        try:
+            source.rollback()
+        except sqlite3.Error:
+            pass
         destination.close()
         source.close()
-    return int(snapshot.stat().st_size)
+
+
+def _record_snapshot_result(
+    *,
+    success: bool,
+    started: float,
+    size: int | None = None,
+    estimated: int | None = None,
+    error_type: str | None = None,
+    source_name: str | None = None,
+) -> None:
+    with _STATE_LOCK:
+        _SNAPSHOT_STATE["last_completed_monotonic"] = time.monotonic()
+        _SNAPSHOT_STATE["last_duration_seconds"] = max(0.0, time.monotonic() - started)
+        _SNAPSHOT_STATE["last_size_bytes"] = size
+        _SNAPSHOT_STATE["last_estimated_bytes"] = estimated
+        _SNAPSHOT_STATE["last_error_type"] = error_type
+        _SNAPSHOT_STATE["last_source_name"] = source_name
+        key = "successes" if success else "failures"
+        _SNAPSHOT_STATE[key] = int(_SNAPSHOT_STATE.get(key, 0) or 0) + 1
 
 
 def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> None:
@@ -264,31 +391,88 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
         if not hmac.compare_digest(x_certification_token or "", expected):
             raise HTTPException(status_code=401, detail="invalid certification snapshot authorization")
 
-        runtime = runtime_provider()
-        store = getattr(runtime, "store", None)
-        if store is None:
-            raise HTTPException(status_code=503, detail="canonical runtime store unavailable")
+        if not _SNAPSHOT_EXPORT_LOCK.acquire(blocking=False):
+            with _STATE_LOCK:
+                _SNAPSHOT_STATE["busy_rejections"] = int(_SNAPSHOT_STATE.get("busy_rejections", 0) or 0) + 1
+            raise HTTPException(status_code=503, detail="certification snapshot export already in progress")
 
-        fd, raw_path = tempfile.mkstemp(prefix="roi-certification-", suffix=".sqlite3", dir="/tmp")
-        os.close(fd)
-        snapshot = Path(raw_path)
+        started = time.monotonic()
+        snapshot: Path | None = None
+        source_name: str | None = None
         try:
-            size = _snapshot_store_to_file(store, snapshot)
-            if size > _snapshot_max_bytes():
-                snapshot.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=503,
-                    detail="canonical certification snapshot exceeds configured bounded export",
-                )
+            with _STATE_LOCK:
+                _SNAPSHOT_STATE["attempts"] = int(_SNAPSHOT_STATE.get("attempts", 0) or 0) + 1
+                _SNAPSHOT_STATE["last_started_monotonic"] = started
+                _SNAPSHOT_STATE["last_error_type"] = None
+
+            runtime = runtime_provider()
+            store = getattr(runtime, "store", None)
+            if store is None:
+                raise HTTPException(status_code=503, detail="canonical runtime store unavailable")
+            source_path = Path(getattr(store, "path", ""))
+            source_name = source_path.name or None
+            directory = _snapshot_directory(store)
+            _cleanup_stale_exports(directory)
+            fd, raw_path = tempfile.mkstemp(
+                prefix=".certification-export-",
+                suffix=".sqlite3",
+                dir=str(directory),
+            )
+            os.close(fd)
+            snapshot = Path(raw_path)
+
+            _LOGGER.info(
+                "SOLANA_ROI_CERTIFICATION_SNAPSHOT_START release=%s source=%s",
+                _release_commit(),
+                source_name or "unknown",
+            )
+            size, estimated = _snapshot_store_to_file(store, snapshot)
+            _record_snapshot_result(
+                success=True,
+                started=started,
+                size=size,
+                estimated=estimated,
+                source_name=source_name,
+            )
+            _LOGGER.info(
+                "SOLANA_ROI_CERTIFICATION_SNAPSHOT_COMPLETE release=%s bytes=%s duration_seconds=%.3f",
+                _release_commit(),
+                size,
+                max(0.0, time.monotonic() - started),
+            )
         except HTTPException:
+            if snapshot is not None:
+                snapshot.unlink(missing_ok=True)
+            _record_snapshot_result(
+                success=False,
+                started=started,
+                error_type="HTTPException",
+                source_name=source_name,
+            )
             raise
         except Exception as exc:
-            snapshot.unlink(missing_ok=True)
+            if snapshot is not None:
+                snapshot.unlink(missing_ok=True)
+            _record_snapshot_result(
+                success=False,
+                started=started,
+                error_type=type(exc).__name__,
+                source_name=source_name,
+            )
+            _LOGGER.warning(
+                "SOLANA_ROI_CERTIFICATION_SNAPSHOT_FAILED release=%s error_type=%s duration_seconds=%.3f",
+                _release_commit(),
+                type(exc).__name__,
+                max(0.0, time.monotonic() - started),
+            )
             raise HTTPException(
                 status_code=503,
                 detail=f"canonical certification snapshot failed closed:{type(exc).__name__}",
             ) from exc
+        finally:
+            _SNAPSHOT_EXPORT_LOCK.release()
 
+        assert snapshot is not None
         return FileResponse(
             snapshot,
             media_type="application/vnd.sqlite3",
@@ -312,9 +496,6 @@ def _strip_local_certification_workers() -> None:
     async def runtime_workers_without_local_certification(runtime: Any, stop: Any) -> None:
         await base(runtime, stop)
 
-    # Preserve introspection markers while making the transfer explicit. The
-    # certification wrappers are intentionally bypassed because their heavy work is
-    # now owned by another Render cgroup; the base real-time worker chain is retained.
     setattr(runtime_workers_without_local_certification, "_roi_e2e_status_snapshot_worker", True)
     setattr(runtime_workers_without_local_certification, "_roi_production_proof_snapshot_worker", True)
     setattr(runtime_workers_without_local_certification, "_roi_forward_certification_snapshot_worker", True)
@@ -324,6 +505,8 @@ def _strip_local_certification_workers() -> None:
 
 
 def status() -> dict[str, Any]:
+    with _STATE_LOCK:
+        snapshot_state = dict(_SNAPSHOT_STATE)
     return {
         "split_version": SPLIT_VERSION,
         "enabled": split_runtime_enabled(),
@@ -332,11 +515,17 @@ def status() -> dict[str, Any]:
         "shared_auth_configured": bool(_shared_token()),
         "runtime_executes_local_certification_builders": False if split_runtime_enabled() else True,
         "canonical_sqlite_owner": "authoritative_runtime",
-        "snapshot_export": "sqlite_online_backup_point_in_time_read_only_connection",
+        "snapshot_export": "pinned_wal_read_transaction_bounded_online_backup",
         "snapshot_holds_runtime_store_lock": False,
+        "snapshot_uses_runtime_persistent_disk": True,
+        "snapshot_shared_writable_disk": False,
+        "snapshot_single_flight": True,
+        "snapshot_deadline_seconds": _snapshot_deadline_seconds(),
         "snapshot_pages_per_step": _snapshot_pages_per_step(),
         "snapshot_step_sleep_seconds": _snapshot_step_sleep_seconds(),
         "snapshot_max_bytes": _snapshot_max_bytes(),
+        "snapshot_free_reserve_bytes": _snapshot_free_reserve_bytes(),
+        "snapshot_state": snapshot_state,
         "shared_writable_disk": False,
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
@@ -368,9 +557,6 @@ def install_certification_service_split(app: Any, runtime_provider: Callable[[],
 
     _strip_local_certification_workers()
 
-    # The legacy system-proof warmer is also certification/analytics work. Keep its
-    # callback installed for code reachability, but prevent the authoritative
-    # runtime lifespan from starting the local precompute task.
     app.state.roi_v51_system_proof_precompute = None
     app.state.roi_v51_system_proof_precompute_worker_enabled = False
 
@@ -385,6 +571,8 @@ def install_certification_service_split(app: Any, runtime_provider: Callable[[],
 
 __all__ = [
     "SPLIT_VERSION",
+    "_cleanup_stale_exports",
+    "_snapshot_store_to_file",
     "install_certification_service_split",
     "split_runtime_enabled",
     "status",
