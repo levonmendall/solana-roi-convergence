@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import unified_strategy_status as unified
+from .certification_generation_coordinator import CertificationResourceGuardError, resource_guard
 from .cgroup_oom_forensics import phase as memory_forensics_phase
 
 
-REPAIR_VERSION = "e2e-status-read-boundary-v2-precomputed-nonblocking"
+REPAIR_VERSION = "e2e-status-read-boundary-v3-owned-publication-postbuild-guard"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -28,6 +29,7 @@ _SNAPSHOT_STATS: dict[str, Any] = {
     "attempts": 0,
     "successes": 0,
     "failures": 0,
+    "guard_rejections": 0,
     "consecutive_failures": 0,
     "last_started_at": None,
     "last_completed_at": None,
@@ -135,6 +137,9 @@ def build_bounded_e2e_status(
             "http_request_executes_deep_status_builder": False,
             "snapshot_precomputed_off_request_path": True,
             "snapshot_stale_seconds": SNAPSHOT_STALE_SECONDS,
+            "publication_uses_owned_builder_payload": True,
+            "post_build_resource_guard": True,
+            "post_build_memory_limit_fraction": 0.90,
             "strategy_contract_or_gate_relaxed": False,
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
@@ -160,9 +165,13 @@ def _cache_state() -> dict[str, Any]:
         "snapshot_interval_seconds": SNAPSHOT_INTERVAL_SECONDS,
         "http_request_executes_deep_status_builder": False,
         "snapshot_precomputed_off_request_path": True,
+        "publication_uses_owned_builder_payload": True,
+        "post_build_resource_guard": True,
+        "post_build_memory_limit_fraction": 0.90,
         "attempts": int(stats.get("attempts", 0) or 0),
         "successes": int(stats.get("successes", 0) or 0),
         "failures": int(stats.get("failures", 0) or 0),
+        "guard_rejections": int(stats.get("guard_rejections", 0) or 0),
         "consecutive_failures": int(stats.get("consecutive_failures", 0) or 0),
         "last_started_at": stats.get("last_started_at"),
         "last_completed_at": stats.get("last_completed_at"),
@@ -212,6 +221,9 @@ def _fail_closed_payload(reason: str) -> dict[str, Any]:
             "http_request_executes_deep_status_builder": False,
             "snapshot_precomputed_off_request_path": True,
             "snapshot_stale_seconds": SNAPSHOT_STALE_SECONDS,
+            "publication_uses_owned_builder_payload": True,
+            "post_build_resource_guard": True,
+            "post_build_memory_limit_fraction": 0.90,
             "strategy_contract_or_gate_relaxed": False,
             "paper_only": True,
             "live_money_authority": False,
@@ -223,10 +235,10 @@ def _fail_closed_payload(reason: str) -> dict[str, Any]:
 
 
 def _publish_snapshot(payload: dict[str, Any]) -> None:
+    """Publish the builder-owned payload without a second whole-status copy."""
     global _SNAPSHOT, _SNAPSHOT_PUBLISHED_MONOTONIC
     published = time.monotonic()
-    copied = copy.deepcopy(payload)
-    boundary = copied.setdefault("read_boundary", {})
+    boundary = payload.setdefault("read_boundary", {})
     if isinstance(boundary, dict):
         boundary.update(
             {
@@ -234,15 +246,17 @@ def _publish_snapshot(payload: dict[str, Any]) -> None:
                 "snapshot_published_at": _utcnow(),
                 "snapshot_precomputed_off_request_path": True,
                 "http_request_executes_deep_status_builder": False,
+                "publication_uses_owned_builder_payload": True,
+                "post_build_resource_guard": True,
             }
         )
     with _SNAPSHOT_LOCK:
-        _SNAPSHOT = copied
+        _SNAPSHOT = payload
         _SNAPSHOT_PUBLISHED_MONOTONIC = published
 
 
 def _cached_e2e_status() -> dict[str, Any]:
-    """Return only an immutable snapshot; never wait for production SQLite work."""
+    """Return only an isolated snapshot; never wait for production SQLite work."""
     with _SNAPSHOT_LOCK:
         payload = copy.deepcopy(_SNAPSHOT) if _SNAPSHOT is not None else None
         published = _SNAPSHOT_PUBLISHED_MONOTONIC
@@ -273,9 +287,17 @@ def _snapshot_thread_main(
         try:
             with memory_forensics_phase("e2e_status_build"):
                 payload = build_bounded_e2e_status(lambda: runtime, robinhood_status_provider)
+            if not isinstance(payload, dict):
+                raise TypeError("E2E status builder returned non-dict payload")
+            resource_guard("e2e_status_post_build_pre_publish")
             _publish_snapshot(payload)
         except BaseException as exc:
             error_type = type(exc).__name__
+            if isinstance(exc, CertificationResourceGuardError):
+                with _SNAPSHOT_LOCK:
+                    _SNAPSHOT_STATS["guard_rejections"] = int(
+                        _SNAPSHOT_STATS.get("guard_rejections", 0) or 0
+                    ) + 1
         duration = max(0.0, time.monotonic() - started)
         with _SNAPSHOT_LOCK:
             _SNAPSHOT_STATS["last_completed_at"] = _utcnow()
