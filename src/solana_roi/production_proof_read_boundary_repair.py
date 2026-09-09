@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import render_runtime_bootstrap_repair as render_bootstrap
+from .certification_generation_coordinator import resource_guard
 from .cgroup_oom_forensics import phase as memory_forensics_phase
 
 
-REPAIR_VERSION = "production-proof-read-boundary-v2-stable-worker-chain"
+REPAIR_VERSION = "production-proof-read-boundary-v3-postbuild-memory-guard"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -66,6 +67,9 @@ def _cache_state() -> dict[str, Any]:
         "snapshot_interval_seconds": SNAPSHOT_INTERVAL_SECONDS,
         "http_request_executes_deep_proof_builder": False,
         "snapshot_precomputed_off_request_path": True,
+        "publication_uses_owned_builder_payload": True,
+        "post_build_resource_guard": True,
+        "post_build_memory_limit_fraction": 0.90,
         "attempts": int(stats.get("attempts", 0) or 0),
         "successes": int(stats.get("successes", 0) or 0),
         "failures": int(stats.get("failures", 0) or 0),
@@ -128,6 +132,8 @@ def _fail_closed_payload(reason: str) -> dict[str, Any]:
             "reason": blocker,
             "http_request_executes_deep_proof_builder": False,
             "snapshot_precomputed_off_request_path": True,
+            "publication_uses_owned_builder_payload": True,
+            "post_build_resource_guard": True,
             "strategy_contract_or_gate_relaxed": False,
             "cache": _cache_state(),
         },
@@ -142,9 +148,14 @@ def _fail_closed_payload(reason: str) -> dict[str, Any]:
 
 
 def _publish_snapshot(payload: dict[str, Any]) -> None:
+    """Publish the builder-owned payload without making a second whole-proof copy.
+
+    The background builder transfers ownership here and does not retain or mutate the
+    object afterward. HTTP callers remain isolated by _cached_production_proof(),
+    which returns a deepcopy rather than exposing the cached object.
+    """
     global _SNAPSHOT, _SNAPSHOT_PUBLISHED_MONOTONIC
-    copied = copy.deepcopy(payload)
-    boundary = copied.setdefault("read_boundary", {})
+    boundary = payload.setdefault("read_boundary", {})
     if isinstance(boundary, dict):
         boundary.update(
             {
@@ -153,16 +164,18 @@ def _publish_snapshot(payload: dict[str, Any]) -> None:
                 "snapshot_published_at": _utcnow(),
                 "http_request_executes_deep_proof_builder": False,
                 "snapshot_precomputed_off_request_path": True,
+                "publication_uses_owned_builder_payload": True,
+                "post_build_resource_guard": True,
                 "strategy_contract_or_gate_relaxed": False,
             }
         )
     with _SNAPSHOT_LOCK:
-        _SNAPSHOT = copied
+        _SNAPSHOT = payload
         _SNAPSHOT_PUBLISHED_MONOTONIC = time.monotonic()
 
 
 def _cached_production_proof() -> dict[str, Any]:
-    """Return an immutable proof snapshot and never touch the canonical store."""
+    """Return an isolated proof snapshot and never touch the canonical store."""
     with _SNAPSHOT_LOCK:
         payload = copy.deepcopy(_SNAPSHOT) if _SNAPSHOT is not None else None
         published = _SNAPSHOT_PUBLISHED_MONOTONIC
@@ -186,10 +199,17 @@ def _snapshot_thread_main(builder: Callable[[], dict[str, Any]], stop: threading
             _SNAPSHOT_STATS["last_started_at"] = _utcnow()
         error_type: str | None = None
         try:
+            # Preserve the existing canonical phase-attribution contract. The cgroup
+            # forensic sampler records the active phase throughout the heavy builder.
             with memory_forensics_phase("production_proof_build"):
                 payload = builder()
             if not isinstance(payload, dict):
                 raise TypeError("production proof builder returned non-dict payload")
+            # Re-run the exact canonical resource guard after the build. A generation
+            # admitted below the 90% threshold may have grown materially while
+            # composing its proof; rejecting here retains the last known-good snapshot
+            # instead of entering publication under unsafe cgroup/disk/WAL pressure.
+            resource_guard("production_proof_post_build_pre_publish")
             _publish_snapshot(payload)
         except BaseException as exc:
             error_type = type(exc).__name__
