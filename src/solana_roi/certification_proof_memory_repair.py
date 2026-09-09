@@ -32,9 +32,9 @@ _LOCK = threading.Lock()
 _LOCAL = threading.local()
 _INSTALLED = False
 _ORIGINAL_ECONOMIC_RECORDS: Callable[[Any], list[dict[str, Any]]] = economic._records
-_ORIGINAL_COMBINED_PROMOTION_RECORDS: Callable[[Any], list[dict[str, Any]]] = (
-    cross_surface.combined_promotion_records
-)
+_ORIGINAL_COMBINED_PROMOTION_RECORDS: Callable[
+    [Any, dict[str, Any] | None], list[dict[str, Any]]
+] = cross_surface.combined_promotion_records
 _ORIGINAL_BOOTSTRAP_DISTRIBUTIONS = economic_core._bootstrap_distributions
 _ORIGINAL_PROOF_BUILDER: Callable[[], dict[str, Any]] | None = None
 _STATE: dict[str, Any] = {
@@ -299,16 +299,26 @@ def _bounded_bootstrap_distributions(
     return distributions
 
 
-def _shared_combined_promotion_records(store: Any) -> list[dict[str, Any]]:
+def _shared_combined_promotion_records(
+    store: Any,
+    robinhood_proof: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Share one cross-surface promotion population without dropping Robinhood evidence.
+
+    The canonical cross-surface reader accepts both the store and the isolated Robinhood
+    proof. Cache only calls that use the same store and the same proof object during one
+    production-proof generation so nested Phase 14/17 reads reuse the population while
+    distinct Robinhood proof snapshots can never alias each other.
+    """
     cache = getattr(_LOCAL, "promotion_cache", None)
     if not isinstance(cache, dict):
-        return _ORIGINAL_COMBINED_PROMOTION_RECORDS(store)
-    key = id(store)
+        return _ORIGINAL_COMBINED_PROMOTION_RECORDS(store, robinhood_proof)
+    key = (id(store), id(robinhood_proof))
     if key in cache:
         _inc("promotion_cache_hits")
         return cache[key]
     _inc("promotion_cache_misses")
-    rows = _ORIGINAL_COMBINED_PROMOTION_RECORDS(store)
+    rows = _ORIGINAL_COMBINED_PROMOTION_RECORDS(store, robinhood_proof)
     cache[key] = rows
     return rows
 
