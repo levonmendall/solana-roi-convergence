@@ -32,6 +32,28 @@ COMPOSITION_VERSION = "v52-explicit-production-authority-v4-robinhood-position-l
 _INSTALLED = False
 
 
+def _bind_concrete_robinhood_lifecycle_owner() -> None:
+    """Bind the final chooser at the concrete composed production class.
+
+    Mature Robinhood repairs may install a class-level chooser before v5.2 is
+    composed. Patching only the source mixin is therefore insufficient: the
+    concrete class can legitimately shadow the mixin and continue resolving its
+    previously composed chooser. Capture that exact predecessor and put the v5.2
+    lifecycle wrapper at the concrete boundary as well. If normal MRO lookup
+    already resolves the lifecycle wrapper, this is a no-op.
+    """
+    from .robinhood_chain_paper import RobinhoodChainPaperPlane
+
+    final_wrapper = getattr(robinhood_lifecycle, "_choose_with_lifecycle")
+    current = RobinhoodChainPaperPlane._v5_choose_lane_fraction
+    if current is final_wrapper:
+        return
+    setattr(robinhood_lifecycle, "_BASE_CHOOSE", current)
+    RobinhoodChainPaperPlane._v5_choose_lane_fraction = final_wrapper  # type: ignore[method-assign]
+    setattr(RobinhoodChainPaperPlane._v5_choose_lane_fraction, "_roi_v52_final_authority", True)
+    setattr(RobinhoodChainPaperPlane._v5_choose_lane_fraction, "_roi_v52_position_lifecycle", True)
+
+
 def _preserve_robinhood_wrapper_contracts() -> None:
     """Keep predecessor reachability markers visible on the final v5.2 wrapper.
 
@@ -82,6 +104,7 @@ def install_v52_production_authority(
     install_v52_robinhood_storage_compatibility()
     install_v52_robinhood_exit_authority()
     install_v52_robinhood_position_lifecycle()
+    _bind_concrete_robinhood_lifecycle_owner()
     _preserve_robinhood_wrapper_contracts()
     install_v52_strategy_api(app)
     app.state.roi_v51_final_economic_authority = False
