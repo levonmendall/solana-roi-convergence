@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight"
+COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight-v21-certification-service-split"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -205,6 +205,12 @@ class ProductionSystem:
             "rpc_task_ownership_repair_version": getattr(
                 self.app.state, "roi_rpc_task_ownership_repair_version", None
             ),
+            "certification_service_split": bool(
+                getattr(self.app.state, "roi_certification_service_split_enabled", False)
+            ),
+            "certification_service_split_version": getattr(
+                self.app.state, "roi_certification_service_split_version", None
+            ),
             "paper_only": PAPER_ONLY,
             "live_money_authority": LIVE_MONEY_AUTHORITY,
             "signing_available": SIGNING_AVAILABLE,
@@ -278,6 +284,7 @@ def build_production_system() -> ProductionSystem:
     from .batch9_finalization_repair import install_batch9_finalization_repair
     from .certification_generation_runtime_repair import install_certification_generation_runtime_repair
     from .certification_proof_memory_repair import install_certification_proof_memory_repair
+    from .certification_service_split import install_certification_service_split
     from .e2e_status_read_boundary_repair import install_e2e_status_read_boundary_repair
     from .production_proof_read_boundary_repair import install_production_proof_read_boundary_repair
     from .rpc_task_ownership_repair import (
@@ -330,8 +337,8 @@ def build_production_system() -> ProductionSystem:
     install_certification_proof_memory_repair(app)
 
     # v5.1-named modules above remain proven compatibility infrastructure. Install
-    # the frozen v5.2 economic authority only after that substrate is complete so
-    # Solana, FOMO and Robinhood all have exactly one final decision owner.
+    # the v5.2 economic authority only after that substrate is complete so Solana,
+    # FOMO and Robinhood all have exactly one final decision owner.
     install_v52_production_authority(app, ingestion_runtime)
 
     # The certification worker wraps a chain that already owns both E2E and
@@ -342,6 +349,11 @@ def build_production_system() -> ProductionSystem:
     if bool(getattr(certification_workers, "_roi_forward_certification_snapshot_worker", False)):
         setattr(certification_workers, "_roi_e2e_status_snapshot_worker", True)
         setattr(certification_workers, "_roi_production_proof_snapshot_worker", True)
+
+    # Certification isolation belongs to this explicit composition root, never to
+    # the thin production facade. Split mode changes only certification execution
+    # and read routing; v5.2 strategy/economic authority remains untouched.
+    install_certification_service_split(app, ingestion_runtime)
 
     components = _required_components()
     missing = [component.name for component in components if component.required and not component.available]
