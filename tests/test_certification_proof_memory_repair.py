@@ -123,11 +123,11 @@ def test_bounded_fomo_shadow_join_preserves_canonical_records_without_full_scan(
 
 
 def test_promotion_population_is_read_once_per_proof_generation(monkeypatch) -> None:
-    calls: list[object] = []
+    calls: list[tuple[object, object | None]] = []
     store = object()
 
-    def source(value: object):
-        calls.append(value)
+    def source(value: object, robinhood_proof: object | None):
+        calls.append((value, robinhood_proof))
         return [{"sample": 1}]
 
     monkeypatch.setattr(repair, "_ORIGINAL_COMBINED_PROMOTION_RECORDS", source)
@@ -144,21 +144,78 @@ def test_promotion_population_is_read_once_per_proof_generation(monkeypatch) -> 
 
     assert first is second
     assert first == [{"sample": 1}]
-    assert calls == [store]
+    assert calls == [(store, None)]
+
+
+def test_shared_population_forwards_robinhood_proof_and_does_not_alias_distinct_snapshots(monkeypatch) -> None:
+    calls: list[tuple[object, dict[str, object] | None]] = []
+    store = object()
+    robinhood_a: dict[str, object] = {
+        "promotion_records": [{"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-a"}]
+    }
+    robinhood_b: dict[str, object] = {
+        "promotion_records": [{"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-b"}]
+    }
+
+    def source(value: object, robinhood_proof: dict[str, object] | None):
+        calls.append((value, robinhood_proof))
+        records = list((robinhood_proof or {}).get("promotion_records", []))
+        return [dict(row) for row in records if isinstance(row, dict)]
+
+    monkeypatch.setattr(repair, "_ORIGINAL_COMBINED_PROMOTION_RECORDS", source)
+    previous = getattr(repair._LOCAL, "promotion_cache", None)
+    repair._LOCAL.promotion_cache = {}
+    try:
+        first = repair._shared_combined_promotion_records(store, robinhood_a)
+        second = repair._shared_combined_promotion_records(store, robinhood_a)
+        third = repair._shared_combined_promotion_records(store, robinhood_b)
+    finally:
+        if previous is None:
+            delattr(repair._LOCAL, "promotion_cache")
+        else:
+            repair._LOCAL.promotion_cache = previous
+
+    assert first is second
+    assert first == [{"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-a"}]
+    assert third == [{"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-b"}]
+    assert calls == [(store, robinhood_a), (store, robinhood_b)]
+
+
+def test_phase14_installed_reader_accepts_robinhood_proof_contract(monkeypatch) -> None:
+    store = object()
+    robinhood_proof = {
+        "promotion_records": [{"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-contract"}]
+    }
+    calls: list[tuple[object, object]] = []
+
+    def source(value: object, proof: object):
+        calls.append((value, proof))
+        return [{"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-contract"}]
+
+    monkeypatch.setattr(repair, "_ORIGINAL_COMBINED_PROMOTION_RECORDS", source)
+    monkeypatch.setattr(repair.phase14, "combined_promotion_records", repair._shared_combined_promotion_records)
+
+    records = repair.phase14.combined_promotion_records(store, robinhood_proof)
+
+    assert records == [{"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-contract"}]
+    assert calls == [(store, robinhood_proof)]
 
 
 def test_proof_wrapper_scopes_shared_population_and_preserves_authority(monkeypatch) -> None:
     store = object()
-    calls: list[object] = []
+    robinhood_proof = {
+        "promotion_records": [{"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-proof"}]
+    }
+    calls: list[tuple[object, object]] = []
 
-    def source(value: object):
-        calls.append(value)
-        return [{"sample": 1}]
+    def source(value: object, proof: object):
+        calls.append((value, proof))
+        return [{"sample": 1}, {"surface": "ROBINHOOD_CHAIN", "source_signature": "rh-proof"}]
 
     def proof_builder():
-        left = repair._shared_combined_promotion_records(store)
-        right = repair._shared_combined_promotion_records(store)
-        return {"same_population": left is right}
+        left = repair._shared_combined_promotion_records(store, robinhood_proof)
+        right = repair._shared_combined_promotion_records(store, robinhood_proof)
+        return {"same_population": left is right, "robinhood_preserved": right[-1]["surface"]}
 
     monkeypatch.setattr(repair, "_ORIGINAL_COMBINED_PROMOTION_RECORDS", source)
     monkeypatch.setattr(repair, "_ORIGINAL_PROOF_BUILDER", proof_builder)
@@ -166,8 +223,8 @@ def test_proof_wrapper_scopes_shared_population_and_preserves_authority(monkeypa
     payload = repair._proof_with_shared_promotion_population()
     status = repair.status()
 
-    assert payload == {"same_population": True}
-    assert calls == [store]
+    assert payload == {"same_population": True, "robinhood_preserved": "ROBINHOOD_CHAIN"}
+    assert calls == [(store, robinhood_proof)]
     assert status["resource_guard_relaxed"] is False
     assert status["stale_gate_relaxed"] is False
     assert status["continuity_gate_relaxed"] is False
