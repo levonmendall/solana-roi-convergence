@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -17,6 +18,7 @@ class AppendOnlyEventStore:
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self._verify_lock = threading.Lock()
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
@@ -80,20 +82,71 @@ class AppendOnlyEventStore:
             )
         return lineage
 
+    def _release_verification_file_cache(self) -> None:
+        """Best-effort file-specific cache advice after a whole-ledger integrity scan.
+
+        This never mutates SQLite state and deliberately does not use process- or
+        host-global cache controls. Unsupported platforms and advisory failures
+        are safe no-ops.
+        """
+        fadvise = getattr(os, "posix_fadvise", None)
+        advice = getattr(os, "POSIX_FADV_DONTNEED", None)
+        if fadvise is None or advice is None:
+            return
+        try:
+            fd = os.open(self.path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            try:
+                fadvise(fd, 0, 0, advice)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+
     def verify(self) -> bool:
-        previous: str | None = None
-        with self._lock:
-            rows = self.db.execute(
-                "SELECT event_type, observed_at, payload_json, previous_hash, lineage_hash FROM events ORDER BY id"
-            ).fetchall()
-        for event_type, observed_at, raw, recorded_previous, lineage in rows:
-            if recorded_previous != previous:
-                return False
-            expected = hashlib.sha256(f"{previous or ''}|{event_type}|{observed_at}|{raw}".encode()).hexdigest()
-            if expected != lineage:
-                return False
-            previous = lineage
-        return True
+        """Verify the complete append-only lineage without materializing it.
+
+        A dedicated read-only SQLite transaction establishes the same committed
+        point-in-time snapshot that the former fetchall-based verifier captured,
+        but rows are hashed one at a time. Concurrent verification calls are
+        serialized so status polling cannot multiply whole-ledger scans. After
+        the reader closes, file-specific POSIX_FADV_DONTNEED is issued when the
+        platform supports it so certification polling does not pin the canonical
+        database's historical pages in the service cgroup.
+        """
+        with self._verify_lock:
+            previous: str | None = None
+            reader: sqlite3.Connection | None = None
+            try:
+                uri = f"{self.path.resolve().as_uri()}?mode=ro"
+                with self._lock:
+                    reader = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                    reader.execute("PRAGMA query_only=ON")
+                    reader.execute("PRAGMA busy_timeout=5000")
+                    reader.execute("BEGIN")
+                    cursor = reader.execute(
+                        "SELECT event_type, observed_at, payload_json, previous_hash, lineage_hash "
+                        "FROM events ORDER BY id"
+                    )
+                    row = cursor.fetchone()
+                while row is not None:
+                    event_type, observed_at, raw, recorded_previous, lineage = row
+                    if recorded_previous != previous:
+                        return False
+                    expected = hashlib.sha256(
+                        f"{previous or ''}|{event_type}|{observed_at}|{raw}".encode()
+                    ).hexdigest()
+                    if expected != lineage:
+                        return False
+                    previous = lineage
+                    row = cursor.fetchone()
+                return True
+            finally:
+                if reader is not None:
+                    reader.close()
+                self._release_verification_file_cache()
 
     def upsert_wallet_profile(self, *, wallet: str, entity_id: str, tier: str, first_touch_sample_size: int, historically_eligible: bool, updated_at: str) -> None:
         with self._lock, self.db:
