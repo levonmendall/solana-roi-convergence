@@ -58,6 +58,7 @@ class DurablePaperTradingEngine(PaperTradingEngine):
     ):
         super().__init__(config=config, store=store)
         self.store = store
+        self._last_engine_event_id = 0
         with store._lock, store.db:
             store.db.execute(
                 "CREATE TABLE IF NOT EXISTS paper_engine_checkpoint ("
@@ -67,14 +68,40 @@ class DurablePaperTradingEngine(PaperTradingEngine):
             )
         self._restore_or_fail_closed()
 
-    def _latest_engine_event_id(self) -> int:
+    def _append(self, event_type: str, observed_at: datetime, payload: dict[str, object]) -> None:
+        lineage = self.store.append(event_type, observed_at.isoformat(), payload)
+        if event_type not in _ENGINE_EVENT_TYPES:
+            return
+        with self.store._lock:
+            row = self.store.db.execute(
+                "SELECT id FROM events WHERE lineage_hash=?",
+                (lineage,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("paper engine checkpoint blocked: appended engine event id unavailable")
+        self._last_engine_event_id = int(row["id"])
+
+    def _engine_event_after(self, event_id: int) -> int | None:
         placeholders = ",".join("?" for _ in _ENGINE_EVENT_TYPES)
         with self.store._lock:
             row = self.store.db.execute(
-                f"SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type IN ({placeholders})",
-                _ENGINE_EVENT_TYPES,
+                f"SELECT id FROM events WHERE id>? AND event_type IN ({placeholders}) "
+                "ORDER BY id LIMIT 1",
+                (int(event_id), *_ENGINE_EVENT_TYPES),
             ).fetchone()
-        return int(row[0]) if row else 0
+        return int(row["id"]) if row is not None else None
+
+    def _checkpoint_event_marker_valid(self, event_id: int) -> bool:
+        if event_id == 0:
+            return True
+        if event_id < 0:
+            return False
+        with self.store._lock:
+            row = self.store.db.execute(
+                "SELECT event_type FROM events WHERE id=?",
+                (int(event_id),),
+            ).fetchone()
+        return row is not None and str(row["event_type"]) in _ENGINE_EVENT_TYPES
 
     def _state_dict(self) -> dict[str, Any]:
         candidates: dict[str, Any] = {}
@@ -159,7 +186,7 @@ class DurablePaperTradingEngine(PaperTradingEngine):
         state = self._state_dict()
         raw = json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
         digest = hashlib.sha256(raw.encode()).hexdigest()
-        last_engine_event_id = self._latest_engine_event_id()
+        last_engine_event_id = self._last_engine_event_id
         with self.store._lock, self.store.db:
             self.store.db.execute(
                 "INSERT INTO paper_engine_checkpoint(id, saved_at, last_engine_event_id, state_json, state_sha256) "
@@ -176,17 +203,21 @@ class DurablePaperTradingEngine(PaperTradingEngine):
             row = self.store.db.execute(
                 "SELECT last_engine_event_id, state_json, state_sha256 FROM paper_engine_checkpoint WHERE id=1"
             ).fetchone()
-        latest_engine_event_id = self._latest_engine_event_id()
         if row is None:
-            if latest_engine_event_id != 0:
+            if self._engine_event_after(0) is not None:
                 raise RuntimeError("paper engine restore blocked: engine history exists without a durable checkpoint")
             return
+
+        checkpoint_event_id = int(row["last_engine_event_id"])
+        if not self._checkpoint_event_marker_valid(checkpoint_event_id):
+            raise RuntimeError("paper engine restore blocked: checkpoint engine event marker invalid")
+        if self._engine_event_after(checkpoint_event_id) is not None:
+            raise RuntimeError("paper engine restore blocked: checkpoint does not cover latest engine event")
+
         raw = str(row["state_json"])
         digest = hashlib.sha256(raw.encode()).hexdigest()
         if digest != str(row["state_sha256"]):
             raise RuntimeError("paper engine restore blocked: checkpoint digest mismatch")
-        if int(row["last_engine_event_id"]) != latest_engine_event_id:
-            raise RuntimeError("paper engine restore blocked: checkpoint does not cover latest engine event")
         state = json.loads(raw)
         if state.get("schema") != "roi-convergence-paper-engine-checkpoint.v1":
             raise RuntimeError("paper engine restore blocked: unsupported checkpoint schema")
@@ -270,6 +301,7 @@ class DurablePaperTradingEngine(PaperTradingEngine):
             )
             for payload in state.get("closed") or []
         ]
+        self._last_engine_event_id = checkpoint_event_id
 
     def on_first_touch(self, touch: WalletTouch, risk: RiskSnapshot, *, execution_price: float | None = None) -> None:
         super().on_first_touch(touch, risk, execution_price=execution_price)
