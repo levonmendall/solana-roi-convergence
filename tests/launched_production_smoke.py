@@ -12,8 +12,8 @@ import urllib.request
 from pathlib import Path
 
 
-AUTHORITY_ID = "roi-convergence-v5.1-consolidated-proof-1"
-STRATEGY_VERSION = "roi-convergence-v5.1-context-exactness-1"
+AUTHORITY_ID = "roi-convergence-v5.2-authoritative-1"
+STRATEGY_VERSION = "roi-convergence-v5.2-continuation-capture-1"
 
 
 def _free_port() -> int:
@@ -84,17 +84,21 @@ def main() -> int:
             assert health["paper_only"] is True
             assert health["live_money_authority"] is False
 
+            # The canonical economic decision surface must be v5.2.  The forward
+            # and alpha endpoints below are read-only measurement/proof surfaces;
+            # their historical measurement provenance must never be interpreted as
+            # retaining v5.1 economic authority.
             assert authority["authority_id"] == AUTHORITY_ID
             assert authority["strategy_version"] == STRATEGY_VERSION
+            assert authority["authoritative_strategy"] == "v5.2"
             assert authority["paper_only"] is True
             assert authority["live_money_authority"] is False
             assert authority["signing_available"] is False
             assert authority["transaction_submission_available"] is False
             assert authority["canonical"] is True
+            assert authority["v51_control_final_decision_authority"] is False
 
             for payload in (forward, alpha):
-                assert payload["authority_id"] == AUTHORITY_ID
-                assert payload["strategy_version"] == STRATEGY_VERSION
                 assert payload["paper_only"] is True
                 assert payload["live_money_authority"] is False
                 assert payload["signing_available"] is False
