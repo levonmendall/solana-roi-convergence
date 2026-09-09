@@ -24,7 +24,7 @@ from . import production_proof_read_boundary_repair as production_proof
 from . import render_runtime_bootstrap_repair as render_bootstrap
 
 
-SPLIT_VERSION = "certification-service-split-v3-pinned-bounded-disk-snapshot"
+SPLIT_VERSION = "certification-service-split-v4-local-forward-freshness"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -487,21 +487,35 @@ def _install_snapshot_route(app: Any, runtime_provider: Callable[[], Any]) -> No
 
 
 def _strip_local_certification_workers() -> None:
+    """Keep only the bounded 15-second forward publisher in the runtime process.
+
+    E2E and production-proof builders remain isolated in the certifier cgroup. The
+    forward publisher is intentionally retained because its existing 45-second stale
+    contract cannot be satisfied behind a full-database export whose bounded deadline
+    is 55 seconds. It reads the authoritative live store, remains single-flight and
+    resource-guarded, and still cannot sign, submit or grant live-money authority.
+    """
     global _ORIGINAL_RUNTIME_WORKERS
     base = e2e._ORIGINAL_RUNTIME_WORKERS
     if not callable(base):
         raise RuntimeError("certification split cannot resolve canonical runtime worker base")
+    forward_worker = certification_runtime._runtime_workers_with_forward_snapshot
+    if not callable(forward_worker):
+        raise RuntimeError("certification split cannot resolve bounded forward publisher")
     _ORIGINAL_RUNTIME_WORKERS = render_bootstrap._run_runtime_workers
+    certification_runtime._ORIGINAL_RUNTIME_WORKERS = base
 
-    async def runtime_workers_without_local_certification(runtime: Any, stop: Any) -> None:
-        await base(runtime, stop)
+    async def runtime_workers_with_local_forward_only(runtime: Any, stop: Any) -> None:
+        await forward_worker(runtime, stop)
 
-    setattr(runtime_workers_without_local_certification, "_roi_e2e_status_snapshot_worker", True)
-    setattr(runtime_workers_without_local_certification, "_roi_production_proof_snapshot_worker", True)
-    setattr(runtime_workers_without_local_certification, "_roi_forward_certification_snapshot_worker", True)
-    setattr(runtime_workers_without_local_certification, "_roi_certification_split_runtime", True)
-    setattr(runtime_workers_without_local_certification, "_roi_local_certification_builders_disabled", True)
-    render_bootstrap._run_runtime_workers = runtime_workers_without_local_certification  # type: ignore[assignment]
+    setattr(runtime_workers_with_local_forward_only, "_roi_e2e_status_snapshot_worker", True)
+    setattr(runtime_workers_with_local_forward_only, "_roi_production_proof_snapshot_worker", True)
+    setattr(runtime_workers_with_local_forward_only, "_roi_forward_certification_snapshot_worker", True)
+    setattr(runtime_workers_with_local_forward_only, "_roi_certification_split_runtime", True)
+    setattr(runtime_workers_with_local_forward_only, "_roi_local_certification_builders_disabled", False)
+    setattr(runtime_workers_with_local_forward_only, "_roi_local_heavy_certification_builders_disabled", True)
+    setattr(runtime_workers_with_local_forward_only, "_roi_local_forward_publisher_retained", True)
+    render_bootstrap._run_runtime_workers = runtime_workers_with_local_forward_only  # type: ignore[assignment]
 
 
 def status() -> dict[str, Any]:
@@ -513,7 +527,12 @@ def status() -> dict[str, Any]:
         "role": "authoritative_runtime",
         "certifier_url_configured": bool(_certifier_url()),
         "shared_auth_configured": bool(_shared_token()),
-        "runtime_executes_local_certification_builders": False if split_runtime_enabled() else True,
+        "runtime_executes_local_certification_builders": False,
+        "runtime_executes_local_heavy_certification_builders": False,
+        "runtime_executes_local_forward_publisher": bool(split_runtime_enabled()),
+        "forward_publication_interval_seconds": certification_runtime.FORWARD_SNAPSHOT_INTERVAL_SECONDS,
+        "forward_publication_stale_seconds": certification_runtime.FORWARD_SNAPSHOT_STALE_SECONDS,
+        "forward_stale_threshold_changed": False,
         "canonical_sqlite_owner": "authoritative_runtime",
         "snapshot_export": "pinned_wal_read_transaction_bounded_online_backup",
         "snapshot_holds_runtime_store_lock": False,
@@ -548,9 +567,10 @@ def install_certification_service_split(app: Any, runtime_provider: Callable[[],
         return
 
     _install_snapshot_route(app, runtime_provider)
+    # E2E and production proof stay remote. Forward keeps the precomputed local
+    # endpoint so its existing 15s publication / 45s stale contract remains viable.
     for surface in (
         "/v1/strategy/e2e-status",
-        "/v1/strategy/forward-certification",
         "/v1/strategy/production-proof",
     ):
         _replace_get_route(app, surface)
@@ -561,6 +581,7 @@ def install_certification_service_split(app: Any, runtime_provider: Callable[[],
     app.state.roi_v51_system_proof_precompute_worker_enabled = False
 
     app.state.roi_certification_local_heavy_workers_disabled = True
+    app.state.roi_certification_local_forward_publisher = True
     app.state.roi_certification_remote_proxy = True
     app.state.roi_certification_snapshot_export = True
     app.state.roi_certification_shared_writable_disk = False
