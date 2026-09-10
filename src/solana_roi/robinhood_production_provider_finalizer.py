@@ -18,6 +18,10 @@ from .robinhood_alchemy_budget_guard import (
     install_robinhood_alchemy_budget_guard,
     status as alchemy_budget_guard_status,
 )
+from .robinhood_drpc_block_number_compat import (
+    install_robinhood_drpc_block_number_compat,
+    status as drpc_block_number_compat_status,
+)
 from .robinhood_drpc_http_failure_diagnostic import (
     install_robinhood_drpc_http_failure_diagnostic,
 )
@@ -48,7 +52,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v12-drpc-http-failure-proof"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v13-drpc-block-number-compat"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -118,8 +122,6 @@ def _enforcing_run(original: Callable[[Any, asyncio.Event], Awaitable[None]]) ->
         try:
             await original(self, stop)
         finally:
-            # Keep the instance fail-closed after shutdown; it must never fall back to
-            # test/legacy freshness semantics after having been a production worker.
             setattr(self, "_roi_production_provider_enforce", True)
 
     setattr(wrapped, "_roi_robinhood_production_provider_finalizer", True)
@@ -127,14 +129,7 @@ def _enforcing_run(original: Callable[[Any, asyncio.Event], Awaitable[None]]) ->
 
 
 def _preserve_bounded_transport_aliases() -> None:
-    """Keep the bounded module's canonical reader aliases on the final wrappers.
-
-    The bounded transport historically exposes the exact reader/readiness functions
-    installed on the production transport module. Provider failover adds one final
-    generation-aware wrapper around those functions. Mirror the final callables back
-    into the bounded module so callers and architecture checks see one canonical
-    reader identity while the generation fail-closed semantics remain intact.
-    """
+    """Keep the bounded module's canonical reader aliases on the final wrappers."""
     bounded_transport._reader_async = production_transport._reader_async
     bounded_transport._reader_ready = production_transport._reader_ready
 
@@ -146,55 +141,39 @@ def install_robinhood_production_provider_finalizer(
 ) -> None:
     """Install the final production provider authority chain.
 
-    Broad discovery remains promotion-only, but when a healthy non-Alchemy private
-    provider is active it may carry the broad screening workload and the configured
-    provider-pool live-market ceiling. If Robinhood falls back to Alchemy, broad
-    screening moves back to the public research plane and the legacy Alchemy budget
-    controls remain authoritative for provider protection.
-
-    Provider failover is deliberately installed *after* the budget guard so quota/
-    budget exhaustion, 429s, provider 5xx/transport failures, or repeated WebSocket
-    failures can move the complete private HTTP/WSS pair to a configured backup. A
-    switch invalidates the old provider generation immediately; paper-entry readiness
-    stays false until the replacement WebSocket has verified Robinhood chain id 4663
-    and re-established the bounded subscription. Public RPC/sequencer transport never
-    enters the decision-authoritative provider pool. Strategy economics and v5.2
-    authority are unchanged, and signing/submission/live-money capability is absent.
+    Broad discovery remains promotion-only. dRPC is allowed to carry broad research
+    only after the same private-provider verification and fresh-event authority gates
+    are satisfied. A narrowly scoped compatibility layer handles the proven dRPC
+    Robinhood HTTP-400 response to ``eth_blockNumber`` by obtaining the same latest
+    block number from the documented ``eth_getBlockByNumber('latest', false)`` read.
+    The compatibility activates only after that exact dRPC 400 and still requires a
+    valid latest block. It does not alter strategy economics, paper-entry authority,
+    failover thresholds, signing, submission, custody, or live-money capability.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
         return
 
     _LEGACY_FRESH_READY = legacy_fresh_ready
-    # This belongs at the existing Robinhood provider-composition boundary rather
-    # than in the top-level production facade. It must run before provider-budget
-    # transport installs so dRPC capacity becomes the canonical acquisition policy.
     install_robinhood_provider_pool_throughput_repair()
     install_robinhood_getlogs_provider_guard()
     install_robinhood_provider_budget_transport()
-    # The budget installer patches the bounded module before it is installed. Restore
-    # the two-stage wrapper *function* here (not the already-bound wrapper factory), so
-    # bounded installation can compose it around the production status wrapper without
-    # invoking a status method at import time.
     bounded_transport._augment_status_wrapper = provider_budget._augment_status_wrapper
     install_robinhood_usage_bounded_transport()
-    # Keep the production transport's existing validation as final authority. This
-    # resolver only supplies the provider-equivalent WSS when a private HTTPS RPC was
-    # explicitly configured and no explicit WSS override exists.
     _install_private_https_wss_derivation()
     production_transport.install_robinhood_production_ws_transport(plane_cls)
     install_robinhood_event_driven_settlement(plane_cls)
     install_robinhood_adaptive_lane_controller(plane_cls)
     install_robinhood_alchemy_budget_guard(plane_cls)
-    # Outermost provider wrapper: catches provider/budget failures emitted by the
-    # guarded RPC path and coordinates the HTTP + WSS generation switch.
+
+    # Provider-specific compatibility must sit immediately inside the failover wrapper
+    # so both normal Robinhood polling and the preferred-provider capability proof use
+    # the same verified read semantics. It activates only on dRPC + eth_blockNumber +
+    # HTTP 400, then uses a documented equivalent read and validates its block number.
+    install_robinhood_drpc_block_number_compat(production_transport.runtime.RobinhoodRpc)
+
     install_robinhood_provider_failover()
-    # Runtime proof belongs inside this same Robinhood provider finalizer, not in the
-    # top-level production facade. It chain-verifies the configured preferred private
-    # provider before authoritative use/failback and records redacted traffic counters.
     install_robinhood_provider_runtime_proof()
-    # Diagnostic-only attribution wraps the saved raw provider RPC after runtime proof
-    # has established that contract. It changes no provider authority or health gate.
     install_robinhood_drpc_http_failure_diagnostic()
     _preserve_bounded_transport_aliases()
 
@@ -217,6 +196,7 @@ def status() -> dict[str, Any]:
         "explicit_websocket_precedence": True,
         "public_rpc_wss_derivation_allowed": False,
         "plain_http_rpc_wss_derivation_allowed": False,
+        "drpc_block_number_compat": drpc_block_number_compat_status(),
         "provider_pool_throughput": provider_pool_throughput_status(),
         "getlogs_provider_guard": getlogs_provider_guard_status(),
         "provider_budget_transport": provider_budget_transport_status(),
