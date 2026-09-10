@@ -344,6 +344,11 @@ def _require_shared_token(value: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid certification replication authorization")
 
 
+def _is_transient_prune_lock(error: sqlite3.OperationalError) -> bool:
+    message = str(error).strip().lower()
+    return "locked" in message or "busy" in message
+
+
 def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_fingerprint: str) -> dict[str, Any]:
     with store._lock, store.db:
         meta, reconfigured = _ensure_tracking_locked(store.db)
@@ -408,8 +413,16 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
         split._drop_file_cache(source_path)
 
     if from_watermark > 0:
-        with store._lock, store.db:
-            store.db.execute(f"DELETE FROM {_qident(CHANGE_TABLE)} WHERE id<=?", (from_watermark,))
+        try:
+            with store._lock, store.db:
+                store.db.execute(f"DELETE FROM {_qident(CHANGE_TABLE)} WHERE id<=?", (from_watermark,))
+        except sqlite3.OperationalError as exc:
+            # Journal pruning is reclaim-only. If another canonical writer briefly owns
+            # SQLite, retain the journal and return the already-computed exact delta;
+            # a later request can safely retry pruning. All non-contention failures
+            # continue to surface rather than weakening replication correctness.
+            if not _is_transient_prune_lock(exc):
+                raise
     return {
         "replication_version": REPLICATION_VERSION,
         "release_commit": split._release_commit(),
