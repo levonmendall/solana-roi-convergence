@@ -3,12 +3,12 @@ from __future__ import annotations
 """Bounded exact-state replication for the isolated certification service.
 
 The authoritative process remains the sole owner of the canonical SQLite database.
-A compact transactional journal records only stable row identities that change.  The
+A compact transactional journal records only stable row identities that change. The
 certifier owns a replica and asks for all mutations after its durable watermark.
 Each response resolves those identities from one pinned read transaction, giving the
 certifier one exact point-in-time logical database state.
 
-Full SQLite copies are retained only for bootstrap/recovery/reconciliation.  Normal
+Full SQLite copies are retained only for bootstrap/recovery/reconciliation. Normal
 certification cycles use bounded deltas.
 """
 
@@ -24,10 +24,11 @@ from fastapi import Header, HTTPException, Query
 
 from . import certification_service_split as split
 
-REPLICATION_VERSION = "certification-incremental-replica-v2-monotonic-watermark"
+REPLICATION_VERSION = "certification-incremental-replica-v3-schema-object-fingerprint"
 CHANGE_TABLE = "certification_replication_changes"
 META_TABLE = "certification_replication_meta"
 TRIGGER_PREFIX = "roi_cert_rep_"
+REPLICATION_INDEX = "ix_certification_replication_changes_id"
 DEFAULT_MAX_DELTA_ROWS = 50_000
 DEFAULT_MAX_DELTA_BYTES = 16 * 1024 * 1024
 
@@ -111,11 +112,36 @@ def _ordinary_tables(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     return tables
 
 
+def _schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
+    """Return user schema objects that define the certifier's exact read model."""
+    rows = connection.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "WHERE type IN ('table','view','index','trigger') ORDER BY type,name"
+    ).fetchall()
+    result: list[tuple[str, str, str, str]] = []
+    for kind, name, table_name, sql in rows:
+        kind = str(kind)
+        name = str(name)
+        table_name = str(table_name or "")
+        if name.startswith("sqlite_"):
+            continue
+        if name in {CHANGE_TABLE, META_TABLE, REPLICATION_INDEX}:
+            continue
+        if name.startswith(TRIGGER_PREFIX):
+            continue
+        if table_name in {CHANGE_TABLE, META_TABLE}:
+            continue
+        result.append((kind, name, table_name, str(sql or "")))
+    return result
+
+
 def _schema_fingerprint(connection: sqlite3.Connection) -> str:
-    payload: list[str] = []
+    payload: list[str] = [
+        f"SCHEMA:{kind}:{name}:{table_name}:{sql}"
+        for kind, name, table_name, sql in _schema_objects(connection)
+    ]
     for table in _ordinary_tables(connection):
         name = str(table["name"])
-        payload.append(f"TABLE:{name}:{table['sql']}")
         for column in _columns(connection, name):
             payload.append(
                 "COLUMN:"
@@ -151,6 +177,7 @@ def _set_meta(connection: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def _current_watermark(connection: sqlite3.Connection) -> int:
+    """Keep the journal watermark monotonic even after acknowledged rows are pruned."""
     row = connection.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (CHANGE_TABLE,)).fetchone()
     return max(0, int(row[0])) if row is not None and row[0] is not None else 0
 
@@ -220,24 +247,29 @@ def _ensure_tracking_locked(connection: sqlite3.Connection) -> tuple[dict[str, s
         "operation TEXT NOT NULL CHECK(operation IN ('upsert','delete')),changed_at TEXT NOT NULL)"
     )
     connection.execute(
-        f"CREATE INDEX IF NOT EXISTS ix_certification_replication_changes_id ON {_qident(CHANGE_TABLE)}(id)"
+        f"CREATE INDEX IF NOT EXISTS {_qident(REPLICATION_INDEX)} ON {_qident(CHANGE_TABLE)}(id)"
     )
     connection.execute(f"CREATE TABLE IF NOT EXISTS {_qident(META_TABLE)}(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
     meta = _meta(connection)
     observed = int(connection.execute("PRAGMA schema_version").fetchone()[0])
+    configured = int(meta.get("configured_schema_version", "-1"))
     if (
         meta.get("replication_version") == REPLICATION_VERSION
         and meta.get("epoch")
         and meta.get("schema_fingerprint")
-        and int(meta.get("configured_schema_version", "-1")) == observed
+        and configured == observed
     ):
         return meta, False
 
     fingerprint = _schema_fingerprint(connection)
+    # Any unaccounted DDL change also rotates the epoch. This protects against a
+    # replication trigger being dropped/replaced even though transport-owned
+    # triggers are intentionally excluded from the user schema fingerprint.
     identity_changed = (
         not meta
         or meta.get("replication_version") != REPLICATION_VERSION
         or meta.get("schema_fingerprint") != fingerprint
+        or configured != observed
     )
     if identity_changed:
         _drop_tracking_triggers(connection)
@@ -374,8 +406,8 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
         reader.close()
 
     # from_watermark is a durable acknowledgement: the client advances it only
-    # after its prior transaction and state sidecar have committed.  Prune only
-    # rows already acknowledged.  sqlite_sequence keeps the watermark monotonic.
+    # after its prior transaction and state sidecar have committed. Prune only
+    # rows already acknowledged. sqlite_sequence keeps the watermark monotonic.
     if from_watermark > 0:
         with store._lock, store.db:
             store.db.execute(f"DELETE FROM {_qident(CHANGE_TABLE)} WHERE id<=?", (from_watermark,))
@@ -402,18 +434,19 @@ def _wrap_bootstrap_snapshot_builder() -> None:
     current = split._snapshot_store_to_file
     if bool(getattr(current, "_roi_replication_bootstrap_prepare", False)):
         return
+
     def snapshot_with_replication_identity(store: Any, snapshot: Path) -> tuple[int, int]:
         prepare_bootstrap(store)
         return current(store, snapshot)
+
     setattr(snapshot_with_replication_identity, "_roi_replication_bootstrap_prepare", True)
     setattr(snapshot_with_replication_identity, "_roi_original_snapshot_store_to_file", current)
     split._snapshot_store_to_file = snapshot_with_replication_identity  # type: ignore[assignment]
 
 
 def install_certification_incremental_replication(app: Any, runtime_provider: Callable[[], Any]) -> None:
-    # Route composition must remain safe before the runtime store exists (several
-    # canonical tests intentionally compose a dummy runtime).  Actual replication
-    # requests remain fail-closed until a canonical store is present.  The full
+    # Composition may run before the runtime store exists. Actual replication
+    # requests remain fail-closed until a canonical store is present. The full
     # bootstrap builder is wrapped unconditionally so a later-available store gets
     # tracking metadata before its first exceptional snapshot.
     _wrap_bootstrap_snapshot_builder()
@@ -477,6 +510,7 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
                 "normal_cycle_transport": "bounded_incremental_delta",
                 "max_delta_rows": _max_delta_rows(),
                 "max_delta_bytes": _max_delta_bytes(),
+                "schema_identity_scope": "tables_columns_views_indexes_user_triggers_and_schema_version",
                 "strategy_thresholds_changed": False,
                 "certification_thresholds_changed": False,
                 "continuity_semantics_changed": False,
@@ -493,6 +527,7 @@ __all__ = [
     "META_TABLE",
     "REPLICATION_VERSION",
     "TRIGGER_PREFIX",
+    "_current_watermark",
     "_delta_payload",
     "install_certification_incremental_replication",
     "prepare_bootstrap",
