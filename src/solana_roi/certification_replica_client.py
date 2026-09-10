@@ -30,7 +30,7 @@ from .certification_incremental_replication import (
 )
 
 
-CLIENT_VERSION = "certification-incremental-replica-client-v3-trigger-safe-replay"
+CLIENT_VERSION = "certification-incremental-replica-client-v4-semicolon-safe-replay"
 DEFAULT_DELTA_TIMEOUT_SECONDS = 30.0
 DEFAULT_COPY_CHUNK_BYTES = 8 * 1024 * 1024
 FICLONE = 0x40049409
@@ -279,8 +279,10 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
             if not isinstance(change, dict):
                 raise RuntimeError("authoritative certification delta row invalid")
             sql = str(change.get("sql") or "")
-            if not sql or ";" in sql.rstrip(";"):
+            if not sql:
                 raise RuntimeError("authoritative certification delta SQL invalid")
+            # sqlite3.execute() enforces a single statement itself; semicolons inside
+            # quoted canonical text are data and must not be rejected or altered.
             connection.execute(sql)
         _restore_user_triggers(connection, user_triggers)
         connection.commit()
@@ -402,6 +404,7 @@ def status() -> dict[str, Any]:
         "child_uses_disposable_local_clone": True,
         "authoritative_full_snapshot_per_cycle": False,
         "trigger_safe_replay": True,
+        "literal_semicolon_safe_replay": True,
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
         "signing_available": SIGNING_AVAILABLE,
