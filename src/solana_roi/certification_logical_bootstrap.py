@@ -21,7 +21,7 @@ from fastapi import Header, HTTPException, Query
 from . import certification_incremental_replication as replication
 from . import certification_service_split as split
 
-BOOTSTRAP_VERSION = "certification-logical-bootstrap-v1-keyset-journal-reconciled"
+BOOTSTRAP_VERSION = "certification-logical-bootstrap-v2-sequence-frontier"
 DEFAULT_PAGE_ROWS = 250
 MAX_PAGE_ROWS = 500
 DEFAULT_PAGE_BYTES = 4 * 1024 * 1024
@@ -151,6 +151,16 @@ def _manifest(store: Any) -> dict[str, Any]:
             for kind, name, table_name, sql in schema_objects
             if kind in {"index", "view", "trigger"} and str(sql or "").strip()
         ]
+        sequence_rows: list[dict[str, Any]] = []
+        sequence_exists = reader.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+        ).fetchone()
+        if sequence_exists is not None:
+            sequence_rows = [
+                {"name": str(name), "seq": int(seq)}
+                for name, seq in reader.execute("SELECT name,seq FROM sqlite_sequence ORDER BY name").fetchall()
+                if str(name) in table_names and seq is not None
+            ]
         start_watermark = replication._current_watermark(reader)
         return {
             "bootstrap_version": BOOTSTRAP_VERSION,
@@ -162,6 +172,11 @@ def _manifest(store: Any) -> dict[str, Any]:
             "start_watermark": int(start_watermark),
             "tables": manifest_tables,
             "post_schema": post_schema,
+            "sqlite_sequence": sequence_rows,
+            "pragmas": {
+                "user_version": int(reader.execute("PRAGMA user_version").fetchone()[0]),
+                "application_id": int(reader.execute("PRAGMA application_id").fetchone()[0]),
+            },
             "page_default_rows": DEFAULT_PAGE_ROWS,
             "page_max_rows": MAX_PAGE_ROWS,
             "page_max_bytes": _page_bytes(),
@@ -221,6 +236,7 @@ def _page(
             params.append(bounded_limit + 1)
             raw_rows = reader.execute(query, params).fetchall()
             records = [{"values": [_encode_value(value) for value in row]} for row in raw_rows]
+
             def cursor_for(record: dict[str, Any]) -> str:
                 values = record["values"]
                 indexes = [names.index(name) for name in pk_names]
@@ -244,6 +260,7 @@ def _page(
                 {"rowid": int(row[0]), "values": [_encode_value(value) for value in row[1:]]}
                 for row in raw_rows
             ]
+
             def cursor_for(record: dict[str, Any]) -> str:
                 return _encode_cursor([int(record["rowid"])])
 
