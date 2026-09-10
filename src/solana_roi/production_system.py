@@ -313,6 +313,13 @@ def build_production_system() -> ProductionSystem:
     if _BUILT is not None:
         return _BUILT
 
+    # Install read-only total-cgroup/process attribution before importing either
+    # legacy compatibility composition module. This is observability-only and has
+    # no strategy, persistence, certification, or resource-control authority.
+    from .memory_pressure_observability import install_memory_pressure_observability
+
+    install_memory_pressure_observability()
+
     # Install the read-only cgroup/SQLite bounds before importing either legacy
     # compatibility composition module. Those imports construct the durable runtime,
     # so installing later would leave the startup event-ledger verification exposed
