@@ -24,7 +24,7 @@ from fastapi import Header, HTTPException, Query
 
 from . import certification_service_split as split
 
-REPLICATION_VERSION = "certification-incremental-replica-v3-schema-object-fingerprint"
+REPLICATION_VERSION = "certification-incremental-replica-v4-pinned-schema-version"
 CHANGE_TABLE = "certification_replication_changes"
 META_TABLE = "certification_replication_meta"
 TRIGGER_PREFIX = "roi_cert_rep_"
@@ -364,6 +364,10 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
         reader.execute("PRAGMA query_only=ON")
         reader.execute("PRAGMA busy_timeout=5000")
         reader.execute("BEGIN")
+        reader_schema_version = int(reader.execute("PRAGMA schema_version").fetchone()[0])
+        configured_schema_version = int(meta.get("configured_schema_version", "-1"))
+        if reader_schema_version != configured_schema_version:
+            raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:schema_changed")
         if _schema_fingerprint(reader) != schema_fingerprint:
             raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:schema_changed")
         to_watermark = _current_watermark(reader)
