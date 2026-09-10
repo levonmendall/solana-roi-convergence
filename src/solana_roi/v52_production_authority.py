@@ -41,8 +41,16 @@ from .v52_adaptive_continuation_refinement import (
     install_v52_adaptive_continuation_refinement,
     status as adaptive_continuation_status,
 )
+from .v52_profit_confidence_completion import (
+    install_v52_profit_confidence_completion,
+    status as profit_confidence_status,
+)
+from .v52_profit_confidence_finalization import (
+    install_v52_profit_confidence_finalization,
+    status as profit_confidence_finalization_status,
+)
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v8-adaptive-continuation"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v9-profit-confidence-complete"
 _INSTALLED = False
 _RUNTIME: Any | None = None
 _WALLET_ALPHA: WalletAlphaRefinementLedger | None = None
@@ -59,16 +67,7 @@ def _copy_robinhood_lineage(wrapper: Any, predecessor: Any) -> None:
 
 
 def _bind_concrete_robinhood_lifecycle_owner() -> None:
-    """Bind the final chooser at the concrete composed production class.
-
-    Mature Robinhood repairs may install a class-level chooser before v5.2 is
-    composed. Patching only the source mixin is therefore insufficient: the
-    concrete class can legitimately shadow the mixin and continue resolving its
-    previously composed chooser. Capture that exact predecessor and put the v5.2
-    lifecycle wrapper at the concrete boundary as well. The predecessor's real
-    reachability markers remain visible for architecture introspection; no marker
-    is manufactured by this layer.
-    """
+    """Bind the final chooser at the concrete composed production class."""
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
     final_wrapper = getattr(robinhood_lifecycle, "_choose_with_lifecycle")
@@ -114,34 +113,15 @@ def install_v52_production_authority(
     app: Any,
     runtime_provider: Callable[[], Any] | Any,
 ) -> None:
-    """Install governed v5.2 paper authority after the compatibility substrate.
+    """Install the single governed v5.2 paper authority in final wrapper order.
 
-    v5.1-named transport, evidence, exact-quote, paper-capital and settlement
-    modules remain reusable infrastructure. This call replaces their final
-    economic-decision and learned-exit ownership with v5.2 authority. The named
-    ``economic_freeze_epoch`` remains a compatibility key for persisted release
-    lineage only; strategy policy may advance through append-only governed epochs.
-
-    Robinhood's durable storage version remains compatibility metadata only. The
-    position-lifecycle layer is installed after the final Robinhood storage and
-    exit-policy wrappers so it owns aggregate lot accounting, scale validation,
-    staged de-risking, runner retention and second-leg re-entry without changing
-    transport, identity or exact-quote semantics. Candidate accounting is then
-    reconciled only after the validated lifecycle commit exists.
-
-    Wallet discovery is bound last to the active v5.2 policy epoch. Its broad
-    discovery input is the already-normalized append-only swap journal, so the
-    wallet lane no longer re-fetches and re-normalizes transactions that canonical
-    ingestion has already hydrated. Paired marginal-alpha and contextual decay
-    remain forward-only research evidence and cannot independently authorize a
-    paper entry. The alpha ledger is owned by this authority module rather than
-    mutating the slotted canonical ingestion runtime.
-
-    The adaptive continuation refinement is installed after the concrete lifecycle
-    owner and wallet-alpha ledger. It may rank already-eligible opportunities,
-    increase validated target utilization, permit exceptional scaling, and retain
-    a larger runner, but cannot weaken exact execution, hard-stop, lane-cap,
-    paper-only, signing, or transaction-submission boundaries.
+    Compatibility transport/storage and the existing v5.2 authority are composed
+    first. Wallet alignment and forward alpha are then installed, followed by the
+    adaptive continuation layer. The max-profit/max-confidence completion is the
+    final economic feature layer across Solana, FOMO and Robinhood; a narrow final
+    guard then reasserts numeric lane caps, the absolute signal-age limit, the
+    20-second latency ceiling and the 80-percent absolute chase ceiling. All of
+    these layers remain paper-only and reuse exact two-sided quote/exit plumbing.
     """
     global _INSTALLED, _RUNTIME, _WALLET_ALPHA
     runtime = _resolve_runtime(runtime_provider)
@@ -156,7 +136,10 @@ def install_v52_production_authority(
     if _WALLET_ALPHA is None or _WALLET_ALPHA.store is not runtime.store:
         _WALLET_ALPHA = WalletAlphaRefinementLedger(runtime.store)
     install_v52_adaptive_continuation_refinement(_WALLET_ALPHA)
+    install_v52_profit_confidence_completion(runtime)
+    install_v52_profit_confidence_finalization()
     install_v52_strategy_api(app)
+
     strategy_epoch = strategy_evolution_snapshot()
     app.state.roi_v51_final_economic_authority = False
     app.state.roi_v51_shadow_control = True
@@ -171,10 +154,11 @@ def install_v52_production_authority(
     app.state.roi_v52_wallet_intelligence_alignment = True
     app.state.roi_v52_wallet_alpha_refinement = True
     app.state.roi_v52_adaptive_continuation_refinement = True
+    app.state.roi_v52_profit_confidence_completion = True
+    app.state.roi_v52_profit_confidence_finalization = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
     app.state.roi_authority_fingerprint = authority_fingerprint()
-    # Backward-compatible field retained for persisted release/outcome joins.
     app.state.roi_economic_freeze_epoch = ECONOMIC_FREEZE_EPOCH
     app.state.roi_strategy_baseline_epoch = ECONOMIC_FREEZE_EPOCH
     app.state.roi_active_strategy_epoch = strategy_epoch
@@ -189,7 +173,10 @@ def status() -> dict[str, Any]:
     lifecycle = robinhood_lifecycle_status()
     reconciliation = robinhood_candidate_reconciliation_status()
     adaptive = adaptive_continuation_status()
+    completion = profit_confidence_status()
+    finalization = profit_confidence_finalization_status()
     strategy_epoch = strategy_evolution_snapshot()
+
     if _RUNTIME is None:
         wallet_alignment = {
             "installed": False,
@@ -209,14 +196,12 @@ def status() -> dict[str, Any]:
     else:
         wallet_alpha = dict(_WALLET_ALPHA.status())
         wallet_alpha["installed"] = True
-    # Robinhood preserves its compatibility table strategy label. Economic
-    # authority and forward-learning scope come from registered v5.2 lineage;
-    # live policy values come from the current governed strategy epoch.
+
     runtime["robinhood_rows_use_compatibility_storage_version"] = True
     runtime["robinhood_v52_authority_from_release_epoch"] = True
     runtime["continuous_strategy_evolution_enabled"] = True
     runtime["active_strategy_epoch"] = strategy_epoch
-    runtime["new_rows_carry_v52_strategy_version"] = "solana_and_fomo_plus_explicit_robinhood_lifecycle_ledger"
+    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_and_explicit_robinhood_lifecycle_plus_profit_confidence_ledger"
     runtime["robinhood_scale_in_authority"] = bool(
         lifecycle.get("installed")
         and lifecycle.get("aggregate_exact_exitability_before_add")
@@ -228,6 +213,32 @@ def status() -> dict[str, Any]:
         lifecycle.get("installed") and lifecycle.get("staged_derisk_runner_authority")
     )
     runtime["adaptive_continuation_refinement"] = bool(adaptive.get("installed"))
+    runtime["profit_confidence_completion"] = bool(completion.get("installed"))
+    runtime["profit_confidence_finalization"] = bool(finalization.get("installed"))
+
+    all_owned = bool(
+        runtime.get("solana_final_owner")
+        and runtime.get("fomo_final_owner")
+        and runtime.get("robinhood_final_owner")
+        and runtime.get("robinhood_forward_profile_owner")
+        and runtime.get("robinhood_scale_in_authority")
+        and runtime.get("staged_derisk_runner_authority")
+        and adaptive.get("installed")
+        and completion.get("installed")
+        and completion.get("parallel_exact_quote_acquisition")
+        and float(completion.get("minimum_exit_depth_coverage_ratio") or 0.0) >= 2.0
+        and finalization.get("installed")
+        and finalization.get("numeric_lane_cap_guard")
+        and finalization.get("absolute_signal_age_guard")
+        and float(finalization.get("absolute_chase_max_fraction") or 1.0) <= 0.80
+        and float(finalization.get("latency_hard_max_seconds") or 99.0) <= 20.0
+        and wallet_alignment.get("installed")
+        and storage.get("v52_authority_from_release_epoch")
+        and robinhood_exit.get("final_exit_policy_owner") == "v52"
+        and lifecycle.get("installed")
+        and reconciliation.get("installed")
+    )
+
     return {
         "composition_version": COMPOSITION_VERSION,
         "installed": _INSTALLED,
@@ -246,25 +257,14 @@ def status() -> dict[str, Any]:
         "wallet_intelligence_alignment": wallet_alignment,
         "wallet_alpha_refinement": wallet_alpha,
         "adaptive_continuation_refinement": adaptive,
+        "profit_confidence_completion": completion,
+        "profit_confidence_finalization": finalization,
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
         "robinhood_position_lifecycle": lifecycle,
         "robinhood_candidate_reconciliation": reconciliation,
         "strategy_api": api_status(),
-        "all_decision_surfaces_v52_owned": bool(
-            runtime.get("solana_final_owner")
-            and runtime.get("fomo_final_owner")
-            and runtime.get("robinhood_final_owner")
-            and runtime.get("robinhood_forward_profile_owner")
-            and runtime.get("robinhood_scale_in_authority")
-            and runtime.get("staged_derisk_runner_authority")
-            and adaptive.get("installed")
-            and wallet_alignment.get("installed")
-            and storage.get("v52_authority_from_release_epoch")
-            and robinhood_exit.get("final_exit_policy_owner") == "v52"
-            and lifecycle.get("installed")
-            and reconciliation.get("installed")
-        ),
+        "all_decision_surfaces_v52_owned": all_owned,
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
         "signing_available": SIGNING_AVAILABLE,

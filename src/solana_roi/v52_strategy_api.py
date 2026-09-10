@@ -5,10 +5,14 @@ from typing import Any
 from .strategy_v51_authority import authority as v51_authority, authority_fingerprint as v51_fingerprint
 from .strategy_v52_authority import authority, authority_fingerprint, safety_manifest
 from .v52_authoritative_strategy import status as strategy_status
+from .v52_profit_confidence_completion import report as profit_confidence_report, status as profit_confidence_status
+from .v52_profit_confidence_finalization import status as profit_confidence_finalization_status
 
 STATUS_PATH = "/v1/strategy/authority"
 V52_STATUS_PATH = "/v1/strategy/v52"
 V51_CONTROL_PATH = "/v1/strategy/control/v51-authority"
+PERFORMANCE_24H_PATH = "/v1/strategy/v52/performance/24h"
+PERFORMANCE_7D_PATH = "/v1/strategy/v52/performance/7d"
 _INSTALLED = False
 
 
@@ -31,6 +35,13 @@ def _payload() -> dict[str, Any]:
         "detection_intelligence": dict(policy["detection_intelligence"]),
         "execution": dict(policy["execution"]),
         "strategy_runtime": strategy_status(),
+        "profit_confidence_completion": profit_confidence_status(),
+        "profit_confidence_finalization": profit_confidence_finalization_status(),
+        "performance_reports": {
+            "24h": PERFORMANCE_24H_PATH,
+            "7d": PERFORMANCE_7D_PATH,
+            "read_only": True,
+        },
         "safety": safety,
         "canonical": True,
         "paper_only": bool(safety["paper_only"]),
@@ -56,13 +67,6 @@ def _v51_control_payload() -> dict[str, Any]:
 
 
 def _remove_existing_path(app: Any, path: str) -> None:
-    """Retire the incumbent canonical route before mounting v5.2.
-
-    FastAPI/Starlette resolves the first matching route, so merely adding another
-    handler would leave the earlier v5.1 canonical endpoint authoritative. Removing
-    only the exact strategy-authority path preserves every other v5.1 read-only
-    proof/diagnostic endpoint.
-    """
     routes = getattr(getattr(app, "router", None), "routes", None)
     if routes is None:
         raise RuntimeError("v52_strategy_api_router_unavailable")
@@ -88,9 +92,19 @@ def install_v52_strategy_api(app: Any) -> None:
         @app.get(V51_CONTROL_PATH)
         def v51_control_status() -> dict[str, Any]:
             return _v51_control_payload()
+    if PERFORMANCE_24H_PATH not in existing:
+        @app.get(PERFORMANCE_24H_PATH)
+        def v52_performance_24h() -> dict[str, Any]:
+            return profit_confidence_report(24)
+    if PERFORMANCE_7D_PATH not in existing:
+        @app.get(PERFORMANCE_7D_PATH)
+        def v52_performance_7d() -> dict[str, Any]:
+            return profit_confidence_report(24 * 7)
 
     app.state.roi_strategy_authority_status = _payload
     app.state.roi_v51_control_authority_status = _v51_control_payload
+    app.state.roi_v52_performance_24h = lambda: profit_confidence_report(24)
+    app.state.roi_v52_performance_7d = lambda: profit_confidence_report(24 * 7)
     _INSTALLED = True
 
 
@@ -100,6 +114,9 @@ def status() -> dict[str, Any]:
         "status_path": STATUS_PATH,
         "v52_status_path": V52_STATUS_PATH,
         "v51_control_path": V51_CONTROL_PATH,
+        "performance_24h_path": PERFORMANCE_24H_PATH,
+        "performance_7d_path": PERFORMANCE_7D_PATH,
+        "performance_reports_read_only": True,
         "authoritative_strategy": "v5.2",
         "v51_control_final_decision_authority": False,
         "paper_only": True,
@@ -110,6 +127,8 @@ def status() -> dict[str, Any]:
 
 
 __all__ = [
+    "PERFORMANCE_24H_PATH",
+    "PERFORMANCE_7D_PATH",
     "STATUS_PATH",
     "V51_CONTROL_PATH",
     "V52_STATUS_PATH",
