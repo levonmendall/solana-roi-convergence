@@ -419,11 +419,13 @@ def _reserve_monthly_request(kind: str, transport_kind: str) -> None:
         _persist_locked()
 
 
-async def _before_request(url: str, transport_kind: str) -> str:
+async def _before_request(url: str, transport_kind: str, method: str = "") -> str:
     kind = _provider_kind_from_url(url)
     if kind not in {"chainstack", "alchemy"}:
         return kind
-    if _priority_kind() == "background":
+    priority = _priority_kind()
+    background_method = transport_kind == "http" and method in {"eth_blockNumber", "eth_getLogs"}
+    if priority == "background" or (priority == "qualification" and background_method):
         await _pace_background(kind)
     if kind == "chainstack":
         await _chainstack_rolling_limit()
@@ -462,14 +464,14 @@ def _guarded_rpc(original: Callable[..., Awaitable[Any]]) -> Callable[..., Await
     @wraps(original)
     async def wrapped(rpc_self: Any, method: str, params: list[Any]) -> Any:
         url = str(getattr(rpc_self, "rpc_url", "") or "")
-        kind = await _before_request(url, "http")
+        kind = await _before_request(url, "http", method)
         try:
             return await original(rpc_self, method, params)
         except httpx.HTTPStatusError as exc:
             _record_http_error(kind, method, exc)
             if kind == "chainstack" and int(exc.response.status_code) == 429:
                 await asyncio.sleep(_retry_after_seconds(exc))
-                await _before_request(str(getattr(rpc_self, "rpc_url", "") or url), "http")
+                await _before_request(str(getattr(rpc_self, "rpc_url", "") or url), "http", method)
                 try:
                     return await original(rpc_self, method, params)
                 except httpx.HTTPStatusError as retry_exc:
@@ -484,7 +486,7 @@ def _guarded_rpc(original: Callable[..., Awaitable[Any]]) -> Callable[..., Await
 def _guarded_ws_rpc(original: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
     @wraps(original)
     async def wrapped(ws: Any, request_id: int, method: str, params: list[Any]) -> Any:
-        await _before_request(str(transport._ws_url() or ""), "ws_control")
+        await _before_request(str(transport._ws_url() or ""), "ws_control", method)
         return await original(ws, request_id, method, params)
 
     setattr(wrapped, "_roi_robinhood_provider_capacity_budget_ws", True)
