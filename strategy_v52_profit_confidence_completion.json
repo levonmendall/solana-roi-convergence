@@ -5,6 +5,7 @@
   "small_nav_threshold_usd": 1000.0,
   "minimum_economic_position_usd": 2.5,
   "small_nav_max_concurrent_tokens": 3,
+  "max_concurrent_positions": 3,
   "small_nav_total_risk_budget_fraction": 0.5,
   "standard_total_risk_budget_fraction": 0.35,
   "winner_concentration_multiplier_max": 1.35,
