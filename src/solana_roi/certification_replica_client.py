@@ -6,6 +6,12 @@ Missing replicas are built through bounded logical keyset pages and then reconci
 through the authoritative change journal. Full authoritative snapshots are no longer
 the default bootstrap path and can be enabled only as an explicit recovery override.
 Normal cycles consume bounded, possibly multi-batch deltas transactionally.
+
+A successfully materialized logical replica is durable catch-up state. Transient
+transport failures and bounded catch-up exhaustion must never throw that exact state
+away and restart the expensive logical scan; the next cycle resumes from the last
+transactionally committed watermark. Only release/schema/epoch invalidation forces a
+fresh bootstrap.
 """
 
 import fcntl
@@ -13,6 +19,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,8 +36,9 @@ from .certification_incremental_replication import (
 )
 from .certification_logical_bootstrap_client import LogicalBootstrapRestartRequired, logical_bootstrap
 
-CLIENT_VERSION = "certification-incremental-replica-client-v5-logical-bootstrap-catchup"
+CLIENT_VERSION = "certification-incremental-replica-client-v6-resumable-catchup"
 DEFAULT_DELTA_TIMEOUT_SECONDS = 30.0
+DEFAULT_DELTA_BATCH_PAUSE_SECONDS = 0.05
 DEFAULT_COPY_CHUNK_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_DELTA_BATCHES = 64
 FICLONE = 0x40049409
@@ -42,7 +50,15 @@ TRANSACTION_SUBMISSION_AVAILABLE = False
 
 
 class ReplicaBootstrapRequired(RuntimeError):
-    pass
+    """The authoritative release/schema/epoch identity requires a fresh replica."""
+
+
+class ReplicaDeltaTransportError(RuntimeError):
+    """A transient authoritative delta request failed; preserve exact local state."""
+
+
+class ReplicaCatchupPending(RuntimeError):
+    """Bounded work was exhausted after durable progress; resume next cycle."""
 
 
 def _truthy(value: str | None) -> bool:
@@ -58,6 +74,24 @@ def _max_delta_batches() -> int:
         return max(1, min(256, int(os.getenv("SOLANA_ROI_CERTIFIER_MAX_DELTA_BATCHES", str(DEFAULT_MAX_DELTA_BATCHES)))))
     except ValueError:
         return DEFAULT_MAX_DELTA_BATCHES
+
+
+def _delta_batch_pause() -> float:
+    try:
+        return max(
+            0.0,
+            min(
+                2.0,
+                float(
+                    os.getenv(
+                        "SOLANA_ROI_CERTIFIER_DELTA_BATCH_PAUSE_SECONDS",
+                        str(DEFAULT_DELTA_BATCH_PAUSE_SECONDS),
+                    )
+                ),
+            ),
+        )
+    except ValueError:
+        return DEFAULT_DELTA_BATCH_PAUSE_SECONDS
 
 
 def _replica_path() -> Path:
@@ -219,7 +253,7 @@ def _fetch_delta(*, base: str, token: str, expected_release: str, state: dict[st
         headers={
             "Accept": "application/json",
             "X-Certification-Token": token,
-            "User-Agent": "solana-roi-isolated-certifier/4",
+            "User-Agent": "solana-roi-isolated-certifier/5",
         },
     )
     try:
@@ -228,13 +262,15 @@ def _fetch_delta(*, base: str, token: str, expected_release: str, state: dict[st
     except urllib.error.HTTPError as exc:
         if int(exc.code) == 409:
             raise ReplicaBootstrapRequired("authoritative incremental replica requested bootstrap") from exc
-        raise RuntimeError(f"authoritative certification delta HTTP failure:{exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"authoritative certification delta failed:{type(exc).__name__}") from exc
+        raise ReplicaDeltaTransportError(f"authoritative certification delta HTTP failure:{exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReplicaDeltaTransportError(
+            f"authoritative certification delta failed:{type(exc).__name__}"
+        ) from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("authoritative certification delta returned non-object")
+        raise ReplicaDeltaTransportError("authoritative certification delta returned non-object")
     if str(payload.get("release_commit") or "") != expected_release:
-        raise RuntimeError("authoritative certification delta release mismatch")
+        raise ReplicaDeltaTransportError("authoritative certification delta release mismatch")
     if str(payload.get("replication_version") or "") != REPLICATION_VERSION:
         raise ReplicaBootstrapRequired("authoritative certification replication version changed")
     if str(payload.get("epoch") or "") != str(state["epoch"]):
@@ -242,7 +278,7 @@ def _fetch_delta(*, base: str, token: str, expected_release: str, state: dict[st
     if str(payload.get("schema_fingerprint") or "") != str(state["schema_fingerprint"]):
         raise ReplicaBootstrapRequired("authoritative certification schema fingerprint changed")
     if int(payload.get("from_watermark") if payload.get("from_watermark") is not None else -1) != int(state["watermark"]):
-        raise RuntimeError("authoritative certification delta starting watermark mismatch")
+        raise ReplicaDeltaTransportError("authoritative certification delta starting watermark mismatch")
     return payload
 
 
@@ -343,7 +379,13 @@ def _catch_up_deltas(
                 "delta_payload_bytes": total_bytes,
                 "caught_up": True,
             }
-    raise RuntimeError("authoritative certification delta catch-up exceeded bounded batch count")
+        pause = _delta_batch_pause()
+        if pause > 0:
+            time.sleep(pause)
+    raise ReplicaCatchupPending(
+        f"authoritative certification delta catch-up pending after {batches} bounded batches; "
+        f"watermark={int(current.get('watermark') or 0)}"
+    )
 
 
 def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -> dict[str, Any]:
@@ -354,8 +396,35 @@ def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -
         os.close(fd)
         tmp = Path(raw)
         try:
-            identity = logical_bootstrap(tmp, base=base, token=token, expected_release=expected_release)
-            actual_bytes = _validate_sqlite(tmp)
+            try:
+                identity = logical_bootstrap(tmp, base=base, token=token, expected_release=expected_release)
+                actual_bytes = _validate_sqlite(tmp)
+            except (LogicalBootstrapRestartRequired, ReplicaBootstrapRequired) as exc:
+                last_error = exc
+                _remove_replica(replica)
+                continue
+            except BaseException as exc:
+                last_error = exc
+                _remove_replica(replica)
+                if _allow_full_snapshot_recovery():
+                    state = _full_snapshot_bootstrap(
+                        replica,
+                        base=base,
+                        token=token,
+                        expected_release=expected_release,
+                    )
+                    return _catch_up_deltas(
+                        replica,
+                        state,
+                        base=base,
+                        token=token,
+                        expected_release=expected_release,
+                    )
+                raise
+
+            # From this point onward the logical scan has become a valid durable
+            # replica. Never discard it merely because catch-up transport is busy,
+            # temporarily unavailable, or needs another bounded cycle.
             os.replace(tmp, replica)
             state = {
                 "client_version": CLIENT_VERSION,
@@ -368,30 +437,12 @@ def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -
                 "bootstrap_rows": int(identity.get("bootstrap_rows") or 0),
                 "bootstrap_payload_bytes": int(identity.get("bootstrap_payload_bytes") or 0),
                 "bootstrap_tables": int(identity.get("bootstrap_tables") or 0),
+                "bootstrap_complete": True,
+                "catchup_complete": False,
                 "last_transport": "bounded_logical_bootstrap",
             }
             _atomic_state(_state_path(replica), state)
-            caught_up = _catch_up_deltas(
-                replica,
-                state,
-                base=base,
-                token=token,
-                expected_release=expected_release,
-            )
-            caught_up["bootstrapped"] = True
-            caught_up["bootstrap_transport"] = "bounded_logical_bootstrap"
-            caught_up["last_transport"] = "bounded_logical_bootstrap_plus_incremental_delta"
-            _atomic_state(_state_path(replica), caught_up)
-            return caught_up
-        except (LogicalBootstrapRestartRequired, ReplicaBootstrapRequired) as exc:
-            last_error = exc
-            _remove_replica(replica)
-            continue
-        except BaseException as exc:
-            last_error = exc
-            _remove_replica(replica)
-            if _allow_full_snapshot_recovery():
-                state = _full_snapshot_bootstrap(replica, base=base, token=token, expected_release=expected_release)
+            try:
                 caught_up = _catch_up_deltas(
                     replica,
                     state,
@@ -399,13 +450,32 @@ def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -
                     token=token,
                     expected_release=expected_release,
                 )
-                caught_up["bootstrapped"] = True
-                caught_up["bootstrap_transport"] = "explicit_full_snapshot_recovery"
-                return caught_up
-            raise
+            except (ReplicaDeltaTransportError, ReplicaCatchupPending):
+                # _apply_delta persists every successful watermark before either
+                # exception can escape. Keeping the files lets the next cycle resume.
+                raise
+            except ReplicaBootstrapRequired as exc:
+                last_error = exc
+                _remove_replica(replica)
+                continue
+            except BaseException:
+                # A local replay/integrity failure is not a transient transport
+                # condition. Remove the suspect replica and fail closed.
+                _remove_replica(replica)
+                raise
+
+            caught_up["bootstrapped"] = True
+            caught_up["bootstrap_complete"] = True
+            caught_up["catchup_complete"] = True
+            caught_up["bootstrap_transport"] = "bounded_logical_bootstrap"
+            caught_up["last_transport"] = "bounded_logical_bootstrap_plus_incremental_delta"
+            _atomic_state(_state_path(replica), caught_up)
+            return caught_up
         finally:
             tmp.unlink(missing_ok=True)
-    raise RuntimeError(f"logical certification bootstrap could not stabilize:{type(last_error).__name__ if last_error else 'unknown'}")
+    raise RuntimeError(
+        f"logical certification bootstrap could not stabilize:{type(last_error).__name__ if last_error else 'unknown'}"
+    )
 
 
 def synchronize_replica(*, base: str, token: str, expected_release: str) -> tuple[Path, dict[str, Any]]:
@@ -425,13 +495,15 @@ def synchronize_replica(*, base: str, token: str, expected_release: str) -> tupl
     except BaseException:
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
     try:
-        return replica, _catch_up_deltas(
+        result = _catch_up_deltas(
             replica,
             state,
             base=base,
             token=token,
             expected_release=expected_release,
         )
+        result["catchup_complete"] = True
+        return replica, result
     except ReplicaBootstrapRequired:
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
 
@@ -495,11 +567,17 @@ def status() -> dict[str, Any]:
         "replica_epoch": state.get("epoch") if state else None,
         "replica_schema_fingerprint": state.get("schema_fingerprint") if state else None,
         "replica_watermark": state.get("watermark") if state else None,
+        "bootstrap_complete": bool(state.get("bootstrap_complete")) if state else False,
+        "catchup_complete": bool(state.get("catchup_complete")) if state else False,
         "logical_bootstrap_default": True,
         "full_snapshot_bootstrap_enabled": _allow_full_snapshot_recovery(),
         "full_snapshot_role": "explicit_recovery_only",
         "normal_cycle_transport": "bounded_incremental_delta",
         "delta_batches_are_paginated": True,
+        "delta_batch_pause_seconds": _delta_batch_pause(),
+        "resumable_delta_catchup": True,
+        "transient_delta_failure_preserves_replica": True,
+        "bounded_catchup_exhaustion_preserves_replica": True,
         "child_uses_disposable_local_clone": True,
         "authoritative_full_snapshot_per_cycle": False,
         "trigger_safe_replay": True,
@@ -514,6 +592,8 @@ def status() -> dict[str, Any]:
 __all__ = [
     "CLIENT_VERSION",
     "ReplicaBootstrapRequired",
+    "ReplicaCatchupPending",
+    "ReplicaDeltaTransportError",
     "_apply_delta",
     "_atomic_state",
     "_fetch_delta",
