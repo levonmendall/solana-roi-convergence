@@ -37,8 +37,12 @@ from .v52_wallet_intelligence_alignment import (
     install_v52_wallet_intelligence_alignment,
     status as wallet_alignment_status,
 )
+from .v52_adaptive_continuation_refinement import (
+    install_v52_adaptive_continuation_refinement,
+    status as adaptive_continuation_status,
+)
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v7-wallet-aligned-continuous-evolution"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v8-adaptive-continuation"
 _INSTALLED = False
 _RUNTIME: Any | None = None
 _WALLET_ALPHA: WalletAlphaRefinementLedger | None = None
@@ -132,6 +136,12 @@ def install_v52_production_authority(
     remain forward-only research evidence and cannot independently authorize a
     paper entry. The alpha ledger is owned by this authority module rather than
     mutating the slotted canonical ingestion runtime.
+
+    The adaptive continuation refinement is installed after the concrete lifecycle
+    owner and wallet-alpha ledger. It may rank already-eligible opportunities,
+    increase validated target utilization, permit exceptional scaling, and retain
+    a larger runner, but cannot weaken exact execution, hard-stop, lane-cap,
+    paper-only, signing, or transaction-submission boundaries.
     """
     global _INSTALLED, _RUNTIME, _WALLET_ALPHA
     runtime = _resolve_runtime(runtime_provider)
@@ -145,6 +155,7 @@ def install_v52_production_authority(
     install_v52_wallet_intelligence_alignment(runtime)
     if _WALLET_ALPHA is None or _WALLET_ALPHA.store is not runtime.store:
         _WALLET_ALPHA = WalletAlphaRefinementLedger(runtime.store)
+    install_v52_adaptive_continuation_refinement(_WALLET_ALPHA)
     install_v52_strategy_api(app)
     strategy_epoch = strategy_evolution_snapshot()
     app.state.roi_v51_final_economic_authority = False
@@ -159,6 +170,7 @@ def install_v52_production_authority(
     app.state.roi_v52_continuous_strategy_evolution = True
     app.state.roi_v52_wallet_intelligence_alignment = True
     app.state.roi_v52_wallet_alpha_refinement = True
+    app.state.roi_v52_adaptive_continuation_refinement = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
     app.state.roi_authority_fingerprint = authority_fingerprint()
@@ -176,6 +188,7 @@ def status() -> dict[str, Any]:
     robinhood_exit = robinhood_exit_status()
     lifecycle = robinhood_lifecycle_status()
     reconciliation = robinhood_candidate_reconciliation_status()
+    adaptive = adaptive_continuation_status()
     strategy_epoch = strategy_evolution_snapshot()
     if _RUNTIME is None:
         wallet_alignment = {
@@ -214,6 +227,7 @@ def status() -> dict[str, Any]:
     runtime["staged_derisk_runner_authority"] = bool(
         lifecycle.get("installed") and lifecycle.get("staged_derisk_runner_authority")
     )
+    runtime["adaptive_continuation_refinement"] = bool(adaptive.get("installed"))
     return {
         "composition_version": COMPOSITION_VERSION,
         "installed": _INSTALLED,
@@ -231,6 +245,7 @@ def status() -> dict[str, Any]:
         "strategy_runtime": runtime,
         "wallet_intelligence_alignment": wallet_alignment,
         "wallet_alpha_refinement": wallet_alpha,
+        "adaptive_continuation_refinement": adaptive,
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
         "robinhood_position_lifecycle": lifecycle,
@@ -243,6 +258,7 @@ def status() -> dict[str, Any]:
             and runtime.get("robinhood_forward_profile_owner")
             and runtime.get("robinhood_scale_in_authority")
             and runtime.get("staged_derisk_runner_authority")
+            and adaptive.get("installed")
             and wallet_alignment.get("installed")
             and storage.get("v52_authority_from_release_epoch")
             and robinhood_exit.get("final_exit_policy_owner") == "v52"
