@@ -192,6 +192,60 @@ def _manifest(store: Any) -> dict[str, Any]:
         split._drop_file_cache(source_path)
 
 
+def _stream_page_records(
+    raw_cursor: Any,
+    *,
+    table_name: str,
+    bounded_limit: int,
+    max_bytes: int,
+    row_to_record: Callable[[Any], dict[str, Any]],
+    cursor_for: Callable[[dict[str, Any]], str],
+) -> tuple[list[dict[str, Any]], int, bool, str | None]:
+    """Materialize at most the bounded response plus one transient SQLite row.
+
+    The old transport called ``fetchall()`` before enforcing ``max_bytes``. A table
+    containing large JSON/text values could therefore inflate hundreds of MiB of
+    Python objects even though the eventual HTTP payload was capped at 4 MiB. This
+    loop enforces the byte limit as each row arrives. A row rejected by the byte cap
+    is intentionally not represented in ``next_cursor``; the next keyset request
+    starts after the last included row and therefore reads that row again exactly.
+    """
+
+    response_rows: list[dict[str, Any]] = []
+    payload_bytes = 0
+    truncated_by_bytes = False
+    exhausted = False
+
+    while len(response_rows) < bounded_limit:
+        row = raw_cursor.fetchone()
+        if row is None:
+            exhausted = True
+            break
+        record = row_to_record(row)
+        size = len(json.dumps(record, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        if response_rows and payload_bytes + size > max_bytes:
+            truncated_by_bytes = True
+            break
+        if not response_rows and size > max_bytes:
+            raise HTTPException(
+                status_code=409,
+                detail=f"certification_logical_bootstrap_row_exceeds_page_bound:{table_name}",
+            )
+        response_rows.append(record)
+        payload_bytes += size
+
+    has_more_by_rows = False
+    if not truncated_by_bytes and not exhausted and len(response_rows) >= bounded_limit:
+        # Consume only one sentinel row to distinguish an exact-sized final page
+        # from a page with more data. The sentinel is never retained in memory.
+        has_more_by_rows = raw_cursor.fetchone() is not None
+        exhausted = not has_more_by_rows
+
+    done = exhausted and not truncated_by_bytes
+    next_cursor = cursor_for(response_rows[-1]) if response_rows and not done else None
+    return response_rows, payload_bytes, done, next_cursor
+
+
 def _page(
     store: Any,
     *,
@@ -218,6 +272,7 @@ def _page(
         quoted_table = replication._qident(table_name)
         projection = ",".join(replication._qident(name) for name in names)
         params: list[Any] = []
+
         if bool(table["without_rowid"]):
             primary = replication._primary_columns(columns)
             pk_names = [str(column["name"]) for column in primary]
@@ -234,14 +289,17 @@ def _page(
                 params.extend(decoded_cursor)
             query = f"SELECT {projection} FROM {quoted_table}{where} ORDER BY {order} LIMIT ?"
             params.append(bounded_limit + 1)
-            raw_rows = reader.execute(query, params).fetchall()
-            records = [{"values": [_encode_value(value) for value in row]} for row in raw_rows]
+            raw_cursor = reader.execute(query, params)
+
+            def row_to_record(row: Any) -> dict[str, Any]:
+                return {"values": [_encode_value(value) for value in row]}
+
+            primary_indexes = [names.index(name) for name in pk_names]
 
             def cursor_for(record: dict[str, Any]) -> str:
                 values = record["values"]
-                indexes = [names.index(name) for name in pk_names]
                 raw_values: list[Any] = []
-                for index in indexes:
+                for index in primary_indexes:
                     value = values[index]
                     if isinstance(value, dict) and "__sqlite_blob_b64__" in value:
                         raw_values.append(base64.b64decode(str(value["__sqlite_blob_b64__"])))
@@ -255,32 +313,22 @@ def _page(
                     raise HTTPException(status_code=400, detail="invalid certification logical bootstrap rowid cursor")
                 last_rowid = int(decoded_cursor[0])
             query = f"SELECT rowid,{projection} FROM {quoted_table} WHERE rowid>? ORDER BY rowid LIMIT ?"
-            raw_rows = reader.execute(query, (last_rowid, bounded_limit + 1)).fetchall()
-            records = [
-                {"rowid": int(row[0]), "values": [_encode_value(value) for value in row[1:]]}
-                for row in raw_rows
-            ]
+            raw_cursor = reader.execute(query, (last_rowid, bounded_limit + 1))
+
+            def row_to_record(row: Any) -> dict[str, Any]:
+                return {"rowid": int(row[0]), "values": [_encode_value(value) for value in row[1:]]}
 
             def cursor_for(record: dict[str, Any]) -> str:
                 return _encode_cursor([int(record["rowid"])])
 
-        has_more_by_rows = len(records) > bounded_limit
-        if has_more_by_rows:
-            records = records[:bounded_limit]
-        response_rows: list[dict[str, Any]] = []
-        payload_bytes = 0
-        max_bytes = _page_bytes()
-        for record in records:
-            size = len(json.dumps(record, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-            if response_rows and payload_bytes + size > max_bytes:
-                break
-            if not response_rows and size > max_bytes:
-                raise HTTPException(status_code=409, detail=f"certification_logical_bootstrap_row_exceeds_page_bound:{table_name}")
-            response_rows.append(record)
-            payload_bytes += size
-        truncated_by_bytes = len(response_rows) < len(records)
-        done = not has_more_by_rows and not truncated_by_bytes
-        next_cursor = cursor_for(response_rows[-1]) if response_rows and not done else None
+        response_rows, payload_bytes, done, next_cursor = _stream_page_records(
+            raw_cursor,
+            table_name=table_name,
+            bounded_limit=bounded_limit,
+            max_bytes=_page_bytes(),
+            row_to_record=row_to_record,
+            cursor_for=cursor_for,
+        )
         return {
             "bootstrap_version": BOOTSTRAP_VERSION,
             "release_commit": split._release_commit(),
