@@ -2,11 +2,10 @@ from __future__ import annotations
 
 """Certifier-owned incremental SQLite replica client.
 
-A full authoritative snapshot is used only when the certifier has no valid replica
-or when exact replication identity/schema continuity is lost. Normal cycles fetch
-bounded logical deltas and apply them transactionally to the certifier-owned replica.
-The pristine replica is cloned locally for the disposable certification child so
-production-composition initialization can never contaminate replication state.
+Missing replicas are built through bounded logical keyset pages and then reconciled
+through the authoritative change journal. Full authoritative snapshots are no longer
+the default bootstrap path and can be enabled only as an explicit recovery override.
+Normal cycles consume bounded, possibly multi-batch deltas transactionally.
 """
 
 import fcntl
@@ -28,11 +27,12 @@ from .certification_incremental_replication import (
     TRIGGER_PREFIX,
     _current_watermark,
 )
+from .certification_logical_bootstrap_client import LogicalBootstrapRestartRequired, logical_bootstrap
 
-
-CLIENT_VERSION = "certification-incremental-replica-client-v4-semicolon-safe-replay"
+CLIENT_VERSION = "certification-incremental-replica-client-v5-logical-bootstrap-catchup"
 DEFAULT_DELTA_TIMEOUT_SECONDS = 30.0
 DEFAULT_COPY_CHUNK_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_DELTA_BATCHES = 64
 FICLONE = 0x40049409
 
 PAPER_ONLY = True
@@ -43,6 +43,21 @@ TRANSACTION_SUBMISSION_AVAILABLE = False
 
 class ReplicaBootstrapRequired(RuntimeError):
     pass
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allow_full_snapshot_recovery() -> bool:
+    return _truthy(os.getenv("SOLANA_ROI_CERTIFIER_ALLOW_FULL_SNAPSHOT_BOOTSTRAP"))
+
+
+def _max_delta_batches() -> int:
+    try:
+        return max(1, min(256, int(os.getenv("SOLANA_ROI_CERTIFIER_MAX_DELTA_BATCHES", str(DEFAULT_MAX_DELTA_BATCHES)))))
+    except ValueError:
+        return DEFAULT_MAX_DELTA_BATCHES
 
 
 def _replica_path() -> Path:
@@ -115,6 +130,7 @@ def _validate_sqlite(path: Path, expected_bytes: int | None = None) -> int:
 
 
 def _read_source_replication_identity(path: Path) -> dict[str, Any]:
+    """Compatibility helper for explicitly enabled legacy full-snapshot recovery."""
     connection = sqlite3.connect(path)
     try:
         tables = {
@@ -133,13 +149,9 @@ def _read_source_replication_identity(path: Path) -> dict[str, Any]:
         epoch = str(meta.get("epoch") or "")
         fingerprint = str(meta.get("schema_fingerprint") or "")
         version = str(meta.get("replication_version") or "")
-        # A bootstrap snapshot can legitimately contain an already-pruned change
-        # journal. sqlite_sequence is the canonical monotonic acknowledgement
-        # frontier and must be used instead of MAX(id), which can fall back to zero.
         watermark = _current_watermark(connection)
         if not epoch or not fingerprint or version != REPLICATION_VERSION:
             raise RuntimeError("authoritative bootstrap replication identity invalid")
-
         connection.execute("PRAGMA journal_mode=DELETE")
         triggers = connection.execute(
             "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE ?",
@@ -160,8 +172,8 @@ def _read_source_replication_identity(path: Path) -> dict[str, Any]:
         connection.close()
 
 
-def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -> dict[str, Any]:
-    fd, raw = tempfile.mkstemp(prefix=".certifier-replica-bootstrap-", suffix=".sqlite3", dir=str(replica.parent))
+def _full_snapshot_bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -> dict[str, Any]:
+    fd, raw = tempfile.mkstemp(prefix=".certifier-replica-full-recovery-", suffix=".sqlite3", dir=str(replica.parent))
     os.close(fd)
     tmp = Path(raw)
     try:
@@ -179,10 +191,10 @@ def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -
             "schema_fingerprint": identity["schema_fingerprint"],
             "watermark": int(identity["watermark"]),
             "bootstrap_bytes": actual_bytes,
-            "last_transport": "full_snapshot_bootstrap",
+            "last_transport": "explicit_full_snapshot_recovery",
         }
         _atomic_state(_state_path(replica), state)
-        return {**state, "bootstrapped": True, "delta_applied": False, "delta_change_count": 0}
+        return state
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -207,7 +219,7 @@ def _fetch_delta(*, base: str, token: str, expected_release: str, state: dict[st
         headers={
             "Accept": "application/json",
             "X-Certification-Token": token,
-            "User-Agent": "solana-roi-isolated-certifier/3",
+            "User-Agent": "solana-roi-isolated-certifier/4",
         },
     )
     try:
@@ -229,13 +241,12 @@ def _fetch_delta(*, base: str, token: str, expected_release: str, state: dict[st
         raise ReplicaBootstrapRequired("authoritative certification replication epoch changed")
     if str(payload.get("schema_fingerprint") or "") != str(state["schema_fingerprint"]):
         raise ReplicaBootstrapRequired("authoritative certification schema fingerprint changed")
-    if int(payload.get("from_watermark") or -1) != int(state["watermark"]):
+    if int(payload.get("from_watermark") if payload.get("from_watermark") is not None else -1) != int(state["watermark"]):
         raise RuntimeError("authoritative certification delta starting watermark mismatch")
     return payload
 
 
 def _user_trigger_definitions(connection: sqlite3.Connection) -> list[tuple[str, str]]:
-    """Capture canonical user triggers so replay cannot fire source side effects twice."""
     rows = connection.execute(
         "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL "
         "AND name NOT LIKE ? ORDER BY name",
@@ -246,8 +257,7 @@ def _user_trigger_definitions(connection: sqlite3.Connection) -> list[tuple[str,
 
 def _drop_user_triggers(connection: sqlite3.Connection, triggers: list[tuple[str, str]]) -> None:
     for name, _sql in triggers:
-        quoted = name.replace('"', '""')
-        connection.execute(f'DROP TRIGGER IF EXISTS "{quoted}"')
+        connection.execute(f'DROP TRIGGER IF EXISTS "{name.replace(chr(34), chr(34) * 2)}"')
 
 
 def _restore_user_triggers(connection: sqlite3.Connection, triggers: list[tuple[str, str]]) -> None:
@@ -262,18 +272,12 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
     changes = payload.get("changes")
     if not isinstance(changes, list):
         raise RuntimeError("authoritative certification delta changes invalid")
-
     connection = sqlite3.connect(replica, timeout=10.0)
     try:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("PRAGMA busy_timeout=10000")
         connection.execute("BEGIN IMMEDIATE")
         user_triggers = _user_trigger_definitions(connection)
-        # Source-side triggers have already executed in the authoritative commit and
-        # their resulting rows are represented by the source journal. Firing those
-        # triggers again during replica replay can create duplicate/random/timestamped
-        # side effects. DDL is transactional in SQLite, so temporarily remove and
-        # restore user triggers inside the same transaction as the exact row replay.
         _drop_user_triggers(connection, user_triggers)
         for change in changes:
             if not isinstance(change, dict):
@@ -281,8 +285,6 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
             sql = str(change.get("sql") or "")
             if not sql:
                 raise RuntimeError("authoritative certification delta SQL invalid")
-            # sqlite3.execute() enforces a single statement itself; semicolons inside
-            # quoted canonical text are data and must not be rejected or altered.
             connection.execute(sql)
         _restore_user_triggers(connection, user_triggers)
         connection.commit()
@@ -294,7 +296,6 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
         raise
     finally:
         connection.close()
-
     next_state = dict(state)
     next_state["client_version"] = CLIENT_VERSION
     next_state["watermark"] = to_watermark
@@ -307,7 +308,104 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
         "delta_change_count": len(changes),
         "source_change_count": int(payload.get("source_change_count") or 0),
         "delta_payload_bytes": int(payload.get("payload_bytes") or 0),
+        "caught_up": bool(payload.get("caught_up", True)),
     }
+
+
+def _catch_up_deltas(
+    replica: Path,
+    state: dict[str, Any],
+    *,
+    base: str,
+    token: str,
+    expected_release: str,
+) -> dict[str, Any]:
+    current = dict(state)
+    total_changes = 0
+    total_source_changes = 0
+    total_bytes = 0
+    batches = 0
+    for _ in range(_max_delta_batches()):
+        payload = _fetch_delta(base=base, token=token, expected_release=expected_release, state=current)
+        applied = _apply_delta(replica, current, payload)
+        current = dict(applied)
+        batches += 1
+        total_changes += int(applied.get("delta_change_count") or 0)
+        total_source_changes += int(applied.get("source_change_count") or 0)
+        total_bytes += int(applied.get("delta_payload_bytes") or 0)
+        if bool(payload.get("caught_up", True)):
+            return {
+                **current,
+                "delta_applied": True,
+                "delta_batches": batches,
+                "delta_change_count": total_changes,
+                "source_change_count": total_source_changes,
+                "delta_payload_bytes": total_bytes,
+                "caught_up": True,
+            }
+    raise RuntimeError("authoritative certification delta catch-up exceeded bounded batch count")
+
+
+def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -> dict[str, Any]:
+    last_error: BaseException | None = None
+    for _attempt in range(3):
+        _remove_replica(replica)
+        fd, raw = tempfile.mkstemp(prefix=".certifier-replica-logical-", suffix=".sqlite3", dir=str(replica.parent))
+        os.close(fd)
+        tmp = Path(raw)
+        try:
+            identity = logical_bootstrap(tmp, base=base, token=token, expected_release=expected_release)
+            actual_bytes = _validate_sqlite(tmp)
+            os.replace(tmp, replica)
+            state = {
+                "client_version": CLIENT_VERSION,
+                "release_commit": expected_release,
+                "replication_version": identity["replication_version"],
+                "epoch": identity["epoch"],
+                "schema_fingerprint": identity["schema_fingerprint"],
+                "watermark": int(identity["watermark"]),
+                "bootstrap_bytes": actual_bytes,
+                "bootstrap_rows": int(identity.get("bootstrap_rows") or 0),
+                "bootstrap_payload_bytes": int(identity.get("bootstrap_payload_bytes") or 0),
+                "bootstrap_tables": int(identity.get("bootstrap_tables") or 0),
+                "last_transport": "bounded_logical_bootstrap",
+            }
+            _atomic_state(_state_path(replica), state)
+            caught_up = _catch_up_deltas(
+                replica,
+                state,
+                base=base,
+                token=token,
+                expected_release=expected_release,
+            )
+            caught_up["bootstrapped"] = True
+            caught_up["bootstrap_transport"] = "bounded_logical_bootstrap"
+            caught_up["last_transport"] = "bounded_logical_bootstrap_plus_incremental_delta"
+            _atomic_state(_state_path(replica), caught_up)
+            return caught_up
+        except (LogicalBootstrapRestartRequired, ReplicaBootstrapRequired) as exc:
+            last_error = exc
+            _remove_replica(replica)
+            continue
+        except BaseException as exc:
+            last_error = exc
+            _remove_replica(replica)
+            if _allow_full_snapshot_recovery():
+                state = _full_snapshot_bootstrap(replica, base=base, token=token, expected_release=expected_release)
+                caught_up = _catch_up_deltas(
+                    replica,
+                    state,
+                    base=base,
+                    token=token,
+                    expected_release=expected_release,
+                )
+                caught_up["bootstrapped"] = True
+                caught_up["bootstrap_transport"] = "explicit_full_snapshot_recovery"
+                return caught_up
+            raise
+        finally:
+            tmp.unlink(missing_ok=True)
+    raise RuntimeError(f"logical certification bootstrap could not stabilize:{type(last_error).__name__ if last_error else 'unknown'}")
 
 
 def synchronize_replica(*, base: str, token: str, expected_release: str) -> tuple[Path, dict[str, Any]]:
@@ -321,21 +419,21 @@ def synchronize_replica(*, base: str, token: str, expected_release: str) -> tupl
         or str(state.get("release_commit") or "") != expected_release
         or str(state.get("replication_version") or "") != REPLICATION_VERSION
     ):
-        _remove_replica(replica)
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
-
     try:
         _validate_sqlite(replica)
     except BaseException:
-        _remove_replica(replica)
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
-
     try:
-        delta = _fetch_delta(base=base, token=token, expected_release=expected_release, state=state)
+        return replica, _catch_up_deltas(
+            replica,
+            state,
+            base=base,
+            token=token,
+            expected_release=expected_release,
+        )
     except ReplicaBootstrapRequired:
-        _remove_replica(replica)
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
-    return replica, _apply_delta(replica, state, delta)
 
 
 def _drop_cache(fd: int, offset: int, length: int) -> None:
@@ -350,7 +448,6 @@ def _drop_cache(fd: int, offset: int, length: int) -> None:
 
 
 def clone_replica_for_cycle(replica: Path, destination: Path) -> str:
-    """Create a disposable local child image without touching authoritative cgroup."""
     src_fd = os.open(replica, os.O_RDONLY)
     dst_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -362,7 +459,6 @@ def clone_replica_for_cycle(replica: Path, destination: Path) -> str:
             os.ftruncate(dst_fd, 0)
             os.lseek(src_fd, 0, os.SEEK_SET)
             os.lseek(dst_fd, 0, os.SEEK_SET)
-
         copied = 0
         while True:
             block = os.read(src_fd, DEFAULT_COPY_CHUNK_BYTES)
@@ -399,8 +495,11 @@ def status() -> dict[str, Any]:
         "replica_epoch": state.get("epoch") if state else None,
         "replica_schema_fingerprint": state.get("schema_fingerprint") if state else None,
         "replica_watermark": state.get("watermark") if state else None,
+        "logical_bootstrap_default": True,
+        "full_snapshot_bootstrap_enabled": _allow_full_snapshot_recovery(),
+        "full_snapshot_role": "explicit_recovery_only",
         "normal_cycle_transport": "bounded_incremental_delta",
-        "full_snapshot_role": "bootstrap_recovery_reconciliation_only",
+        "delta_batches_are_paginated": True,
         "child_uses_disposable_local_clone": True,
         "authoritative_full_snapshot_per_cycle": False,
         "trigger_safe_replay": True,
@@ -412,4 +511,15 @@ def status() -> dict[str, Any]:
     }
 
 
-__all__ = ["CLIENT_VERSION", "ReplicaBootstrapRequired", "clone_replica_for_cycle", "status", "synchronize_replica"]
+__all__ = [
+    "CLIENT_VERSION",
+    "ReplicaBootstrapRequired",
+    "_apply_delta",
+    "_atomic_state",
+    "_fetch_delta",
+    "_read_source_replication_identity",
+    "_state_path",
+    "clone_replica_for_cycle",
+    "status",
+    "synchronize_replica",
+]
