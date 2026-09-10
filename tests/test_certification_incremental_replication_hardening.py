@@ -119,25 +119,29 @@ def test_bootstrap_identity_keeps_sqlite_sequence_watermark_after_ack_pruning(tm
 def test_storeless_composition_stays_up_but_replication_requests_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
     app = FastAPI()
-    replication.install_certification_incremental_replication(app, lambda: object())
+    original_snapshot_builder = replication.split._snapshot_store_to_file
+    try:
+        replication.install_certification_incremental_replication(app, lambda: object())
 
-    with TestClient(app) as client:
-        status = client.get("/v1/operations/certification-db-replication")
-        assert status.status_code == 200
-        assert status.json()["ready"] is False
-        assert status.json()["reason"] == "canonical_store_unavailable"
+        with TestClient(app) as client:
+            status = client.get("/v1/operations/certification-db-replication")
+            assert status.status_code == 200
+            assert status.json()["ready"] is False
+            assert status.json()["reason"] == "canonical_store_unavailable"
 
-        delta = client.get(
-            "/v1/operations/certification-db-delta",
-            params={
-                "from_watermark": 0,
-                "epoch": "12345678",
-                "schema_fingerprint": "a" * 64,
-            },
-            headers={"X-Certification-Token": "test-token"},
-        )
-        assert delta.status_code == 503
-        assert "canonical certification store unavailable" in delta.text
+            delta = client.get(
+                "/v1/operations/certification-db-delta",
+                params={
+                    "from_watermark": 0,
+                    "epoch": "12345678",
+                    "schema_fingerprint": "a" * 64,
+                },
+                headers={"X-Certification-Token": "test-token"},
+            )
+            assert delta.status_code == 503
+            assert "canonical certification store unavailable" in delta.text
 
-    assert app.state.roi_certification_incremental_replication is True
-    assert app.state.roi_certification_incremental_replication_version == replication.REPLICATION_VERSION
+        assert app.state.roi_certification_incremental_replication is True
+        assert app.state.roi_certification_incremental_replication_version == replication.REPLICATION_VERSION
+    finally:
+        replication.split._snapshot_store_to_file = original_snapshot_builder
