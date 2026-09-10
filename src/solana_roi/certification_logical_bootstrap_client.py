@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sqlite3
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,11 +17,30 @@ from .certification_incremental_replication import REPLICATION_VERSION
 from .certification_logical_bootstrap import BOOTSTRAP_VERSION
 
 
-CLIENT_VERSION = "certification-logical-bootstrap-client-v2-sqlite-metadata"
+CLIENT_VERSION = "certification-logical-bootstrap-client-v3-cooperative-pacing"
+DEFAULT_PAGE_PAUSE_SECONDS = 0.01
 
 
 class LogicalBootstrapRestartRequired(RuntimeError):
     pass
+
+
+def _page_pause_seconds() -> float:
+    try:
+        return max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    os.getenv(
+                        "SOLANA_ROI_CERTIFIER_LOGICAL_BOOTSTRAP_PAGE_PAUSE_SECONDS",
+                        str(DEFAULT_PAGE_PAUSE_SECONDS),
+                    )
+                ),
+            ),
+        )
+    except ValueError:
+        return DEFAULT_PAGE_PAUSE_SECONDS
 
 
 def _open_json(request: urllib.request.Request, *, timeout: float = 30.0) -> dict[str, Any]:
@@ -43,7 +64,7 @@ def _request(url: str, token: str) -> urllib.request.Request:
         headers={
             "Accept": "application/json",
             "X-Certification-Token": token,
-            "User-Agent": "solana-roi-isolated-certifier-logical-bootstrap/2",
+            "User-Agent": "solana-roi-isolated-certifier-logical-bootstrap/3",
         },
     )
 
@@ -240,6 +261,9 @@ def logical_bootstrap(
                 if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
                     raise RuntimeError("certification logical bootstrap cursor did not advance")
                 cursor = next_cursor
+                pause = _page_pause_seconds()
+                if pause > 0:
+                    time.sleep(pause)
 
         # Data loads occur before user triggers exist, so source-side effects are not
         # re-fired. Restore metadata frontiers before user schema objects are attached.
@@ -282,6 +306,7 @@ def logical_bootstrap(
         "bootstrap_tables": table_count,
         "sqlite_sequence_preserved": True,
         "sqlite_pragma_metadata_preserved": True,
+        "page_pause_seconds": _page_pause_seconds(),
         "last_transport": "bounded_logical_bootstrap",
         "paper_only": True,
         "live_money_authority": False,

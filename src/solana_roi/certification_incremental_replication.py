@@ -30,7 +30,10 @@ CHANGE_TABLE = "certification_replication_changes"
 META_TABLE = "certification_replication_meta"
 TRIGGER_PREFIX = "roi_cert_rep_"
 REPLICATION_INDEX = "ix_certification_replication_changes_id"
-DEFAULT_MAX_DELTA_ROWS = 50_000
+# Keep one authenticated delta request small enough that the authoritative Uvicorn
+# process can continue serving liveness/composition traffic while catch-up advances.
+# Larger backlogs are exact paginated work and resume from the durable watermark.
+DEFAULT_MAX_DELTA_ROWS = 2_000
 DEFAULT_MAX_DELTA_BYTES = 16 * 1024 * 1024
 
 PAPER_ONLY = True
