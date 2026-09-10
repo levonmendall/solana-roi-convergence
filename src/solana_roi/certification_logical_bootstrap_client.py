@@ -11,6 +11,7 @@ that invalidate that partial replica.
 import base64
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -25,10 +26,14 @@ from .certification_incremental_replication import REPLICATION_VERSION
 from .certification_logical_bootstrap import BOOTSTRAP_VERSION
 
 
-CLIENT_VERSION = "certification-logical-bootstrap-client-v4-durable-page-resume"
+CLIENT_VERSION = "certification-logical-bootstrap-client-v5-adaptive-memory-bound"
 DEFAULT_PAGE_PAUSE_SECONDS = 0.01
 DEFAULT_TRANSIENT_RETRY_ATTEMPTS = 4
 DEFAULT_TRANSIENT_RETRY_SECONDS = 2.0
+DEFAULT_ADAPTIVE_PAGE_ATTEMPTS = 6
+DEFAULT_MIN_PAGE_ROWS = 16
+DEFAULT_PAGE_RECOVERY_SUCCESSES = 8
+_LOGGER = logging.getLogger(__name__)
 
 
 class LogicalBootstrapRestartRequired(RuntimeError):
@@ -37,6 +42,10 @@ class LogicalBootstrapRestartRequired(RuntimeError):
 
 class LogicalBootstrapPause(RuntimeError):
     """Transient transport/resource pressure paused bootstrap; preserve progress."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _page_pause_seconds() -> float:
@@ -93,6 +102,60 @@ def _transient_retry_seconds() -> float:
         return DEFAULT_TRANSIENT_RETRY_SECONDS
 
 
+def _adaptive_page_attempts() -> int:
+    try:
+        return max(
+            2,
+            min(
+                12,
+                int(
+                    os.getenv(
+                        "SOLANA_ROI_CERTIFIER_LOGICAL_BOOTSTRAP_ADAPTIVE_PAGE_ATTEMPTS",
+                        str(DEFAULT_ADAPTIVE_PAGE_ATTEMPTS),
+                    )
+                ),
+            ),
+        )
+    except ValueError:
+        return DEFAULT_ADAPTIVE_PAGE_ATTEMPTS
+
+
+def _minimum_page_rows() -> int:
+    try:
+        return max(
+            1,
+            min(
+                250,
+                int(
+                    os.getenv(
+                        "SOLANA_ROI_CERTIFIER_LOGICAL_BOOTSTRAP_MIN_PAGE_ROWS",
+                        str(DEFAULT_MIN_PAGE_ROWS),
+                    )
+                ),
+            ),
+        )
+    except ValueError:
+        return DEFAULT_MIN_PAGE_ROWS
+
+
+def _page_recovery_successes() -> int:
+    try:
+        return max(
+            2,
+            min(
+                64,
+                int(
+                    os.getenv(
+                        "SOLANA_ROI_CERTIFIER_LOGICAL_BOOTSTRAP_PAGE_RECOVERY_SUCCESSES",
+                        str(DEFAULT_PAGE_RECOVERY_SUCCESSES),
+                    )
+                ),
+            ),
+        )
+    except ValueError:
+        return DEFAULT_PAGE_RECOVERY_SUCCESSES
+
+
 def _open_json(request: urllib.request.Request, *, timeout: float = 30.0) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -101,7 +164,10 @@ def _open_json(request: urllib.request.Request, *, timeout: float = 30.0) -> dic
         if int(exc.code) == 409:
             raise LogicalBootstrapRestartRequired("authoritative logical bootstrap identity changed") from exc
         if int(exc.code) in {502, 503, 504}:
-            raise LogicalBootstrapPause(f"certification logical bootstrap HTTP pause:{exc.code}") from exc
+            raise LogicalBootstrapPause(
+                f"certification logical bootstrap HTTP pause:{exc.code}",
+                status_code=int(exc.code),
+            ) from exc
         raise RuntimeError(f"certification logical bootstrap HTTP failure:{exc.code}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise LogicalBootstrapPause(
@@ -135,7 +201,7 @@ def _request(url: str, token: str) -> urllib.request.Request:
         headers={
             "Accept": "application/json",
             "X-Certification-Token": token,
-            "User-Agent": "solana-roi-isolated-certifier-logical-bootstrap/4",
+            "User-Agent": "solana-roi-isolated-certifier-logical-bootstrap/5",
         },
     )
 
@@ -305,6 +371,9 @@ def _base_checkpoint(
         "bootstrap_rows": 0,
         "bootstrap_payload_bytes": 0,
         "bootstrap_tables": 0,
+        "page_rows": None,
+        "page_success_streak": 0,
+        "resource_pressure_pauses": 0,
     }
 
 
@@ -314,6 +383,26 @@ def _schema_object_exists(connection: sqlite3.Connection, kind: str, name: str) 
         (kind, name),
     ).fetchone()
     return row is not None
+
+
+def _manifest_page_rows(manifest: dict[str, Any]) -> tuple[int, int]:
+    try:
+        default_rows = max(1, int(manifest.get("page_default_rows") or 250))
+    except (TypeError, ValueError):
+        default_rows = 250
+    try:
+        max_rows = max(1, int(manifest.get("page_max_rows") or default_rows))
+    except (TypeError, ValueError):
+        max_rows = default_rows
+    default_rows = min(default_rows, max_rows)
+    return default_rows, min(default_rows, _minimum_page_rows())
+
+
+def _next_recovered_page_rows(current: int, target: int) -> int:
+    """Grow conservatively after sustained success; never jump back to the target."""
+    if current >= target:
+        return target
+    return min(target, max(current + 1, (current * 5 + 3) // 4))
 
 
 def logical_bootstrap(
@@ -357,13 +446,25 @@ def logical_bootstrap(
         _atomic_state(state_path, checkpoint)
     assert checkpoint is not None
 
+    target_page_rows, min_page_rows = _manifest_page_rows(manifest)
+    try:
+        saved_page_rows = int(checkpoint.get("page_rows"))
+    except (TypeError, ValueError):
+        saved_page_rows = target_page_rows
+    page_rows = min(target_page_rows, max(min_page_rows, saved_page_rows))
+    checkpoint["page_rows"] = page_rows
+    checkpoint["page_success_streak"] = max(0, int(checkpoint.get("page_success_streak") or 0))
+    checkpoint["resource_pressure_pauses"] = max(0, int(checkpoint.get("resource_pressure_pauses") or 0))
+    _atomic_state(state_path, checkpoint)
+
     connection = sqlite3.connect(partial, timeout=30.0)
     table_names: set[str] = set()
     try:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=OFF")
-        connection.execute("PRAGMA cache_size=-8192")
+        connection.execute("PRAGMA cache_size=-4096")
+        connection.execute("PRAGMA mmap_size=0")
 
         next_table_index = int(checkpoint.get("next_table_index") or 0)
         if next_table_index < 0 or next_table_index > len(tables):
@@ -404,21 +505,52 @@ def logical_bootstrap(
                 cursor = None
 
             while True:
-                query: dict[str, Any] = {
-                    "table": name,
-                    "epoch": epoch,
-                    "schema_fingerprint": fingerprint,
-                    "limit": int(manifest.get("page_default_rows") or 250),
-                }
-                if cursor:
-                    query["cursor"] = cursor
-                payload = _open_json_resumable(
-                    _request(
-                        f"{base}/v1/operations/certification-db-logical-bootstrap-page?{urllib.parse.urlencode(query)}",
-                        token,
-                    ),
-                    timeout=30.0,
-                )
+                payload: dict[str, Any] | None = None
+                last_pause: LogicalBootstrapPause | None = None
+                for attempt in range(_adaptive_page_attempts()):
+                    query: dict[str, Any] = {
+                        "table": name,
+                        "epoch": epoch,
+                        "schema_fingerprint": fingerprint,
+                        "limit": page_rows,
+                    }
+                    if cursor:
+                        query["cursor"] = cursor
+                    try:
+                        payload = _open_json(
+                            _request(
+                                f"{base}/v1/operations/certification-db-logical-bootstrap-page?{urllib.parse.urlencode(query)}",
+                                token,
+                            ),
+                            timeout=30.0,
+                        )
+                        break
+                    except LogicalBootstrapPause as exc:
+                        last_pause = exc
+                        prior_rows = page_rows
+                        if exc.status_code == 503:
+                            page_rows = max(min_page_rows, page_rows // 2)
+                            checkpoint["page_rows"] = page_rows
+                            checkpoint["page_success_streak"] = 0
+                            checkpoint["resource_pressure_pauses"] = int(
+                                checkpoint.get("resource_pressure_pauses") or 0
+                            ) + 1
+                            _atomic_state(state_path, checkpoint)
+                            _LOGGER.warning(
+                                "SOLANA_ROI_CERTIFIER_LOGICAL_BOOTSTRAP_BACKOFF table=%s same_cursor=true status=503 prior_rows=%s next_rows=%s attempt=%s",
+                                name,
+                                prior_rows,
+                                page_rows,
+                                attempt + 1,
+                            )
+                        if attempt + 1 >= _adaptive_page_attempts():
+                            raise
+                        multiplier = (2 ** min(attempt, 4)) if exc.status_code == 503 else (attempt + 1)
+                        time.sleep(min(30.0, _transient_retry_seconds() * multiplier))
+                if payload is None:
+                    assert last_pause is not None
+                    raise last_pause
+
                 if str(payload.get("release_commit") or "") != expected_release:
                     raise LogicalBootstrapRestartRequired("certification logical bootstrap release changed")
                 if str(payload.get("epoch") or "") != epoch or str(payload.get("schema_fingerprint") or "") != fingerprint:
@@ -460,6 +592,20 @@ def logical_bootstrap(
                 checkpoint["bootstrap_payload_bytes"] = int(checkpoint.get("bootstrap_payload_bytes") or 0) + int(
                     payload.get("payload_bytes") or 0
                 )
+                success_streak = int(checkpoint.get("page_success_streak") or 0) + 1
+                if success_streak >= _page_recovery_successes() and page_rows < target_page_rows:
+                    prior_rows = page_rows
+                    page_rows = _next_recovered_page_rows(page_rows, target_page_rows)
+                    success_streak = 0
+                    _LOGGER.info(
+                        "SOLANA_ROI_CERTIFIER_LOGICAL_BOOTSTRAP_RECOVERY table=%s prior_rows=%s next_rows=%s",
+                        name,
+                        prior_rows,
+                        page_rows,
+                    )
+                checkpoint["page_rows"] = page_rows
+                checkpoint["page_success_streak"] = success_streak
+
                 done = bool(payload.get("done"))
                 next_cursor = payload.get("next_cursor")
                 if done:
@@ -483,9 +629,6 @@ def logical_bootstrap(
         if int(checkpoint.get("next_table_index") or 0) != len(tables):
             raise RuntimeError("certification logical bootstrap checkpoint did not reach final table")
 
-        # Data loads occur before user triggers exist, so source-side effects are not
-        # re-fired. Metadata and post-schema restoration are idempotent, allowing a
-        # process restart after the last data page without rescanning any table.
         _restore_sqlite_metadata(connection, manifest=manifest, table_names=table_names)
         connection.commit()
 
@@ -545,9 +688,15 @@ def logical_bootstrap(
         "sqlite_sequence_preserved": True,
         "sqlite_pragma_metadata_preserved": True,
         "page_pause_seconds": _page_pause_seconds(),
+        "adaptive_page_rows": int(checkpoint.get("page_rows") or target_page_rows),
+        "minimum_page_rows": min_page_rows,
+        "resource_pressure_pauses": int(checkpoint.get("resource_pressure_pauses") or 0),
         "durable_page_resume": True,
         "resource_pressure_503_resumable": True,
+        "resource_pressure_503_adaptive": True,
+        "cursor_advances_only_after_commit": True,
         "transient_transport_resumable": True,
+        "sqlite_mmap_disabled": True,
         "last_transport": "bounded_logical_bootstrap",
         "paper_only": True,
         "live_money_authority": False,

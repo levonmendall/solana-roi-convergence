@@ -21,11 +21,12 @@ from fastapi import Header, HTTPException, Query
 from . import certification_incremental_replication as replication
 from . import certification_service_split as split
 
-BOOTSTRAP_VERSION = "certification-logical-bootstrap-v2-sequence-frontier"
+BOOTSTRAP_VERSION = "certification-logical-bootstrap-v4-adaptive-memory-bound"
 DEFAULT_PAGE_ROWS = 250
 MAX_PAGE_ROWS = 500
 DEFAULT_PAGE_BYTES = 4 * 1024 * 1024
 MAX_PAGE_BYTES = 16 * 1024 * 1024
+READER_CACHE_KIB = 1024
 
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
@@ -91,17 +92,43 @@ def _runtime_store(runtime_provider: Callable[[], Any]) -> Any:
 
 
 def _pinned_reader(store: Any) -> sqlite3.Connection:
+    """Open one fail-closed, private, deliberately tiny-cache reader."""
     source_path = Path(getattr(store, "path", ""))
     if not source_path.is_file():
         raise HTTPException(status_code=503, detail="canonical certification source unavailable")
-    reader = sqlite3.connect(f"file:{source_path.resolve()}?mode=ro", uri=True, timeout=5.0)
+
+    # Keep the cgroup guard in the canonical reader itself. The durable-bootstrap
+    # installer detects the marker below and therefore does not replace these stricter
+    # settings with its older larger-cache wrapper.
+    from . import durable_bootstrap_memory_repair as durable_memory
+
+    try:
+        durable_memory._guard_raw_cgroup(source_path)
+    except MemoryError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="certification logical bootstrap deferred: raw cgroup memory pressure",
+        ) from exc
+
+    reader = sqlite3.connect(
+        f"file:{source_path.resolve()}?mode=ro&cache=private",
+        uri=True,
+        timeout=5.0,
+    )
     reader.execute("PRAGMA query_only=ON")
     reader.execute("PRAGMA busy_timeout=5000")
-    reader.execute("PRAGMA cache_size=-4096")
-    # Do not open a page-wide read transaction here. Each bounded SELECT owns only
-    # its statement snapshot, allowing WAL checkpoint/writeback progress between
-    # metadata reads and certification pages while journal replay preserves truth.
+    reader.execute(f"PRAGMA cache_size=-{READER_CACHE_KIB}")
+    reader.execute("PRAGMA mmap_size=0")
+    reader.execute("PRAGMA temp_store=FILE")
+    # Deliberately no page-wide BEGIN. Each bounded SELECT owns only its statement
+    # snapshot so WAL checkpoint/writeback can progress between pages.
     return reader
+
+
+# The durable-bootstrap installer uses this marker to avoid double-wrapping an
+# already fail-closed bounded reader. It does not disable the guard: the guard is
+# invoked directly above before every manifest/page read.
+setattr(_pinned_reader, "_roi_durable_bootstrap_memory_bounded", True)
 
 
 def _validate_identity(reader: sqlite3.Connection, epoch: str, fingerprint: str) -> dict[str, str]:
@@ -164,9 +191,9 @@ def _manifest(store: Any) -> dict[str, Any]:
                 if str(name) in table_names and seq is not None
             ]
         start_watermark = replication._current_watermark(reader)
-        # Without a page-wide snapshot, revalidate after all manifest reads so a
-        # racing DDL/schema change still fails closed instead of publishing a mixed
-        # manifest. Ordinary DML is reconciled from start_watermark by the journal.
+        # Statement-scoped reads allow WAL progress, so revalidate after all manifest
+        # reads to fail closed on any racing DDL/schema identity change. Ordinary DML
+        # remains reconciled from the start watermark by the append-only journal.
         _validate_identity(reader, str(identity["epoch"]), str(identity["schema_fingerprint"]))
         return {
             "bootstrap_version": BOOTSTRAP_VERSION,
@@ -186,6 +213,10 @@ def _manifest(store: Any) -> dict[str, Any]:
             "page_default_rows": DEFAULT_PAGE_ROWS,
             "page_max_rows": MAX_PAGE_ROWS,
             "page_max_bytes": _page_bytes(),
+            "reader_cache_kib": READER_CACHE_KIB,
+            "reader_mmap_disabled": True,
+            "reader_private_cache": True,
+            "reader_page_wide_transaction": False,
             "full_snapshot_required": False,
             "bootstrap_transport": "bounded_logical_keyset_pages_plus_journal_reconciliation",
             "paper_only": True,
@@ -207,16 +238,7 @@ def _stream_page_records(
     row_to_record: Callable[[Any], dict[str, Any]],
     cursor_for: Callable[[dict[str, Any]], str],
 ) -> tuple[list[dict[str, Any]], int, bool, str | None]:
-    """Materialize at most the bounded response plus one transient SQLite row.
-
-    The old transport called ``fetchall()`` before enforcing ``max_bytes``. A table
-    containing large JSON/text values could therefore inflate hundreds of MiB of
-    Python objects even though the eventual HTTP payload was capped at 4 MiB. This
-    loop enforces the byte limit as each row arrives. A row rejected by the byte cap
-    is intentionally not represented in ``next_cursor``; the next keyset request
-    starts after the last included row and therefore reads that row again exactly.
-    """
-
+    """Materialize at most the bounded response plus one transient SQLite row."""
     response_rows: list[dict[str, Any]] = []
     payload_bytes = 0
     truncated_by_bytes = False
@@ -242,8 +264,6 @@ def _stream_page_records(
 
     has_more_by_rows = False
     if not truncated_by_bytes and not exhausted and len(response_rows) >= bounded_limit:
-        # Consume only one sentinel row to distinguish an exact-sized final page
-        # from a page with more data. The sentinel is never retained in memory.
         has_more_by_rows = raw_cursor.fetchone() is not None
         exhausted = not has_more_by_rows
 
@@ -337,12 +357,12 @@ def _page(
                 cursor_for=cursor_for,
             )
         finally:
-            # End the SELECT statement snapshot before any subsequent validation or
-            # response construction so WAL checkpoints are not pinned unnecessarily.
+            # End the SELECT statement snapshot before subsequent validation/response
+            # construction so WAL checkpoint/writeback is not pinned unnecessarily.
             raw_cursor.close()
 
-        # Removing the broad read transaction must not weaken schema identity. If a
-        # schema change raced with this page, discard it and force a clean restart.
+        # Statement-scoped paging still fails closed if schema identity changed while
+        # this page was being read.
         _validate_identity(reader, epoch, fingerprint)
         return {
             "bootstrap_version": BOOTSTRAP_VERSION,
