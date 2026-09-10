@@ -8,7 +8,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 
 
-COMPAT_VERSION = "robinhood-drpc-block-number-compat-v3-ogrpc-routing"
+COMPAT_VERSION = "robinhood-drpc-block-number-compat-v4-feehistory-head"
 _INSTALLED = False
 _LOCK = threading.Lock()
 _MODE: str | None = None
@@ -18,6 +18,8 @@ _FALLBACK_FAILURES = 0
 _MODE_PARAMLESS = "eth_blockNumber_without_params"
 _MODE_FINALIZED = "eth_getBlockByNumber_finalized_false"
 _MODE_OGRPC = "ogrpc_header_robinhood"
+_MODE_FEE_HISTORY_PATH = "eth_feeHistory_latest_one_path"
+_MODE_FEE_HISTORY_OGRPC = "eth_feeHistory_latest_one_ogrpc"
 _OGRPC_URL = "https://lb.drpc.org/ogrpc?network=robinhood"
 
 
@@ -93,6 +95,20 @@ def _extract_block_number(block: Any) -> str:
     )
 
 
+def _extract_fee_history_head(history: Any) -> str:
+    if not isinstance(history, dict):
+        raise RuntimeError("InvalidDrpcFeeHistoryResponse")
+    # EIP-1559 eth_feeHistory returns oldestBlock for the first block in the
+    # requested range. With blockCount=1 and newestBlock="latest", that is
+    # exactly the latest block height. We require the value to be a valid,
+    # non-negative JSON-RPC quantity before it can satisfy provider health.
+    return _extract_quantity(
+        history.get("oldestBlock"),
+        missing_error="MissingDrpcFeeHistoryOldestBlock",
+        invalid_error="InvalidDrpcFeeHistoryOldestBlock",
+    )
+
+
 def _mode() -> str | None:
     with _LOCK:
         return _MODE
@@ -117,7 +133,7 @@ def _record_failure(*, stage: str, exc: BaseException) -> None:
     with _LOCK:
         _FALLBACK_FAILURES += 1
         failures = int(_FALLBACK_FAILURES)
-    if failures <= 6 or failures % 20 == 0:
+    if failures <= 8 or failures % 20 == 0:
         status = _http_status(exc)
         code = _drpc_code(exc)
         safe_status = str(status) if status is not None else "none"
@@ -210,6 +226,15 @@ async def _ogrpc_block_number(rpc_self: Any) -> str:
     )
 
 
+async def _fee_history_block_number(rpc_self: Any, *, ogrpc: bool) -> str:
+    params: list[Any] = [1, "latest", []]
+    if ogrpc:
+        history = await _ogrpc_json_rpc(rpc_self, method="eth_feeHistory", params=params)
+    else:
+        history = await _direct_json_rpc(rpc_self, method="eth_feeHistory", params=params)
+    return _extract_fee_history_head(history)
+
+
 async def _read_compatible_block_number(rpc_self: Any, *, preferred_mode: str | None) -> tuple[str, str]:
     if preferred_mode == _MODE_PARAMLESS:
         return await _paramless_block_number(rpc_self), _MODE_PARAMLESS
@@ -217,6 +242,10 @@ async def _read_compatible_block_number(rpc_self: Any, *, preferred_mode: str | 
         return await _finalized_block_number(rpc_self), _MODE_FINALIZED
     if preferred_mode == _MODE_OGRPC:
         return await _ogrpc_block_number(rpc_self), _MODE_OGRPC
+    if preferred_mode == _MODE_FEE_HISTORY_PATH:
+        return await _fee_history_block_number(rpc_self, ogrpc=False), _MODE_FEE_HISTORY_PATH
+    if preferred_mode == _MODE_FEE_HISTORY_OGRPC:
+        return await _fee_history_block_number(rpc_self, ogrpc=True), _MODE_FEE_HISTORY_OGRPC
 
     try:
         return await _paramless_block_number(rpc_self), _MODE_PARAMLESS
@@ -232,6 +261,16 @@ async def _read_compatible_block_number(rpc_self: Any, *, preferred_mode: str | 
         return await _ogrpc_block_number(rpc_self), _MODE_OGRPC
     except Exception as exc:
         _record_failure(stage=_MODE_OGRPC, exc=exc)
+
+    try:
+        return await _fee_history_block_number(rpc_self, ogrpc=False), _MODE_FEE_HISTORY_PATH
+    except Exception as exc:
+        _record_failure(stage=_MODE_FEE_HISTORY_PATH, exc=exc)
+
+    try:
+        return await _fee_history_block_number(rpc_self, ogrpc=True), _MODE_FEE_HISTORY_OGRPC
+    except Exception as exc:
+        _record_failure(stage=_MODE_FEE_HISTORY_OGRPC, exc=exc)
         raise
 
 
@@ -243,6 +282,11 @@ def _compat_rpc_wrapper(
         drpc = _is_drpc_url(str(getattr(rpc_self, "rpc_url", "") or ""))
         active_mode = _mode()
 
+        # Only a proven direct OGRPC eth_blockNumber route is strong enough to
+        # move all subsequent dRPC HTTP methods to OGRPC. A feeHistory-derived
+        # block head proves block-height capability only, so unrelated methods
+        # continue through their canonical configured path and must prove
+        # themselves independently in provider-traffic telemetry.
         if drpc and active_mode == _MODE_OGRPC:
             try:
                 result = await _ogrpc_json_rpc(rpc_self, method=str(method), params=list(params))
@@ -307,8 +351,12 @@ def status() -> dict[str, Any]:
                 _MODE_PARAMLESS,
                 _MODE_FINALIZED,
                 _MODE_OGRPC,
+                _MODE_FEE_HISTORY_PATH,
+                _MODE_FEE_HISTORY_OGRPC,
             ],
-            "ogrpc_routes_all_drpc_http_after_proof": True,
+            "fee_history_contract": "blockCount=1,newestBlock=latest,rewardPercentiles=[]",
+            "ogrpc_routes_all_drpc_http_after_direct_block_proof": True,
+            "fee_history_proof_routes_only_block_head": True,
             "logs_only_numeric_drpc_error_code": True,
             "paper_only": True,
             "live_money_authority": False,
