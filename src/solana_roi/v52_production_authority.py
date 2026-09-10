@@ -49,15 +49,22 @@ from .v52_profit_confidence_finalization import (
     install_v52_profit_confidence_finalization,
     status as profit_confidence_finalization_status,
 )
+from .v52_learning_governance import (
+    install_v52_learning_governance,
+    status as learning_governance_status,
+)
+from .v52_learning_governance_hardening import (
+    install_v52_learning_governance_hardening,
+    status as learning_governance_hardening_status,
+)
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v9-profit-confidence-complete"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v11-learning-governance-hardened"
 _INSTALLED = False
 _RUNTIME: Any | None = None
 _WALLET_ALPHA: WalletAlphaRefinementLedger | None = None
 
 
 def _copy_robinhood_lineage(wrapper: Any, predecessor: Any) -> None:
-    """Expose only real predecessor lineage on the final production wrapper."""
     if not callable(predecessor):
         raise RuntimeError("v52 Robinhood lifecycle predecessor unavailable")
     setattr(wrapper, "__wrapped__", predecessor)
@@ -67,7 +74,6 @@ def _copy_robinhood_lineage(wrapper: Any, predecessor: Any) -> None:
 
 
 def _bind_concrete_robinhood_lifecycle_owner() -> None:
-    """Bind the final chooser at the concrete composed production class."""
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
     final_wrapper = getattr(robinhood_lifecycle, "_choose_with_lifecycle")
@@ -82,18 +88,11 @@ def _bind_concrete_robinhood_lifecycle_owner() -> None:
 
 
 def _preserve_robinhood_wrapper_contracts() -> None:
-    """Keep predecessor reachability markers visible on final v5.2 entry wrappers."""
     from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
     pairs = (
-        (
-            RobinhoodChainPaperPlane._maybe_open_v3,
-            getattr(robinhood_lifecycle, "_BASE_MAYBE_V3", None),
-        ),
-        (
-            RobinhoodChainPaperPlane._maybe_open_v2,
-            getattr(robinhood_lifecycle, "_BASE_MAYBE_V2", None),
-        ),
+        (RobinhoodChainPaperPlane._maybe_open_v3, getattr(robinhood_lifecycle, "_BASE_MAYBE_V3", None)),
+        (RobinhoodChainPaperPlane._maybe_open_v2, getattr(robinhood_lifecycle, "_BASE_MAYBE_V2", None)),
     )
     for wrapper, predecessor in pairs:
         _copy_robinhood_lineage(wrapper, predecessor)
@@ -109,20 +108,8 @@ def wallet_alpha_refinement() -> WalletAlphaRefinementLedger:
     return _WALLET_ALPHA
 
 
-def install_v52_production_authority(
-    app: Any,
-    runtime_provider: Callable[[], Any] | Any,
-) -> None:
-    """Install the single governed v5.2 paper authority in final wrapper order.
-
-    Compatibility transport/storage and the existing v5.2 authority are composed
-    first. Wallet alignment and forward alpha are then installed, followed by the
-    adaptive continuation layer. The max-profit/max-confidence completion is the
-    final economic feature layer across Solana, FOMO and Robinhood; a narrow final
-    guard then reasserts numeric lane caps, the absolute signal-age limit, the
-    20-second latency ceiling and the 80-percent absolute chase ceiling. All of
-    these layers remain paper-only and reuse exact two-sided quote/exit plumbing.
-    """
+def install_v52_production_authority(app: Any, runtime_provider: Callable[[], Any] | Any) -> None:
+    """Install the single governed v5.2 paper authority in final wrapper order."""
     global _INSTALLED, _RUNTIME, _WALLET_ALPHA
     runtime = _resolve_runtime(runtime_provider)
     install_v52_authoritative_strategy()
@@ -137,6 +124,8 @@ def install_v52_production_authority(
         _WALLET_ALPHA = WalletAlphaRefinementLedger(runtime.store)
     install_v52_adaptive_continuation_refinement(_WALLET_ALPHA)
     install_v52_profit_confidence_completion(runtime)
+    install_v52_learning_governance(runtime)
+    install_v52_learning_governance_hardening()
     install_v52_profit_confidence_finalization()
     install_v52_strategy_api(app)
 
@@ -155,6 +144,8 @@ def install_v52_production_authority(
     app.state.roi_v52_wallet_alpha_refinement = True
     app.state.roi_v52_adaptive_continuation_refinement = True
     app.state.roi_v52_profit_confidence_completion = True
+    app.state.roi_v52_learning_governance = True
+    app.state.roi_v52_learning_governance_hardening = True
     app.state.roi_v52_profit_confidence_finalization = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
@@ -174,6 +165,8 @@ def status() -> dict[str, Any]:
     reconciliation = robinhood_candidate_reconciliation_status()
     adaptive = adaptive_continuation_status()
     completion = profit_confidence_status()
+    learning = learning_governance_status()
+    hardening = learning_governance_hardening_status()
     finalization = profit_confidence_finalization_status()
     strategy_epoch = strategy_evolution_snapshot()
 
@@ -201,7 +194,7 @@ def status() -> dict[str, Any]:
     runtime["robinhood_v52_authority_from_release_epoch"] = True
     runtime["continuous_strategy_evolution_enabled"] = True
     runtime["active_strategy_epoch"] = strategy_epoch
-    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_and_explicit_robinhood_lifecycle_plus_profit_confidence_ledger"
+    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_robinhood_profit_confidence_plus_hardened_learning_governance"
     runtime["robinhood_scale_in_authority"] = bool(
         lifecycle.get("installed")
         and lifecycle.get("aggregate_exact_exitability_before_add")
@@ -214,6 +207,8 @@ def status() -> dict[str, Any]:
     )
     runtime["adaptive_continuation_refinement"] = bool(adaptive.get("installed"))
     runtime["profit_confidence_completion"] = bool(completion.get("installed"))
+    runtime["learning_governance"] = bool(learning.get("installed"))
+    runtime["learning_governance_hardening"] = bool(hardening.get("installed"))
     runtime["profit_confidence_finalization"] = bool(finalization.get("installed"))
 
     all_owned = bool(
@@ -227,6 +222,18 @@ def status() -> dict[str, Any]:
         and completion.get("installed")
         and completion.get("parallel_exact_quote_acquisition")
         and float(completion.get("minimum_exit_depth_coverage_ratio") or 0.0) >= 2.0
+        and learning.get("installed")
+        and learning.get("bayesian_posterior_confidence")
+        and learning.get("wallet_distribution_reversal_primary_exit_signal")
+        and learning.get("lane_specific_learned_decay")
+        and learning.get("automatic_challenger_generation")
+        and learning.get("concurrent_named_same_stream_tournament")
+        and learning.get("automatic_forward_promotion")
+        and learning.get("automatic_forward_demotion")
+        and hardening.get("installed")
+        and hardening.get("stable_auto_challenger_ids")
+        and hardening.get("fresh_same_stream_epoch_after_promotion")
+        and not hardening.get("old_forward_evidence_reuse_for_next_promotion")
         and finalization.get("installed")
         and finalization.get("numeric_lane_cap_guard")
         and finalization.get("absolute_signal_age_guard")
@@ -258,6 +265,8 @@ def status() -> dict[str, Any]:
         "wallet_alpha_refinement": wallet_alpha,
         "adaptive_continuation_refinement": adaptive,
         "profit_confidence_completion": completion,
+        "learning_governance": learning,
+        "learning_governance_hardening": hardening,
         "profit_confidence_finalization": finalization,
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
