@@ -16,6 +16,7 @@ from solana_roi.v52_adaptive_continuation_refinement import (
     exceptional_continuation_evidence,
     opportunity_priority_score,
     rank_eligible_opportunities,
+    status,
     wallet_utilization_multiplier,
 )
 from solana_roi.v52_wallet_alpha_refinement import ContextualWalletScore
@@ -36,26 +37,29 @@ def _wallet_score(*, episodes: int, alpha: float, eligible: bool) -> ContextualW
     )
 
 
-def test_manifest_preserves_hard_authority_and_adaptive_overlay_bounds() -> None:
+def test_manifest_preserves_hard_authority_and_overlay_stays_separate() -> None:
     payload = authority()
     assert payload["paper_only"] is True
     assert payload["live_money_authority"] is False
     assert payload["signing_available"] is False
     assert payload["transaction_submission_available"] is False
     assert payload["execution"]["latency_hard_max_seconds"] == 20.0
+    assert payload["execution"]["chase_observe_only_above_fraction"] == NORMAL_CHASE_MAX
     assert payload["position_management"]["minimum_exit_depth_coverage_ratio"] == 2.0
     assert payload["position_management"]["averaging_down_allowed"] is False
-
-    # Canonical v5.2 remains unchanged; the wider chase and larger add are
-    # conditional overlay ceilings rather than weakened baseline constraints.
-    assert payload["execution"]["chase_normal_max_fraction"] == NORMAL_CHASE_MAX
-    assert payload["execution"]["chase_observe_only_above_fraction"] == NORMAL_CHASE_MAX
-    assert payload["execution"]["chase_exceptional_overlay_max_fraction"] == ABSOLUTE_CHASE_MAX
-    assert payload["position_management"]["ordinary_max_scale_fraction_of_target_per_add"] == ORDINARY_SCALE_FRACTION
     assert payload["position_management"]["max_scale_fraction_of_target_per_add"] == ORDINARY_SCALE_FRACTION
-    assert payload["position_management"]["exceptional_max_scale_fraction_of_target_per_add"] == EXCEPTIONAL_SCALE_FRACTION
     assert payload["position_management"]["runner_fraction_of_target"] == BASE_RUNNER_FRACTION
-    assert payload["position_management"]["max_dynamic_runner_fraction_of_target"] == MAX_DYNAMIC_RUNNER_FRACTION
+
+    overlay = status()
+    assert overlay["ordinary_scale_fraction"] == ORDINARY_SCALE_FRACTION
+    assert overlay["exceptional_scale_fraction"] == EXCEPTIONAL_SCALE_FRACTION
+    assert overlay["normal_chase_max_fraction"] == NORMAL_CHASE_MAX
+    assert overlay["absolute_chase_max_fraction"] == ABSOLUTE_CHASE_MAX
+    assert overlay["base_runner_fraction"] == BASE_RUNNER_FRACTION
+    assert overlay["max_dynamic_runner_fraction"] == MAX_DYNAMIC_RUNNER_FRACTION
+    assert overlay["exceptional_chase_is_overlay_only"] is True
+    assert overlay["paper_only"] is True
+    assert overlay["live_money_authority"] is False
 
 
 def test_contextual_scale_defaults_to_ordinary_and_only_exceptional_reaches_half_target() -> None:
