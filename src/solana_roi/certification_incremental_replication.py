@@ -4,12 +4,13 @@ from __future__ import annotations
 
 The authoritative process remains the sole owner of the canonical SQLite database.
 A compact transactional journal records only stable row identities that change. The
-certifier owns a replica and asks for all mutations after its durable watermark.
-Each response resolves those identities from one pinned read transaction, giving the
-certifier one exact point-in-time logical database state.
+certifier owns a replica and asks for mutations after its durable watermark. Each
+response resolves those identities from one pinned read transaction.
 
-Full SQLite copies are retained only for bootstrap/recovery/reconciliation. Normal
-certification cycles use bounded deltas.
+Normal certification uses bounded deltas. A replica with no local state is initialized
+through bounded logical keyset pages plus journal reconciliation, so authoritative
+production never needs to materialize a second full database merely to bootstrap the
+certifier. The legacy full snapshot stays available only as an explicit recovery tool.
 """
 
 import hashlib
@@ -24,7 +25,7 @@ from fastapi import Header, HTTPException, Query
 
 from . import certification_service_split as split
 
-REPLICATION_VERSION = "certification-incremental-replica-v5-startup-prepared-bootstrap"
+REPLICATION_VERSION = "certification-incremental-replica-v6-logical-bootstrap-bounded-delta"
 CHANGE_TABLE = "certification_replication_changes"
 META_TABLE = "certification_replication_meta"
 TRIGGER_PREFIX = "roi_cert_rep_"
@@ -113,7 +114,6 @@ def _ordinary_tables(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def _schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
-    """Return user schema objects that define the certifier's exact read model."""
     rows = connection.execute(
         "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
         "WHERE type IN ('table','view','index','trigger') ORDER BY type,name"
@@ -177,7 +177,6 @@ def _set_meta(connection: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def _current_watermark(connection: sqlite3.Connection) -> int:
-    """Keep the journal watermark monotonic even after acknowledged rows are pruned."""
     row = connection.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (CHANGE_TABLE,)).fetchone()
     return max(0, int(row[0])) if row is not None and row[0] is not None else 0
 
@@ -260,7 +259,6 @@ def _ensure_tracking_locked(connection: sqlite3.Connection) -> tuple[dict[str, s
         and configured == observed
     ):
         return meta, False
-
     fingerprint = _schema_fingerprint(connection)
     identity_changed = (
         not meta
@@ -323,9 +321,7 @@ def _upsert_sql(connection: sqlite3.Connection, table: dict[str, Any], key_sql: 
         projection, insert_names = ",".join(_qident(name) for name in names), names
     else:
         projection, insert_names = "rowid," + ",".join(_qident(name) for name in names), ["rowid", *names]
-    row = connection.execute(
-        f"SELECT {projection} FROM {_qident(name)} WHERE {key_sql} LIMIT 1"
-    ).fetchone()
+    row = connection.execute(f"SELECT {projection} FROM {_qident(name)} WHERE {key_sql} LIMIT 1").fetchone()
     if row is None:
         return None
     return (
@@ -360,6 +356,7 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
     try:
         reader.execute("PRAGMA query_only=ON")
         reader.execute("PRAGMA busy_timeout=5000")
+        reader.execute("PRAGMA cache_size=-4096")
         reader.execute("BEGIN")
         reader_schema_version = int(reader.execute("PRAGMA schema_version").fetchone()[0])
         configured_schema_version = int(meta.get("configured_schema_version", "-1"))
@@ -367,23 +364,23 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
             raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:schema_changed")
         if _schema_fingerprint(reader) != schema_fingerprint:
             raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:schema_changed")
-        to_watermark = _current_watermark(reader)
-        if from_watermark > to_watermark:
+        observed_current_watermark = _current_watermark(reader)
+        if from_watermark > observed_current_watermark:
             raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:watermark_ahead")
-        count = int(
-            reader.execute(
-                f"SELECT COUNT(*) FROM {_qident(CHANGE_TABLE)} WHERE id>? AND id<=?",
-                (from_watermark, to_watermark),
-            ).fetchone()[0]
-        )
-        if count > _max_delta_rows():
-            raise HTTPException(status_code=409, detail="certification_replica_bootstrap_required:delta_too_large")
-        rows = reader.execute(
-            f"SELECT table_name,key_sql,operation FROM {_qident(CHANGE_TABLE)} WHERE id>? AND id<=? ORDER BY id",
-            (from_watermark, to_watermark),
+
+        max_rows = _max_delta_rows()
+        raw_rows = reader.execute(
+            f"SELECT id,table_name,key_sql,operation FROM {_qident(CHANGE_TABLE)} "
+            "WHERE id>? AND id<=? ORDER BY id LIMIT ?",
+            (from_watermark, observed_current_watermark, max_rows + 1),
         ).fetchall()
+        more_rows = len(raw_rows) > max_rows
+        batch_rows = raw_rows[:max_rows]
+        to_watermark = int(batch_rows[-1][0]) if more_rows and batch_rows else observed_current_watermark
+        caught_up = to_watermark == observed_current_watermark
+
         coalesced: dict[tuple[str, str], str] = {}
-        for table_name, key_sql, operation in rows:
+        for _change_id, table_name, key_sql, operation in batch_rows:
             coalesced[(str(table_name), str(key_sql))] = str(operation)
         tables = {str(table["name"]): table for table in _ordinary_tables(reader)}
         changes: list[dict[str, str]] = []
@@ -405,6 +402,7 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
             changes.append({"table": table_name, "sql": sql})
     finally:
         reader.close()
+        split._drop_file_cache(source_path)
 
     if from_watermark > 0:
         with store._lock, store.db:
@@ -416,10 +414,13 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
         "schema_fingerprint": schema_fingerprint,
         "from_watermark": int(from_watermark),
         "to_watermark": int(to_watermark),
-        "source_change_count": int(count),
+        "observed_current_watermark": int(observed_current_watermark),
+        "source_change_count": len(batch_rows),
         "coalesced_change_count": len(changes),
         "payload_bytes": int(payload_bytes),
         "changes": changes,
+        "caught_up": caught_up,
+        "bounded_batch": more_rows,
         "full_snapshot_required": False,
         "paper_only": True,
         "live_money_authority": False,
@@ -488,7 +489,7 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
                     "ready": False,
                     "reason": "canonical_store_unavailable",
                     "full_snapshot_normal_cycle": False,
-                    "snapshot_copy_holds_runtime_store_lock": False,
+                    "logical_bootstrap_default": True,
                     "paper_only": True,
                     "live_money_authority": False,
                 }
@@ -497,10 +498,13 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
                 **state,
                 "ready": True,
                 "full_snapshot_normal_cycle": False,
-                "full_snapshot_role": "bootstrap_recovery_reconciliation_only",
+                "full_snapshot_role": "explicit_recovery_only",
+                "logical_bootstrap_default": True,
+                "logical_bootstrap_transport": "bounded_keyset_pages_plus_journal_reconciliation",
                 "normal_cycle_transport": "bounded_incremental_delta",
                 "max_delta_rows": _max_delta_rows(),
                 "max_delta_bytes": _max_delta_bytes(),
+                "delta_batches_are_paginated": True,
                 "schema_identity_scope": "tables_columns_views_indexes_user_triggers_and_schema_version",
                 "snapshot_copy_holds_runtime_store_lock": False,
                 "replication_prepared_before_http_bootstrap": True,
@@ -510,6 +514,12 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
                 "signing_available": False,
                 "transaction_submission_available": False,
             }
+
+    # Keep the registration nested under the existing production-composition-owned
+    # replication installer. This adds read-only authenticated transport only; it
+    # does not create a second production composition root.
+    from .certification_logical_bootstrap import install_certification_logical_bootstrap as _register_logical_bootstrap
+    _register_logical_bootstrap(app, runtime_provider)
 
     app.state.roi_certification_incremental_replication = True
     app.state.roi_certification_incremental_replication_version = REPLICATION_VERSION
@@ -521,9 +531,17 @@ __all__ = [
     "META_TABLE",
     "REPLICATION_VERSION",
     "TRIGGER_PREFIX",
+    "_columns",
     "_current_watermark",
     "_delta_payload",
+    "_meta",
+    "_ordinary_tables",
     "_prepare_available_runtime_store",
+    "_primary_columns",
+    "_qident",
+    "_require_shared_token",
+    "_schema_fingerprint",
+    "_schema_objects",
     "install_certification_incremental_replication",
     "prepare_bootstrap",
 ]
