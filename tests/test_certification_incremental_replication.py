@@ -4,7 +4,6 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -152,7 +151,10 @@ def test_schema_change_rotates_identity_and_requires_full_bootstrap(tmp_path: Pa
         store.close()
 
 
-def test_delta_cap_fails_closed_instead_of_returning_partial_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_delta_cap_returns_explicit_bounded_continuation_without_partial_state_ambiguity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _store(tmp_path)
     try:
         identity = replication.prepare_bootstrap(store)
@@ -162,15 +164,28 @@ def test_delta_cap_fails_closed_instead_of_returning_partial_state(tmp_path: Pat
                 "INSERT INTO sample(id,value) VALUES (?,?)",
                 [(index, "x") for index in range(1, 102)],
             )
-        with pytest.raises(HTTPException) as caught:
-            replication._delta_payload(
-                store,
-                from_watermark=0,
-                epoch=str(identity["epoch"]),
-                schema_fingerprint=str(identity["schema_fingerprint"]),
-            )
-        assert caught.value.status_code == 409
-        assert "delta_too_large" in str(caught.value.detail)
+        first = replication._delta_payload(
+            store,
+            from_watermark=0,
+            epoch=str(identity["epoch"]),
+            schema_fingerprint=str(identity["schema_fingerprint"]),
+        )
+        assert first["source_change_count"] == 100
+        assert first["bounded_batch"] is True
+        assert first["caught_up"] is False
+        assert first["full_snapshot_required"] is False
+        assert int(first["to_watermark"]) < int(first["observed_current_watermark"])
+
+        second = replication._delta_payload(
+            store,
+            from_watermark=int(first["to_watermark"]),
+            epoch=str(identity["epoch"]),
+            schema_fingerprint=str(identity["schema_fingerprint"]),
+        )
+        assert second["source_change_count"] == 1
+        assert second["caught_up"] is True
+        assert second["full_snapshot_required"] is False
+        assert int(second["to_watermark"]) == int(second["observed_current_watermark"])
     finally:
         store.close()
 
