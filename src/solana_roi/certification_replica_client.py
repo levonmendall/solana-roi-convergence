@@ -21,10 +21,16 @@ from pathlib import Path
 from typing import Any
 
 from .certification_chunk_transfer import download_snapshot_chunked
-from .certification_incremental_replication import CHANGE_TABLE, META_TABLE, REPLICATION_VERSION, TRIGGER_PREFIX
+from .certification_incremental_replication import (
+    CHANGE_TABLE,
+    META_TABLE,
+    REPLICATION_VERSION,
+    TRIGGER_PREFIX,
+    _current_watermark,
+)
 
 
-CLIENT_VERSION = "certification-incremental-replica-client-v1"
+CLIENT_VERSION = "certification-incremental-replica-client-v2-monotonic-bootstrap-watermark"
 DEFAULT_DELTA_TIMEOUT_SECONDS = 30.0
 DEFAULT_COPY_CHUNK_BYTES = 8 * 1024 * 1024
 FICLONE = 0x40049409
@@ -127,7 +133,10 @@ def _read_source_replication_identity(path: Path) -> dict[str, Any]:
         epoch = str(meta.get("epoch") or "")
         fingerprint = str(meta.get("schema_fingerprint") or "")
         version = str(meta.get("replication_version") or "")
-        watermark = int(connection.execute(f'SELECT COALESCE(MAX(id),0) FROM "{CHANGE_TABLE}"').fetchone()[0])
+        # A bootstrap snapshot can legitimately contain an already-pruned change
+        # journal. sqlite_sequence is the canonical monotonic acknowledgement
+        # frontier and must be used instead of MAX(id), which can fall back to zero.
+        watermark = _current_watermark(connection)
         if not epoch or not fingerprint or version != REPLICATION_VERSION:
             raise RuntimeError("authoritative bootstrap replication identity invalid")
 
@@ -256,6 +265,7 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
         connection.close()
 
     next_state = dict(state)
+    next_state["client_version"] = CLIENT_VERSION
     next_state["watermark"] = to_watermark
     next_state["last_transport"] = "incremental_delta"
     _atomic_state(_state_path(replica), next_state)
