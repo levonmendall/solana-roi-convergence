@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v2-proactive-reclaim"
+REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v3-dirty-writeback"
 VERIFY_CACHE_RELEASE_ROWS = 4_096
 SQLITE_READER_CACHE_KIB = 2_048
 RAW_RECLAIM_FRACTION = 0.82
@@ -29,8 +29,10 @@ RAW_RECLAIM_RESERVE_BYTES = 384 * 1024 * 1024
 RAW_CRITICAL_RESERVE_BYTES = 128 * 1024 * 1024
 MIN_CGROUP_RECLAIM_BYTES = 64 * 1024 * 1024
 MAX_CGROUP_RECLAIM_BYTES = 1024 * 1024 * 1024
+DIRTY_WRITEBACK_TRIGGER_BYTES = 64 * 1024 * 1024
 RECLAIM_ATTEMPTS = 4
 RECLAIM_SETTLE_SECONDS = 0.05
+WRITEBACK_SETTLE_SECONDS = 0.10
 
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
@@ -137,6 +139,41 @@ def _release_sqlite_file_cache(path: Path) -> bool:
     return released
 
 
+def _dirty_writeback_needed(state: dict[str, int | float | None]) -> bool:
+    dirty = state.get("file_dirty_bytes")
+    return isinstance(dirty, int) and dirty >= DIRTY_WRITEBACK_TRIGGER_BYTES
+
+
+def _sync_sqlite_dirty_pages(path: Path) -> bool:
+    """Force DB/WAL/SHM dirty pages to storage before asking Linux to evict them.
+
+    ``POSIX_FADV_DONTNEED`` cannot discard dirty cache. Production telemetry proved
+    that hundreds of MiB of dirty SQLite-backed pages can therefore keep raw cgroup
+    memory pinned near the hard limit even though anonymous process memory is small.
+    A read-only fdatasync only strengthens durability; it does not checkpoint WAL,
+    alter rows, or change SQLite transaction semantics.
+    """
+
+    sync = getattr(os, "fdatasync", None) or getattr(os, "fsync", None)
+    if sync is None:
+        return False
+    flushed = False
+    for candidate in _sqlite_cache_paths(path):
+        try:
+            fd = os.open(candidate, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            try:
+                sync(fd)
+                flushed = True
+            except OSError:
+                continue
+        finally:
+            os.close(fd)
+    return flushed
+
+
 def _trim_process_heap() -> bool:
     """Return unused Python/glibc heap pages without changing live object state."""
 
@@ -219,6 +256,7 @@ def _emit_reclaim_telemetry(
     attempts: int,
     cgroup_requested: bool,
     heap_trimmed: bool,
+    writeback_flushed: bool,
     deferred: bool,
 ) -> None:
     # Numeric-only resource telemetry: no paths, tokens, payloads, or market data.
@@ -233,13 +271,14 @@ def _emit_reclaim_telemetry(
         f"slab_reclaimable={_safe_metric(after.get('slab_reclaimable_bytes'))} "
         f"oom_kill_events={_safe_metric(after.get('oom_kill_events'))} "
         f"attempts={attempts} cgroup_requested={str(cgroup_requested).lower()} "
-        f"heap_trimmed={str(heap_trimmed).lower()} deferred={str(deferred).lower()}",
+        f"heap_trimmed={str(heap_trimmed).lower()} "
+        f"writeback_flushed={str(writeback_flushed).lower()} deferred={str(deferred).lower()}",
         flush=True,
     )
 
 
 def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
-    """Actively reclaim clean cache and fail closed before the hard cgroup limit."""
+    """Flush dirty SQLite pages, reclaim clean cache, then fail closed if needed."""
 
     before = _cgroup_memory()
     if not _needs_reclaim(before):
@@ -248,9 +287,14 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
     after = before
     any_cgroup_request = False
     any_heap_trim = False
+    any_writeback_flush = False
     attempts = 0
     for attempt in range(RECLAIM_ATTEMPTS):
         attempts = attempt + 1
+        if _dirty_writeback_needed(after):
+            any_writeback_flush = _sync_sqlite_dirty_pages(path) or any_writeback_flush
+            if any_writeback_flush and WRITEBACK_SETTLE_SECONDS > 0:
+                time.sleep(WRITEBACK_SETTLE_SECONDS)
         _release_sqlite_file_cache(path)
         any_heap_trim = _trim_process_heap() or any_heap_trim
         any_cgroup_request = _request_cgroup_file_reclaim(after) or any_cgroup_request
@@ -264,6 +308,7 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
                 attempts=attempts,
                 cgroup_requested=any_cgroup_request,
                 heap_trimmed=any_heap_trim,
+                writeback_flushed=any_writeback_flush,
                 deferred=False,
             )
             return after
@@ -275,6 +320,7 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
         attempts=attempts,
         cgroup_requested=any_cgroup_request,
         heap_trimmed=any_heap_trim,
+        writeback_flushed=any_writeback_flush,
         deferred=deferred,
     )
     if deferred:
@@ -410,10 +456,13 @@ def status() -> dict[str, Any]:
         "raw_reclaim_target_fraction": RAW_RECLAIM_TARGET_FRACTION,
         "raw_reclaim_reserve_bytes": RAW_RECLAIM_RESERVE_BYTES,
         "raw_critical_reserve_bytes": RAW_CRITICAL_RESERVE_BYTES,
+        "dirty_writeback_trigger_bytes": DIRTY_WRITEBACK_TRIGGER_BYTES,
         "reclaim_attempts": RECLAIM_ATTEMPTS,
         "cgroup_file_reclaim_best_effort": True,
         "cgroup_reclaim_swappiness_zero": True,
         "heap_trim_under_pressure": True,
+        "targeted_sqlite_dirty_writeback": True,
+        "writeback_changes_logical_state": False,
         "cgroup_memory": _cgroup_memory(),
         "full_hash_chain_verification_preserved": True,
         "logical_bootstrap_keyset_semantics_preserved": True,
