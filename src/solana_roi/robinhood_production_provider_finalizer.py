@@ -37,6 +37,10 @@ from .robinhood_provider_budget_transport import (
     install_robinhood_provider_budget_transport,
     status as provider_budget_transport_status,
 )
+from .robinhood_provider_capacity_budget import (
+    install_robinhood_provider_capacity_budget,
+    status as provider_capacity_budget_status,
+)
 from .robinhood_provider_failover import (
     install_robinhood_provider_failover,
     status as provider_failover_status,
@@ -52,7 +56,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v13-drpc-block-number-compat"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v14-chainstack-monthly-capacity"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -141,14 +145,18 @@ def install_robinhood_production_provider_finalizer(
 ) -> None:
     """Install the final production provider authority chain.
 
-    Broad discovery remains promotion-only. dRPC is allowed to carry broad research
-    only after the same private-provider verification and fresh-event authority gates
-    are satisfied. A narrowly scoped compatibility layer handles the proven dRPC
-    Robinhood HTTP-400 response to ``eth_blockNumber`` by obtaining the same latest
-    block number from the documented ``eth_getBlockByNumber('latest', false)`` read.
-    The compatibility activates only after that exact dRPC 400 and still requires a
-    valid latest block. It does not alter strategy economics, paper-entry authority,
-    failover thresholds, signing, submission, custody, or live-money capability.
+    Broad discovery remains promotion-only. Healthy private providers may carry the
+    broad screening workload, while the provider-capacity layer enforces provider
+    burst limits and durable calendar-month request allowances before failover. The
+    current operational budget is 3M Chainstack + 3M Alchemy requests per UTC month,
+    with a combined 6M ceiling and a protected reserve for decision-critical quotes
+    and settlement. Candidate discovery remains complete; budget pacing changes only
+    acquisition cadence and never grants or removes paper-entry authority.
+
+    dRPC compatibility remains installed for safe historical/future recovery but has
+    no special authority. Provider generation switching, Robinhood chain-id 4663
+    verification, fresh-event authority, paper-only operation, and the absence of
+    signing/submission/live-money capability are unchanged.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
@@ -166,12 +174,12 @@ def install_robinhood_production_provider_finalizer(
     install_robinhood_adaptive_lane_controller(plane_cls)
     install_robinhood_alchemy_budget_guard(plane_cls)
 
-    # Provider-specific compatibility must sit immediately inside the failover wrapper
-    # so both normal Robinhood polling and the preferred-provider capability proof use
-    # the same verified read semantics. It activates only on dRPC + eth_blockNumber +
-    # HTTP 400, then uses a documented equivalent read and validates its block number.
+    # Provider-specific compatibility remains immediately inside capacity/failover.
+    # The capacity guard then counts every actual private-provider attempt, including
+    # bounded WSS control requests, before failover decides whether another provider
+    # should be tried.
     install_robinhood_drpc_block_number_compat(production_transport.runtime.RobinhoodRpc)
-
+    install_robinhood_provider_capacity_budget()
     install_robinhood_provider_failover()
     install_robinhood_provider_runtime_proof()
     install_robinhood_drpc_http_failure_diagnostic()
@@ -198,6 +206,7 @@ def status() -> dict[str, Any]:
         "plain_http_rpc_wss_derivation_allowed": False,
         "drpc_block_number_compat": drpc_block_number_compat_status(),
         "provider_pool_throughput": provider_pool_throughput_status(),
+        "provider_capacity_budget": provider_capacity_budget_status(),
         "getlogs_provider_guard": getlogs_provider_guard_status(),
         "provider_budget_transport": provider_budget_transport_status(),
         "provider_transport": usage_bounded_transport_status(),
