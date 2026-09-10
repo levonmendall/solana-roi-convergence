@@ -36,7 +36,7 @@ def _wallet_score(*, episodes: int, alpha: float, eligible: bool) -> ContextualW
     )
 
 
-def test_manifest_preserves_hard_authority_and_new_bounds() -> None:
+def test_manifest_preserves_hard_authority_and_adaptive_overlay_bounds() -> None:
     payload = authority()
     assert payload["paper_only"] is True
     assert payload["live_money_authority"] is False
@@ -45,10 +45,15 @@ def test_manifest_preserves_hard_authority_and_new_bounds() -> None:
     assert payload["execution"]["latency_hard_max_seconds"] == 20.0
     assert payload["position_management"]["minimum_exit_depth_coverage_ratio"] == 2.0
     assert payload["position_management"]["averaging_down_allowed"] is False
+
+    # Canonical v5.2 remains unchanged; the wider chase and larger add are
+    # conditional overlay ceilings rather than weakened baseline constraints.
     assert payload["execution"]["chase_normal_max_fraction"] == NORMAL_CHASE_MAX
-    assert payload["execution"]["chase_observe_only_above_fraction"] == ABSOLUTE_CHASE_MAX
+    assert payload["execution"]["chase_observe_only_above_fraction"] == NORMAL_CHASE_MAX
+    assert payload["execution"]["chase_exceptional_overlay_max_fraction"] == ABSOLUTE_CHASE_MAX
     assert payload["position_management"]["ordinary_max_scale_fraction_of_target_per_add"] == ORDINARY_SCALE_FRACTION
-    assert payload["position_management"]["max_scale_fraction_of_target_per_add"] == EXCEPTIONAL_SCALE_FRACTION
+    assert payload["position_management"]["max_scale_fraction_of_target_per_add"] == ORDINARY_SCALE_FRACTION
+    assert payload["position_management"]["exceptional_max_scale_fraction_of_target_per_add"] == EXCEPTIONAL_SCALE_FRACTION
     assert payload["position_management"]["runner_fraction_of_target"] == BASE_RUNNER_FRACTION
     assert payload["position_management"]["max_dynamic_runner_fraction_of_target"] == MAX_DYNAMIC_RUNNER_FRACTION
 
@@ -83,7 +88,7 @@ def test_exceptional_continuation_requires_low_risk_broad_independent_persistent
     assert exceptional_continuation_evidence({**strong, "flow_state": "neutral"}) is False
 
 
-def test_chase_classifier_keeps_normal_zone_and_absolute_observe_only_ceiling() -> None:
+def test_chase_classifier_keeps_canonical_zone_and_overlay_ceiling() -> None:
     assert chase_classification(0.40, exceptional=False) == "normal"
     assert chase_classification(0.60, exceptional=False) == "observe_only"
     assert chase_classification(0.60, exceptional=True) == "exceptional_continuation"
