@@ -1,25 +1,29 @@
 from __future__ import annotations
 
-"""Tamper-evident incremental verification for the append-only event ledger.
+"""Tamper-evident incremental verification for the durable paper-engine startup path.
 
-The first run against an existing ledger performs the already-governed complete hash
-verification and records a durable sidecar anchor beside the SQLite database. Ordinary
-starts then validate that anchor and hash only the append-only tail. The sidecar never
-creates trading authority and is never trusted without verifying its digest and its
-anchoring database row. Missing/corrupt/inconsistent sidecar state falls back to the
-complete fail-closed verifier rather than skipping integrity work.
+The first ordinary engine start against an existing ledger performs the already-governed
+complete hash verification and records a durable sidecar anchor beside the SQLite
+database. Subsequent engine starts validate that anchor and hash only the append-only
+tail. The public ``AppendOnlyEventStore.verify()`` contract intentionally remains the
+complete-history verifier, so explicit integrity audits retain exact historical tamper
+detection and file-cache-advice behavior.
+
+The sidecar never creates trading authority. Missing, corrupt, or inconsistent sidecar
+state falls back to the complete fail-closed verifier rather than skipping integrity
+work.
 """
 
 import hashlib
 import json
 import os
 import sqlite3
-import tempfile
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-REPAIR_VERSION = "event-integrity-checkpoint-v1-tail-verified"
+REPAIR_VERSION = "event-integrity-checkpoint-v2-tail-startup-full-audit-preserved"
 CHECKPOINT_SCHEMA = "solana-roi-event-integrity-checkpoint.v1"
 CHECKPOINT_PERSIST_EVERY_EVENTS = 2_048
 ENGINE_EVENT_TYPES = frozenset({"first_touch", "confirmation", "price", "trade_intent", "trade_outcome"})
@@ -34,7 +38,6 @@ CANONICAL_EVIDENCE_RESET = False
 
 _INSTALLED = False
 _ORIGINAL_STORE_APPEND: Any = None
-_ORIGINAL_STORE_VERIFY: Any = None
 _ORIGINAL_BOUNDED_VERIFY: Any = None
 
 
@@ -63,25 +66,22 @@ def _checkpoint_payload(*, event_id: int, lineage_hash: str | None, latest_engin
 
 
 def _atomic_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically persist an acceleration anchor without depending on ``os.open``.
+
+    Some canonical storage regressions deliberately monkeypatch ``os.open`` to verify
+    file-cache advice. Using ``Path.open`` here keeps that test contract isolated. A
+    lost directory-entry fsync can at worst lose this non-canonical sidecar, which
+    safely triggers a complete verification on the next start.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    tmp = Path(raw)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with tmp.open("x", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
-        try:
-            parent_fd = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(parent_fd)
-        except OSError:
-            pass
-        finally:
-            os.close(parent_fd)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -227,21 +227,13 @@ def _verify_with_checkpoint(store: Any) -> tuple[bool, int, int | None]:
         return _seed_from_full_verification(store)
     with store._verify_lock:
         checkpoint = _load_checkpoint(store)
-        if checkpoint is None:
-            # Never recurse into the full verifier while holding _verify_lock.
-            pass
-        else:
+        if checkpoint is not None:
             return _verify_tail_locked(store, checkpoint)
     return _seed_from_full_verification(store)
 
 
 def _incremental_engine_snapshot(self: Any) -> tuple[bool, int, int | None]:
     return _verify_with_checkpoint(self.store)
-
-
-def _incremental_store_verify(self: Any) -> bool:
-    verified, _event_id, _latest_engine_event_id = _verify_with_checkpoint(self)
-    return bool(verified)
 
 
 def _checkpointing_append(self: Any, event_type: str, observed_at: str, payload: dict[str, Any]) -> str:
@@ -297,21 +289,20 @@ def full_integrity_audit(store: Any) -> tuple[bool, int, int | None]:
 
 
 def configure_incremental_event_integrity_repair() -> None:
-    global _INSTALLED, _ORIGINAL_STORE_APPEND, _ORIGINAL_STORE_VERIFY, _ORIGINAL_BOUNDED_VERIFY
+    global _INSTALLED, _ORIGINAL_STORE_APPEND, _ORIGINAL_BOUNDED_VERIFY
     if _INSTALLED:
         return
     from . import durable_bootstrap_memory_repair as memory
     from .storage import AppendOnlyEventStore
 
     _ORIGINAL_STORE_APPEND = AppendOnlyEventStore.append
-    _ORIGINAL_STORE_VERIFY = AppendOnlyEventStore.verify
     _ORIGINAL_BOUNDED_VERIFY = memory._bounded_verify_engine_snapshot
 
     setattr(_checkpointing_append, "_roi_incremental_integrity_append", True)
-    setattr(_incremental_store_verify, "_roi_incremental_integrity_verify", True)
     setattr(_incremental_engine_snapshot, "_roi_durable_bootstrap_memory_bounded", True)
     AppendOnlyEventStore.append = _checkpointing_append  # type: ignore[assignment]
-    AppendOnlyEventStore.verify = _incremental_store_verify  # type: ignore[assignment]
+    # Do not replace AppendOnlyEventStore.verify: explicit integrity audits must retain
+    # complete-history semantics and exact historical tamper detection.
     memory._bounded_verify_engine_snapshot = _incremental_engine_snapshot
     _INSTALLED = True
 
@@ -322,7 +313,8 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "checkpoint_schema": CHECKPOINT_SCHEMA,
         "checkpoint_persist_every_events": CHECKPOINT_PERSIST_EVERY_EVENTS,
-        "ordinary_start_verification": "validated_anchor_plus_append_only_tail",
+        "ordinary_engine_start_verification": "validated_anchor_plus_append_only_tail",
+        "explicit_store_verification": "complete_hash_chain",
         "first_run_or_invalid_anchor": "complete_hash_chain_fail_closed",
         "explicit_full_integrity_audit_retained": True,
         "canonical_evidence_reset": CANONICAL_EVIDENCE_RESET,
