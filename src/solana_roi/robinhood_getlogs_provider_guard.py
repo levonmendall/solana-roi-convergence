@@ -6,16 +6,22 @@ from functools import wraps
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
+
 from . import robinhood_chain_core as core
 
 
-REPAIR_VERSION = "robinhood-getlogs-provider-guard-v1"
+REPAIR_VERSION = "robinhood-getlogs-provider-guard-v2-http403-failover"
 ALCHEMY_SAFE_MAX_BLOCKS = 10
 MAX_CONFIGURED_BLOCKS = 10_000
 ENV_MAX_BLOCKS = "ROBINHOOD_ETH_GET_LOGS_MAX_BLOCKS"
 
 _INSTALLED = False
 _ORIGINAL_GET_LOGS: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None
+
+
+def _normalized_endpoint(value: str) -> str:
+    return str(value or "").strip().rstrip("/").lower()
 
 
 def _is_alchemy_endpoint(rpc_url: str) -> bool:
@@ -67,6 +73,90 @@ def _set_max(self: Any, name: str, value: int) -> None:
     setattr(self, attr, max(int(getattr(self, attr, 0) or 0), int(value)))
 
 
+def _is_getlogs_http_403(exc: BaseException) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError) and int(exc.response.status_code) == 403
+
+
+def _failover_from_getlogs_403(self: Any) -> bool:
+    """Quarantine the refusing private provider and move to a verified pool peer.
+
+    The provider failover module imports this guard, so the import remains local to
+    avoid a module-initialization cycle. This deliberately uses the existing provider
+    health/cooldown authority instead of maintaining a second provider truth here.
+    """
+    try:
+        from . import robinhood_provider_failover as failover
+
+        current_url = _normalized_endpoint(str(getattr(self, "rpc_url", "") or ""))
+        provider = failover.active_provider()
+        if provider is None or _normalized_endpoint(provider.http) != current_url:
+            provider = next(
+                (
+                    item
+                    for item in failover.providers()
+                    if _normalized_endpoint(item.http) == current_url
+                ),
+                None,
+            )
+        if provider is None:
+            return False
+
+        replacement = failover._switch_from(
+            provider.name,
+            failure_type="EthGetLogsHTTP403",
+            immediate=True,
+            transport_kind="http",
+        )
+        if replacement is None or replacement.name == provider.name:
+            return False
+        self.rpc_url = replacement.http
+        return True
+    except Exception:
+        # Recovery itself must never convert a provider denial into apparent success.
+        return False
+
+
+async def _request_range(
+    self: Any,
+    *,
+    from_block: int,
+    to_block: int,
+    addresses: list[str] | tuple[str, ...] | None,
+    topics: list[Any] | None,
+) -> list[dict[str, Any]]:
+    if _ORIGINAL_GET_LOGS is None:
+        raise RuntimeError("Robinhood eth_getLogs provider guard is not installed")
+
+    try:
+        return await _ORIGINAL_GET_LOGS(
+            self,
+            from_block=from_block,
+            to_block=to_block,
+            addresses=addresses,
+            topics=topics,
+        )
+    except Exception as exc:
+        if not _is_getlogs_http_403(exc):
+            raise
+        _inc(self, "http_403s")
+        if not _failover_from_getlogs_403(self):
+            _inc(self, "http_403_fail_closed")
+            raise
+
+        # Retry the exact same contiguous range. Re-entering the provider guard is
+        # intentional: the replacement can have a stricter range limit (Alchemy is
+        # ten blocks), so its own bound is applied before the retry is sent. No caller
+        # cursor/watermark can observe success until this complete range succeeds.
+        _inc(self, "http_403_failovers")
+        return await _provider_bounded_get_logs(
+            self,
+            from_block=from_block,
+            to_block=to_block,
+            addresses=addresses,
+            topics=topics,
+        )
+
+
 async def _provider_bounded_get_logs(
     self: Any,
     *,
@@ -81,7 +171,7 @@ async def _provider_bounded_get_logs(
     start = int(from_block)
     end = int(to_block)
     if end < start:
-        return await _ORIGINAL_GET_LOGS(
+        return await _request_range(
             self,
             from_block=start,
             to_block=end,
@@ -94,7 +184,7 @@ async def _provider_bounded_get_logs(
     limit = _provider_max_blocks(self)
     if limit is None or requested_blocks <= limit:
         _set_max(self, "max_sent_blocks", requested_blocks)
-        return await _ORIGINAL_GET_LOGS(
+        return await _request_range(
             self,
             from_block=start,
             to_block=end,
@@ -111,7 +201,7 @@ async def _provider_bounded_get_logs(
         _inc(self, "provider_requests")
         _set_max(self, "max_sent_blocks", chunk_blocks)
         rows.extend(
-            await _ORIGINAL_GET_LOGS(
+            await _request_range(
                 self,
                 from_block=cursor,
                 to_block=chunk_end,
@@ -119,6 +209,9 @@ async def _provider_bounded_get_logs(
                 topics=topics,
             )
         )
+        # Advance only after the entire current chunk returned successfully. Any
+        # refusal by every configured provider raises above and leaves this frontier
+        # unadvanced, preserving fail-closed contiguous event coverage.
         cursor = chunk_end + 1
     return rows
 
@@ -147,6 +240,9 @@ def status() -> dict[str, Any]:
         "configured_max_blocks_env": ENV_MAX_BLOCKS,
         "prevents_oversized_provider_requests": True,
         "inclusive_block_range_accounting": True,
+        "http_403_same_range_failover": True,
+        "replacement_provider_limits_reapplied": True,
+        "contiguous_frontier_fail_closed": True,
         "changes_strategy_thresholds": False,
         "paper_only": True,
         "live_money_authority": False,
@@ -159,9 +255,12 @@ __all__ = [
     "ALCHEMY_SAFE_MAX_BLOCKS",
     "ENV_MAX_BLOCKS",
     "REPAIR_VERSION",
+    "_failover_from_getlogs_403",
     "_is_alchemy_endpoint",
+    "_is_getlogs_http_403",
     "_provider_bounded_get_logs",
     "_provider_max_blocks",
+    "_request_range",
     "install_robinhood_getlogs_provider_guard",
     "status",
 ]
