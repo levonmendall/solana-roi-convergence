@@ -34,6 +34,10 @@ from .robinhood_provider_failover import (
     install_robinhood_provider_failover,
     status as provider_failover_status,
 )
+from .robinhood_provider_pool_throughput_repair import (
+    install_robinhood_provider_pool_throughput_repair,
+    status as provider_pool_throughput_status,
+)
 from .robinhood_provider_runtime_proof import install_robinhood_provider_runtime_proof
 from .robinhood_usage_bounded_transport import (
     install_robinhood_usage_bounded_transport,
@@ -41,7 +45,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v10-provider-runtime-proof"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v11-provider-pool-throughput"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -139,25 +143,30 @@ def install_robinhood_production_provider_finalizer(
 ) -> None:
     """Install the final production provider authority chain.
 
-    Broad discovery remains on the research-only public plane while bounded private
-    WebSocket subscriptions carry only the prospective live shortlist and open
-    positions. The hard Alchemy budget guard coalesces duplicate ``eth_call`` work,
-    budgets noncritical reads, and reserves open-position settlement as critical.
+    Broad discovery remains promotion-only, but when a healthy non-Alchemy private
+    provider is active it may carry the broad screening workload and the configured
+    provider-pool live-market ceiling. If Robinhood falls back to Alchemy, broad
+    screening moves back to the public research plane and the legacy Alchemy budget
+    controls remain authoritative for provider protection.
 
-    Provider failover is deliberately installed *after* that guard so quota/budget
-    exhaustion, 429s, provider 5xx/transport failures, or repeated WebSocket failures
-    can move the complete private HTTP/WSS pair to a configured backup. A switch
-    invalidates the old provider generation immediately; paper-entry readiness stays
-    false until the replacement WebSocket has verified Robinhood chain id 4663 and
-    re-established the bounded subscription. Public RPC/sequencer transport never
-    enters the authoritative provider pool. Strategy economics and v5.2 authority are
-    unchanged, and signing/submission/live-money capability remains absent.
+    Provider failover is deliberately installed *after* the budget guard so quota/
+    budget exhaustion, 429s, provider 5xx/transport failures, or repeated WebSocket
+    failures can move the complete private HTTP/WSS pair to a configured backup. A
+    switch invalidates the old provider generation immediately; paper-entry readiness
+    stays false until the replacement WebSocket has verified Robinhood chain id 4663
+    and re-established the bounded subscription. Public RPC/sequencer transport never
+    enters the decision-authoritative provider pool. Strategy economics and v5.2
+    authority are unchanged, and signing/submission/live-money capability is absent.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
         return
 
     _LEGACY_FRESH_READY = legacy_fresh_ready
+    # This belongs at the existing Robinhood provider-composition boundary rather
+    # than in the top-level production facade. It must run before provider-budget
+    # transport installs so dRPC capacity becomes the canonical acquisition policy.
+    install_robinhood_provider_pool_throughput_repair()
     install_robinhood_getlogs_provider_guard()
     install_robinhood_provider_budget_transport()
     # The budget installer patches the bounded module before it is installed. Restore
@@ -202,6 +211,7 @@ def status() -> dict[str, Any]:
         "explicit_websocket_precedence": True,
         "public_rpc_wss_derivation_allowed": False,
         "plain_http_rpc_wss_derivation_allowed": False,
+        "provider_pool_throughput": provider_pool_throughput_status(),
         "getlogs_provider_guard": getlogs_provider_guard_status(),
         "provider_budget_transport": provider_budget_transport_status(),
         "provider_transport": usage_bounded_transport_status(),

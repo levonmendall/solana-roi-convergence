@@ -1,0 +1,283 @@
+from __future__ import annotations
+
+import asyncio
+import os
+from functools import wraps
+from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
+
+from . import robinhood_alchemy_budget_guard as alchemy_guard
+from . import robinhood_chain_runtime as runtime
+from . import robinhood_provider_budget_transport as budget
+from . import robinhood_provider_failover as failover
+
+
+THROUGHPUT_REPAIR_VERSION = "robinhood-provider-pool-throughput-v1"
+DEFAULT_PROVIDER_POOL_LIVE_MARKET_CAP = 16
+MAX_PROVIDER_POOL_LIVE_MARKET_CAP = 64
+DEFAULT_PRIVATE_RESEARCH_POLL_SECONDS = 1.0
+DEFAULT_PUBLIC_RESEARCH_POLL_SECONDS = 5.0
+_INSTALLED = False
+_ORIGINAL_AUGMENT_STATUS_WRAPPER: Callable[..., Any] | None = None
+_ORIGINAL_MODULE_STATUS: Callable[[], dict[str, Any]] | None = None
+
+
+def _normalized(value: str) -> str:
+    return str(value or "").strip().rstrip("/").lower()
+
+
+def _float_env(name: str, default: float, minimum: float) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(minimum, value)
+
+
+def _configured_pool_cap() -> int:
+    raw = os.getenv("ROBINHOOD_PROVIDER_POOL_LIVE_MARKET_CAP")
+    if raw is None:
+        # Backward-compatible fallback only. The provider-pool setting is canonical.
+        raw = os.getenv("ROBINHOOD_ALCHEMY_LIVE_MARKET_CAP", str(DEFAULT_PROVIDER_POOL_LIVE_MARKET_CAP))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_PROVIDER_POOL_LIVE_MARKET_CAP
+    return max(1, min(MAX_PROVIDER_POOL_LIVE_MARKET_CAP, value))
+
+
+def _provider_kind(provider: Any | None) -> str:
+    if provider is None:
+        return "none"
+    try:
+        host = (urlparse(str(provider.http)).hostname or "").lower()
+    except Exception:
+        return "private_rpc"
+    if "drpc" in host:
+        return "drpc"
+    if "alchemy" in host:
+        return "alchemy"
+    return "private_rpc"
+
+
+def _active_non_alchemy_private_provider() -> Any | None:
+    try:
+        active = failover.active_provider()
+    except Exception:
+        return None
+    if active is None:
+        return None
+    candidate = _normalized(getattr(active, "http", ""))
+    if not candidate or candidate == _normalized(runtime.ROBINHOOD_PUBLIC_RPC):
+        return None
+    alchemy = _normalized(os.getenv("ROBINHOOD_RPC_URL") or "")
+    if alchemy and candidate == alchemy:
+        return None
+    return active
+
+
+def _effective_live_market_cap() -> int:
+    """Use expanded capacity only while a non-Alchemy private provider is active.
+
+    If dRPC is unavailable and Robinhood is temporarily operating on Alchemy, keep
+    the legacy 16-market safety ceiling even if the configured provider-pool ceiling
+    is higher. The existing Alchemy adaptive/budget layers can contract further.
+    """
+    configured = _configured_pool_cap()
+    if _active_non_alchemy_private_provider() is not None:
+        return configured
+    return min(configured, 16)
+
+
+def _research_target() -> tuple[str, str, float, int | None]:
+    active = _active_non_alchemy_private_provider()
+    if active is not None:
+        poll = _float_env(
+            "ROBINHOOD_PROVIDER_POOL_RESEARCH_POLL_SECONDS",
+            DEFAULT_PRIVATE_RESEARCH_POLL_SECONDS,
+            0.25,
+        )
+        try:
+            generation = int(failover.generation())
+        except Exception:
+            generation = None
+        return str(active.http), _provider_kind(active), poll, generation
+
+    # When the constrained Alchemy endpoint is active, broad research remains on the
+    # official public read-only plane and retains zero paper-entry authority.
+    poll = _float_env(
+        "ROBINHOOD_PUBLIC_RESEARCH_POLL_SECONDS",
+        DEFAULT_PUBLIC_RESEARCH_POLL_SECONDS,
+        1.0,
+    )
+    return runtime.ROBINHOOD_PUBLIC_RPC, "public_rpc", poll, None
+
+
+async def _provider_pool_research_async(self: Any, stop: Any) -> None:
+    rpc: runtime.RobinhoodRpc | None = None
+    rpc_url = ""
+    try:
+        while not stop.is_set():
+            target_url, provider_kind, poll_seconds, generation = _research_target()
+            if rpc is None or _normalized(rpc_url) != _normalized(target_url):
+                if rpc is not None:
+                    await rpc.close()
+                rpc = runtime.RobinhoodRpc(rpc_url=target_url, timeout_seconds=3.0)
+                rpc_url = target_url
+
+            budget._update_research_state(
+                self,
+                research_provider_kind=provider_kind,
+                research_provider_private=provider_kind not in {"public_rpc", "none"},
+                research_provider_generation=generation,
+                research_poll_seconds=poll_seconds,
+                provider_pool_live_market_cap=_effective_live_market_cap(),
+                provider_pool_capacity_source="active_private_provider" if provider_kind not in {"public_rpc", "none"} else "public_research_fallback",
+            )
+            try:
+                await budget._research_pass(self, rpc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                state = budget._research_state(self)
+                budget._update_research_state(
+                    self,
+                    ready=False,
+                    last_error_type=type(exc).__name__,
+                    rpc_failures=int(state.get("rpc_failures", 0) or 0) + 1,
+                )
+
+            if not stop.is_set():
+                await asyncio.sleep(poll_seconds)
+    finally:
+        if rpc is not None:
+            await rpc.close()
+
+
+def _throughput_augment_status_wrapper(original_factory: Callable[..., Any]) -> Callable[..., Any]:
+    assert _ORIGINAL_AUGMENT_STATUS_WRAPPER is not None
+    base_factory = _ORIGINAL_AUGMENT_STATUS_WRAPPER(original_factory)
+
+    def factory(original: Callable[[Any], dict[str, Any]]) -> Callable[[Any], dict[str, Any]]:
+        wrapped = base_factory(original)
+
+        @wraps(wrapped)
+        def throughput_status(self: Any) -> dict[str, Any]:
+            payload = wrapped(self)
+            authority = payload.setdefault("production_transport_authority", {})
+            research = budget._research_state(self)
+            authority.update(
+                {
+                    "throughput_repair_version": THROUGHPUT_REPAIR_VERSION,
+                    "provider_pool_live_market_cap": _effective_live_market_cap(),
+                    "configured_provider_pool_live_market_cap": _configured_pool_cap(),
+                    "provider_pool_cap_is_canonical": True,
+                    "alchemy_named_cap_can_restrict_active_drpc": False,
+                    "research_screening_provider_kind": research.get("research_provider_kind"),
+                    "research_screening_private_provider": bool(research.get("research_provider_private", False)),
+                    "research_screening_provider_generation": research.get("research_provider_generation"),
+                    "research_screening_poll_seconds": research.get("research_poll_seconds"),
+                    "broad_research_uses_active_non_alchemy_private_provider": True,
+                    "alchemy_active_uses_public_research_fallback": True,
+                    "research_transport_authority": "promotion_only_no_paper_entry",
+                    "paper_entry_still_requires_subsequent_private_live_event": True,
+                }
+            )
+            return payload
+
+        setattr(throughput_status, "_roi_robinhood_provider_pool_throughput_status", True)
+        return throughput_status
+
+    return factory
+
+
+def _throughput_module_status() -> dict[str, Any]:
+    assert _ORIGINAL_MODULE_STATUS is not None
+    result = dict(_ORIGINAL_MODULE_STATUS())
+    target_url, provider_kind, poll_seconds, generation = _research_target()
+    del target_url
+    result.update(
+        {
+            "throughput_repair_version": THROUGHPUT_REPAIR_VERSION,
+            "provider_pool_live_market_cap": _effective_live_market_cap(),
+            "configured_provider_pool_live_market_cap": _configured_pool_cap(),
+            "provider_pool_cap_is_canonical": True,
+            "alchemy_named_cap_can_restrict_active_drpc": False,
+            "research_screening_provider_kind": provider_kind,
+            "research_screening_private_provider": provider_kind not in {"public_rpc", "none"},
+            "research_screening_provider_generation": generation,
+            "research_screening_poll_seconds": poll_seconds,
+            "broad_research_uses_active_non_alchemy_private_provider": True,
+            "alchemy_active_uses_public_research_fallback": True,
+            "research_transport_authority": "promotion_only_no_paper_entry",
+            "paper_entry_still_requires_subsequent_private_live_event": True,
+            "paper_only": True,
+            "live_money_authority": False,
+            "signing_available": False,
+            "transaction_submission_available": False,
+        }
+    )
+    return result
+
+
+def install_robinhood_provider_pool_throughput_repair() -> None:
+    """Remove Alchemy-era capacity assumptions when dRPC/private capacity is active.
+
+    This repair is intentionally installed before the production composition root.
+    It changes provider acquisition/capacity only; it does not alter strategy
+    economics, candidate scoring, entry/exit thresholds, wallet authority, or the
+    requirement for a fresh decision-authoritative private WebSocket event.
+    """
+    global _INSTALLED, _ORIGINAL_AUGMENT_STATUS_WRAPPER, _ORIGINAL_MODULE_STATUS
+    if _INSTALLED:
+        return
+    if bool(getattr(budget, "_INSTALLED", False)):
+        raise RuntimeError("provider-pool throughput repair must install before provider-budget transport")
+
+    _ORIGINAL_AUGMENT_STATUS_WRAPPER = budget._augment_status_wrapper
+    _ORIGINAL_MODULE_STATUS = budget.status
+
+    budget.BUDGET_VERSION = "robinhood-production-ws-transport-v4-provider-pool-throughput"
+    budget.SUBSCRIPTION_MODE = "factory_discovery_plus_provider_pool_research_promoted_live_shortlist"
+    budget._live_market_cap = _effective_live_market_cap
+    budget._research_async = _provider_pool_research_async
+    budget._augment_status_wrapper = _throughput_augment_status_wrapper
+    budget.status = _throughput_module_status
+
+    # The hard Alchemy guard remains installed, but when a healthy non-Alchemy
+    # provider is active its admission ceiling now uses the same provider-pool cap.
+    alchemy_guard._provider_pool_live_market_cap = _effective_live_market_cap
+
+    _INSTALLED = True
+
+
+def status() -> dict[str, Any]:
+    return {
+        "version": THROUGHPUT_REPAIR_VERSION,
+        "installed": _INSTALLED,
+        "configured_provider_pool_live_market_cap": _configured_pool_cap(),
+        "effective_live_market_cap": _effective_live_market_cap(),
+        "active_non_alchemy_private_provider": _provider_kind(_active_non_alchemy_private_provider()),
+        "private_research_poll_seconds": _float_env(
+            "ROBINHOOD_PROVIDER_POOL_RESEARCH_POLL_SECONDS",
+            DEFAULT_PRIVATE_RESEARCH_POLL_SECONDS,
+            0.25,
+        ),
+        "public_research_poll_seconds": _float_env(
+            "ROBINHOOD_PUBLIC_RESEARCH_POLL_SECONDS",
+            DEFAULT_PUBLIC_RESEARCH_POLL_SECONDS,
+            1.0,
+        ),
+        "paper_only": True,
+        "live_money_authority": False,
+        "signing_available": False,
+        "transaction_submission_available": False,
+    }
+
+
+__all__ = [
+    "THROUGHPUT_REPAIR_VERSION",
+    "install_robinhood_provider_pool_throughput_repair",
+    "status",
+]
