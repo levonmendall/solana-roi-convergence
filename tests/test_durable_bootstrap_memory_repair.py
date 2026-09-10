@@ -39,6 +39,7 @@ def test_bounded_restore_preserves_full_hash_verification_and_reclaims_during_sc
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(repair, "_cgroup_memory", _healthy_memory)
     monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: releases.append(str(path)) or True)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: True)
 
     verified, through, latest_engine = repair._bounded_verify_engine_snapshot(engine)
 
@@ -58,6 +59,7 @@ def test_bounded_restore_still_fails_on_hash_chain_corruption(tmp_path, monkeypa
 
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(repair, "_cgroup_memory", _healthy_memory)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: True)
 
     assert repair._bounded_verify_engine_snapshot(engine) == (False, 0, None)
     store.close()
@@ -86,11 +88,65 @@ def test_raw_cgroup_guard_reclaims_before_critical_boundary(tmp_path, monkeypatc
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
     monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: releases.append(str(path)) or True)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: True)
+    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: True)
+    monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
 
     result = repair._guard_raw_cgroup(source)
 
     assert result["fraction"] < 0.50
     assert releases == [str(source)]
+
+
+def test_raw_cgroup_guard_retries_reclaim_until_headroom_returns(tmp_path, monkeypatch):
+    source = tmp_path / "state.sqlite3"
+    source.write_bytes(b"sqlite")
+    states = iter(
+        [
+            {
+                "current_bytes": 1980 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 68 * MIB,
+                "fraction": 1980 / 2048,
+            },
+            {
+                "current_bytes": 1900 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 148 * MIB,
+                "fraction": 1900 / 2048,
+            },
+            {
+                "current_bytes": 1400 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 648 * MIB,
+                "fraction": 1400 / 2048,
+            },
+        ]
+    )
+    calls = {"cache": 0, "heap": 0, "cgroup": 0}
+    monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
+    monkeypatch.setattr(
+        repair,
+        "_release_sqlite_file_cache",
+        lambda path: calls.__setitem__("cache", calls["cache"] + 1) or True,
+    )
+    monkeypatch.setattr(
+        repair,
+        "_trim_process_heap",
+        lambda: calls.__setitem__("heap", calls["heap"] + 1) or True,
+    )
+    monkeypatch.setattr(
+        repair,
+        "_request_cgroup_file_reclaim",
+        lambda state: calls.__setitem__("cgroup", calls["cgroup"] + 1) or True,
+    )
+    monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
+
+    result = repair._guard_raw_cgroup(source)
+
+    assert result["current_bytes"] == 1400 * MIB
+    assert calls == {"cache": 2, "heap": 2, "cgroup": 2}
 
 
 def test_raw_cgroup_guard_fails_closed_if_reclaim_cannot_restore_headroom(tmp_path, monkeypatch):
@@ -108,9 +164,30 @@ def test_raw_cgroup_guard_fails_closed_if_reclaim_cannot_restore_headroom(tmp_pa
         },
     )
     monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: True)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: True)
+    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: False)
+    monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
 
     with pytest.raises(MemoryError, match="raw cgroup memory pressure"):
         repair._guard_raw_cgroup(source)
+
+
+def test_cgroup_reclaim_requests_only_file_reclaim_with_zero_swappiness(tmp_path):
+    reclaim = tmp_path / "memory.reclaim"
+    reclaim.write_text("", encoding="ascii")
+    state = {
+        "current_bytes": 1900 * MIB,
+        "max_bytes": 2 * GIB,
+        "headroom_bytes": 148 * MIB,
+        "fraction": 1900 / 2048,
+    }
+
+    assert repair._request_cgroup_file_reclaim(state, root=tmp_path) is True
+    payload = reclaim.read_text(encoding="ascii")
+    amount, policy = payload.split()
+    assert int(amount) >= repair.MIN_CGROUP_RECLAIM_BYTES
+    assert int(amount) <= repair.MAX_CGROUP_RECLAIM_BYTES
+    assert policy == "swappiness=0"
 
 
 def test_sqlite_cache_release_includes_wal_and_shm(tmp_path, monkeypatch):
@@ -134,6 +211,9 @@ def test_install_patches_only_read_paths_and_preserves_authority_contract():
     status = repair.status()
     assert status["full_hash_chain_verification_preserved"] is True
     assert status["logical_bootstrap_keyset_semantics_preserved"] is True
+    assert status["cgroup_file_reclaim_best_effort"] is True
+    assert status["cgroup_reclaim_swappiness_zero"] is True
+    assert status["heap_trim_under_pressure"] is True
     assert status["canonical_evidence_reset"] is False
     assert status["strategy_thresholds_changed"] is False
     assert status["certification_thresholds_changed"] is False
