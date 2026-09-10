@@ -31,7 +31,14 @@ from .production_system import (
     ingestion_runtime,
     production_system,
 )
+from .robinhood_provider_runtime_proof import install_robinhood_provider_runtime_proof
 from . import legacy_production_composition as _legacy_production
+
+# The canonical composition has now installed the provider failover wrappers. Add
+# a secret-free proof layer that chain-verifies the preferred private provider,
+# records actual HTTP/WSS successes, and safely reclaims the preferred provider
+# after its cooldown. It does not add signing, submission, or live-money authority.
+install_robinhood_provider_runtime_proof()
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
