@@ -169,6 +169,45 @@ def test_delta_replay_does_not_refire_canonical_user_trigger_side_effects(tmp_pa
         check.close()
 
 
+def test_delta_replay_preserves_semicolons_inside_canonical_text(tmp_path: Path) -> None:
+    replica = tmp_path / "semicolon-replica.sqlite3"
+    connection = sqlite3.connect(replica)
+    try:
+        connection.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY,value TEXT NOT NULL)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    state = {
+        "client_version": replica_client.CLIENT_VERSION,
+        "release_commit": "a" * 40,
+        "replication_version": replication.REPLICATION_VERSION,
+        "epoch": "epoch-12345678",
+        "schema_fingerprint": "b" * 64,
+        "watermark": 20,
+    }
+    replica_client._atomic_state(replica_client._state_path(replica), state)
+    payload = {
+        "to_watermark": 21,
+        "source_change_count": 1,
+        "payload_bytes": 80,
+        "changes": [
+            {
+                "table": "sample",
+                "sql": 'INSERT OR REPLACE INTO "sample"("id","value") VALUES (1,\'left;right\')',
+            }
+        ],
+    }
+    result = replica_client._apply_delta(replica, state, payload)
+    assert result["watermark"] == 21
+
+    check = sqlite3.connect(replica)
+    try:
+        assert check.execute("SELECT value FROM sample WHERE id=1").fetchone() == ("left;right",)
+    finally:
+        check.close()
+
+
 def test_storeless_composition_stays_up_but_replication_requests_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
     app = FastAPI()
