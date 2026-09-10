@@ -33,6 +33,14 @@ def _drpc() -> SimpleNamespace:
     )
 
 
+def _chainstack() -> SimpleNamespace:
+    return SimpleNamespace(
+        name="backup",
+        http="https://robinhood-mainnet.core.chainstack.com/redacted",
+        ws="wss://robinhood-mainnet.core.chainstack.com/redacted",
+    )
+
+
 def _alchemy() -> SimpleNamespace:
     return SimpleNamespace(
         name="primary",
@@ -49,12 +57,20 @@ def test_drpc_uses_full_provider_pool_cap(monkeypatch) -> None:
     assert repair._effective_live_market_cap() == 64
 
 
-def test_alchemy_fallback_retains_legacy_safety_ceiling(monkeypatch) -> None:
+def test_chainstack_is_named_and_uses_full_provider_pool_cap(monkeypatch) -> None:
+    chainstack = _chainstack()
+    monkeypatch.setenv("ROBINHOOD_PROVIDER_POOL_LIVE_MARKET_CAP", "64")
+    monkeypatch.setattr(repair.failover, "active_provider", lambda: chainstack)
+    assert repair._provider_kind(chainstack) == "chainstack"
+    assert repair._effective_live_market_cap() == 64
+
+
+def test_alchemy_uses_full_cap_under_monthly_budget_guard(monkeypatch) -> None:
     alchemy = _alchemy()
     monkeypatch.setenv("ROBINHOOD_PROVIDER_POOL_LIVE_MARKET_CAP", "64")
     monkeypatch.setenv("ROBINHOOD_RPC_URL", alchemy.http)
     monkeypatch.setattr(repair.failover, "active_provider", lambda: alchemy)
-    assert repair._effective_live_market_cap() == 16
+    assert repair._effective_live_market_cap() == 64
 
 
 def test_drpc_carries_broad_research_instead_of_public_rpc(monkeypatch) -> None:
@@ -70,19 +86,31 @@ def test_drpc_carries_broad_research_instead_of_public_rpc(monkeypatch) -> None:
     assert generation == 7
 
 
-def test_alchemy_carries_no_broad_research_load(monkeypatch) -> None:
+def test_alchemy_carries_budgeted_broad_research(monkeypatch) -> None:
     alchemy = _alchemy()
     monkeypatch.setenv("ROBINHOOD_RPC_URL", alchemy.http)
+    monkeypatch.setenv("ROBINHOOD_PROVIDER_POOL_RESEARCH_POLL_SECONDS", "1.0")
     monkeypatch.setattr(repair.failover, "active_provider", lambda: alchemy)
+    monkeypatch.setattr(repair.failover, "generation", lambda: 9)
+    url, kind, poll_seconds, generation = repair._research_target()
+    assert url == alchemy.http
+    assert kind == "alchemy"
+    assert poll_seconds == 1.0
+    assert generation == 9
+
+
+def test_public_research_is_only_fallback_when_no_private_provider(monkeypatch) -> None:
+    monkeypatch.setattr(repair.failover, "active_provider", lambda: None)
     url, kind, poll_seconds, generation = repair._research_target()
     assert url == repair.runtime.ROBINHOOD_PUBLIC_RPC
     assert kind == "public_rpc"
     assert poll_seconds == 5.0
     assert generation is None
+    assert repair._effective_live_market_cap() <= 16
 
 
 def test_research_loop_rebinds_to_active_private_provider_and_proves_success(monkeypatch, capsys) -> None:
-    drpc = _drpc()
+    chainstack = _chainstack()
     stop = SimpleNamespace(is_set=lambda: False)
     calls: list[str] = []
 
@@ -98,9 +126,8 @@ def test_research_loop_rebinds_to_active_private_provider_and_proves_success(mon
         stop.is_set = lambda: True
 
     plane = SimpleNamespace()
-    monkeypatch.setenv("ROBINHOOD_RPC_URL", _alchemy().http)
     monkeypatch.setenv("ROBINHOOD_PROVIDER_POOL_LIVE_MARKET_CAP", "64")
-    monkeypatch.setattr(repair.failover, "active_provider", lambda: drpc)
+    monkeypatch.setattr(repair.failover, "active_provider", lambda: chainstack)
     monkeypatch.setattr(repair.failover, "generation", lambda: 3)
     monkeypatch.setattr(repair.runtime, "RobinhoodRpc", _Rpc)
     monkeypatch.setattr(repair.budget, "_research_pass", _pass)
@@ -108,15 +135,15 @@ def test_research_loop_rebinds_to_active_private_provider_and_proves_success(mon
     asyncio.run(repair._provider_pool_research_async(plane, stop))
 
     output = capsys.readouterr().out
-    assert calls == [drpc.http]
-    assert "ROBINHOOD_RESEARCH_PROVIDER_ACTIVE provider_kind=drpc generation=3" in output
-    assert "ROBINHOOD_RESEARCH_PROVIDER_TRAFFIC provider_kind=drpc generation=3 successful_passes=1" in output
+    assert calls == [chainstack.http]
+    assert "ROBINHOOD_RESEARCH_PROVIDER_ACTIVE provider_kind=chainstack generation=3" in output
+    assert "ROBINHOOD_RESEARCH_PROVIDER_TRAFFIC provider_kind=chainstack generation=3 successful_passes=1" in output
     assert "live_market_cap=64" in output
-    assert "lb.drpc" not in output
+    assert "chainstack.com" not in output
 
 
 def test_research_failure_is_visible_without_endpoint_or_secret(monkeypatch, capsys) -> None:
-    drpc = _drpc()
+    chainstack = _chainstack()
     stop = SimpleNamespace(is_set=lambda: False)
 
     class _Rpc:
@@ -131,8 +158,7 @@ def test_research_failure_is_visible_without_endpoint_or_secret(monkeypatch, cap
         raise TimeoutError("synthetic-secret-should-not-appear")
 
     plane = SimpleNamespace()
-    monkeypatch.setenv("ROBINHOOD_RPC_URL", _alchemy().http)
-    monkeypatch.setattr(repair.failover, "active_provider", lambda: drpc)
+    monkeypatch.setattr(repair.failover, "active_provider", lambda: chainstack)
     monkeypatch.setattr(repair.failover, "generation", lambda: 4)
     monkeypatch.setattr(repair.runtime, "RobinhoodRpc", _Rpc)
     monkeypatch.setattr(repair.budget, "_research_pass", _fail)
@@ -141,16 +167,16 @@ def test_research_failure_is_visible_without_endpoint_or_secret(monkeypatch, cap
     asyncio.run(repair._provider_pool_research_async(plane, stop))
 
     output = capsys.readouterr().out
-    assert "ROBINHOOD_RESEARCH_PROVIDER_FAILED provider_kind=drpc generation=4 error_type=TimeoutError failures=1" in output
+    assert "ROBINHOOD_RESEARCH_PROVIDER_FAILED provider_kind=chainstack generation=4 error_type=TimeoutError failures=1" in output
     assert "synthetic-secret-should-not-appear" not in output
-    assert "lb.drpc" not in output
+    assert "chainstack.com" not in output
 
 
 def test_installation_source_unifies_provider_budget_caps_without_import_side_effects() -> None:
     source = Path(repair.__file__).read_text(encoding="utf-8")
     assert "budget._live_market_cap = _effective_live_market_cap" in source
     assert "alchemy_guard._provider_pool_live_market_cap = _effective_live_market_cap" in source
-    assert 'budget.BUDGET_VERSION = "robinhood-production-ws-transport-v4-provider-pool-throughput"' in source
+    assert 'budget.BUDGET_VERSION = "robinhood-production-ws-transport-v5-budgeted-private-pool"' in source
 
 
 def test_provider_finalizer_installs_repair_before_budget_transport() -> None:
