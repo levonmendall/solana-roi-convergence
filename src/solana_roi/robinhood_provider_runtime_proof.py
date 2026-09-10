@@ -11,9 +11,11 @@ from . import robinhood_chain_runtime as runtime
 from . import robinhood_provider_failover as failover
 
 
-RUNTIME_PROOF_VERSION = "robinhood-provider-runtime-proof-v1"
+RUNTIME_PROOF_VERSION = "robinhood-provider-runtime-proof-v2-read-capability"
 _INSTALLED = False
 _PROBE_LOCK = threading.Lock()
+_FAILURE_LOCK = threading.Lock()
+_REQUEST_FAILURE_COUNTS: dict[tuple[str, str], int] = {}
 _ORIGINAL_MARK_SUCCESS: Callable[..., None] | None = None
 _ORIGINAL_SWITCH_FROM: Callable[..., Any] | None = None
 _ORIGINAL_STATUS: Callable[[], dict[str, Any]] | None = None
@@ -52,12 +54,29 @@ def _mark_success_with_telemetry(name: str, *, transport_kind: str) -> None:
         state[f"last_{transport_kind}_success_at"] = time.time()
         count = int(state[key])
         chain_verified = bool(state.get("chain_verified", False))
+        read_capability_verified = bool(state.get("read_capability_verified", False))
     if count == 1 or count % 100 == 0:
         print(
             "ROBINHOOD_PROVIDER_TRAFFIC "
             f"provider={name} provider_kind={_provider_kind(provider)} "
             f"transport={transport_kind} successes={count} "
-            f"generation={failover.generation()} chain_verified={str(chain_verified).lower()}",
+            f"generation={failover.generation()} chain_verified={str(chain_verified).lower()} "
+            f"read_capability_verified={str(read_capability_verified).lower()}",
+            flush=True,
+        )
+
+
+def _record_request_failure(provider: failover.ProviderEndpoint | None, method: str, exc_name: str) -> None:
+    kind = _provider_kind(provider)
+    key = (kind, str(method))
+    with _FAILURE_LOCK:
+        count = int(_REQUEST_FAILURE_COUNTS.get(key, 0)) + 1
+        _REQUEST_FAILURE_COUNTS[key] = count
+    if count == 1 or count % 20 == 0:
+        print(
+            "ROBINHOOD_PROVIDER_REQUEST_FAILED "
+            f"provider_kind={kind} method={method} error_type={exc_name} failures={count} "
+            f"generation={failover.generation()}",
             flush=True,
         )
 
@@ -78,7 +97,9 @@ def _switch_from_with_verification_reset(
     )
     if result is None or result.name != failed_name:
         with failover._LOCK:
-            failover._state_for_locked(failed_name)["chain_verified"] = False
+            state = failover._state_for_locked(failed_name)
+            state["chain_verified"] = False
+            state["read_capability_verified"] = False
     return result
 
 
@@ -90,30 +111,36 @@ def _record_probe_failure(provider: failover.ProviderEndpoint, exc_name: str) ->
         state["last_failure_at"] = time.time()
         state["cooldown_until"] = time.monotonic() + failover._cooldown_seconds()
         state["chain_verified"] = False
+        state["read_capability_verified"] = False
 
 
-def _record_chain_verified(
+def _record_provider_verified(
     provider: failover.ProviderEndpoint,
     *,
     previous_name: str | None,
+    latest_block: int,
 ) -> None:
     changed = previous_name is not None and previous_name != provider.name
     with failover._LOCK:
         state = failover._state_for_locked(provider.name)
         state["http_failures"] = 0
         state["chain_verified"] = True
+        state["read_capability_verified"] = True
         state["chain_verifications"] = int(state.get("chain_verifications", 0) or 0) + 1
+        state["read_capability_verifications"] = int(state.get("read_capability_verifications", 0) or 0) + 1
         state["last_chain_verified_at"] = time.time()
+        state["last_read_capability_verified_at"] = time.time()
+        state["last_verified_block"] = int(latest_block)
         if changed:
             failover._ACTIVE_NAME = provider.name
             failover._GENERATION += 1
             state["failbacks_to"] = int(state.get("failbacks_to", 0) or 0) + 1
         current_generation = int(failover._GENERATION)
     print(
-        "ROBINHOOD_PROVIDER_CHAIN_VERIFIED "
+        "ROBINHOOD_PROVIDER_CAPABILITY_VERIFIED "
         f"provider={provider.name} provider_kind={_provider_kind(provider)} "
         f"generation={current_generation} failback={str(changed).lower()} "
-        f"chain_id={runtime.ROBINHOOD_CHAIN_ID}",
+        f"chain_id={runtime.ROBINHOOD_CHAIN_ID} eth_block_number=true latest_block={int(latest_block)}",
         flush=True,
     )
 
@@ -126,7 +153,9 @@ async def _verify_preferred_if_needed(rpc_self: Any) -> bool:
     with failover._LOCK:
         state = failover._state_for_locked(preferred.name)
         eligible = float(state.get("cooldown_until", 0.0) or 0.0) <= time.monotonic()
-        already_verified = bool(state.get("chain_verified", False))
+        already_verified = bool(state.get("chain_verified", False)) and bool(
+            state.get("read_capability_verified", False)
+        )
     if not eligible:
         return False
     if active.name == preferred.name and already_verified:
@@ -134,7 +163,6 @@ async def _verify_preferred_if_needed(rpc_self: Any) -> bool:
     if not _PROBE_LOCK.acquire(blocking=False):
         return False
     try:
-        # Re-evaluate after acquiring the singleton probe guard.
         preferred = _preferred_provider()
         active = failover.active_provider()
         if preferred is None or active is None:
@@ -143,7 +171,9 @@ async def _verify_preferred_if_needed(rpc_self: Any) -> bool:
             state = failover._state_for_locked(preferred.name)
             if float(state.get("cooldown_until", 0.0) or 0.0) > time.monotonic():
                 return False
-            if active.name == preferred.name and bool(state.get("chain_verified", False)):
+            if active.name == preferred.name and bool(state.get("chain_verified", False)) and bool(
+                state.get("read_capability_verified", False)
+            ):
                 return True
         original = failover._ORIGINAL_RPC
         if original is None:
@@ -156,17 +186,25 @@ async def _verify_preferred_if_needed(rpc_self: Any) -> bool:
             chain_id = int(text, 16) if text.startswith("0x") else int(text)
             if chain_id != runtime.ROBINHOOD_CHAIN_ID:
                 raise RuntimeError("WrongRobinhoodChainId")
+
+            # Chain identity alone is not enough. The provider must also execute a
+            # normal Robinhood read before it can be considered healthy/preferred.
+            head_raw = await original(rpc_self, "eth_blockNumber", [])
+            head_text = str(head_raw).strip().lower()
+            latest_block = int(head_text, 16) if head_text.startswith("0x") else int(head_text)
+            if latest_block < 0:
+                raise RuntimeError("InvalidRobinhoodBlockNumber")
         except Exception as exc:
             _record_probe_failure(preferred, type(exc).__name__)
             rpc_self.rpc_url = active.http if active is not None else old_url
             print(
-                "ROBINHOOD_PROVIDER_CHAIN_VERIFY_FAILED "
+                "ROBINHOOD_PROVIDER_CAPABILITY_VERIFY_FAILED "
                 f"provider={preferred.name} provider_kind={_provider_kind(preferred)} "
                 f"error_type={type(exc).__name__}",
                 flush=True,
             )
             return False
-        _record_chain_verified(preferred, previous_name=active.name)
+        _record_provider_verified(preferred, previous_name=active.name, latest_block=latest_block)
         rpc_self.rpc_url = preferred.http
         return True
     finally:
@@ -181,7 +219,13 @@ def _runtime_rpc_with_preferred_verification(
         current = str(getattr(rpc_self, "rpc_url", "") or "")
         if current and failover._is_pool_http(current):
             await _verify_preferred_if_needed(rpc_self)
-        return await original(rpc_self, method, params)
+        try:
+            return await original(rpc_self, method, params)
+        except Exception as exc:
+            provider = failover.active_provider() if failover._is_pool_http(str(getattr(rpc_self, "rpc_url", "") or "")) else None
+            if provider is not None:
+                _record_request_failure(provider, method, type(exc).__name__)
+            raise
 
     setattr(wrapped, "_roi_robinhood_provider_runtime_proof", True)
     return wrapped
@@ -199,11 +243,26 @@ def _status_with_runtime_proof() -> dict[str, Any]:
                 "ws_successes": int(failover._state_for_locked(item.name).get("ws_successes", 0) or 0),
                 "last_http_success_at": failover._state_for_locked(item.name).get("last_http_success_at"),
                 "last_ws_success_at": failover._state_for_locked(item.name).get("last_ws_success_at"),
+                "chain_verified": bool(failover._state_for_locked(item.name).get("chain_verified", False)),
+                "read_capability_verified": bool(
+                    failover._state_for_locked(item.name).get("read_capability_verified", False)
+                ),
                 "chain_verifications": int(failover._state_for_locked(item.name).get("chain_verifications", 0) or 0),
+                "read_capability_verifications": int(
+                    failover._state_for_locked(item.name).get("read_capability_verifications", 0) or 0
+                ),
                 "last_chain_verified_at": failover._state_for_locked(item.name).get("last_chain_verified_at"),
+                "last_read_capability_verified_at": failover._state_for_locked(item.name).get(
+                    "last_read_capability_verified_at"
+                ),
+                "last_verified_block": failover._state_for_locked(item.name).get("last_verified_block"),
                 "failbacks_to": int(failover._state_for_locked(item.name).get("failbacks_to", 0) or 0),
             }
             for item in failover.providers()
+        }
+    with _FAILURE_LOCK:
+        request_failures = {
+            f"{kind}:{method}": count for (kind, method), count in sorted(_REQUEST_FAILURE_COUNTS.items())
         }
     result.update(
         {
@@ -214,6 +273,7 @@ def _status_with_runtime_proof() -> dict[str, Any]:
             "provider_traffic_observed": any(
                 state["http_successes"] > 0 or state["ws_successes"] > 0 for state in traffic.values()
             ),
+            "provider_request_failures": request_failures,
         }
     )
     return result

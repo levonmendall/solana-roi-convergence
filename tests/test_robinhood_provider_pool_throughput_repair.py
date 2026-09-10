@@ -4,7 +4,25 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from solana_roi import robinhood_provider_pool_throughput_repair as repair
+
+
+@pytest.fixture(autouse=True)
+def _reset_stats():
+    with repair._TELEMETRY_LOCK:
+        repair._RESEARCH_STATS.update(
+            {
+                "passes": 0,
+                "failures": 0,
+                "provider_switches": 0,
+                "last_provider_kind": None,
+                "last_generation": None,
+                "last_error_type": None,
+            }
+        )
+    yield
 
 
 def _drpc() -> SimpleNamespace:
@@ -63,7 +81,7 @@ def test_alchemy_carries_no_broad_research_load(monkeypatch) -> None:
     assert generation is None
 
 
-def test_research_loop_rebinds_to_active_private_provider(monkeypatch) -> None:
+def test_research_loop_rebinds_to_active_private_provider_and_proves_success(monkeypatch, capsys) -> None:
     drpc = _drpc()
     stop = SimpleNamespace(is_set=lambda: False)
     calls: list[str] = []
@@ -81,13 +99,51 @@ def test_research_loop_rebinds_to_active_private_provider(monkeypatch) -> None:
 
     plane = SimpleNamespace()
     monkeypatch.setenv("ROBINHOOD_RPC_URL", _alchemy().http)
+    monkeypatch.setenv("ROBINHOOD_PROVIDER_POOL_LIVE_MARKET_CAP", "64")
     monkeypatch.setattr(repair.failover, "active_provider", lambda: drpc)
     monkeypatch.setattr(repair.failover, "generation", lambda: 3)
     monkeypatch.setattr(repair.runtime, "RobinhoodRpc", _Rpc)
     monkeypatch.setattr(repair.budget, "_research_pass", _pass)
     monkeypatch.setattr(repair.budget, "_update_research_state", lambda *_args, **_kwargs: None)
     asyncio.run(repair._provider_pool_research_async(plane, stop))
+
+    output = capsys.readouterr().out
     assert calls == [drpc.http]
+    assert "ROBINHOOD_RESEARCH_PROVIDER_ACTIVE provider_kind=drpc generation=3" in output
+    assert "ROBINHOOD_RESEARCH_PROVIDER_TRAFFIC provider_kind=drpc generation=3 successful_passes=1" in output
+    assert "live_market_cap=64" in output
+    assert "lb.drpc" not in output
+
+
+def test_research_failure_is_visible_without_endpoint_or_secret(monkeypatch, capsys) -> None:
+    drpc = _drpc()
+    stop = SimpleNamespace(is_set=lambda: False)
+
+    class _Rpc:
+        def __init__(self, *, rpc_url: str, timeout_seconds: float) -> None:
+            self.rpc_url = rpc_url
+
+        async def close(self) -> None:
+            return None
+
+    async def _fail(_self, _rpc) -> None:
+        stop.is_set = lambda: True
+        raise TimeoutError("synthetic-secret-should-not-appear")
+
+    plane = SimpleNamespace()
+    monkeypatch.setenv("ROBINHOOD_RPC_URL", _alchemy().http)
+    monkeypatch.setattr(repair.failover, "active_provider", lambda: drpc)
+    monkeypatch.setattr(repair.failover, "generation", lambda: 4)
+    monkeypatch.setattr(repair.runtime, "RobinhoodRpc", _Rpc)
+    monkeypatch.setattr(repair.budget, "_research_pass", _fail)
+    monkeypatch.setattr(repair.budget, "_research_state", lambda *_args, **_kwargs: {"rpc_failures": 0})
+    monkeypatch.setattr(repair.budget, "_update_research_state", lambda *_args, **_kwargs: None)
+    asyncio.run(repair._provider_pool_research_async(plane, stop))
+
+    output = capsys.readouterr().out
+    assert "ROBINHOOD_RESEARCH_PROVIDER_FAILED provider_kind=drpc generation=4 error_type=TimeoutError failures=1" in output
+    assert "synthetic-secret-should-not-appear" not in output
+    assert "lb.drpc" not in output
 
 
 def test_installation_source_unifies_provider_budget_caps_without_import_side_effects() -> None:
