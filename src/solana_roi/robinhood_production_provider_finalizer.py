@@ -29,6 +29,10 @@ from .robinhood_event_driven_settlement import (
     install_robinhood_event_driven_settlement,
     status as event_driven_settlement_status,
 )
+from .robinhood_getlogs_capability_repair import (
+    install_robinhood_getlogs_capability_repair,
+    status as getlogs_capability_repair_status,
+)
 from .robinhood_getlogs_provider_guard import (
     install_robinhood_getlogs_provider_guard,
     status as getlogs_provider_guard_status,
@@ -56,7 +60,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v14-chainstack-monthly-capacity"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v15-capability-specific-getlogs"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -156,7 +160,9 @@ def install_robinhood_production_provider_finalizer(
     dRPC compatibility remains installed for safe historical/future recovery but has
     no special authority. Provider generation switching, Robinhood chain-id 4663
     verification, fresh-event authority, paper-only operation, and the absence of
-    signing/submission/live-money capability are unchanged.
+    signing/submission/live-money capability are unchanged. ``eth_getLogs`` is
+    capability-specific: basic EVM reads cannot make a provider fully healthy when
+    mandatory log retrieval is unavailable.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
@@ -183,6 +189,11 @@ def install_robinhood_production_provider_finalizer(
     install_robinhood_provider_failover()
     install_robinhood_provider_runtime_proof()
     install_robinhood_drpc_http_failure_diagnostic()
+
+    # Install after the provider pool has captured its inner RPC seam. This lets the
+    # getLogs repair probe/reroute one capability without changing the paired basic
+    # HTTP/WSS provider or bypassing the existing capacity/budget wrappers.
+    install_robinhood_getlogs_capability_repair()
     _preserve_bounded_transport_aliases()
 
     current_run = plane_cls.run
@@ -208,6 +219,7 @@ def status() -> dict[str, Any]:
         "provider_pool_throughput": provider_pool_throughput_status(),
         "provider_capacity_budget": provider_capacity_budget_status(),
         "getlogs_provider_guard": getlogs_provider_guard_status(),
+        "getlogs_capability_repair": getlogs_capability_repair_status(),
         "provider_budget_transport": provider_budget_transport_status(),
         "provider_transport": usage_bounded_transport_status(),
         "event_driven_settlement": event_driven_settlement_status(),
