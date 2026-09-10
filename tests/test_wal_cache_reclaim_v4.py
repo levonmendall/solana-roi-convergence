@@ -118,7 +118,8 @@ def test_drop_file_cache_checkpoints_then_flushes_before_release(tmp_path, monke
 def test_repair_preserves_paper_only_and_fail_closed_boundaries():
     state = repair.status()
 
-    assert state["repair_version"] == "durable-bootstrap-cgroup-memory-v4-wal-checkpoint"
+    assert state["repair_version"] == "durable-bootstrap-cgroup-memory-v5-statement-bootstrap-readers"
+    assert state["logical_bootstrap_page_wide_transaction"] is False
     assert state["passive_wal_checkpoint_under_pressure"] is True
     assert state["wal_checkpoint_busy_timeout_ms"] == 0
     assert state["wal_checkpoint_changes_logical_state"] is False

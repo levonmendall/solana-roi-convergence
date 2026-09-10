@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v4-wal-checkpoint"
+REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v5-statement-bootstrap-readers"
 VERIFY_CACHE_RELEASE_ROWS = 4_096
 SQLITE_READER_CACHE_KIB = 2_048
 RAW_RECLAIM_FRACTION = 0.82
@@ -502,7 +502,12 @@ def _bounded_verify_engine_snapshot(self: Any) -> tuple[bool, int, int | None]:
 
 
 def _guarded_pinned_reader(store: Any) -> sqlite3.Connection:
-    """Open one bounded logical-bootstrap reader or fail closed before OOM."""
+    """Open one bounded logical-bootstrap reader or fail closed before OOM.
+
+    The logical bootstrap transport is keyset-paginated and journal-reconciled, so
+    this connection must not pin a page-wide WAL snapshot. Each bounded SELECT owns
+    only its statement snapshot; the caller revalidates schema identity afterwards.
+    """
 
     source_path = Path(getattr(store, "path", ""))
     if not source_path.is_file():
@@ -519,7 +524,6 @@ def _guarded_pinned_reader(store: Any) -> sqlite3.Connection:
     reader.execute("PRAGMA busy_timeout=5000")
     reader.execute(f"PRAGMA cache_size=-{SQLITE_READER_CACHE_KIB}")
     reader.execute("PRAGMA mmap_size=0")
-    reader.execute("BEGIN")
     return reader
 
 
@@ -591,6 +595,7 @@ def status() -> dict[str, Any]:
         "cgroup_memory": _cgroup_memory(),
         "full_hash_chain_verification_preserved": True,
         "logical_bootstrap_keyset_semantics_preserved": True,
+        "logical_bootstrap_page_wide_transaction": False,
         "canonical_evidence_reset": CANONICAL_EVIDENCE_RESET,
         "strategy_thresholds_changed": STRATEGY_THRESHOLDS_CHANGED,
         "certification_thresholds_changed": CERTIFICATION_THRESHOLDS_CHANGED,
