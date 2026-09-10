@@ -11,7 +11,7 @@ import httpx
 from . import robinhood_chain_core as core
 
 
-REPAIR_VERSION = "robinhood-getlogs-provider-guard-v2-http403-failover"
+REPAIR_VERSION = "robinhood-getlogs-provider-guard-v3-http403-chain-verified-failover"
 ALCHEMY_SAFE_MAX_BLOCKS = 10
 MAX_CONFIGURED_BLOCKS = 10_000
 ENV_MAX_BLOCKS = "ROBINHOOD_ETH_GET_LOGS_MAX_BLOCKS"
@@ -77,12 +77,12 @@ def _is_getlogs_http_403(exc: BaseException) -> bool:
     return isinstance(exc, httpx.HTTPStatusError) and int(exc.response.status_code) == 403
 
 
-def _failover_from_getlogs_403(self: Any) -> bool:
-    """Quarantine the refusing private provider and move to a verified pool peer.
+async def _failover_from_getlogs_403(self: Any) -> bool:
+    """Quarantine a refusing provider and require fresh Robinhood chain proof on its peer.
 
     The provider failover module imports this guard, so the import remains local to
-    avoid a module-initialization cycle. This deliberately uses the existing provider
-    health/cooldown authority instead of maintaining a second provider truth here.
+    avoid a module-initialization cycle. Recovery deliberately reuses the canonical
+    provider pool, cooldown, and chain-id verifier rather than creating second truths.
     """
     try:
         from . import robinhood_provider_failover as failover
@@ -109,7 +109,20 @@ def _failover_from_getlogs_403(self: Any) -> bool:
         )
         if replacement is None or replacement.name == provider.name:
             return False
-        self.rpc_url = replacement.http
+
+        original_rpc = failover._ORIGINAL_RPC
+        if original_rpc is None:
+            # A replacement may not remain active without a canonical chain verifier.
+            failover._switch_from(
+                replacement.name,
+                failure_type="MissingRobinhoodChainVerifier",
+                immediate=True,
+                transport_kind="http",
+            )
+            return False
+
+        if not await failover._verify_candidate_chain(original_rpc, self, replacement):
+            return False
         return True
     except Exception:
         # Recovery itself must never convert a provider denial into apparent success.
@@ -139,14 +152,14 @@ async def _request_range(
         if not _is_getlogs_http_403(exc):
             raise
         _inc(self, "http_403s")
-        if not _failover_from_getlogs_403(self):
+        if not await _failover_from_getlogs_403(self):
             _inc(self, "http_403_fail_closed")
             raise
 
         # Retry the exact same contiguous range. Re-entering the provider guard is
-        # intentional: the replacement can have a stricter range limit (Alchemy is
-        # ten blocks), so its own bound is applied before the retry is sent. No caller
-        # cursor/watermark can observe success until this complete range succeeds.
+        # intentional: the verified replacement can have a stricter range limit
+        # (Alchemy is ten blocks), so that limit is applied before any retry is sent.
+        # No caller cursor/watermark can observe success until the full range succeeds.
         _inc(self, "http_403_failovers")
         return await _provider_bounded_get_logs(
             self,
@@ -210,7 +223,7 @@ async def _provider_bounded_get_logs(
             )
         )
         # Advance only after the entire current chunk returned successfully. Any
-        # refusal by every configured provider raises above and leaves this frontier
+        # refusal by every verified provider raises above and leaves this frontier
         # unadvanced, preserving fail-closed contiguous event coverage.
         cursor = chunk_end + 1
     return rows
@@ -242,6 +255,7 @@ def status() -> dict[str, Any]:
         "inclusive_block_range_accounting": True,
         "http_403_same_range_failover": True,
         "replacement_provider_limits_reapplied": True,
+        "replacement_chain_id_verified": True,
         "contiguous_frontier_fail_closed": True,
         "changes_strategy_thresholds": False,
         "paper_only": True,
