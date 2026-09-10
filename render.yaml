@@ -125,8 +125,15 @@ services:
       # in Render only and is never committed or exposed through status telemetry.
       - key: BLOCKSCOUT_API_KEY
         sync: false
-      # Optional production RPC override. When absent, the implementation falls
-      # back to Robinhood's official rate-limited public read-only RPC and reports
-      # that condition in telemetry. No private key is ever configured.
+      # Alchemy remains configured as a protected private backup, but dRPC now has
+      # ample usage capacity and is preferred for the normal Robinhood workload.
+      # Provider failover still verifies Robinhood Mainnet chain id 4663 and
+      # reanchors the paired WSS generation before paper-entry authority resumes.
       - key: ROBINHOOD_RPC_URL
         sync: false
+      - key: ROBINHOOD_PROVIDER_PRIMARY
+        value: "drpc"
+      # Use the existing proven transport ceiling. Open positions are reserved
+      # first; remaining capacity is available to the highest-ranked candidates.
+      - key: ROBINHOOD_PROVIDER_POOL_LIVE_MARKET_CAP
+        value: "16"
