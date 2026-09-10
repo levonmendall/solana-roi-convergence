@@ -86,6 +86,9 @@ def test_logical_bootstrap_reconstructs_schema_rows_and_sqlite_metadata_without_
 ) -> None:
     release = "a" * 40
     monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", release)
+    # GitHub Actions evaluates PRs at a synthetic merge SHA. Model the explicit
+    # authoritative release under test rather than inheriting that CI-only SHA.
+    monkeypatch.setattr(bootstrap_server.split, "_release_commit", lambda: release)
     store = _build_source(tmp_path / "source.sqlite3")
     destination = tmp_path / "replica.sqlite3"
     try:
@@ -142,6 +145,7 @@ def test_journal_delta_repairs_mutations_that_race_with_keyset_bootstrap(
 ) -> None:
     release = "b" * 40
     monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", release)
+    monkeypatch.setattr(bootstrap_server.split, "_release_commit", lambda: release)
     store = _build_source(tmp_path / "source.sqlite3")
     destination = tmp_path / "replica.sqlite3"
     try:
