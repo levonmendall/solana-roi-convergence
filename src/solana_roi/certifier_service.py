@@ -20,13 +20,14 @@ from .certification_chunk_transfer import download_snapshot_chunked
 from .certification_replica_client import clone_replica_for_cycle, status as replica_status, synchronize_replica
 
 
-SERVICE_VERSION = "isolated-certifier-service-v5-incremental-replica"
+SERVICE_VERSION = "isolated-certifier-service-v6-child-lifecycle"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
 
 _LOCK = threading.Lock()
+_CYCLE_SINGLE_FLIGHT = threading.Lock()
 _ARTIFACTS: dict[str, dict[str, Any]] = {}
 _PUBLISHED: dict[str, float] = {}
 _STATE: dict[str, Any] = {
@@ -42,7 +43,16 @@ _STATE: dict[str, Any] = {
     "last_snapshot_received_bytes": None,
     "last_snapshot_validation": None,
     "last_published_surfaces": [],
+    "active_cycle": False,
     "active_child_pid": None,
+    "last_child_pid": None,
+    "last_child_returncode": None,
+    "child_launches": 0,
+    "child_reaps": 0,
+    "child_terminate_requests": 0,
+    "child_forced_kills": 0,
+    "child_reap_failures": 0,
+    "cycle_overlap_rejections": 0,
     "replica_bootstraps": 0,
     "replica_delta_cycles": 0,
     "last_replica_transport": None,
@@ -64,6 +74,14 @@ _STALE_SECONDS = {
     "production": 300.0,
 }
 _SQLITE_MAGIC = b"SQLite format 3\x00"
+_NATIVE_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+)
 
 
 def _release_commit() -> str:
@@ -282,13 +300,78 @@ def _record_replica_sync(sync: dict[str, Any]) -> None:
         _STATE["last_replica_delta_bytes"] = sync.get("delta_payload_bytes")
 
 
-def _run_cycle_sync(stop_requested: threading.Event) -> bool:
+def _child_environment(snapshot: Path, release: str) -> dict[str, str]:
+    """Build a certifier-only environment with bounded native thread fan-out."""
+    env = dict(os.environ)
+    env["SOLANA_ROI_DB_PATH"] = str(snapshot)
+    env["SOLANA_ROI_RELEASE_COMMIT"] = release
+    env.pop("SOLANA_ROI_CERTIFICATION_SPLIT_RUNTIME", None)
+    for key in _NATIVE_THREAD_ENV_KEYS:
+        env[key] = "1"
+    return env
+
+
+def _tail_text(path: Path, max_bytes: int = 4096) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            raw = handle.read(max_bytes)
+    except OSError:
+        return ""
+    return raw.decode("utf-8", errors="replace")[-1000:].replace("\n", " ").replace("\r", " ")
+
+
+def _reap_child(
+    process: subprocess.Popen[Any],
+    *,
+    terminate_first: bool = False,
+    kill_first: bool = False,
+) -> int:
+    """Guarantee the certifier child reaches a waited/reaped terminal state."""
+    terminated = False
+    forced_kill = False
+    if process.poll() is None:
+        if kill_first:
+            process.kill()
+            forced_kill = True
+        elif terminate_first:
+            process.terminate()
+            terminated = True
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                forced_kill = True
+    try:
+        returncode = int(process.wait(timeout=5.0))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        forced_kill = True
+        returncode = int(process.wait(timeout=5.0))
+    with _LOCK:
+        _STATE["child_reaps"] = int(_STATE.get("child_reaps", 0) or 0) + 1
+        if terminated:
+            _STATE["child_terminate_requests"] = int(_STATE.get("child_terminate_requests", 0) or 0) + 1
+        if forced_kill:
+            _STATE["child_forced_kills"] = int(_STATE.get("child_forced_kills", 0) or 0) + 1
+        _STATE["last_child_returncode"] = returncode
+        if _STATE.get("active_child_pid") == process.pid:
+            _STATE["active_child_pid"] = None
+    return returncode
+
+
+def _run_cycle_single_flight(stop_requested: threading.Event) -> bool:
     with _LOCK:
         _STATE["cycles"] = int(_STATE.get("cycles", 0) or 0) + 1
         _STATE["last_started_at_monotonic"] = time.monotonic()
+        _STATE["active_cycle"] = True
     error_type: str | None = None
     success = False
     published: set[str] = set()
+    process: subprocess.Popen[Any] | None = None
+    child_reaped = False
     try:
         replica, sync = synchronize_replica(base=_runtime_url(), token=_token(), expected_release=_release_commit())
         _record_replica_sync(sync)
@@ -296,40 +379,55 @@ def _run_cycle_sync(stop_requested: threading.Event) -> bool:
             directory = Path(raw_dir)
             snapshot = directory / "canonical.sqlite3"
             output = directory / "artifacts"
+            stdout_path = directory / "child.stdout.log"
+            stderr_path = directory / "child.stderr.log"
             output.mkdir()
             clone_method = clone_replica_for_cycle(replica, snapshot)
             _validate_sqlite_snapshot(snapshot, int(snapshot.stat().st_size))
             with _LOCK:
                 _STATE["last_local_clone_method"] = clone_method
             release = _release_commit()
-            env = dict(os.environ)
-            env["SOLANA_ROI_DB_PATH"] = str(snapshot)
-            env["SOLANA_ROI_RELEASE_COMMIT"] = release
-            env.pop("SOLANA_ROI_CERTIFICATION_SPLIT_RUNTIME", None)
+            env = _child_environment(snapshot, release)
             command = [sys.executable, "-m", "solana_roi.certifier_job", "--output-dir", str(output)]
-            process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            with _LOCK:
-                _STATE["active_child_pid"] = process.pid
-            started = time.monotonic()
-            while process.poll() is None:
-                if stop_requested.is_set():
-                    process.terminate()
-                    break
-                if time.monotonic() - started > _child_timeout_seconds():
-                    process.kill()
+            with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+                process = subprocess.Popen(command, env=env, stdout=stdout_handle, stderr=stderr_handle)
+                with _LOCK:
+                    _STATE["active_child_pid"] = process.pid
+                    _STATE["last_child_pid"] = process.pid
+                    _STATE["child_launches"] = int(_STATE.get("child_launches", 0) or 0) + 1
+                started = time.monotonic()
+                timed_out = False
+                stop_exit = False
+                while process.poll() is None:
+                    if stop_requested.is_set():
+                        stop_exit = True
+                        break
+                    if time.monotonic() - started > _child_timeout_seconds():
+                        timed_out = True
+                        break
+                    for surface, filename in _SURFACE_FILES.items():
+                        if surface not in published and _publish_file(surface, output / filename, release):
+                            published.add(surface)
+                    time.sleep(0.25)
+
+                if stop_exit:
+                    _reap_child(process, terminate_first=True)
+                    child_reaped = True
+                    raise RuntimeError("isolated certification child stopped during service shutdown")
+                if timed_out:
+                    _reap_child(process, kill_first=True)
+                    child_reaped = True
                     raise TimeoutError("isolated certification child exceeded bounded runtime")
-                for surface, filename in _SURFACE_FILES.items():
-                    if surface not in published and _publish_file(surface, output / filename, release):
-                        published.add(surface)
-                time.sleep(0.25)
-            stdout, stderr = process.communicate(timeout=5)
-            _ = stdout
+
+                returncode = _reap_child(process)
+                child_reaped = True
+
             for surface, filename in _SURFACE_FILES.items():
                 if surface not in published and _publish_file(surface, output / filename, release):
                     published.add(surface)
-            if process.returncode != 0:
-                tail = (stderr or "")[-1000:].replace("\n", " ")
-                raise RuntimeError(f"isolated certification child failed:{process.returncode}:{tail}")
+            if returncode != 0:
+                tail = _tail_text(stderr_path)
+                raise RuntimeError(f"isolated certification child failed:{returncode}:{tail}")
             if published != set(_SURFACE_FILES):
                 raise RuntimeError(f"isolated certification child incomplete:{sorted(published)}")
             success = True
@@ -350,8 +448,18 @@ def _run_cycle_sync(stop_requested: threading.Event) -> bool:
         }
         print("SOLANA_ROI_CERTIFIER_CYCLE_FAILED " + json.dumps(diagnostic, sort_keys=True, separators=(",", ":")), flush=True)
     finally:
+        if process is not None and not child_reaped:
+            try:
+                _reap_child(process, terminate_first=True)
+                child_reaped = True
+            except BaseException as reap_exc:
+                with _LOCK:
+                    _STATE["child_reap_failures"] = int(_STATE.get("child_reap_failures", 0) or 0) + 1
+                if error_type is None:
+                    error_type = type(reap_exc).__name__
+                success = False
         with _LOCK:
-            _STATE["active_child_pid"] = None
+            _STATE["active_cycle"] = False
             _STATE["last_completed_at_monotonic"] = time.monotonic()
             _STATE["last_published_surfaces"] = sorted(published)
             if success:
@@ -363,6 +471,31 @@ def _run_cycle_sync(stop_requested: threading.Event) -> bool:
                 _STATE["failures"] = int(_STATE.get("failures", 0) or 0) + 1
                 _STATE["consecutive_failures"] = int(_STATE.get("consecutive_failures", 0) or 0) + 1
     return success
+
+
+def _run_cycle_sync(stop_requested: threading.Event) -> bool:
+    if not _CYCLE_SINGLE_FLIGHT.acquire(blocking=False):
+        with _LOCK:
+            _STATE["cycle_overlap_rejections"] = int(_STATE.get("cycle_overlap_rejections", 0) or 0) + 1
+        print(
+            "SOLANA_ROI_CERTIFIER_CYCLE_OVERLAP_REJECTED "
+            + json.dumps(
+                {
+                    "event": "isolated_certifier_cycle_overlap_rejected",
+                    "release_commit": _release_commit(),
+                    "paper_only": True,
+                    "live_money_authority": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        return False
+    try:
+        return _run_cycle_single_flight(stop_requested)
+    finally:
+        _CYCLE_SINGLE_FLIGHT.release()
 
 
 async def _worker(stop: asyncio.Event) -> None:
@@ -438,6 +571,10 @@ def health() -> dict[str, Any]:
             "child_receives_disposable_local_clone": True,
             "authoritative_full_snapshot_per_cycle": False,
             "sqlite_header_and_page_geometry_checked": True,
+            "child_output_uses_bounded_file_tail_not_pipes": True,
+            "child_native_thread_limit": 1,
+            "cycle_single_flight": True,
+            "child_reap_required_before_pid_clear": True,
         },
         "child_process_isolation": True,
         "shared_writable_disk": False,
