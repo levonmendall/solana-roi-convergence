@@ -98,7 +98,9 @@ def _pinned_reader(store: Any) -> sqlite3.Connection:
     reader.execute("PRAGMA query_only=ON")
     reader.execute("PRAGMA busy_timeout=5000")
     reader.execute("PRAGMA cache_size=-4096")
-    reader.execute("BEGIN")
+    # Do not open a page-wide read transaction here. Each bounded SELECT owns only
+    # its statement snapshot, allowing WAL checkpoint/writeback progress between
+    # metadata reads and certification pages while journal replay preserves truth.
     return reader
 
 
@@ -162,6 +164,10 @@ def _manifest(store: Any) -> dict[str, Any]:
                 if str(name) in table_names and seq is not None
             ]
         start_watermark = replication._current_watermark(reader)
+        # Without a page-wide snapshot, revalidate after all manifest reads so a
+        # racing DDL/schema change still fails closed instead of publishing a mixed
+        # manifest. Ordinary DML is reconciled from start_watermark by the journal.
+        _validate_identity(reader, str(identity["epoch"]), str(identity["schema_fingerprint"]))
         return {
             "bootstrap_version": BOOTSTRAP_VERSION,
             "replication_version": replication.REPLICATION_VERSION,
@@ -321,14 +327,23 @@ def _page(
             def cursor_for(record: dict[str, Any]) -> str:
                 return _encode_cursor([int(record["rowid"])])
 
-        response_rows, payload_bytes, done, next_cursor = _stream_page_records(
-            raw_cursor,
-            table_name=table_name,
-            bounded_limit=bounded_limit,
-            max_bytes=_page_bytes(),
-            row_to_record=row_to_record,
-            cursor_for=cursor_for,
-        )
+        try:
+            response_rows, payload_bytes, done, next_cursor = _stream_page_records(
+                raw_cursor,
+                table_name=table_name,
+                bounded_limit=bounded_limit,
+                max_bytes=_page_bytes(),
+                row_to_record=row_to_record,
+                cursor_for=cursor_for,
+            )
+        finally:
+            # End the SELECT statement snapshot before any subsequent validation or
+            # response construction so WAL checkpoints are not pinned unnecessarily.
+            raw_cursor.close()
+
+        # Removing the broad read transaction must not weaken schema identity. If a
+        # schema change raced with this page, discard it and force a clean restart.
+        _validate_identity(reader, epoch, fingerprint)
         return {
             "bootstrap_version": BOOTSTRAP_VERSION,
             "release_commit": split._release_commit(),
