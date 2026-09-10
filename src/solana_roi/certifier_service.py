@@ -4,15 +4,12 @@ import asyncio
 import json
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -20,9 +17,10 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 
 from .certification_chunk_transfer import download_snapshot_chunked
+from .certification_replica_client import clone_replica_for_cycle, status as replica_status, synchronize_replica
 
 
-SERVICE_VERSION = "isolated-certifier-service-v4-resumable-snapshot-transfer"
+SERVICE_VERSION = "isolated-certifier-service-v5-incremental-replica"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -35,6 +33,7 @@ _STATE: dict[str, Any] = {
     "cycles": 0,
     "successes": 0,
     "failures": 0,
+    "consecutive_failures": 0,
     "last_started_at_monotonic": None,
     "last_completed_at_monotonic": None,
     "last_error_type": None,
@@ -44,6 +43,14 @@ _STATE: dict[str, Any] = {
     "last_snapshot_validation": None,
     "last_published_surfaces": [],
     "active_child_pid": None,
+    "replica_bootstraps": 0,
+    "replica_delta_cycles": 0,
+    "last_replica_transport": None,
+    "last_replica_watermark": None,
+    "last_replica_delta_changes": None,
+    "last_replica_delta_bytes": None,
+    "last_local_clone_method": None,
+    "current_retry_delay_seconds": None,
 }
 
 _SURFACE_FILES = {
@@ -76,10 +83,18 @@ def _token() -> str:
 
 
 def _interval_seconds() -> float:
+    """Normal certification cadence after a successful replica-backed cycle."""
     try:
-        return max(0.0, float(os.getenv("SOLANA_ROI_CERTIFIER_CYCLE_INTERVAL_SECONDS", "2")))
+        return max(5.0, float(os.getenv("SOLANA_ROI_CERTIFIER_CYCLE_INTERVAL_SECONDS", "15")))
     except ValueError:
-        return 2.0
+        return 15.0
+
+
+def _retry_delay_seconds(consecutive_failures: int) -> float:
+    """Bound retry pressure without weakening any certification staleness gate."""
+    base = max(5.0, _interval_seconds())
+    exponent = max(0, min(3, int(consecutive_failures) - 1))
+    return min(60.0, base * (2 ** exponent))
 
 
 def _child_timeout_seconds() -> float:
@@ -90,7 +105,6 @@ def _child_timeout_seconds() -> float:
 
 
 def _safe_error_message(exc: BaseException) -> str:
-    """Return bounded operational diagnostics without leaking service credentials."""
     text = str(exc).replace("\n", " ").replace("\r", " ")
     token = _token()
     if token:
@@ -116,15 +130,12 @@ def _require_token(value: str | None) -> None:
 def _fail_closed(surface: str, reason: str) -> dict[str, Any]:
     if surface == "e2e":
         from . import e2e_status_read_boundary_repair as e2e
-
         payload = e2e._fail_closed_payload(reason)
     elif surface == "forward":
         from . import certification_generation_runtime_repair as certification_runtime
-
         payload = certification_runtime._fail_closed_forward(reason)
     else:
         from . import production_proof_read_boundary_repair as proof
-
         payload = proof._fail_closed_payload(reason)
     boundary = payload.setdefault("isolated_certifier", {})
     if isinstance(boundary, dict):
@@ -134,6 +145,7 @@ def _fail_closed(surface: str, reason: str) -> dict[str, Any]:
                 "state": "failed_closed",
                 "reason": reason,
                 "release_commit": _release_commit(),
+                "incremental_replica_required": True,
                 "paper_only": True,
                 "live_money_authority": False,
                 "signing_available": False,
@@ -161,6 +173,8 @@ def _cached(surface: str) -> dict[str, Any]:
                 "snapshot_age_seconds": age,
                 "release_commit": _release_commit(),
                 "child_process_isolation": True,
+                "incremental_replica": True,
+                "authoritative_full_snapshot_per_cycle": False,
                 "shared_writable_disk": False,
                 "paper_only": True,
                 "live_money_authority": False,
@@ -194,27 +208,16 @@ def _publish_file(surface: str, path: Path, expected_release: str) -> bool:
 
 
 def _validate_sqlite_snapshot(path: Path, expected_bytes: int) -> int:
-    """Validate transfer completeness before a snapshot can reach the child process.
-
-    The runtime already creates the snapshot with SQLite's online-backup API. The
-    certifier therefore validates transport integrity here: exact advertised byte
-    count, SQLite header/page geometry, and a read-only schema open. This prevents a
-    truncated HTTP body from being mistaken for a valid point-in-time database while
-    avoiding a second full-database integrity scan before the bounded child starts.
-    """
+    """Compatibility validator retained for bootstrap and regression contracts."""
     actual_bytes = int(path.stat().st_size)
     if expected_bytes <= 0:
         raise RuntimeError("runtime snapshot advertised invalid byte count")
     if actual_bytes != expected_bytes:
-        raise RuntimeError(
-            f"runtime snapshot byte-count mismatch:{actual_bytes}:{expected_bytes}"
-        )
-
+        raise RuntimeError(f"runtime snapshot byte-count mismatch:{actual_bytes}:{expected_bytes}")
     with path.open("rb") as handle:
         header = handle.read(100)
     if len(header) < 100 or not header.startswith(_SQLITE_MAGIC):
         raise RuntimeError("runtime snapshot SQLite header invalid")
-
     page_size_raw = int.from_bytes(header[16:18], "big")
     page_size = 65536 if page_size_raw == 1 else page_size_raw
     if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
@@ -224,10 +227,7 @@ def _validate_sqlite_snapshot(path: Path, expected_bytes: int) -> int:
         raise RuntimeError("runtime snapshot SQLite page count invalid")
     geometry_bytes = page_size * header_page_count
     if geometry_bytes != actual_bytes:
-        raise RuntimeError(
-            f"runtime snapshot SQLite geometry mismatch:{actual_bytes}:{geometry_bytes}"
-        )
-
+        raise RuntimeError(f"runtime snapshot SQLite geometry mismatch:{actual_bytes}:{geometry_bytes}")
     uri = f"file:{path.resolve()}?mode=ro&immutable=1"
     connection: sqlite3.Connection | None = None
     try:
@@ -235,9 +235,7 @@ def _validate_sqlite_snapshot(path: Path, expected_bytes: int) -> int:
         connection.execute("PRAGMA query_only=ON")
         connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
     except sqlite3.DatabaseError as exc:
-        raise RuntimeError(
-            f"runtime snapshot SQLite open failed:{type(exc).__name__}"
-        ) from exc
+        raise RuntimeError(f"runtime snapshot SQLite open failed:{type(exc).__name__}") from exc
     finally:
         if connection is not None:
             connection.close()
@@ -245,6 +243,7 @@ def _validate_sqlite_snapshot(path: Path, expected_bytes: int) -> int:
 
 
 def _download_snapshot(destination: Path) -> str:
+    """Legacy one-shot bootstrap helper retained for existing regression callers."""
     release, expected_bytes = download_snapshot_chunked(
         destination,
         base=_runtime_url(),
@@ -256,12 +255,9 @@ def _download_snapshot(destination: Path) -> str:
     except BaseException:
         with _LOCK:
             _STATE["last_snapshot_expected_bytes"] = expected_bytes
-            _STATE["last_snapshot_received_bytes"] = (
-                int(destination.stat().st_size) if destination.exists() else None
-            )
+            _STATE["last_snapshot_received_bytes"] = int(destination.stat().st_size) if destination.exists() else None
             _STATE["last_snapshot_validation"] = "failed"
         raise
-
     with _LOCK:
         _STATE["last_snapshot_expected_bytes"] = expected_bytes
         _STATE["last_snapshot_received_bytes"] = actual_bytes
@@ -269,43 +265,49 @@ def _download_snapshot(destination: Path) -> str:
     return release
 
 
-def _run_cycle_sync(stop_requested: threading.Event) -> None:
+def _record_replica_sync(sync: dict[str, Any]) -> None:
+    with _LOCK:
+        if bool(sync.get("bootstrapped")):
+            _STATE["replica_bootstraps"] = int(_STATE.get("replica_bootstraps", 0) or 0) + 1
+            _STATE["last_snapshot_expected_bytes"] = sync.get("bootstrap_bytes")
+            _STATE["last_snapshot_received_bytes"] = sync.get("bootstrap_bytes")
+            _STATE["last_snapshot_validation"] = "passed"
+        else:
+            _STATE["replica_delta_cycles"] = int(_STATE.get("replica_delta_cycles", 0) or 0) + 1
+            _STATE["last_snapshot_validation"] = "not_required_incremental_delta"
+        _STATE["last_snapshot_release"] = sync.get("release_commit")
+        _STATE["last_replica_transport"] = sync.get("last_transport")
+        _STATE["last_replica_watermark"] = sync.get("watermark")
+        _STATE["last_replica_delta_changes"] = sync.get("delta_change_count")
+        _STATE["last_replica_delta_bytes"] = sync.get("delta_payload_bytes")
+
+
+def _run_cycle_sync(stop_requested: threading.Event) -> bool:
     with _LOCK:
         _STATE["cycles"] = int(_STATE.get("cycles", 0) or 0) + 1
         _STATE["last_started_at_monotonic"] = time.monotonic()
-
     error_type: str | None = None
-    error_message: str | None = None
     success = False
     published: set[str] = set()
     try:
+        replica, sync = synchronize_replica(base=_runtime_url(), token=_token(), expected_release=_release_commit())
+        _record_replica_sync(sync)
         with tempfile.TemporaryDirectory(prefix="roi-isolated-certifier-") as raw_dir:
             directory = Path(raw_dir)
             snapshot = directory / "canonical.sqlite3"
             output = directory / "artifacts"
             output.mkdir()
-            release = _download_snapshot(snapshot)
+            clone_method = clone_replica_for_cycle(replica, snapshot)
+            _validate_sqlite_snapshot(snapshot, int(snapshot.stat().st_size))
             with _LOCK:
-                _STATE["last_snapshot_release"] = release
-
+                _STATE["last_local_clone_method"] = clone_method
+            release = _release_commit()
             env = dict(os.environ)
             env["SOLANA_ROI_DB_PATH"] = str(snapshot)
             env["SOLANA_ROI_RELEASE_COMMIT"] = release
             env.pop("SOLANA_ROI_CERTIFICATION_SPLIT_RUNTIME", None)
-            command = [
-                sys.executable,
-                "-m",
-                "solana_roi.certifier_job",
-                "--output-dir",
-                str(output),
-            ]
-            process = subprocess.Popen(
-                command,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            command = [sys.executable, "-m", "solana_roi.certifier_job", "--output-dir", str(output)]
+            process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             with _LOCK:
                 _STATE["active_child_pid"] = process.pid
             started = time.monotonic()
@@ -320,7 +322,6 @@ def _run_cycle_sync(stop_requested: threading.Event) -> None:
                     if surface not in published and _publish_file(surface, output / filename, release):
                         published.add(surface)
                 time.sleep(0.25)
-
             stdout, stderr = process.communicate(timeout=5)
             _ = stdout
             for surface, filename in _SURFACE_FILES.items():
@@ -334,36 +335,34 @@ def _run_cycle_sync(stop_requested: threading.Event) -> None:
             success = True
     except BaseException as exc:
         error_type = type(exc).__name__
-        error_message = _safe_error_message(exc)
         diagnostic = {
             "event": "isolated_certifier_cycle_failed",
             "error_type": error_type,
-            "error_message": error_message,
+            "error_message": _safe_error_message(exc),
             "published_surfaces": sorted(published),
             "release_commit": _release_commit(),
+            "incremental_replica": True,
+            "authoritative_full_snapshot_per_cycle": False,
             "paper_only": True,
             "live_money_authority": False,
             "signing_available": False,
             "transaction_submission_available": False,
         }
-        print(
-            "SOLANA_ROI_CERTIFIER_CYCLE_FAILED "
-            + json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
-            flush=True,
-        )
+        print("SOLANA_ROI_CERTIFIER_CYCLE_FAILED " + json.dumps(diagnostic, sort_keys=True, separators=(",", ":")), flush=True)
     finally:
         with _LOCK:
             _STATE["active_child_pid"] = None
             _STATE["last_completed_at_monotonic"] = time.monotonic()
             _STATE["last_published_surfaces"] = sorted(published)
-            # Preserve the last failure through the next cycle. It is cleared only
-            # by a complete successful e2e+forward+production cycle.
             if success:
                 _STATE["last_error_type"] = None
                 _STATE["successes"] = int(_STATE.get("successes", 0) or 0) + 1
+                _STATE["consecutive_failures"] = 0
             else:
                 _STATE["last_error_type"] = error_type
                 _STATE["failures"] = int(_STATE.get("failures", 0) or 0) + 1
+                _STATE["consecutive_failures"] = int(_STATE.get("consecutive_failures", 0) or 0) + 1
+    return success
 
 
 async def _worker(stop: asyncio.Event) -> None:
@@ -383,8 +382,14 @@ async def _worker(stop: asyncio.Event) -> None:
             pass
         if stop.is_set():
             return
+        success = bool(task.result())
+        with _LOCK:
+            failures = int(_STATE.get("consecutive_failures", 0) or 0)
+        delay = _interval_seconds() if success else _retry_delay_seconds(failures)
+        with _LOCK:
+            _STATE["current_retry_delay_seconds"] = delay
         try:
-            await asyncio.wait_for(stop.wait(), timeout=_interval_seconds())
+            await asyncio.wait_for(stop.wait(), timeout=delay)
         except TimeoutError:
             continue
 
@@ -409,11 +414,7 @@ def health() -> dict[str, Any]:
     with _LOCK:
         state = dict(_STATE)
         freshness = {
-            surface: (
-                max(0.0, time.monotonic() - published)
-                if isinstance(published, (int, float))
-                else None
-            )
+            surface: max(0.0, time.monotonic() - published) if isinstance(published, (int, float)) else None
             for surface, published in _PUBLISHED.items()
         }
     return {
@@ -426,14 +427,17 @@ def health() -> dict[str, Any]:
         "shared_auth_configured": bool(_token()),
         "artifacts": freshness,
         "state": state,
+        "incremental_replica": replica_status(),
         "snapshot_transfer_integrity": {
             "resumable_bounded_chunks": True,
-            "single_giant_http_body_required": False,
-            "advertised_byte_count_required": True,
-            "per_chunk_release_id_offset_and_total_bound": True,
+            "full_snapshot_normal_cycle": False,
+            "full_snapshot_role": "bootstrap_recovery_reconciliation_only",
+            "normal_cycle_transport": "bounded_incremental_delta",
+            "replica_delta_applied_transactionally": True,
+            "replica_identity_release_epoch_schema_and_watermark_bound": True,
+            "child_receives_disposable_local_clone": True,
+            "authoritative_full_snapshot_per_cycle": False,
             "sqlite_header_and_page_geometry_checked": True,
-            "read_only_schema_open_checked": True,
-            "full_integrity_scan_duplicated_before_child": False,
         },
         "child_process_isolation": True,
         "shared_writable_disk": False,
@@ -445,41 +449,27 @@ def health() -> dict[str, Any]:
 
 
 @app.get("/v1/strategy/e2e-status")
-def e2e_status(
-    x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
-) -> dict[str, Any]:
+def e2e_status(x_certification_token: str | None = Header(default=None, alias="X-Certification-Token")) -> dict[str, Any]:
     _require_token(x_certification_token)
     return _cached("e2e")
 
 
 @app.get("/v1/strategy/forward-certification")
-def forward_certification(
-    x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
-) -> dict[str, Any]:
+def forward_certification(x_certification_token: str | None = Header(default=None, alias="X-Certification-Token")) -> dict[str, Any]:
     _require_token(x_certification_token)
     return _cached("forward")
 
 
 @app.get("/v1/strategy/production-proof")
-def production_proof(
-    x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
-) -> dict[str, Any]:
+def production_proof(x_certification_token: str | None = Header(default=None, alias="X-Certification-Token")) -> dict[str, Any]:
     _require_token(x_certification_token)
     return _cached("production")
 
 
 @app.get("/v1/operations/isolated-certifier")
-def isolated_certifier_status(
-    x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
-) -> dict[str, Any]:
+def isolated_certifier_status(x_certification_token: str | None = Header(default=None, alias="X-Certification-Token")) -> dict[str, Any]:
     _require_token(x_certification_token)
     return health()
 
 
-__all__ = [
-    "SERVICE_VERSION",
-    "_download_snapshot",
-    "_validate_sqlite_snapshot",
-    "app",
-    "health",
-]
+__all__ = ["SERVICE_VERSION", "_download_snapshot", "_validate_sqlite_snapshot", "app", "health"]
