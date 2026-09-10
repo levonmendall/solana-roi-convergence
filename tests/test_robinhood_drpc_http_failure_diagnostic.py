@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -87,3 +88,15 @@ def test_installer_wraps_saved_raw_provider_rpc_once() -> None:
     assert bool(getattr(first, "_roi_robinhood_drpc_http_failure_diagnostic", False)) is True
     assert diagnostic.status()["live_money_authority"] is False
     assert diagnostic.status()["logs_credentials"] is False
+
+
+def test_diagnostic_is_installed_only_inside_robinhood_provider_finalizer() -> None:
+    root = Path(__file__).parents[1] / "src" / "solana_roi"
+    production = (root / "production.py").read_text(encoding="utf-8")
+    finalizer = (root / "robinhood_production_provider_finalizer.py").read_text(encoding="utf-8")
+
+    assert "install_robinhood_drpc_http_failure_diagnostic()" not in production
+    install_body = finalizer[finalizer.index("def install_robinhood_production_provider_finalizer("):]
+    assert install_body.index("install_robinhood_provider_runtime_proof()") < install_body.index(
+        "install_robinhood_drpc_http_failure_diagnostic()"
+    ) < install_body.index("_preserve_bounded_transport_aliases()")
