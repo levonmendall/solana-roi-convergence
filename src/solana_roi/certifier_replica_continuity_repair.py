@@ -1,25 +1,27 @@
 from __future__ import annotations
 
-"""Keep certifier replica state durable and release-compatible without weakening truth.
+"""Keep certifier bootstrap and replica state durable across compatible releases.
 
-Certification artifacts remain bound to the exact running release. The SQLite replica
-itself is reusable across a code release when the authoritative replication protocol,
-epoch, schema fingerprint, and watermark continuity still prove compatibility. A
-schema/epoch/protocol discontinuity or invalid local SQLite state still forces a full
-logical bootstrap, but production can require that such a bootstrap only run on a real
-certifier-owned persistent disk so ephemeral replacements cannot repeatedly reread the
-authoritative history-scale database.
+Certification artifacts, manifests, pages, and deltas remain bound to the exact running
+release. Durable SQLite state is reusable across a code release only when the
+replication/bootstrap protocol, epoch, schema fingerprint, and watermark continuity
+prove compatibility. A schema/epoch/protocol discontinuity or invalid local SQLite
+state still forces a fresh logical bootstrap. Production can additionally require that
+history-scale bootstrap work run only on a real certifier-owned persistent disk.
 """
 
+import hashlib
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
+from . import certification_logical_bootstrap_client as logical
 from . import certification_replica_client as client
 from .certification_incremental_replication import REPLICATION_VERSION
 
-REPAIR_VERSION = "certifier-replica-continuity-v2-durable-bootstrap-guard"
+REPAIR_VERSION = "certifier-replica-continuity-v3-partial-cross-release-resume"
 DEFAULT_DURABLE_ROOT = Path("/var/data")
 DEFAULT_REPLICA_NAME = "solana-roi-certifier-replica.sqlite3"
 
@@ -35,6 +37,10 @@ _ORIGINAL_REPLICA_PATH: Any = None
 _ORIGINAL_APPLY_DELTA: Any = None
 _ORIGINAL_SYNCHRONIZE: Any = None
 _ORIGINAL_STATUS: Any = None
+_ORIGINAL_LOGICAL_RESUME_PATHS: Any = None
+_ORIGINAL_LOGICAL_CHECKPOINT_MATCHES: Any = None
+_ORIGINAL_LOGICAL_BOOTSTRAP: Any = None
+_RESUME_CONTEXT = threading.local()
 
 
 def _truthy_env(name: str, default: bool = False) -> bool:
@@ -94,6 +100,108 @@ def _require_durable_before_history_bootstrap(replica: Path) -> None:
 def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -> dict[str, Any]:
     _require_durable_before_history_bootstrap(replica)
     return client._bootstrap(replica, base=base, token=token, expected_release=expected_release)
+
+
+def _stable_resume_paths(destination: Path, *, base: str, expected_release: str) -> tuple[Path, Path]:
+    """Name durable partial state by source/protocol, never by deployment SHA."""
+
+    del expected_release
+    identity = f"{base}|{destination.name}|{logical.BOOTSTRAP_VERSION}|{REPLICATION_VERSION}"
+    key = hashlib.sha256(identity.encode()).hexdigest()[:20]
+    partial = destination.parent / f".certifier-logical-bootstrap-{key}.sqlite3"
+    return partial, partial.with_suffix(partial.suffix + ".state.json")
+
+
+def _compatible_checkpoint_matches(
+    state: dict[str, Any] | None,
+    *,
+    expected_release: str,
+    epoch: str,
+    fingerprint: str,
+    start_watermark: int,
+) -> bool:
+    """Accept an older-release partial only when delta catch-up can preserve truth.
+
+    The saved watermark is deliberately allowed to be older than the current manifest
+    watermark. It is retained as the completed replica's catch-up frontier so every
+    source mutation since the original partial began must be replayed through the
+    authoritative delta journal. A saved watermark ahead of the current manifest is a
+    continuity regression and cannot be reused.
+    """
+
+    setattr(_RESUME_CONTEXT, "reused", False)
+    setattr(_RESUME_CONTEXT, "saved_watermark", None)
+    setattr(_RESUME_CONTEXT, "manifest_watermark", int(start_watermark))
+    setattr(_RESUME_CONTEXT, "release_changed", False)
+    if not isinstance(state, dict):
+        return False
+    try:
+        saved_watermark = int(state.get("start_watermark") if state.get("start_watermark") is not None else -1)
+    except (TypeError, ValueError):
+        return False
+    compatible = (
+        str(state.get("client_version") or "") == logical.CLIENT_VERSION
+        and str(state.get("bootstrap_version") or "") == logical.BOOTSTRAP_VERSION
+        and str(state.get("replication_version") or "") == REPLICATION_VERSION
+        and str(state.get("epoch") or "") == epoch
+        and str(state.get("schema_fingerprint") or "") == fingerprint
+        and saved_watermark >= 0
+        and saved_watermark <= int(start_watermark)
+    )
+    if not compatible:
+        return False
+
+    prior_release = str(state.get("release_commit") or "")
+    release_changed = bool(prior_release and prior_release != expected_release)
+    # The current manifest has already passed exact-release validation before this
+    # matcher is called. Rebinding this metadata is observability only; compatibility
+    # continues to come from protocol/epoch/schema/watermark continuity.
+    state["release_commit"] = expected_release
+    setattr(_RESUME_CONTEXT, "reused", True)
+    setattr(_RESUME_CONTEXT, "saved_watermark", saved_watermark)
+    setattr(_RESUME_CONTEXT, "manifest_watermark", int(start_watermark))
+    setattr(_RESUME_CONTEXT, "release_changed", release_changed)
+    return True
+
+
+def _cross_release_logical_bootstrap(
+    destination: Path,
+    *,
+    base: str,
+    token: str,
+    expected_release: str,
+) -> dict[str, Any]:
+    """Run canonical bootstrap while retaining a compatible partial's old watermark."""
+
+    assert _ORIGINAL_LOGICAL_BOOTSTRAP is not None
+    setattr(_RESUME_CONTEXT, "reused", False)
+    setattr(_RESUME_CONTEXT, "saved_watermark", None)
+    setattr(_RESUME_CONTEXT, "manifest_watermark", None)
+    setattr(_RESUME_CONTEXT, "release_changed", False)
+    result = dict(
+        _ORIGINAL_LOGICAL_BOOTSTRAP(
+            destination,
+            base=base,
+            token=token,
+            expected_release=expected_release,
+        )
+    )
+    if bool(getattr(_RESUME_CONTEXT, "reused", False)):
+        saved_watermark = getattr(_RESUME_CONTEXT, "saved_watermark", None)
+        if not isinstance(saved_watermark, int) or saved_watermark < 0:
+            raise RuntimeError("certification logical bootstrap resume watermark invalid")
+        # This is the critical correctness property: completed tables may predate the
+        # new release, so catch-up must begin at the original bootstrap frontier.
+        result["watermark"] = saved_watermark
+        result["partial_reused"] = True
+        result["partial_reused_across_release"] = bool(getattr(_RESUME_CONTEXT, "release_changed", False))
+        result["partial_resume_manifest_watermark"] = getattr(_RESUME_CONTEXT, "manifest_watermark", None)
+        result["partial_resume_compatibility"] = "bootstrap_version+replication_version+epoch+schema_fingerprint+watermark_nonregression"
+        result["page_release_binding_preserved"] = True
+    else:
+        result["partial_reused"] = False
+        result["partial_reused_across_release"] = False
+    return result
 
 
 def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +280,8 @@ def _status() -> dict[str, Any]:
             "history_bootstrap_permitted": (not required) or durable,
             "ephemeral_history_bootstrap_blocked": required and not durable,
             "replica_compatibility_identity": "replication_version+epoch+schema_fingerprint+watermark",
+            "partial_bootstrap_release_change_requires_restart": False,
+            "partial_bootstrap_preserves_original_watermark": True,
             "release_change_requires_bootstrap": False,
             "artifact_release_binding_preserved": True,
             "paper_only": PAPER_ONLY,
@@ -185,13 +295,23 @@ def _status() -> dict[str, Any]:
 
 def configure_certifier_replica_continuity_repair() -> None:
     global _INSTALLED, _ORIGINAL_REPLICA_PATH, _ORIGINAL_APPLY_DELTA, _ORIGINAL_SYNCHRONIZE, _ORIGINAL_STATUS
+    global _ORIGINAL_LOGICAL_RESUME_PATHS, _ORIGINAL_LOGICAL_CHECKPOINT_MATCHES, _ORIGINAL_LOGICAL_BOOTSTRAP
     if _INSTALLED:
         return
     _ORIGINAL_REPLICA_PATH = client._replica_path
     _ORIGINAL_APPLY_DELTA = client._apply_delta
     _ORIGINAL_SYNCHRONIZE = client.synchronize_replica
     _ORIGINAL_STATUS = client.status
+    _ORIGINAL_LOGICAL_RESUME_PATHS = logical._resume_paths
+    _ORIGINAL_LOGICAL_CHECKPOINT_MATCHES = logical._checkpoint_matches
+    _ORIGINAL_LOGICAL_BOOTSTRAP = logical.logical_bootstrap
 
+    logical._resume_paths = _stable_resume_paths  # type: ignore[assignment]
+    logical._checkpoint_matches = _compatible_checkpoint_matches  # type: ignore[assignment]
+    logical.logical_bootstrap = _cross_release_logical_bootstrap  # type: ignore[assignment]
+    # certification_replica_client imported the function by name, so update that
+    # reference explicitly as well.
+    client.logical_bootstrap = _cross_release_logical_bootstrap  # type: ignore[assignment]
     client._replica_path = _replica_path  # type: ignore[assignment]
     client._apply_delta = _apply_delta  # type: ignore[assignment]
     client.synchronize_replica = _synchronize_replica  # type: ignore[assignment]
@@ -212,6 +332,8 @@ def status() -> dict[str, Any]:
         "history_bootstrap_permitted": (not required) or durable,
         "ephemeral_history_bootstrap_blocked": required and not durable,
         "release_change_requires_bootstrap": False,
+        "partial_bootstrap_release_change_requires_restart": False,
+        "partial_bootstrap_preserves_original_watermark": True,
         "replica_compatibility_identity": "replication_version+epoch+schema_fingerprint+watermark",
         "artifact_release_binding_preserved": True,
         "strategy_thresholds_changed": STRATEGY_THRESHOLDS_CHANGED,
