@@ -18,6 +18,9 @@ from .robinhood_alchemy_budget_guard import (
     install_robinhood_alchemy_budget_guard,
     status as alchemy_budget_guard_status,
 )
+from .robinhood_drpc_http_failure_diagnostic import (
+    install_robinhood_drpc_http_failure_diagnostic,
+)
 from .robinhood_event_driven_settlement import (
     install_robinhood_event_driven_settlement,
     status as event_driven_settlement_status,
@@ -45,7 +48,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v11-provider-pool-throughput"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v12-drpc-http-failure-proof"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -190,6 +193,9 @@ def install_robinhood_production_provider_finalizer(
     # top-level production facade. It chain-verifies the configured preferred private
     # provider before authoritative use/failback and records redacted traffic counters.
     install_robinhood_provider_runtime_proof()
+    # Diagnostic-only attribution wraps the saved raw provider RPC after runtime proof
+    # has established that contract. It changes no provider authority or health gate.
+    install_robinhood_drpc_http_failure_diagnostic()
     _preserve_bounded_transport_aliases()
 
     current_run = plane_cls.run
