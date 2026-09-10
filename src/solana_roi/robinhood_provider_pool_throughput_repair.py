@@ -13,7 +13,7 @@ from . import robinhood_provider_budget_transport as budget
 from . import robinhood_provider_failover as failover
 
 
-THROUGHPUT_REPAIR_VERSION = "robinhood-provider-pool-throughput-v2-live-proof"
+THROUGHPUT_REPAIR_VERSION = "robinhood-provider-pool-throughput-v3-budgeted-private-pool"
 DEFAULT_PROVIDER_POOL_LIVE_MARKET_CAP = 16
 MAX_PROVIDER_POOL_LIVE_MARKET_CAP = 64
 DEFAULT_PRIVATE_RESEARCH_POLL_SECONDS = 1.0
@@ -63,6 +63,8 @@ def _provider_kind(provider: Any | None) -> str:
         host = (urlparse(str(provider.http)).hostname or "").lower()
     except Exception:
         return "private_rpc"
+    if "chainstack" in host:
+        return "chainstack"
     if "drpc" in host:
         return "drpc"
     if "alchemy" in host:
@@ -70,7 +72,7 @@ def _provider_kind(provider: Any | None) -> str:
     return "private_rpc"
 
 
-def _active_non_alchemy_private_provider() -> Any | None:
+def _active_private_provider() -> Any | None:
     try:
         active = failover.active_provider()
     except Exception:
@@ -80,21 +82,28 @@ def _active_non_alchemy_private_provider() -> Any | None:
     candidate = _normalized(getattr(active, "http", ""))
     if not candidate or candidate == _normalized(runtime.ROBINHOOD_PUBLIC_RPC):
         return None
-    alchemy = _normalized(os.getenv("ROBINHOOD_RPC_URL") or "")
-    if alchemy and candidate == alchemy:
+    return active
+
+
+def _active_non_alchemy_private_provider() -> Any | None:
+    """Compatibility helper retained for diagnostics; capacity no longer depends on it."""
+    active = _active_private_provider()
+    if active is None or _provider_kind(active) == "alchemy":
         return None
     return active
 
 
 def _effective_live_market_cap() -> int:
+    """Keep the configured market universe while any budgeted private provider is healthy."""
     configured = _configured_pool_cap()
-    if _active_non_alchemy_private_provider() is not None:
+    if _active_private_provider() is not None:
         return configured
     return min(configured, 16)
 
 
 def _research_target() -> tuple[str, str, float, int | None]:
-    active = _active_non_alchemy_private_provider()
+    """Use whichever private provider failover selected; capacity layer governs consumption."""
+    active = _active_private_provider()
     if active is not None:
         poll = _float_env(
             "ROBINHOOD_PROVIDER_POOL_RESEARCH_POLL_SECONDS",
@@ -182,7 +191,7 @@ async def _provider_pool_research_async(self: Any, stop: Any) -> None:
                 research_provider_generation=generation,
                 research_poll_seconds=poll_seconds,
                 provider_pool_live_market_cap=_effective_live_market_cap(),
-                provider_pool_capacity_source="active_private_provider" if provider_kind not in {"public_rpc", "none"} else "public_research_fallback",
+                provider_pool_capacity_source="budgeted_active_private_provider" if provider_kind not in {"public_rpc", "none"} else "public_research_fallback",
             )
             try:
                 await budget._research_pass(self, rpc)
@@ -230,7 +239,7 @@ def _throughput_augment_status_wrapper(original_factory: Callable[..., Any]) -> 
                     "provider_pool_live_market_cap": _effective_live_market_cap(),
                     "configured_provider_pool_live_market_cap": _configured_pool_cap(),
                     "provider_pool_cap_is_canonical": True,
-                    "alchemy_named_cap_can_restrict_active_drpc": False,
+                    "alchemy_named_cap_can_restrict_budgeted_private_pool": False,
                     "research_screening_provider_kind": research.get("research_provider_kind"),
                     "research_screening_private_provider": bool(research.get("research_provider_private", False)),
                     "research_screening_provider_generation": research.get("research_provider_generation"),
@@ -238,8 +247,10 @@ def _throughput_augment_status_wrapper(original_factory: Callable[..., Any]) -> 
                     "research_provider_successful_passes": int(stats.get("passes", 0) or 0),
                     "research_provider_failures": int(stats.get("failures", 0) or 0),
                     "research_provider_last_error_type": stats.get("last_error_type"),
-                    "broad_research_uses_active_non_alchemy_private_provider": True,
-                    "alchemy_active_uses_public_research_fallback": True,
+                    "broad_research_uses_active_private_provider": True,
+                    "alchemy_active_uses_budgeted_private_research": True,
+                    "alchemy_active_uses_public_research_fallback": False,
+                    "public_research_fallback_only_without_private_provider": True,
                     "research_transport_authority": "promotion_only_no_paper_entry",
                     "paper_entry_still_requires_subsequent_private_live_event": True,
                 }
@@ -263,7 +274,7 @@ def _throughput_module_status() -> dict[str, Any]:
             "provider_pool_live_market_cap": _effective_live_market_cap(),
             "configured_provider_pool_live_market_cap": _configured_pool_cap(),
             "provider_pool_cap_is_canonical": True,
-            "alchemy_named_cap_can_restrict_active_drpc": False,
+            "alchemy_named_cap_can_restrict_budgeted_private_pool": False,
             "research_screening_provider_kind": provider_kind,
             "research_screening_private_provider": provider_kind not in {"public_rpc", "none"},
             "research_screening_provider_generation": generation,
@@ -271,8 +282,10 @@ def _throughput_module_status() -> dict[str, Any]:
             "research_provider_successful_passes": int(stats.get("passes", 0) or 0),
             "research_provider_failures": int(stats.get("failures", 0) or 0),
             "research_provider_last_error_type": stats.get("last_error_type"),
-            "broad_research_uses_active_non_alchemy_private_provider": True,
-            "alchemy_active_uses_public_research_fallback": True,
+            "broad_research_uses_active_private_provider": True,
+            "alchemy_active_uses_budgeted_private_research": True,
+            "alchemy_active_uses_public_research_fallback": False,
+            "public_research_fallback_only_without_private_provider": True,
             "research_transport_authority": "promotion_only_no_paper_entry",
             "paper_entry_still_requires_subsequent_private_live_event": True,
             "paper_only": True,
@@ -294,8 +307,8 @@ def install_robinhood_provider_pool_throughput_repair() -> None:
     _ORIGINAL_AUGMENT_STATUS_WRAPPER = budget._augment_status_wrapper
     _ORIGINAL_MODULE_STATUS = budget.status
 
-    budget.BUDGET_VERSION = "robinhood-production-ws-transport-v4-provider-pool-throughput"
-    budget.SUBSCRIPTION_MODE = "factory_discovery_plus_provider_pool_research_promoted_live_shortlist"
+    budget.BUDGET_VERSION = "robinhood-production-ws-transport-v5-budgeted-private-pool"
+    budget.SUBSCRIPTION_MODE = "factory_discovery_plus_budgeted_private_pool_research_promoted_live_shortlist"
     budget._live_market_cap = _effective_live_market_cap
     budget._research_async = _provider_pool_research_async
     budget._augment_status_wrapper = _throughput_augment_status_wrapper
@@ -306,11 +319,13 @@ def install_robinhood_provider_pool_throughput_repair() -> None:
 
 def status() -> dict[str, Any]:
     stats = _research_stats()
+    active = _active_private_provider()
     return {
         "version": THROUGHPUT_REPAIR_VERSION,
         "installed": _INSTALLED,
         "configured_provider_pool_live_market_cap": _configured_pool_cap(),
         "effective_live_market_cap": _effective_live_market_cap(),
+        "active_private_provider": _provider_kind(active),
         "active_non_alchemy_private_provider": _provider_kind(_active_non_alchemy_private_provider()),
         "private_research_poll_seconds": _float_env(
             "ROBINHOOD_PROVIDER_POOL_RESEARCH_POLL_SECONDS",
@@ -322,6 +337,8 @@ def status() -> dict[str, Any]:
             DEFAULT_PUBLIC_RESEARCH_POLL_SECONDS,
             1.0,
         ),
+        "alchemy_active_uses_budgeted_private_research": True,
+        "alchemy_active_uses_public_research_fallback": False,
         "research_provider_successful_passes": int(stats.get("passes", 0) or 0),
         "research_provider_failures": int(stats.get("failures", 0) or 0),
         "research_provider_last_error_type": stats.get("last_error_type"),
