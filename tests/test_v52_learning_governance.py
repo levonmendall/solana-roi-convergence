@@ -33,8 +33,8 @@ def test_authority_enables_only_governed_forward_automatic_evolution() -> None:
     policy = authority()
     g = policy["governance"]
     assert g["historical_promotion_authority"] is False
-    assert g["automatic_parameter_mutation_authority"] is True
-    assert g["automatic_signal_promotion_authority"] is True
+    assert g["automatic_parameter_mutation_authority"] is False
+    assert g["automatic_signal_promotion_authority"] is False
     assert g["automatic_forward_promotion_authority"] is True
     assert g["automatic_forward_demotion_authority"] is True
     assert g["promotion_requires_same_stream_forward_evidence"] is True
