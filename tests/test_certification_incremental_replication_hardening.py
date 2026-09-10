@@ -116,6 +116,59 @@ def test_bootstrap_identity_keeps_sqlite_sequence_watermark_after_ack_pruning(tm
         store.close()
 
 
+def test_delta_replay_does_not_refire_canonical_user_trigger_side_effects(tmp_path: Path) -> None:
+    replica = tmp_path / "replica.sqlite3"
+    connection = sqlite3.connect(replica)
+    try:
+        connection.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY,value TEXT NOT NULL)")
+        connection.execute("CREATE TABLE audit(k TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        connection.execute(
+            "CREATE TRIGGER sample_audit AFTER INSERT ON sample BEGIN "
+            "INSERT INTO audit(k,value) VALUES (lower(hex(randomblob(16))),'local-side-effect'); END"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    state = {
+        "client_version": replica_client.CLIENT_VERSION,
+        "release_commit": "a" * 40,
+        "replication_version": replication.REPLICATION_VERSION,
+        "epoch": "epoch-12345678",
+        "schema_fingerprint": "b" * 64,
+        "watermark": 10,
+    }
+    replica_client._atomic_state(replica_client._state_path(replica), state)
+    payload = {
+        "to_watermark": 12,
+        "source_change_count": 2,
+        "payload_bytes": 100,
+        "changes": [
+            {
+                "table": "sample",
+                "sql": 'INSERT OR REPLACE INTO "sample"("id","value") VALUES (1,\'canonical\')',
+            },
+            {
+                "table": "audit",
+                "sql": 'INSERT OR REPLACE INTO "audit"("k","value") VALUES (\'source-key\',\'source-side-effect\')',
+            },
+        ],
+    }
+    result = replica_client._apply_delta(replica, state, payload)
+    assert result["watermark"] == 12
+
+    check = sqlite3.connect(replica)
+    try:
+        assert check.execute("SELECT id,value FROM sample").fetchall() == [(1, "canonical")]
+        assert check.execute("SELECT k,value FROM audit").fetchall() == [("source-key", "source-side-effect")]
+        trigger = check.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='sample_audit'"
+        ).fetchone()
+        assert trigger is not None and "randomblob" in str(trigger[0]).lower()
+    finally:
+        check.close()
+
+
 def test_storeless_composition_stays_up_but_replication_requests_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", "test-token")
     app = FastAPI()
