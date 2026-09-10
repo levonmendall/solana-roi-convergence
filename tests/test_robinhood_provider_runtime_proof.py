@@ -124,8 +124,26 @@ def test_wrong_chain_drpc_cannot_reclaim_from_healthy_alchemy(monkeypatch) -> No
 
 def test_runtime_status_counts_traffic_without_endpoint_or_secret(monkeypatch) -> None:
     _production_legacy_drpc(monkeypatch)
-    monkeypatch.setattr(proof, "_ORIGINAL_MARK_SUCCESS", failover._mark_success)
-    monkeypatch.setattr(proof, "_ORIGINAL_STATUS", failover.status)
+
+    # This regression also runs inside the fully composed production interpreter,
+    # where failover._mark_success/status may already be wrapped by this proof layer.
+    # Stub the pre-proof delegates explicitly so the test validates augmentation
+    # without recursively feeding the wrapper back into itself.
+    def original_mark_success(name: str, *, transport_kind: str) -> None:
+        with failover._LOCK:
+            state = failover._state_for_locked(name)
+            state[f"{transport_kind}_failures"] = 0
+
+    monkeypatch.setattr(proof, "_ORIGINAL_MARK_SUCCESS", original_mark_success)
+    monkeypatch.setattr(
+        proof,
+        "_ORIGINAL_STATUS",
+        lambda: {
+            "version": failover.FAILOVER_VERSION,
+            "provider_count": len(failover.providers()),
+            "provider_names": [item.name for item in failover.providers()],
+        },
+    )
 
     proof._mark_success_with_telemetry("backup", transport_kind="http")
     proof._mark_success_with_telemetry("backup", transport_kind="ws")
@@ -155,8 +173,9 @@ def test_runtime_proof_stays_inside_existing_robinhood_provider_finalizer() -> N
         "from .production_system import"
     )
 
-    # Runtime proof is composed immediately after the existing outermost provider
-    # failover wrapper, preserving one Robinhood provider authority chain.
-    assert finalizer.index("install_robinhood_provider_failover()") < finalizer.index(
+    # Search only inside the composition function so the earlier helper definition
+    # cannot be mistaken for the actual alias-preservation call.
+    install_body = finalizer[finalizer.index("def install_robinhood_production_provider_finalizer("):]
+    assert install_body.index("install_robinhood_provider_failover()") < install_body.index(
         "install_robinhood_provider_runtime_proof()"
-    ) < finalizer.index("_preserve_bounded_transport_aliases()")
+    ) < install_body.index("_preserve_bounded_transport_aliases()")
