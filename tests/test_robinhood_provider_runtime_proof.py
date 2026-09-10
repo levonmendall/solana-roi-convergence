@@ -5,6 +5,7 @@ import json
 import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from solana_roi import robinhood_drpc_environment as drpc
@@ -21,6 +22,7 @@ _ENV = (
     "ROBINHOOD_BACKUP_WS_URL",
     "ROBINHOOD_PROVIDER_PRIMARY",
     "ROBINHOOD_PROVIDER_FAILOVER_COOLDOWN_SECONDS",
+    "ROBINHOOD_DRPC_METHOD_UNAVAILABLE_COOLDOWN_SECONDS",
 )
 
 
@@ -66,6 +68,16 @@ def _capability_base(calls: list[tuple[str, str]]):
     return base
 
 
+def _http_jsonrpc_error(status: int, code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://redacted.invalid")
+    response = httpx.Response(
+        status,
+        request=request,
+        json={"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": "SECRET provider body"}},
+    )
+    return httpx.HTTPStatusError("SECRET exception", request=request, response=response)
+
+
 def test_preferred_drpc_proves_chain_and_read_before_first_authoritative_rpc(monkeypatch) -> None:
     _production_legacy_drpc(monkeypatch)
     calls: list[tuple[str, str]] = []
@@ -105,6 +117,7 @@ def test_recovered_drpc_reclaims_primary_only_after_read_capability(monkeypatch)
     assert state["chain_verified"] is True
     assert state["read_capability_verified"] is True
     assert state["failbacks_to"] == 1
+    assert state.get("capability_quarantine_reason") is None
     assert "drpc.live" in rpc.rpc_url
 
 
@@ -132,6 +145,7 @@ def test_wrong_chain_drpc_cannot_reclaim_from_healthy_alchemy(monkeypatch) -> No
     assert state["chain_verified"] is False
     assert state["read_capability_verified"] is False
     assert state["cooldown_until"] > time.monotonic()
+    assert state.get("capability_quarantine_reason") is None
     assert rpc.rpc_url == primary.http
 
 
@@ -148,12 +162,80 @@ def test_chain_only_provider_cannot_be_marked_healthy(monkeypatch) -> None:
     monkeypatch.setattr(failover, "_ORIGINAL_RPC", base)
     rpc = SimpleNamespace(rpc_url=failover.active_provider().http)
 
+    before = time.monotonic()
     assert asyncio.run(proof._verify_preferred_if_needed(rpc)) is False
     state = failover._PROVIDER_STATE["backup"]
     assert state["chain_verified"] is False
     assert state["read_capability_verified"] is False
     assert state["last_failure_type"] == "TimeoutError"
-    assert state["cooldown_until"] > time.monotonic()
+    assert state["cooldown_until"] > before
+    assert state["cooldown_until"] < before + 60
+    assert state.get("capability_quarantine_reason") is None
+
+
+def test_drpc_method_not_found_capability_failure_gets_long_quarantine(monkeypatch, capsys) -> None:
+    _production_legacy_drpc(monkeypatch)
+    monkeypatch.setenv("ROBINHOOD_DRPC_METHOD_UNAVAILABLE_COOLDOWN_SECONDS", "900")
+
+    async def base(rpc_self, method, params):
+        if method == "eth_chainId":
+            return hex(failover.runtime.ROBINHOOD_CHAIN_ID)
+        if method == "eth_blockNumber":
+            raise _http_jsonrpc_error(400, -32601)
+        raise AssertionError(method)
+
+    monkeypatch.setattr(failover, "_ORIGINAL_RPC", base)
+    rpc = SimpleNamespace(rpc_url=failover.active_provider().http)
+    before = time.monotonic()
+
+    assert asyncio.run(proof._verify_preferred_if_needed(rpc)) is False
+    state = failover._PROVIDER_STATE["backup"]
+    assert state["chain_verified"] is False
+    assert state["read_capability_verified"] is False
+    assert state["last_failure_type"] == "HTTPStatusError"
+    assert state["last_capability_jsonrpc_code"] == -32601
+    assert state["capability_quarantine_reason"] == "jsonrpc_method_not_found"
+    assert state["cooldown_until"] >= before + 899
+    assert failover.active_name() == "primary"
+
+    output = capsys.readouterr().out
+    assert "ROBINHOOD_PROVIDER_CAPABILITY_QUARANTINED" in output
+    assert "provider_kind=drpc" in output
+    assert "reason=jsonrpc_method_not_found" in output
+    assert "jsonrpc_code=-32601" in output
+    assert "cooldown_seconds=900" in output
+    assert "SECRET" not in output
+    assert "not-a-real-secret" not in output
+    assert "lb.drpc.live" not in output
+
+
+def test_drpc_quarantine_self_expires_and_allows_recovery_probe(monkeypatch) -> None:
+    _production_legacy_drpc(monkeypatch)
+    with failover._LOCK:
+        state = failover._state_for_locked("backup")
+        state["cooldown_until"] = time.monotonic() + 900
+        state["capability_quarantine_reason"] = "jsonrpc_method_not_found"
+        state["last_capability_jsonrpc_code"] = -32601
+        failover._ACTIVE_NAME = "primary"
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(failover, "_ORIGINAL_RPC", _capability_base(calls))
+    primary = failover._provider_by_name("primary")
+    rpc = SimpleNamespace(rpc_url=primary.http)
+
+    assert asyncio.run(proof._verify_preferred_if_needed(rpc)) is False
+    assert calls == []
+
+    with failover._LOCK:
+        state = failover._state_for_locked("backup")
+        state["cooldown_until"] = 0.0
+
+    assert asyncio.run(proof._verify_preferred_if_needed(rpc)) is True
+    assert failover.active_name() == "backup"
+    state = failover._PROVIDER_STATE["backup"]
+    assert state["capability_quarantine_reason"] is None
+    assert state["last_capability_jsonrpc_code"] is None
+    assert state["read_capability_verified"] is True
 
 
 def test_runtime_status_counts_traffic_without_endpoint_or_secret(monkeypatch) -> None:
@@ -190,9 +272,41 @@ def test_runtime_status_counts_traffic_without_endpoint_or_secret(monkeypatch) -
     assert status["provider_traffic"]["backup"]["http_successes"] == 1
     assert status["provider_traffic"]["backup"]["ws_successes"] == 1
     assert status["provider_traffic"]["backup"]["read_capability_verified"] is True
+    assert status["provider_traffic"]["backup"]["capability_quarantined"] is False
+    assert status["drpc_method_unavailable_cooldown_seconds"] == 900.0
     assert "not-a-real-secret" not in encoded
     assert "lb.drpc.live" not in encoded
     assert "alchemy.com" not in encoded
+
+
+def test_runtime_status_exposes_safe_drpc_quarantine_state(monkeypatch) -> None:
+    _production_legacy_drpc(monkeypatch)
+    monkeypatch.setattr(
+        proof,
+        "_ORIGINAL_STATUS",
+        lambda: {
+            "version": failover.FAILOVER_VERSION,
+            "provider_count": len(failover.providers()),
+            "provider_names": [item.name for item in failover.providers()],
+        },
+    )
+    with failover._LOCK:
+        state = failover._state_for_locked("backup")
+        state["cooldown_until"] = time.monotonic() + 900
+        state["capability_quarantine_reason"] = "jsonrpc_method_not_found"
+        state["last_capability_jsonrpc_code"] = -32601
+        failover._ACTIVE_NAME = "primary"
+
+    status = proof._status_with_runtime_proof()
+    encoded = json.dumps(status, sort_keys=True)
+    drpc_state = status["provider_traffic"]["backup"]
+    assert drpc_state["capability_quarantined"] is True
+    assert drpc_state["capability_quarantine_reason"] == "jsonrpc_method_not_found"
+    assert 0 < drpc_state["capability_quarantine_remaining_seconds"] <= 900
+    assert drpc_state["last_capability_jsonrpc_code"] == -32601
+    assert "not-a-real-secret" not in encoded
+    assert "lb.drpc.live" not in encoded
+    assert "SECRET" not in encoded
 
 
 def test_runtime_request_failure_telemetry_is_secret_free(monkeypatch, capsys) -> None:
@@ -223,3 +337,4 @@ def test_runtime_proof_stays_inside_existing_robinhood_provider_finalizer() -> N
     assert install_body.index("install_robinhood_provider_failover()") < install_body.index(
         "install_robinhood_provider_runtime_proof()"
     ) < install_body.index("_preserve_bounded_transport_aliases()")
+    assert proof.DEFAULT_DRPC_METHOD_UNAVAILABLE_COOLDOWN_SECONDS == 900.0
