@@ -29,32 +29,30 @@ def _endpoint_pair(key: str) -> tuple[str, str]:
     return f"{DRPC_HTTP_BASE}/{encoded}", f"{DRPC_WS_BASE}/{encoded}"
 
 
-def _provider_name(http_url: str, fallback: str) -> str:
+def _is_drpc_endpoint(value: str) -> bool:
     try:
-        host = (urlparse(str(http_url or "").strip()).hostname or "").lower()
+        host = (urlparse(str(value or "").strip()).hostname or "").lower()
     except Exception:
-        return fallback
-    if host == "lb.drpc.live" or host.endswith(".drpc.live"):
-        return "drpc"
-    if host.endswith("alchemy.com"):
-        return "alchemy"
-    return fallback
+        return False
+    return host == "lb.drpc.live" or host.endswith(".drpc.live")
 
 
-def _legacy_primary_pair() -> tuple[str, str] | None:
-    http_url = (os.getenv("ROBINHOOD_RPC_URL") or "").strip()
-    if not http_url:
-        return None
-    ws_url = (os.getenv("ROBINHOOD_WS_URL") or "").strip()
-    if not ws_url:
-        try:
-            parsed = urlparse(http_url)
-        except Exception:
-            return None
-        if parsed.scheme.lower() != "https" or not parsed.netloc:
-            return None
-        ws_url = parsed._replace(scheme="wss").geturl()
-    return http_url, ws_url
+def _resolve_legacy_drpc_preference(http_url: str, ws_url: str) -> None:
+    """Map the semantic dRPC preference onto the legacy internal backup name.
+
+    The failover pool historically names legacy pairs ``primary`` and ``backup``.
+    Keep that compatibility contract intact, but when the configured preferred
+    provider is ``drpc`` and the backup pair is verifiably dRPC, resolve the
+    process-local preference to ``backup`` before production composition imports
+    the failover layer. This avoids synthesizing a stale JSON provider pool while
+    still making dRPC the actual active provider.
+    """
+
+    preferred = (os.getenv("ROBINHOOD_PROVIDER_PRIMARY") or "").strip().lower()
+    if preferred != "drpc":
+        return
+    if _is_drpc_endpoint(http_url) and _is_drpc_endpoint(ws_url):
+        os.environ["ROBINHOOD_PROVIDER_PRIMARY"] = "backup"
 
 
 def _append_json_provider(http_url: str, ws_url: str) -> bool:
@@ -84,31 +82,14 @@ def _append_json_provider(http_url: str, ws_url: str) -> bool:
     return True
 
 
-def _materialize_semantic_pool(http_url: str, ws_url: str) -> bool:
-    primary = _legacy_primary_pair()
-    if primary is None:
-        return False
-    primary_http, primary_ws = primary
-    if not primary_http or not primary_ws:
-        return False
-    primary_name = _provider_name(primary_http, "primary")
-    payload = [
-        {"name": primary_name, "http": primary_http, "ws": primary_ws},
-        {"name": "drpc", "http": http_url, "ws": ws_url},
-    ]
-    os.environ["ROBINHOOD_RPC_ENDPOINTS_JSON"] = json.dumps(payload, separators=(",", ":"))
-    return True
-
-
 def configure_robinhood_drpc_backup() -> bool:
-    """Materialize the Render-held dRPC key into the private provider-pool contract.
+    """Materialize the Render-held dRPC key into the existing provider-pair contract.
 
-    Explicit JSON or backup configuration retains precedence. When production is
-    still using the legacy primary-only variables, promote that pair plus dRPC into
-    a semantically named JSON provider pool. This lets ROBINHOOD_PROVIDER_PRIMARY
-    select `drpc` deterministically while preserving the original private provider
-    (normally Alchemy) as failover capacity. No endpoint or key is returned, logged,
-    or exposed through status telemetry.
+    Explicit backup URLs retain precedence. If the runtime already uses the JSON
+    provider pool, dRPC is appended there with its semantic name. Otherwise the
+    existing legacy backup variables are populated and a semantic ``drpc`` primary
+    preference is resolved to that legacy backup pair before production composition.
+    No endpoint or key is returned, logged, or exposed through status telemetry.
     """
 
     key = _api_key()
@@ -122,13 +103,14 @@ def configure_robinhood_drpc_backup() -> bool:
     explicit_http = (os.getenv("ROBINHOOD_BACKUP_RPC_URL") or "").strip()
     explicit_ws = (os.getenv("ROBINHOOD_BACKUP_WS_URL") or "").strip()
     if explicit_http or explicit_ws:
-        return bool(explicit_http and explicit_ws)
-
-    if _materialize_semantic_pool(http_url, ws_url):
+        if not (explicit_http and explicit_ws):
+            return False
+        _resolve_legacy_drpc_preference(explicit_http, explicit_ws)
         return True
 
     os.environ["ROBINHOOD_BACKUP_RPC_URL"] = http_url
     os.environ["ROBINHOOD_BACKUP_WS_URL"] = ws_url
+    _resolve_legacy_drpc_preference(http_url, ws_url)
     return True
 
 
