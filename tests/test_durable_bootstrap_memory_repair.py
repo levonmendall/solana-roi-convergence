@@ -8,6 +8,18 @@ from solana_roi import durable_bootstrap_memory_repair as repair
 from solana_roi.durable_engine import DurablePaperTradingEngine
 from solana_roi.observation_store import ObservationEventStore
 
+GIB = 1024 * 1024 * 1024
+MIB = 1024 * 1024
+
+
+def _healthy_memory():
+    return {
+        "current_bytes": 100 * MIB,
+        "max_bytes": 2 * GIB,
+        "headroom_bytes": 2 * GIB - 100 * MIB,
+        "fraction": (100 * MIB) / (2 * GIB),
+    }
+
 
 def _store_with_events(tmp_path, count: int = 9) -> ObservationEventStore:
     store = ObservationEventStore(tmp_path / "events.sqlite3")
@@ -25,11 +37,7 @@ def test_bounded_restore_preserves_full_hash_verification_and_reclaims_during_sc
 
     monkeypatch.setattr(repair, "VERIFY_CACHE_RELEASE_ROWS", 2)
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
-    monkeypatch.setattr(
-        repair,
-        "_cgroup_memory",
-        lambda: {"current_bytes": 100, "max_bytes": 1_000, "headroom_bytes": 900, "fraction": 0.1},
-    )
+    monkeypatch.setattr(repair, "_cgroup_memory", _healthy_memory)
     monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: releases.append(str(path)) or True)
 
     verified, through, latest_engine = repair._bounded_verify_engine_snapshot(engine)
@@ -49,11 +57,7 @@ def test_bounded_restore_still_fails_on_hash_chain_corruption(tmp_path, monkeypa
     engine.store = store
 
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
-    monkeypatch.setattr(
-        repair,
-        "_cgroup_memory",
-        lambda: {"current_bytes": 100, "max_bytes": 1_000, "headroom_bytes": 900, "fraction": 0.1},
-    )
+    monkeypatch.setattr(repair, "_cgroup_memory", _healthy_memory)
 
     assert repair._bounded_verify_engine_snapshot(engine) == (False, 0, None)
     store.close()
@@ -64,8 +68,18 @@ def test_raw_cgroup_guard_reclaims_before_critical_boundary(tmp_path, monkeypatc
     source.write_bytes(b"sqlite")
     states = iter(
         [
-            {"current_bytes": 1_800, "max_bytes": 2_000, "headroom_bytes": 200, "fraction": 0.90},
-            {"current_bytes": 1_000, "max_bytes": 2_000, "headroom_bytes": 1_000, "fraction": 0.50},
+            {
+                "current_bytes": 1800 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 248 * MIB,
+                "fraction": (1800 * MIB) / (2 * GIB),
+            },
+            {
+                "current_bytes": 1000 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 1048 * MIB,
+                "fraction": (1000 * MIB) / (2 * GIB),
+            },
         ]
     )
     releases: list[str] = []
@@ -75,7 +89,7 @@ def test_raw_cgroup_guard_reclaims_before_critical_boundary(tmp_path, monkeypatc
 
     result = repair._guard_raw_cgroup(source)
 
-    assert result["fraction"] == 0.50
+    assert result["fraction"] < 0.50
     assert releases == [str(source)]
 
 
@@ -86,7 +100,12 @@ def test_raw_cgroup_guard_fails_closed_if_reclaim_cannot_restore_headroom(tmp_pa
     monkeypatch.setattr(
         repair,
         "_cgroup_memory",
-        lambda: {"current_bytes": 1_950, "max_bytes": 2_000, "headroom_bytes": 50, "fraction": 0.975},
+        lambda: {
+            "current_bytes": 1950 * MIB,
+            "max_bytes": 2 * GIB,
+            "headroom_bytes": 98 * MIB,
+            "fraction": (1950 * MIB) / (2 * GIB),
+        },
     )
     monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: True)
 
