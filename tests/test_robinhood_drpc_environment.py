@@ -4,19 +4,24 @@ import json
 from pathlib import Path
 
 from solana_roi import robinhood_drpc_environment as drpc
+from solana_roi import robinhood_provider_failover as failover
 
 
 _ENV_NAMES = (
     *drpc.DRPC_KEY_ENV_NAMES,
     "ROBINHOOD_RPC_ENDPOINTS_JSON",
+    "ROBINHOOD_RPC_URL",
+    "ROBINHOOD_WS_URL",
     "ROBINHOOD_BACKUP_RPC_URL",
     "ROBINHOOD_BACKUP_WS_URL",
+    "ROBINHOOD_PROVIDER_PRIMARY",
 )
 
 
 def _clear(monkeypatch) -> None:
     for name in _ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    failover.reset_for_tests()
 
 
 def test_missing_key_fails_closed_without_provider_mutation(monkeypatch) -> None:
@@ -55,6 +60,48 @@ def test_drpc_is_appended_after_existing_json_provider(monkeypatch) -> None:
     assert len(json.loads(drpc.os.environ["ROBINHOOD_RPC_ENDPOINTS_JSON"])) == 2
 
 
+def test_legacy_alchemy_pair_becomes_semantic_pool_and_drpc_is_preferred(monkeypatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("ROBINHOOD_DRPC_API_KEY", "secret")
+    monkeypatch.setenv(
+        "ROBINHOOD_RPC_URL",
+        "https://robinhood-mainnet.g.alchemy.com/v2/redacted",
+    )
+    monkeypatch.setenv(
+        "ROBINHOOD_WS_URL",
+        "wss://robinhood-mainnet.g.alchemy.com/v2/redacted",
+    )
+    monkeypatch.setenv("ROBINHOOD_PROVIDER_PRIMARY", "drpc")
+
+    assert drpc.configure_robinhood_drpc_backup() is True
+    providers = json.loads(drpc.os.environ["ROBINHOOD_RPC_ENDPOINTS_JSON"])
+    assert [item["name"] for item in providers] == ["alchemy", "drpc"]
+    assert "ROBINHOOD_BACKUP_RPC_URL" not in drpc.os.environ
+    assert "ROBINHOOD_BACKUP_WS_URL" not in drpc.os.environ
+
+    failover.reset_for_tests()
+    assert [item.name for item in failover.providers()] == ["alchemy", "drpc"]
+    assert failover.active_name() == "drpc"
+    assert failover.active_provider() is not None
+    assert failover.active_provider().http.startswith("https://lb.drpc.live/robinhood/")
+
+
+def test_legacy_primary_wss_can_be_derived_before_semantic_pool_materialization(monkeypatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("ROBINHOOD_DRPC_API_KEY", "secret")
+    monkeypatch.setenv(
+        "ROBINHOOD_RPC_URL",
+        "https://robinhood-mainnet.g.alchemy.com/v2/redacted",
+    )
+    monkeypatch.setenv("ROBINHOOD_PROVIDER_PRIMARY", "drpc")
+
+    assert drpc.configure_robinhood_drpc_backup() is True
+    providers = json.loads(drpc.os.environ["ROBINHOOD_RPC_ENDPOINTS_JSON"])
+    assert providers[0]["name"] == "alchemy"
+    assert providers[0]["ws"] == "wss://robinhood-mainnet.g.alchemy.com/v2/redacted"
+    assert providers[1]["name"] == "drpc"
+
+
 def test_explicit_backup_pair_keeps_precedence(monkeypatch) -> None:
     _clear(monkeypatch)
     monkeypatch.setenv("DRPC_API_KEY", "secret")
@@ -64,6 +111,7 @@ def test_explicit_backup_pair_keeps_precedence(monkeypatch) -> None:
     assert drpc.configure_robinhood_drpc_backup() is True
     assert drpc.os.environ["ROBINHOOD_BACKUP_RPC_URL"] == "https://backup.example/rpc"
     assert drpc.os.environ["ROBINHOOD_BACKUP_WS_URL"] == "wss://backup.example/ws"
+    assert "ROBINHOOD_RPC_ENDPOINTS_JSON" not in drpc.os.environ
 
 
 def test_partial_explicit_backup_fails_closed_without_overwrite(monkeypatch) -> None:
@@ -74,6 +122,7 @@ def test_partial_explicit_backup_fails_closed_without_overwrite(monkeypatch) -> 
     assert drpc.configure_robinhood_drpc_backup() is False
     assert drpc.os.environ["ROBINHOOD_BACKUP_RPC_URL"] == "https://partial.example/rpc"
     assert "ROBINHOOD_BACKUP_WS_URL" not in drpc.os.environ
+    assert "ROBINHOOD_RPC_ENDPOINTS_JSON" not in drpc.os.environ
 
 
 def test_production_bootstraps_drpc_before_composition_import() -> None:
