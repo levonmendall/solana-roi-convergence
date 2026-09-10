@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from solana_roi import robinhood_getlogs_provider_guard as guard
+from solana_roi import robinhood_provider_failover as failover
 
 
 @dataclass
@@ -125,12 +126,12 @@ def test_chainstack_403_retries_same_range_on_alchemy_and_reapplies_limit(monkey
         assert to_block - from_block + 1 <= guard.ALCHEMY_SAFE_MAX_BLOCKS
         return [{"blockNumber": hex(block)} for block in range(from_block, to_block + 1)]
 
-    def failover(self: _Rpc) -> bool:
+    async def verified_failover(self: _Rpc) -> bool:
         self.rpc_url = "https://robinhood-mainnet.g.alchemy.com/v2/example"
         return True
 
     monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", original)
-    monkeypatch.setattr(guard, "_failover_from_getlogs_403", failover)
+    monkeypatch.setattr(guard, "_failover_from_getlogs_403", verified_failover)
 
     rows = _run(rpc, 500, 524)
 
@@ -148,6 +149,71 @@ def test_chainstack_403_retries_same_range_on_alchemy_and_reapplies_limit(monkey
     assert rpc._roi_getlogs_guard_max_sent_blocks == 25
 
 
+def test_403_failover_requires_canonical_replacement_chain_proof(monkeypatch) -> None:
+    chainstack = failover.ProviderEndpoint(
+        name="chainstack",
+        http="https://robinhood-mainnet.core.chainstack.com/example",
+        ws="wss://robinhood-mainnet.core.chainstack.com/example",
+    )
+    alchemy = failover.ProviderEndpoint(
+        name="alchemy",
+        http="https://robinhood-mainnet.g.alchemy.com/v2/example",
+        ws="wss://robinhood-mainnet.g.alchemy.com/v2/example",
+    )
+    rpc = _Rpc(chainstack.http)
+    original_rpc = object()
+    proof_calls: list[tuple[Any, Any, Any]] = []
+
+    monkeypatch.setattr(failover, "active_provider", lambda: chainstack)
+    monkeypatch.setattr(failover, "providers", lambda: (chainstack, alchemy))
+    monkeypatch.setattr(failover, "_ORIGINAL_RPC", original_rpc)
+    monkeypatch.setattr(
+        failover,
+        "_switch_from",
+        lambda *_args, **_kwargs: alchemy,
+    )
+
+    async def verify(original: Any, rpc_self: Any, provider: Any) -> bool:
+        proof_calls.append((original, rpc_self, provider))
+        rpc_self.rpc_url = provider.http
+        return True
+
+    monkeypatch.setattr(failover, "_verify_candidate_chain", verify)
+
+    assert asyncio.run(guard._failover_from_getlogs_403(rpc)) is True
+    assert proof_calls == [(original_rpc, rpc, alchemy)]
+    assert rpc.rpc_url == alchemy.http
+
+
+def test_failed_replacement_chain_proof_keeps_getlogs_fail_closed(monkeypatch) -> None:
+    chainstack = failover.ProviderEndpoint(
+        name="chainstack",
+        http="https://robinhood-mainnet.core.chainstack.com/example",
+        ws="wss://robinhood-mainnet.core.chainstack.com/example",
+    )
+    alchemy = failover.ProviderEndpoint(
+        name="alchemy",
+        http="https://robinhood-mainnet.g.alchemy.com/v2/example",
+        ws="wss://robinhood-mainnet.g.alchemy.com/v2/example",
+    )
+    rpc = _Rpc(chainstack.http)
+
+    async def original_rpc(*_args: Any, **_kwargs: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(failover, "active_provider", lambda: chainstack)
+    monkeypatch.setattr(failover, "providers", lambda: (chainstack, alchemy))
+    monkeypatch.setattr(failover, "_ORIGINAL_RPC", original_rpc)
+    monkeypatch.setattr(failover, "_switch_from", lambda *_args, **_kwargs: alchemy)
+
+    async def reject_chain(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(failover, "_verify_candidate_chain", reject_chain)
+
+    assert asyncio.run(guard._failover_from_getlogs_403(rpc)) is False
+
+
 def test_403_with_no_healthy_peer_fails_closed(monkeypatch) -> None:
     rpc = _Rpc("https://robinhood-mainnet.core.chainstack.com/example")
 
@@ -162,8 +228,11 @@ def test_403_with_no_healthy_peer_fails_closed(monkeypatch) -> None:
         self.calls.append((from_block, to_block))
         raise _http_403(self.rpc_url)
 
+    async def no_failover(_self: _Rpc) -> bool:
+        return False
+
     monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", forbidden)
-    monkeypatch.setattr(guard, "_failover_from_getlogs_403", lambda _self: False)
+    monkeypatch.setattr(guard, "_failover_from_getlogs_403", no_failover)
 
     with pytest.raises(httpx.HTTPStatusError):
         _run(rpc, 600, 609)
@@ -190,8 +259,11 @@ def test_failed_middle_chunk_never_advances_to_later_chunk(monkeypatch) -> None:
             raise _http_403(self.rpc_url)
         return [{"blockNumber": hex(block)} for block in range(from_block, to_block + 1)]
 
+    async def no_failover(_self: _Rpc) -> bool:
+        return False
+
     monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", fail_middle)
-    monkeypatch.setattr(guard, "_failover_from_getlogs_403", lambda _self: False)
+    monkeypatch.setattr(guard, "_failover_from_getlogs_403", no_failover)
 
     with pytest.raises(httpx.HTTPStatusError):
         _run(rpc, 700, 714)
@@ -205,6 +277,7 @@ def test_status_preserves_paper_only_authority() -> None:
     assert proof["prevents_oversized_provider_requests"] is True
     assert proof["http_403_same_range_failover"] is True
     assert proof["replacement_provider_limits_reapplied"] is True
+    assert proof["replacement_chain_id_verified"] is True
     assert proof["contiguous_frontier_fail_closed"] is True
     assert proof["changes_strategy_thresholds"] is False
     assert proof["paper_only"] is True
