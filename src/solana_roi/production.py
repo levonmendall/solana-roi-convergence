@@ -22,6 +22,17 @@ from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 # bootstrap: it grants no strategy, signing, submission, or live-money authority.
 configure_robinhood_drpc_backup()
 
+# Remove the remaining Alchemy-era throughput assumptions before the production
+# composition installs the Robinhood provider-budget/failover chain. A healthy
+# non-Alchemy private provider (currently dRPC) may carry broad promotion research
+# and the full configured provider-pool live-market ceiling. If Alchemy is active,
+# its original budget protections and public-research fallback remain fail-closed.
+from .robinhood_provider_pool_throughput_repair import (
+    install_robinhood_provider_pool_throughput_repair,
+)
+
+install_robinhood_provider_pool_throughput_repair()
+
 from .production_system import (
     COMPOSITION_STATUS_PATH,
     COMPOSITION_VERSION,
