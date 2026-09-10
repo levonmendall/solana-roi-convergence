@@ -102,15 +102,49 @@ def _pinned_reader(store: Any) -> sqlite3.Connection:
     return reader
 
 
-def _validate_identity(reader: sqlite3.Connection, epoch: str, fingerprint: str) -> dict[str, str]:
+def _validate_identity(
+    reader: sqlite3.Connection,
+    epoch: str,
+    fingerprint: str,
+    *,
+    verify_fingerprint: bool = True,
+) -> dict[str, str]:
     meta = replication._meta(reader)
     if str(meta.get("epoch") or "") != epoch or str(meta.get("schema_fingerprint") or "") != fingerprint:
         raise HTTPException(status_code=409, detail="certification_logical_bootstrap_restart_required:identity_changed")
     configured = int(meta.get("configured_schema_version", "-1"))
     observed = int(reader.execute("PRAGMA schema_version").fetchone()[0])
-    if configured != observed or replication._schema_fingerprint(reader) != fingerprint:
+    if configured != observed:
+        raise HTTPException(status_code=409, detail="certification_logical_bootstrap_restart_required:schema_changed")
+    # Manifest construction performs the full fingerprint walk. Page requests only
+    # need the durable identity plus SQLite's schema cookie: every DDL operation that
+    # can alter tables/indexes/views/triggers changes schema_version. Avoiding a full
+    # sqlite_master/table_xinfo walk on every historical page keeps page work bounded
+    # without weakening fail-closed schema-change detection.
+    if verify_fingerprint and replication._schema_fingerprint(reader) != fingerprint:
         raise HTTPException(status_code=409, detail="certification_logical_bootstrap_restart_required:schema_changed")
     return meta
+
+
+def _page_table(reader: sqlite3.Connection, table_name: str) -> dict[str, Any] | None:
+    """Resolve one ordinary table without rescanning metadata for every table."""
+
+    if table_name.startswith("sqlite_") or table_name in {replication.CHANGE_TABLE, replication.META_TABLE}:
+        return None
+    row = reader.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    if row is None:
+        return None
+    sql = str(row[0] or "")
+    if not sql or "VIRTUAL TABLE" in sql.upper():
+        return None
+    return {
+        "name": table_name,
+        "sql": sql,
+        "without_rowid": "WITHOUT ROWID" in sql.upper(),
+    }
 
 
 def _manifest(store: Any) -> dict[str, Any]:
@@ -203,12 +237,10 @@ def _stream_page_records(
 ) -> tuple[list[dict[str, Any]], int, bool, str | None]:
     """Materialize at most the bounded response plus one transient SQLite row.
 
-    The old transport called ``fetchall()`` before enforcing ``max_bytes``. A table
-    containing large JSON/text values could therefore inflate hundreds of MiB of
-    Python objects even though the eventual HTTP payload was capped at 4 MiB. This
-    loop enforces the byte limit as each row arrives. A row rejected by the byte cap
-    is intentionally not represented in ``next_cursor``; the next keyset request
-    starts after the last included row and therefore reads that row again exactly.
+    The transport enforces the byte limit as each buffered row is encoded. A row
+    rejected by the byte cap is intentionally not represented in ``next_cursor``;
+    the next keyset request starts after the last included row and therefore reads
+    that row again exactly.
     """
 
     response_rows: list[dict[str, Any]] = []
@@ -236,14 +268,67 @@ def _stream_page_records(
 
     has_more_by_rows = False
     if not truncated_by_bytes and not exhausted and len(response_rows) >= bounded_limit:
-        # Consume only one sentinel row to distinguish an exact-sized final page
-        # from a page with more data. The sentinel is never retained in memory.
         has_more_by_rows = raw_cursor.fetchone() is not None
         exhausted = not has_more_by_rows
 
     done = exhausted and not truncated_by_bytes
     next_cursor = cursor_for(response_rows[-1]) if response_rows and not done else None
     return response_rows, payload_bytes, done, next_cursor
+
+
+def _json_value_lower_bound(value: Any) -> int:
+    """Cheap allocation-free lower bound for encoded JSON bytes of a SQLite value."""
+
+    if value is None:
+        return 4
+    if isinstance(value, bytes):
+        # Blob transport uses base64 plus a wrapper, so raw bytes are a strict lower bound.
+        return len(value)
+    if isinstance(value, str):
+        # UTF-8 uses at least one byte per code point and JSON adds quoting/escaping.
+        return len(value)
+    if isinstance(value, bool):
+        return 4
+    if isinstance(value, int):
+        return len(str(value))
+    if isinstance(value, float):
+        return 1
+    return 0
+
+
+def _fetch_bounded_raw_rows(raw_cursor: Any, *, bounded_limit: int, max_bytes: int) -> list[tuple[Any, ...]]:
+    """Copy a small raw batch, then let the SQLite snapshot close before JSON work.
+
+    At most ``bounded_limit + 1`` rows are retained. For wide rows, the raw-value
+    lower bound stops collection after the first row that proves the eventual JSON
+    page must cross ``max_bytes``. Keeping that one overflow row is intentional: the
+    normal byte-bound materializer will reject or defer it exactly, preserving cursor
+    semantics without holding the SQLite read transaction during encoding.
+    """
+
+    rows: list[tuple[Any, ...]] = []
+    raw_lower_bound = 0
+    while len(rows) < bounded_limit + 1:
+        row = raw_cursor.fetchone()
+        if row is None:
+            break
+        copied = tuple(row)
+        rows.append(copied)
+        raw_lower_bound += sum(_json_value_lower_bound(value) for value in copied)
+        if raw_lower_bound > max_bytes:
+            break
+    return rows
+
+
+class _BufferedRawCursor:
+    def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+        self._rows = iter(rows)
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        try:
+            return next(self._rows)
+        except StopIteration:
+            return None
 
 
 def _page(
@@ -257,10 +342,17 @@ def _page(
 ) -> dict[str, Any]:
     reader = _pinned_reader(store)
     source_path = Path(getattr(store, "path", ""))
+    names: list[str]
+    row_to_record: Callable[[Any], dict[str, Any]]
+    cursor_for: Callable[[dict[str, Any]], str]
+    raw_rows: list[tuple[Any, ...]]
+    max_bytes = _page_bytes()
     try:
-        _validate_identity(reader, epoch, fingerprint)
-        tables = {str(table["name"]): table for table in replication._ordinary_tables(reader)}
-        table = tables.get(table_name)
+        # The manifest already performed the expensive full schema fingerprint walk.
+        # Each page still fails closed on epoch/fingerprint identity and schema_version,
+        # but does not rescan every schema object and every table's columns.
+        _validate_identity(reader, epoch, fingerprint, verify_fingerprint=False)
+        table = _page_table(reader, table_name)
         if table is None:
             raise HTTPException(status_code=404, detail="certification logical bootstrap table not found")
         columns = [column for column in replication._columns(reader, table_name) if int(column["hidden"]) == 0]
@@ -321,32 +413,41 @@ def _page(
             def cursor_for(record: dict[str, Any]) -> str:
                 return _encode_cursor([int(record["rowid"])])
 
-        response_rows, payload_bytes, done, next_cursor = _stream_page_records(
+        raw_rows = _fetch_bounded_raw_rows(
             raw_cursor,
-            table_name=table_name,
             bounded_limit=bounded_limit,
-            max_bytes=_page_bytes(),
-            row_to_record=row_to_record,
-            cursor_for=cursor_for,
+            max_bytes=max_bytes,
         )
-        return {
-            "bootstrap_version": BOOTSTRAP_VERSION,
-            "release_commit": split._release_commit(),
-            "epoch": epoch,
-            "schema_fingerprint": fingerprint,
-            "table": table_name,
-            "columns": names,
-            "rows": response_rows,
-            "row_count": len(response_rows),
-            "payload_bytes": payload_bytes,
-            "next_cursor": next_cursor,
-            "done": done,
-            "paper_only": True,
-            "live_money_authority": False,
-        }
     finally:
+        # Release the WAL read snapshot and advise away source pages before base64/
+        # JSON materialization. Concurrent canonical mutations remain exact through
+        # the start-watermark replication journal and post-bootstrap delta replay.
         reader.close()
         split._drop_file_cache(source_path)
+
+    response_rows, payload_bytes, done, next_cursor = _stream_page_records(
+        _BufferedRawCursor(raw_rows),
+        table_name=table_name,
+        bounded_limit=bounded_limit,
+        max_bytes=max_bytes,
+        row_to_record=row_to_record,
+        cursor_for=cursor_for,
+    )
+    return {
+        "bootstrap_version": BOOTSTRAP_VERSION,
+        "release_commit": split._release_commit(),
+        "epoch": epoch,
+        "schema_fingerprint": fingerprint,
+        "table": table_name,
+        "columns": names,
+        "rows": response_rows,
+        "row_count": len(response_rows),
+        "payload_bytes": payload_bytes,
+        "next_cursor": next_cursor,
+        "done": done,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
 
 
 def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable[[], Any]) -> None:
