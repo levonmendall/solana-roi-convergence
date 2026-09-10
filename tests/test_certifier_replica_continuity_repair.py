@@ -125,10 +125,68 @@ def test_default_replica_uses_real_durable_mount_only(
     assert path.parent != tmp_path
 
 
-def test_repair_preserves_authority_and_certification_thresholds() -> None:
+def test_required_durable_storage_blocks_history_bootstrap_before_authoritative_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replica = tmp_path / "ephemeral-replica.sqlite3"
+    monkeypatch.setenv("SOLANA_ROI_CERTIFIER_REQUIRE_DURABLE_REPLICA", "true")
+    monkeypatch.setattr(client, "_replica_path", lambda: replica)
+    monkeypatch.setattr(client, "_read_state", lambda path: None)
+    monkeypatch.setattr(repair, "_replica_storage_is_durable", lambda path: False)
+
+    calls: list[int] = []
+
+    def forbidden_bootstrap(*args, **kwargs):
+        calls.append(1)
+        raise AssertionError("authoritative history bootstrap must not begin")
+
+    monkeypatch.setattr(client, "_bootstrap", forbidden_bootstrap)
+
+    with pytest.raises(RuntimeError, match="durable replica storage required"):
+        repair._synchronize_replica(
+            base="https://runtime.invalid",
+            token="redacted",
+            expected_release=NEW_RELEASE,
+        )
+    assert calls == []
+
+
+def test_required_durable_storage_allows_one_time_bootstrap_on_real_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replica = tmp_path / "durable-replica.sqlite3"
+    monkeypatch.setenv("SOLANA_ROI_CERTIFIER_REQUIRE_DURABLE_REPLICA", "true")
+    monkeypatch.setattr(client, "_replica_path", lambda: replica)
+    monkeypatch.setattr(client, "_read_state", lambda path: None)
+    monkeypatch.setattr(repair, "_replica_storage_is_durable", lambda path: True)
+
+    calls: list[str] = []
+
+    def bootstrap(path, *, base, token, expected_release):
+        calls.append(expected_release)
+        return {"release_commit": expected_release, "bootstrapped": True}
+
+    monkeypatch.setattr(client, "_bootstrap", bootstrap)
+    _path, result = repair._synchronize_replica(
+        base="https://runtime.invalid",
+        token="redacted",
+        expected_release=NEW_RELEASE,
+    )
+    assert calls == [NEW_RELEASE]
+    assert result["bootstrapped"] is True
+
+
+def test_repair_preserves_authority_and_certification_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SOLANA_ROI_CERTIFIER_REQUIRE_DURABLE_REPLICA", "true")
+    monkeypatch.setattr(repair, "_replica_storage_is_durable", lambda path: False)
     status = repair.status()
     assert status["release_change_requires_bootstrap"] is False
     assert status["artifact_release_binding_preserved"] is True
+    assert status["durable_replica_required"] is True
+    assert status["history_bootstrap_permitted"] is False
+    assert status["ephemeral_history_bootstrap_blocked"] is True
     assert status["strategy_thresholds_changed"] is False
     assert status["certification_thresholds_changed"] is False
     assert status["paper_only"] is True
