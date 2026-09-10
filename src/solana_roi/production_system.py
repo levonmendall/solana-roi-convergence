@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight-v21-certification-service-split-v22-certification-snapshot-cgroup-memory"
+COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight-v21-certification-service-split-v22-certification-snapshot-cgroup-memory-v23-durable-bootstrap-cgroup-memory"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -89,10 +89,26 @@ class ProductionSystem:
                 "transaction_submission_available": False,
             }
 
+    def _durable_bootstrap_memory_status(self) -> dict[str, Any]:
+        try:
+            from . import durable_bootstrap_memory_repair as durable_memory
+
+            return dict(durable_memory.status())
+        except Exception as exc:
+            return {
+                "installed": False,
+                "last_error": f"{type(exc).__name__}:{exc}",
+                "paper_only": True,
+                "live_money_authority": False,
+                "signing_available": False,
+                "transaction_submission_available": False,
+            }
+
     def status(self) -> dict[str, Any]:
         lifecycle = self._paper_lifecycle_status()
         runtime_memory_capacity = self._runtime_memory_capacity_status()
         rpc_task_ownership = self._rpc_task_ownership_status()
+        durable_bootstrap_memory = self._durable_bootstrap_memory_status()
         code_present = bool(self.healthy and lifecycle.get("installed"))
         worker_active = bool(lifecycle.get("worker_running"))
         lifecycle_proven = bool(lifecycle.get("lifecycle_proven"))
@@ -131,6 +147,7 @@ class ProductionSystem:
             "paper_execution_lifecycle": lifecycle,
             "runtime_memory_capacity": runtime_memory_capacity,
             "rpc_task_ownership": rpc_task_ownership,
+            "durable_bootstrap_memory": durable_bootstrap_memory,
             "components": {component.name: component.as_dict() for component in self.components},
             "required_component_count": sum(1 for component in self.components if component.required),
             "unavailable_required_components": [
@@ -204,6 +221,12 @@ class ProductionSystem:
             ),
             "rpc_task_ownership_repair_version": getattr(
                 self.app.state, "roi_rpc_task_ownership_repair_version", None
+            ),
+            "durable_bootstrap_memory_repair": bool(
+                getattr(self.app.state, "roi_durable_bootstrap_memory_repair", False)
+            ),
+            "durable_bootstrap_memory_repair_version": getattr(
+                self.app.state, "roi_durable_bootstrap_memory_repair_version", None
             ),
             "certification_service_split": bool(
                 getattr(self.app.state, "roi_certification_service_split_enabled", False)
@@ -290,6 +313,17 @@ def build_production_system() -> ProductionSystem:
     if _BUILT is not None:
         return _BUILT
 
+    # Install the read-only cgroup/SQLite bounds before importing either legacy
+    # compatibility composition module. Those imports construct the durable runtime,
+    # so installing later would leave the startup event-ledger verification exposed
+    # to the exact 2 GiB OOM boundary this repair addresses.
+    from .durable_bootstrap_memory_repair import (
+        REPAIR_VERSION as DURABLE_BOOTSTRAP_MEMORY_REPAIR_VERSION,
+        install_durable_bootstrap_memory_repair,
+    )
+
+    install_durable_bootstrap_memory_repair()
+
     from . import legacy_package_runtime_composition as _legacy_package_runtime_composition
     from . import legacy_production_composition as _legacy_production_composition
     from . import render_runtime_bootstrap_repair as _render_runtime_bootstrap
@@ -330,6 +364,8 @@ def build_production_system() -> ProductionSystem:
     app = _legacy_production_composition.app
     ingestion_runtime = _legacy_production_composition.ingestion_runtime
 
+    app.state.roi_durable_bootstrap_memory_repair = True
+    app.state.roi_durable_bootstrap_memory_repair_version = DURABLE_BOOTSTRAP_MEMORY_REPAIR_VERSION
     install_runtime_memory_capacity_repair()
     app.state.roi_runtime_memory_capacity_repair = True
     app.state.roi_runtime_memory_capacity_repair_version = RUNTIME_MEMORY_CAPACITY_REPAIR_VERSION
