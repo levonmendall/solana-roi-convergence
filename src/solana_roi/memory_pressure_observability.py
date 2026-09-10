@@ -2,8 +2,8 @@ from __future__ import annotations
 
 """Low-overhead production attribution for cgroup memory-pressure events.
 
-This module is observability-only.  It reads cgroup-v2 and /proc state and emits a
-bounded JSON line when the service approaches its memory envelope.  It never
+This module is observability-only. It reads cgroup-v2 and /proc state and emits a
+bounded JSON line when the service approaches its memory envelope. It never
 changes strategy, persistence, certification, or resource-control behavior.
 """
 
@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-OBSERVABILITY_VERSION = "memory-pressure-attribution-v1"
+OBSERVABILITY_VERSION = "memory-pressure-attribution-v2-task-counts"
 SAMPLE_INTERVAL_SECONDS = 5.0
 PRESSURE_LOG_FRACTION = 0.70
 MAX_PROCESS_ROWS = 16
@@ -114,6 +114,38 @@ def _smaps_rollup(path: Path) -> dict[str, int]:
     return result
 
 
+def _process_status(path: Path) -> dict[str, int]:
+    """Read bounded process/task counters that explain kernel-stack pressure."""
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return {}
+    selected = {
+        "Threads": "threads",
+        "VmSize": "vm_size_kib",
+        "VmRSS": "vm_rss_kib",
+        "RssAnon": "rss_anon_kib",
+        "RssFile": "rss_file_kib",
+    }
+    result: dict[str, int] = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, raw = line.split(":", 1)
+        out = selected.get(key.strip())
+        if out is None:
+            continue
+        parts = raw.strip().split()
+        if not parts:
+            continue
+        try:
+            result[out] = max(0, int(parts[0]))
+        except ValueError:
+            continue
+    return result
+
+
 def _process_rows(cgroup_root: Path, proc_root: Path) -> list[dict[str, Any]]:
     try:
         raw_pids = (cgroup_root / "cgroup.procs").read_text(encoding="utf-8").splitlines()
@@ -133,6 +165,7 @@ def _process_rows(cgroup_root: Path, proc_root: Path) -> list[dict[str, Any]]:
         except (OSError, UnicodeError):
             comm = "unknown"
         row: dict[str, Any] = {"pid": pid, "comm": comm}
+        row.update(_process_status(proc / "status"))
         row.update(_smaps_rollup(proc / "smaps_rollup"))
         rows.append(row)
     rows.sort(key=lambda row: int(row.get("pss_kib") or row.get("rss_kib") or 0), reverse=True)
@@ -189,6 +222,7 @@ def capture_detail(
         for key in ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")
         if key in events
     }
+    pids_events = _read_key_values(root / "pids.events")
     return {
         "version": OBSERVABILITY_VERSION,
         "memory_current_bytes": current,
@@ -198,6 +232,9 @@ def capture_detail(
         "memory_stat": selected_stat,
         "memory_events": selected_events,
         "memory_pressure": _read_pressure(root / "memory.pressure"),
+        "pids_current": _read_scalar(root / "pids.current"),
+        "pids_max": _read_scalar(root / "pids.max"),
+        "pids_events": {key: int(value) for key, value in pids_events.items()},
         "processes": _process_rows(root, proc),
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
