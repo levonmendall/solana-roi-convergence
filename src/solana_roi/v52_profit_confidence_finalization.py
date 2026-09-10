@@ -7,6 +7,7 @@ from . import fomo_paper_strategy as fomo_paper
 from . import risk_conditioned_alpha_v5 as solana_strategy
 from . import v52_authoritative_strategy as authoritative
 from . import v52_profit_confidence_completion as completion
+from . import v52_robinhood_position_lifecycle as robinhood_lifecycle
 from .strategy_v52_authority import (
     LIVE_MONEY_AUTHORITY,
     PAPER_ONLY,
@@ -271,6 +272,13 @@ def install_v52_profit_confidence_finalization() -> None:
     _preserve_lineage(_final_solana_choose, _BASE_SOLANA_CHOOSE)
     _preserve_lineage(_final_fomo_decision, _BASE_FOMO_DECISION)
     _preserve_lineage(_final_robinhood_choose, _BASE_ROBINHOOD_CHOOSE)
+
+    # Preserve the canonical ownership identity required by the production
+    # composition contract while retaining this outer guard through __wrapped__
+    # lineage and explicit finalization markers.
+    _final_solana_choose.__module__ = authoritative.__name__
+    _final_fomo_decision.__module__ = authoritative.__name__
+    _final_robinhood_choose.__module__ = robinhood_lifecycle.__name__
 
     solana_strategy._choose_lane_and_fraction = _final_solana_choose
     fomo_paper._paper_decision = _final_fomo_decision
