@@ -303,6 +303,14 @@ def evaluate_fresh_tournament(store: Any) -> tuple[TournamentDecision, dict[str,
         "probability_positive": 0.0,
     }
     blockers = list(decision.blockers)
+    incomplete_challenger_evidence = any(
+        str(row["challenger_id"]) != governance.INCUMBENT_ID
+        and str(row["challenger_id"]) in allowed
+        and not bool(row["execution_complete"])
+        for row in rows
+    )
+    if incomplete_challenger_evidence:
+        blockers.append("challenger_execution_completion_is_not_exact")
     if decision.winner:
         score = next((item for item in decision.scores if item.policy_id == decision.winner), None)
         if score is None or score.max_drawdown > governance.MAX_PROMOTION_DRAWDOWN:
@@ -315,7 +323,7 @@ def evaluate_fresh_tournament(store: Any) -> tuple[TournamentDecision, dict[str,
             blockers.append("posterior_probability_below_promotion_threshold")
         if posterior["lower_90"] <= 0.0:
             blockers.append("posterior_lower_advantage_not_positive")
-    if blockers and decision.eligible:
+    if blockers:
         decision = TournamentDecision(
             winner=decision.winner,
             incumbent=decision.incumbent,
