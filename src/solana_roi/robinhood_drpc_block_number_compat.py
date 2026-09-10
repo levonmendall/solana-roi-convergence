@@ -8,12 +8,15 @@ from urllib.parse import urlparse
 import httpx
 
 
-COMPAT_VERSION = "robinhood-drpc-block-number-compat-v1"
+COMPAT_VERSION = "robinhood-drpc-block-number-compat-v2-documented-request-forms"
 _INSTALLED = False
 _LOCK = threading.Lock()
-_FALLBACK_ACTIVE = False
+_MODE: str | None = None
 _FALLBACK_SUCCESSES = 0
 _FALLBACK_FAILURES = 0
+
+_MODE_PARAMLESS = "eth_blockNumber_without_params"
+_MODE_FINALIZED = "eth_getBlockByNumber_finalized_false"
 
 
 def _is_drpc_url(value: str) -> bool:
@@ -33,57 +36,121 @@ def _http_status(exc: BaseException) -> int | None:
         return None
 
 
-def _extract_block_number(block: Any) -> str:
-    if not isinstance(block, dict):
-        raise RuntimeError("InvalidDrpcLatestBlockResponse")
-    raw = block.get("number")
+def _extract_quantity(raw: Any, *, missing_error: str, invalid_error: str) -> str:
     text = str(raw or "").strip().lower()
     if not text:
-        raise RuntimeError("MissingDrpcLatestBlockNumber")
-    value = int(text, 16) if text.startswith("0x") else int(text)
+        raise RuntimeError(missing_error)
+    try:
+        value = int(text, 16) if text.startswith("0x") else int(text)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(invalid_error) from exc
     if value < 0:
-        raise RuntimeError("InvalidDrpcLatestBlockNumber")
+        raise RuntimeError(invalid_error)
     return hex(value)
 
 
-def _fallback_active() -> bool:
-    with _LOCK:
-        return bool(_FALLBACK_ACTIVE)
+def _extract_block_number(block: Any) -> str:
+    if not isinstance(block, dict):
+        raise RuntimeError("InvalidDrpcFinalizedBlockResponse")
+    return _extract_quantity(
+        block.get("number"),
+        missing_error="MissingDrpcFinalizedBlockNumber",
+        invalid_error="InvalidDrpcFinalizedBlockNumber",
+    )
 
 
-def _record_success(*, activated: bool) -> None:
-    global _FALLBACK_ACTIVE, _FALLBACK_SUCCESSES
+def _mode() -> str | None:
     with _LOCK:
-        _FALLBACK_ACTIVE = True
+        return _MODE
+
+
+def _record_success(*, mode: str, activated: bool) -> None:
+    global _MODE, _FALLBACK_SUCCESSES
+    with _LOCK:
+        _MODE = str(mode)
         _FALLBACK_SUCCESSES += 1
         successes = int(_FALLBACK_SUCCESSES)
     if activated or successes == 1 or successes % 100 == 0:
         print(
             "ROBINHOOD_DRPC_BLOCK_NUMBER_COMPATIBILITY "
-            f"fallback=eth_getBlockByNumber active=true successes={successes}",
+            f"mode={mode} active=true successes={successes}",
             flush=True,
         )
 
 
-def _record_failure(exc: BaseException) -> None:
+def _record_failure(*, stage: str, exc: BaseException) -> None:
     global _FALLBACK_FAILURES
     with _LOCK:
         _FALLBACK_FAILURES += 1
         failures = int(_FALLBACK_FAILURES)
-    if failures == 1 or failures % 20 == 0:
+    if failures <= 4 or failures % 20 == 0:
+        status = _http_status(exc)
+        safe_status = str(status) if status is not None else "none"
         print(
             "ROBINHOOD_DRPC_BLOCK_NUMBER_COMPATIBILITY_FAILED "
-            f"fallback=eth_getBlockByNumber error_type={type(exc).__name__} failures={failures}",
+            f"stage={stage} error_type={type(exc).__name__} http_status={safe_status} failures={failures}",
             flush=True,
         )
 
 
-async def _equivalent_latest_block(
-    original: Callable[..., Awaitable[Any]],
+async def _direct_json_rpc(
     rpc_self: Any,
-) -> str:
-    block = await original(rpc_self, "eth_getBlockByNumber", ["latest", False])
+    *,
+    method: str,
+    params: list[Any] | None,
+) -> Any:
+    payload: dict[str, Any] = {
+        "jsonrpc": "2.0",
+        "id": int(getattr(rpc_self, "_request_id", 0) or 0) + 1,
+        "method": method,
+    }
+    if params is not None:
+        payload["params"] = params
+    setattr(rpc_self, "_request_id", int(payload["id"]))
+    response = await rpc_self.client.post(str(getattr(rpc_self, "rpc_url", "") or ""), json=payload)
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise RuntimeError("InvalidDrpcCompatibilityResponse")
+    if body.get("error") is not None:
+        raise RuntimeError("DrpcCompatibilityJsonRpcError")
+    return body.get("result")
+
+
+async def _paramless_block_number(rpc_self: Any) -> str:
+    raw = await _direct_json_rpc(rpc_self, method="eth_blockNumber", params=None)
+    return _extract_quantity(
+        raw,
+        missing_error="MissingDrpcParamlessBlockNumber",
+        invalid_error="InvalidDrpcParamlessBlockNumber",
+    )
+
+
+async def _finalized_block_number(rpc_self: Any) -> str:
+    block = await _direct_json_rpc(
+        rpc_self,
+        method="eth_getBlockByNumber",
+        params=["finalized", False],
+    )
     return _extract_block_number(block)
+
+
+async def _read_compatible_block_number(rpc_self: Any, *, preferred_mode: str | None) -> tuple[str, str]:
+    if preferred_mode == _MODE_PARAMLESS:
+        return await _paramless_block_number(rpc_self), _MODE_PARAMLESS
+    if preferred_mode == _MODE_FINALIZED:
+        return await _finalized_block_number(rpc_self), _MODE_FINALIZED
+
+    try:
+        return await _paramless_block_number(rpc_self), _MODE_PARAMLESS
+    except Exception as exc:
+        _record_failure(stage=_MODE_PARAMLESS, exc=exc)
+
+    try:
+        return await _finalized_block_number(rpc_self), _MODE_FINALIZED
+    except Exception as exc:
+        _record_failure(stage=_MODE_FINALIZED, exc=exc)
+        raise
 
 
 def _compat_rpc_wrapper(
@@ -92,13 +159,14 @@ def _compat_rpc_wrapper(
     @wraps(original)
     async def wrapped(rpc_self: Any, method: str, params: list[Any]) -> Any:
         drpc = _is_drpc_url(str(getattr(rpc_self, "rpc_url", "") or ""))
-        if drpc and str(method) == "eth_blockNumber" and _fallback_active():
+        active_mode = _mode()
+        if drpc and str(method) == "eth_blockNumber" and active_mode is not None:
             try:
-                result = await _equivalent_latest_block(original, rpc_self)
+                result, mode = await _read_compatible_block_number(rpc_self, preferred_mode=active_mode)
             except Exception as exc:
-                _record_failure(exc)
+                _record_failure(stage=str(active_mode), exc=exc)
                 raise
-            _record_success(activated=False)
+            _record_success(mode=mode, activated=False)
             return result
 
         try:
@@ -107,11 +175,10 @@ def _compat_rpc_wrapper(
             if not (drpc and str(method) == "eth_blockNumber" and _http_status(exc) == 400):
                 raise
             try:
-                result = await _equivalent_latest_block(original, rpc_self)
+                result, mode = await _read_compatible_block_number(rpc_self, preferred_mode=None)
             except Exception as fallback_exc:
-                _record_failure(fallback_exc)
                 raise exc from fallback_exc
-            _record_success(activated=True)
+            _record_success(mode=mode, activated=True)
             return result
 
     setattr(wrapped, "_roi_robinhood_drpc_block_number_compat", True)
@@ -133,11 +200,15 @@ def status() -> dict[str, Any]:
         return {
             "version": COMPAT_VERSION,
             "installed": _INSTALLED,
-            "fallback_active": bool(_FALLBACK_ACTIVE),
-            "fallback_method": "eth_getBlockByNumber_latest_false",
+            "fallback_active": _MODE is not None,
+            "fallback_mode": _MODE,
             "fallback_successes": int(_FALLBACK_SUCCESSES),
             "fallback_failures": int(_FALLBACK_FAILURES),
             "activation_condition": "drpc_eth_blockNumber_http_400_only",
+            "documented_request_forms": [
+                _MODE_PARAMLESS,
+                _MODE_FINALIZED,
+            ],
             "paper_only": True,
             "live_money_authority": False,
             "signing_available": False,
