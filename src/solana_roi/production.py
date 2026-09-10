@@ -15,12 +15,18 @@ the explicit composition root (not called from this facade):
 import asyncio
 
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
+from .durable_bootstrap_memory_repair import install_durable_bootstrap_memory_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 
 # Keep authoritative certification-replica requests below the certifier's bounded
 # HTTP deadline. This changes only transport pagination; evidence, continuity, and
 # every strategy/certification threshold remain unchanged.
 configure_production_certification_delta_bound()
+
+# Install bounded read-only SQLite/cgroup behavior before the production composition
+# constructs the durable paper engine or certification routes. The repair preserves
+# the full hash-chain verification, canonical evidence, and fail-closed semantics.
+install_durable_bootstrap_memory_repair()
 
 # Provider credentials must be materialized before importing the production
 # composition root because the legacy-compatible Robinhood ingestion substrate
