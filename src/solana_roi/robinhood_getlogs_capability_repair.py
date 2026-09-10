@@ -12,7 +12,7 @@ from . import robinhood_getlogs_provider_guard as guard
 from . import robinhood_provider_failover as failover
 
 
-REPAIR_VERSION = "robinhood-getlogs-capability-repair-v1"
+REPAIR_VERSION = "robinhood-getlogs-capability-repair-v2-exact-chunk-failover"
 RECOVERY_SUCCESS_STREAK = 3
 CHAINSTACK_DISCOVERY_MAX_BLOCKS = 200
 _MAX_SAFE_BODY_CHARS = 320
@@ -39,7 +39,12 @@ def _provider_kind(provider: failover.ProviderEndpoint | None) -> str:
         host = (urlparse(provider.http).hostname or "").lower()
     except Exception:
         host = ""
-    if "chainstack" in name or host.endswith(".chainstack.com") or host.endswith(".chainstacklabs.com") or host.endswith(".p2pify.com"):
+    if (
+        "chainstack" in name
+        or host.endswith(".chainstack.com")
+        or host.endswith(".chainstacklabs.com")
+        or host.endswith(".p2pify.com")
+    ):
         return "chainstack"
     if "alchemy" in name or "alchemy" in host:
         return "alchemy"
@@ -76,7 +81,11 @@ def _safe_error_body(exc: BaseException) -> str:
         else:
             text = "http_error"
     text = re.sub(r"(?i)(https?|wss?)://[^\s\"']+", "[redacted_url]", text)
-    text = re.sub(r"(?i)(authorization|bearer|api[_ -]?key|token|secret)\s*[:=]\s*[^\s,;}]+", r"\1=[redacted]", text)
+    text = re.sub(
+        r"(?i)(authorization|bearer|api[_ -]?key|token|secret)\s*[:=]\s*[^\s,;}]+",
+        r"\1=[redacted]",
+        text,
+    )
     text = re.sub(r"\b[A-Za-z0-9_-]{40,}\b", "[redacted_token]", text)
     return text[:_MAX_SAFE_BODY_CHARS] or "empty"
 
@@ -196,7 +205,10 @@ def _raw_query(
     addresses: list[str] | tuple[str, ...] | None,
     topics: list[Any] | None,
 ) -> dict[str, Any]:
-    query: dict[str, Any] = {"fromBlock": hex(max(0, int(from_block))), "toBlock": hex(max(0, int(to_block)))}
+    query: dict[str, Any] = {
+        "fromBlock": hex(max(0, int(from_block))),
+        "toBlock": hex(max(0, int(to_block))),
+    }
     if addresses:
         query["address"] = list(addresses) if len(addresses) > 1 else addresses[0]
     if topics is not None:
@@ -222,7 +234,12 @@ async def _direct_getlogs(
         result = await original_rpc(
             self,
             "eth_getLogs",
-            [_raw_query(from_block=from_block, to_block=to_block, addresses=addresses, topics=topics)],
+            [_raw_query(
+                from_block=from_block,
+                to_block=to_block,
+                addresses=addresses,
+                topics=topics,
+            )],
         )
         rows = list(result or [])
     except Exception as exc:
@@ -258,7 +275,10 @@ async def _ensure_chain(provider: failover.ProviderEndpoint, self: Any) -> bool:
     return bool(await failover._verify_candidate_chain(original, self, provider))
 
 
-def _candidate_providers(current: failover.ProviderEndpoint | None, excluded: set[str]) -> list[failover.ProviderEndpoint]:
+def _candidate_providers(
+    current: failover.ProviderEndpoint | None,
+    excluded: set[str],
+) -> list[failover.ProviderEndpoint]:
     items = list(failover.providers())
     ordered: list[failover.ProviderEndpoint] = []
     if current is not None:
@@ -317,7 +337,14 @@ async def _discover_chainstack_max(
     while probe <= ceiling:
         end = int(from_block) + probe - 1
         try:
-            await _direct_getlogs(self, provider, from_block=from_block, to_block=end, addresses=addresses, topics=topics)
+            await _direct_getlogs(
+                self,
+                provider,
+                from_block=from_block,
+                to_block=end,
+                addresses=addresses,
+                topics=topics,
+            )
             accepted = probe
             if probe == ceiling:
                 break
@@ -336,7 +363,14 @@ async def _discover_chainstack_max(
             mid = (low + high) // 2
             end = int(from_block) + mid - 1
             try:
-                await _direct_getlogs(self, provider, from_block=from_block, to_block=end, addresses=addresses, topics=topics)
+                await _direct_getlogs(
+                    self,
+                    provider,
+                    from_block=from_block,
+                    to_block=end,
+                    addresses=addresses,
+                    topics=topics,
+                )
                 accepted = mid
                 low = mid + 1
             except Exception as exc:
@@ -354,6 +388,34 @@ async def _discover_chainstack_max(
     return accepted
 
 
+async def _fallback_exact_range(
+    self: Any,
+    provider: failover.ProviderEndpoint,
+    original_error: BaseException,
+    *,
+    from_block: int,
+    to_block: int,
+    addresses: list[str] | tuple[str, ...] | None,
+    topics: list[Any] | None,
+    excluded: set[str],
+) -> list[dict[str, Any]]:
+    try:
+        return await _retrieve_range(
+            self,
+            from_block=from_block,
+            to_block=to_block,
+            addresses=addresses,
+            topics=topics,
+            excluded=set(excluded) | {provider.name},
+            preferred=None,
+        )
+    except failover.RobinhoodProviderPoolUnavailable:
+        # Preserve the concrete provider failure when no alternate can serve the
+        # exact missing interval. Replacing it with a generic pool error obscures
+        # the boundary and makes retry accounting non-authoritative.
+        raise original_error
+
+
 async def _retrieve_from_provider(
     self: Any,
     provider: failover.ProviderEndpoint,
@@ -368,24 +430,28 @@ async def _retrieve_from_provider(
     limit = _safe_max(provider)
     if limit is None and guard._is_alchemy_endpoint(provider.http):
         limit = guard.ALCHEMY_SAFE_MAX_BLOCKS
+
     if limit is not None and span > limit:
         rows: list[dict[str, Any]] = []
         cursor = int(from_block)
         while cursor <= int(to_block):
             end = min(int(to_block), cursor + limit - 1)
-            rows.extend(
-                await _retrieve_range(
-                    self,
-                    from_block=cursor,
-                    to_block=end,
-                    addresses=addresses,
-                    topics=topics,
-                    excluded=set(excluded),
-                    preferred=provider,
-                )
+            # Each bounded interval is its own failover unit. If a later interval
+            # fails, only that interval is retried elsewhere; successful earlier
+            # intervals are never replayed and the caller frontier cannot skip ahead.
+            chunk = await _retrieve_range(
+                self,
+                from_block=cursor,
+                to_block=end,
+                addresses=addresses,
+                topics=topics,
+                excluded=set(excluded),
+                preferred=provider,
             )
+            rows.extend(chunk)
             cursor = end + 1
         return rows
+
     try:
         return await _direct_getlogs(
             self,
@@ -396,12 +462,18 @@ async def _retrieve_from_provider(
             topics=topics,
         )
     except Exception as exc:
-        _record_failure(provider, exc, span=span, basic_only=bool(_is_http_403(exc) and span == 1))
+        _record_failure(
+            provider,
+            exc,
+            span=span,
+            basic_only=bool(_is_http_403(exc) and span == 1),
+        )
         if _provider_kind(provider) == "chainstack" and _is_http_403(exc):
             if span == 1:
                 print(
                     "ROBINHOOD_GETLOGS_CAPABILITY provider="
-                    f"{_safe_provider(provider)} provider_kind=chainstack capability=basic_evm_rpc_only reason=span1_http_403",
+                    f"{_safe_provider(provider)} provider_kind=chainstack "
+                    "capability=basic_evm_rpc_only reason=span1_http_403",
                     flush=True,
                 )
             elif await _probe_span_one(
@@ -411,7 +483,7 @@ async def _retrieve_from_provider(
                 addresses=addresses,
                 topics=topics,
             ):
-                limit = await _discover_chainstack_max(
+                await _discover_chainstack_max(
                     self,
                     provider,
                     from_block=from_block,
@@ -433,14 +505,16 @@ async def _retrieve_from_provider(
                     state = failover._state_for_locked(provider.name)
                     if state.get("getlogs_capability") != "basic_evm_rpc_only":
                         state["getlogs_capability"] = "degraded"
-        return await _retrieve_range(
+
+        return await _fallback_exact_range(
             self,
+            provider,
+            exc,
             from_block=from_block,
             to_block=to_block,
             addresses=addresses,
             topics=topics,
-            excluded=set(excluded) | {provider.name},
-            preferred=None,
+            excluded=excluded,
         )
 
 
@@ -456,28 +530,25 @@ async def _retrieve_range(
 ) -> list[dict[str, Any]]:
     current = preferred or _provider_for_url(str(getattr(self, "rpc_url", "") or ""))
     candidates = _candidate_providers(current, excluded)
-    last_error: BaseException | None = None
     for provider in candidates:
         if not await _ensure_chain(provider, self):
             excluded.add(provider.name)
             continue
-        try:
-            return await _retrieve_from_provider(
-                self,
-                provider,
-                from_block=from_block,
-                to_block=to_block,
-                addresses=addresses,
-                topics=topics,
-                excluded=excluded,
-            )
-        except Exception as exc:
-            last_error = exc
-            excluded.add(provider.name)
-            continue
-    if last_error is not None:
-        raise last_error
-    raise failover.RobinhoodProviderPoolUnavailable("robinhood_getlogs_capable_provider_unavailable")
+        # _retrieve_from_provider owns exact-range failover. Do not catch its
+        # terminal failure here and replay the parent interval on another provider:
+        # that would duplicate every chunk that already completed successfully.
+        return await _retrieve_from_provider(
+            self,
+            provider,
+            from_block=from_block,
+            to_block=to_block,
+            addresses=addresses,
+            topics=topics,
+            excluded=excluded,
+        )
+    raise failover.RobinhoodProviderPoolUnavailable(
+        "robinhood_getlogs_capable_provider_unavailable"
+    )
 
 
 async def _capability_request_range(
@@ -488,7 +559,11 @@ async def _capability_request_range(
     addresses: list[str] | tuple[str, ...] | None,
     topics: list[Any] | None,
 ) -> list[dict[str, Any]]:
-    if int(to_block) < int(from_block) or not failover.providers() or failover._ORIGINAL_RPC is None:
+    if (
+        int(to_block) < int(from_block)
+        or not failover.providers()
+        or failover._ORIGINAL_RPC is None
+    ):
         if _ORIGINAL_REQUEST_RANGE is None:
             raise RuntimeError("Robinhood getLogs capability repair is not installed")
         return await _ORIGINAL_REQUEST_RANGE(
@@ -527,7 +602,12 @@ def status() -> dict[str, Any]:
                 "eth_getlogs_safe_max_blocks": state.get("getlogs_safe_max_blocks"),
                 "eth_getlogs_span1_proven": bool(state.get("getlogs_span1_proven", False)),
                 "eth_getlogs_last_http_status": state.get("getlogs_last_http_status"),
-                "fully_healthy": bool(chain_verified and read_verified and capability == "healthy" and streak >= RECOVERY_SUCCESS_STREAK),
+                "fully_healthy": bool(
+                    chain_verified
+                    and read_verified
+                    and capability == "healthy"
+                    and streak >= RECOVERY_SUCCESS_STREAK
+                ),
             }
     return {
         "repair_version": REPAIR_VERSION,
@@ -538,6 +618,7 @@ def status() -> dict[str, Any]:
         "bounded_adaptive_pagination": True,
         "failed_range_cursor_authority": False,
         "exact_range_fallback": True,
+        "completed_chunks_replayed_on_failover": False,
         "recovery_success_streak_required": RECOVERY_SUCCESS_STREAK,
         "diagnostics_expose_endpoint": False,
         "diagnostics_expose_credentials": False,
