@@ -30,7 +30,7 @@ from .certification_incremental_replication import (
 )
 
 
-CLIENT_VERSION = "certification-incremental-replica-client-v2-monotonic-bootstrap-watermark"
+CLIENT_VERSION = "certification-incremental-replica-client-v3-trigger-safe-replay"
 DEFAULT_DELTA_TIMEOUT_SECONDS = 30.0
 DEFAULT_COPY_CHUNK_BYTES = 8 * 1024 * 1024
 FICLONE = 0x40049409
@@ -234,6 +234,27 @@ def _fetch_delta(*, base: str, token: str, expected_release: str, state: dict[st
     return payload
 
 
+def _user_trigger_definitions(connection: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Capture canonical user triggers so replay cannot fire source side effects twice."""
+    rows = connection.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL "
+        "AND name NOT LIKE ? ORDER BY name",
+        (TRIGGER_PREFIX + "%",),
+    ).fetchall()
+    return [(str(name), str(sql)) for name, sql in rows if str(sql or "").strip()]
+
+
+def _drop_user_triggers(connection: sqlite3.Connection, triggers: list[tuple[str, str]]) -> None:
+    for name, _sql in triggers:
+        quoted = name.replace('"', '""')
+        connection.execute(f'DROP TRIGGER IF EXISTS "{quoted}"')
+
+
+def _restore_user_triggers(connection: sqlite3.Connection, triggers: list[tuple[str, str]]) -> None:
+    for _name, sql in triggers:
+        connection.execute(sql)
+
+
 def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     to_watermark = int(payload.get("to_watermark") or 0)
     if to_watermark < int(state["watermark"]):
@@ -247,6 +268,13 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("PRAGMA busy_timeout=10000")
         connection.execute("BEGIN IMMEDIATE")
+        user_triggers = _user_trigger_definitions(connection)
+        # Source-side triggers have already executed in the authoritative commit and
+        # their resulting rows are represented by the source journal. Firing those
+        # triggers again during replica replay can create duplicate/random/timestamped
+        # side effects. DDL is transactional in SQLite, so temporarily remove and
+        # restore user triggers inside the same transaction as the exact row replay.
+        _drop_user_triggers(connection, user_triggers)
         for change in changes:
             if not isinstance(change, dict):
                 raise RuntimeError("authoritative certification delta row invalid")
@@ -254,6 +282,7 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
             if not sql or ";" in sql.rstrip(";"):
                 raise RuntimeError("authoritative certification delta SQL invalid")
             connection.execute(sql)
+        _restore_user_triggers(connection, user_triggers)
         connection.commit()
     except BaseException:
         try:
@@ -372,6 +401,7 @@ def status() -> dict[str, Any]:
         "full_snapshot_role": "bootstrap_recovery_reconciliation_only",
         "child_uses_disposable_local_clone": True,
         "authoritative_full_snapshot_per_cycle": False,
+        "trigger_safe_replay": True,
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
         "signing_available": SIGNING_AVAILABLE,
