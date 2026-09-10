@@ -262,9 +262,6 @@ def _ensure_tracking_locked(connection: sqlite3.Connection) -> tuple[dict[str, s
         return meta, False
 
     fingerprint = _schema_fingerprint(connection)
-    # Any unaccounted DDL change also rotates the epoch. This protects against a
-    # replication trigger being dropped/replaced even though transport-owned
-    # triggers are intentionally excluded from the user schema fingerprint.
     identity_changed = (
         not meta
         or meta.get("replication_version") != REPLICATION_VERSION
@@ -409,9 +406,6 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
     finally:
         reader.close()
 
-    # from_watermark is a durable acknowledgement: the client advances it only
-    # after its prior transaction and state sidecar have committed. Prune only
-    # rows already acknowledged. sqlite_sequence keeps the watermark monotonic.
     if from_watermark > 0:
         with store._lock, store.db:
             store.db.execute(f"DELETE FROM {_qident(CHANGE_TABLE)} WHERE id<=?", (from_watermark,))
@@ -435,13 +429,6 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
 
 
 def _prepare_available_runtime_store(runtime_provider: Callable[[], Any]) -> dict[str, Any] | None:
-    """Prepare tracking while the runtime may safely own its normal store lock.
-
-    This is intentionally separate from the SQLite snapshot-copy primitive. HTTP
-    bootstrap routes are not reachable until FastAPI startup has completed, so a
-    late-created runtime store is prepared before the first exceptional bootstrap
-    without making the pinned-read snapshot helper acquire the live store lock.
-    """
     try:
         runtime = runtime_provider()
     except Exception:
@@ -453,16 +440,12 @@ def _prepare_available_runtime_store(runtime_provider: Callable[[], Any]) -> dic
 
 
 def install_certification_incremental_replication(app: Any, runtime_provider: Callable[[], Any]) -> None:
-    # Composition can precede creation of the canonical runtime store. Prepare it
-    # immediately when available and again at application startup for the late-store
-    # case. The snapshot copy primitive itself remains an unwrapped, lock-free pinned
-    # read transaction; normal replication requests remain fail-closed without store.
     _prepare_available_runtime_store(runtime_provider)
     startup_marker = "roi_certification_incremental_replication_startup_prepare"
     if not bool(getattr(app.state, startup_marker, False)):
         def prepare_certification_replication_on_startup() -> None:
             _prepare_available_runtime_store(runtime_provider)
-        app.add_event_handler("startup", prepare_certification_replication_on_startup)
+        app.router.add_event_handler("startup", prepare_certification_replication_on_startup)
         setattr(app.state, startup_marker, True)
 
     path = "/v1/operations/certification-db-delta"
