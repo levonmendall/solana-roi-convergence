@@ -225,6 +225,8 @@ def _full_snapshot_bootstrap(replica: Path, *, base: str, token: str, expected_r
             "schema_fingerprint": identity["schema_fingerprint"],
             "watermark": int(identity["watermark"]),
             "bootstrap_bytes": actual_bytes,
+            "bootstrap_complete": True,
+            "catchup_complete": False,
             "last_transport": "explicit_full_snapshot_recovery",
         }
         _atomic_state(_state_path(replica), state)
@@ -332,9 +334,11 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
         raise
     finally:
         connection.close()
+    caught_up = bool(payload.get("caught_up", True))
     next_state = dict(state)
     next_state["client_version"] = CLIENT_VERSION
     next_state["watermark"] = to_watermark
+    next_state["catchup_complete"] = caught_up
     next_state["last_transport"] = "incremental_delta"
     _atomic_state(_state_path(replica), next_state)
     return {
@@ -344,7 +348,7 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
         "delta_change_count": len(changes),
         "source_change_count": int(payload.get("source_change_count") or 0),
         "delta_payload_bytes": int(payload.get("payload_bytes") or 0),
-        "caught_up": bool(payload.get("caught_up", True)),
+        "caught_up": caught_up,
     }
 
 
@@ -413,13 +417,18 @@ def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -
                         token=token,
                         expected_release=expected_release,
                     )
-                    return _catch_up_deltas(
+                    caught_up = _catch_up_deltas(
                         replica,
                         state,
                         base=base,
                         token=token,
                         expected_release=expected_release,
                     )
+                    caught_up["bootstrapped"] = True
+                    caught_up["bootstrap_complete"] = True
+                    caught_up["bootstrap_transport"] = "explicit_full_snapshot_recovery"
+                    _atomic_state(_state_path(replica), caught_up)
+                    return caught_up
                 raise
 
             # From this point onward the logical scan has become a valid durable
@@ -503,6 +512,7 @@ def synchronize_replica(*, base: str, token: str, expected_release: str) -> tupl
             expected_release=expected_release,
         )
         result["catchup_complete"] = True
+        _atomic_state(_state_path(replica), result)
         return replica, result
     except ReplicaBootstrapRequired:
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
