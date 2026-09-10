@@ -2,11 +2,13 @@ from __future__ import annotations
 
 """Keep certifier replica state durable and release-compatible without weakening truth.
 
-Certification artifacts remain bound to the exact running release.  The SQLite replica
+Certification artifacts remain bound to the exact running release. The SQLite replica
 itself is reusable across a code release when the authoritative replication protocol,
-epoch, schema fingerprint, and watermark continuity still prove compatibility.  A
+epoch, schema fingerprint, and watermark continuity still prove compatibility. A
 schema/epoch/protocol discontinuity or invalid local SQLite state still forces a full
-logical bootstrap.
+logical bootstrap, but production can require that such a bootstrap only run on a real
+certifier-owned persistent disk so ephemeral replacements cannot repeatedly reread the
+authoritative history-scale database.
 """
 
 import os
@@ -17,7 +19,7 @@ from typing import Any
 from . import certification_replica_client as client
 from .certification_incremental_replication import REPLICATION_VERSION
 
-REPAIR_VERSION = "certifier-replica-continuity-v1-cross-release-durable-disk"
+REPAIR_VERSION = "certifier-replica-continuity-v2-durable-bootstrap-guard"
 DEFAULT_DURABLE_ROOT = Path("/var/data")
 DEFAULT_REPLICA_NAME = "solana-roi-certifier-replica.sqlite3"
 
@@ -33,6 +35,13 @@ _ORIGINAL_REPLICA_PATH: Any = None
 _ORIGINAL_APPLY_DELTA: Any = None
 _ORIGINAL_SYNCHRONIZE: Any = None
 _ORIGINAL_STATUS: Any = None
+
+
+def _truthy_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _durable_root() -> Path:
@@ -70,6 +79,23 @@ def _replica_storage_is_durable(replica: Path) -> bool:
     return resolved == durable or durable in resolved.parents
 
 
+def _durable_replica_required() -> bool:
+    return _truthy_env("SOLANA_ROI_CERTIFIER_REQUIRE_DURABLE_REPLICA", default=False)
+
+
+def _require_durable_before_history_bootstrap(replica: Path) -> None:
+    if _durable_replica_required() and not _replica_storage_is_durable(replica):
+        raise RuntimeError(
+            "certifier durable replica storage required before logical bootstrap; "
+            "refusing history-scale authoritative reread on ephemeral filesystem"
+        )
+
+
+def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -> dict[str, Any]:
+    _require_durable_before_history_bootstrap(replica)
+    return client._bootstrap(replica, base=base, token=token, expected_release=expected_release)
+
+
 def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     assert _ORIGINAL_APPLY_DELTA is not None
     result = _ORIGINAL_APPLY_DELTA(replica, state, payload)
@@ -78,12 +104,13 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
         raise client.ReplicaDeltaTransportError("authoritative certification delta release missing")
     result["release_commit"] = release
     result["replica_reused_across_release"] = str(state.get("release_commit") or "") not in {"", release}
+    result["replica_storage_durable"] = _replica_storage_is_durable(replica)
     client._atomic_state(client._state_path(replica), result)
     return result
 
 
 def _synchronize_replica(*, base: str, token: str, expected_release: str) -> tuple[Path, dict[str, Any]]:
-    """Reuse a valid replica across releases; let authoritative identity decide compatibility."""
+    """Reuse a valid replica across releases; authoritative identity decides compatibility."""
 
     if not base or not token:
         raise RuntimeError("incremental certification replica source is not configured")
@@ -94,19 +121,19 @@ def _synchronize_replica(*, base: str, token: str, expected_release: str) -> tup
         or not replica.is_file()
         or str(state.get("replication_version") or "") != REPLICATION_VERSION
     ):
-        return replica, client._bootstrap(replica, base=base, token=token, expected_release=expected_release)
+        return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
 
     try:
         watermark = int(state.get("watermark") if state.get("watermark") is not None else -1)
     except (TypeError, ValueError):
-        return replica, client._bootstrap(replica, base=base, token=token, expected_release=expected_release)
+        return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
     if watermark < 0 or not str(state.get("epoch") or "") or not str(state.get("schema_fingerprint") or ""):
-        return replica, client._bootstrap(replica, base=base, token=token, expected_release=expected_release)
+        return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
 
     try:
         client._validate_sqlite(replica)
     except BaseException:
-        return replica, client._bootstrap(replica, base=base, token=token, expected_release=expected_release)
+        return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
 
     prior_release = str(state.get("release_commit") or "")
     try:
@@ -118,13 +145,14 @@ def _synchronize_replica(*, base: str, token: str, expected_release: str) -> tup
             expected_release=expected_release,
         )
     except client.ReplicaBootstrapRequired:
-        return replica, client._bootstrap(replica, base=base, token=token, expected_release=expected_release)
+        return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
 
     result["release_commit"] = expected_release
     result["catchup_complete"] = True
     result["replica_reused_across_release"] = bool(prior_release and prior_release != expected_release)
     result["replica_compatibility_identity"] = "replication_version+epoch+schema_fingerprint+watermark"
     result["artifact_release_binding_preserved"] = True
+    result["replica_storage_durable"] = _replica_storage_is_durable(replica)
     client._atomic_state(client._state_path(replica), result)
     return replica, result
 
@@ -133,11 +161,16 @@ def _status() -> dict[str, Any]:
     assert _ORIGINAL_STATUS is not None
     payload = dict(_ORIGINAL_STATUS())
     replica = client._replica_path()
+    durable = _replica_storage_is_durable(replica)
+    required = _durable_replica_required()
     payload.update(
         {
             "replica_storage_path": str(replica),
-            "replica_storage_durable": _replica_storage_is_durable(replica),
-            "replica_storage_kind": "render_persistent_disk" if _replica_storage_is_durable(replica) else "ephemeral_filesystem",
+            "replica_storage_durable": durable,
+            "replica_storage_kind": "render_persistent_disk" if durable else "ephemeral_filesystem",
+            "durable_replica_required": required,
+            "history_bootstrap_permitted": (not required) or durable,
+            "ephemeral_history_bootstrap_blocked": required and not durable,
             "replica_compatibility_identity": "replication_version+epoch+schema_fingerprint+watermark",
             "release_change_requires_bootstrap": False,
             "artifact_release_binding_preserved": True,
@@ -168,11 +201,16 @@ def configure_certifier_replica_continuity_repair() -> None:
 
 def status() -> dict[str, Any]:
     replica = _replica_path()
+    durable = _replica_storage_is_durable(replica)
+    required = _durable_replica_required()
     return {
         "repair_version": REPAIR_VERSION,
         "installed": _INSTALLED,
         "replica_path": str(replica),
-        "replica_storage_durable": _replica_storage_is_durable(replica),
+        "replica_storage_durable": durable,
+        "durable_replica_required": required,
+        "history_bootstrap_permitted": (not required) or durable,
+        "ephemeral_history_bootstrap_blocked": required and not durable,
         "release_change_requires_bootstrap": False,
         "replica_compatibility_identity": "replication_version+epoch+schema_fingerprint+watermark",
         "artifact_release_binding_preserved": True,
