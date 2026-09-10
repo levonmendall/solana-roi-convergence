@@ -344,6 +344,44 @@ def _require_shared_token(value: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid certification replication authorization")
 
 
+def _is_transient_prune_lock(exc: sqlite3.OperationalError) -> bool:
+    """Return true only for SQLite BUSY/LOCKED cleanup contention.
+
+    Extended SQLite result codes retain the primary result code in their low byte.
+    Exact-message fallbacks cover Python/SQLite builds that do not expose
+    ``sqlite_errorcode``. Other operational failures remain authoritative errors.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        base_code = code & 0xFF
+        if base_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return True
+    message = str(exc).strip().lower()
+    return message in {
+        "database is locked",
+        "database table is locked",
+        "database schema is locked",
+    }
+
+
+def _prune_acknowledged_changes(store: Any, from_watermark: int) -> bool:
+    """Best-effort cleanup after an exact delta has already been materialized.
+
+    Pruning is not part of certification truth. If another canonical writer holds the
+    SQLite write lock, retain the journal rows and defer cleanup to a later request.
+    Only BUSY/LOCKED contention is suppressed; every unrelated SQLite failure still
+    propagates so canonical-store defects remain fail-closed and visible.
+    """
+    try:
+        with store._lock, store.db:
+            store.db.execute(f"DELETE FROM {_qident(CHANGE_TABLE)} WHERE id<=?", (from_watermark,))
+    except sqlite3.OperationalError as exc:
+        if not _is_transient_prune_lock(exc):
+            raise
+        return False
+    return True
+
+
 def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_fingerprint: str) -> dict[str, Any]:
     with store._lock, store.db:
         meta, reconfigured = _ensure_tracking_locked(store.db)
@@ -408,8 +446,7 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
         split._drop_file_cache(source_path)
 
     if from_watermark > 0:
-        with store._lock, store.db:
-            store.db.execute(f"DELETE FROM {_qident(CHANGE_TABLE)} WHERE id<=?", (from_watermark,))
+        _prune_acknowledged_changes(store, from_watermark)
     return {
         "replication_version": REPLICATION_VERSION,
         "release_commit": split._release_commit(),
@@ -537,10 +574,12 @@ __all__ = [
     "_columns",
     "_current_watermark",
     "_delta_payload",
+    "_is_transient_prune_lock",
     "_meta",
     "_ordinary_tables",
     "_prepare_available_runtime_store",
     "_primary_columns",
+    "_prune_acknowledged_changes",
     "_qident",
     "_require_shared_token",
     "_schema_fingerprint",
