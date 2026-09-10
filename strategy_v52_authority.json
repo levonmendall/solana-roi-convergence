@@ -24,7 +24,9 @@
   "hazards_are_not_blanket_vetoes": ["bundled_launch", "sniper_concentration", "common_funding", "creator_linkage_or_distribution", "mint_authority", "early_holder_distribution", "quote_or_slippage_deterioration", "late_lifecycle", "high_snipe_tax"],
   "execution": {
     "latency_hard_max_seconds": 20.0,
-    "chase_observe_only_above_fraction": 0.40,
+    "chase_normal_max_fraction": 0.40,
+    "chase_observe_only_above_fraction": 0.80,
+    "chase_exceptional_continuation_requires_strict_evidence": true,
     "amount_specific_entry_and_exit_quotes_required": true,
     "first_slot_pump_fun_sniping_allowed": false,
     "maximum_sizing_requotes": 2
@@ -38,15 +40,21 @@
     "fomo_max_target_fraction": 0.05,
     "robinhood_max_target_fraction": 0.05,
     "robinhood_max_open_exposure_fraction": 0.20,
+    "wallet_validated_minimum_forward_samples": 30,
+    "wallet_target_utilization_multiplier_max": 1.25,
+    "portfolio_opportunity_ranking_enabled": true,
+    "portfolio_ranking_only_after_eligibility": true,
     "v51_outcomes_may_seed_target_selection_prior": false,
     "v51_outcomes_may_grant_v52_promotion": false
   },
   "position_management": {
     "starter_fraction_of_target": 0.25,
-    "max_scale_fraction_of_target_per_add": 0.25,
+    "ordinary_max_scale_fraction_of_target_per_add": 0.25,
+    "max_scale_fraction_of_target_per_add": 0.50,
     "first_derisk_fraction_of_position": 0.25,
     "second_derisk_fraction_of_position": 0.50,
     "runner_fraction_of_target": 0.10,
+    "max_dynamic_runner_fraction_of_target": 0.25,
     "minimum_exit_depth_coverage_ratio": 2.0,
     "scale_requires_new_forward_evidence": true,
     "scale_requires_price_not_below_last_add": true,
