@@ -25,7 +25,8 @@
   "execution": {
     "latency_hard_max_seconds": 20.0,
     "chase_normal_max_fraction": 0.40,
-    "chase_observe_only_above_fraction": 0.80,
+    "chase_observe_only_above_fraction": 0.40,
+    "chase_exceptional_overlay_max_fraction": 0.80,
     "chase_exceptional_continuation_requires_strict_evidence": true,
     "amount_specific_entry_and_exit_quotes_required": true,
     "first_slot_pump_fun_sniping_allowed": false,
@@ -50,7 +51,8 @@
   "position_management": {
     "starter_fraction_of_target": 0.25,
     "ordinary_max_scale_fraction_of_target_per_add": 0.25,
-    "max_scale_fraction_of_target_per_add": 0.50,
+    "max_scale_fraction_of_target_per_add": 0.25,
+    "exceptional_max_scale_fraction_of_target_per_add": 0.50,
     "first_derisk_fraction_of_position": 0.25,
     "second_derisk_fraction_of_position": 0.50,
     "runner_fraction_of_target": 0.10,
