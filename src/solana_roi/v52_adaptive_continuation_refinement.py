@@ -199,6 +199,8 @@ def profile_confidence(profile: Mapping[str, Any]) -> float:
     if n < minimum or _profile_growth(profile) <= 0.0 or not _profile_trimmed_positive(profile):
         return 0.0
     drawdown = profile.get("max_drawdown_at_best_fraction")
+    if drawdown is None:
+        drawdown = profile.get("max_drawdown")
     if drawdown is not None and float(drawdown) > _policy_float("max_forward_drawdown", 0.35):
         return 0.0
     shortfall = profile.get("expected_shortfall_20")
@@ -551,10 +553,6 @@ def _robinhood_choose(
         auth["canonical_direct_profit_confidence_enabled"] = True
         profile["v52_authority"] = auth
         copied[lane] = profile
-        # The lifecycle wrapper records a pending target before this final canonical
-        # adaptive layer runs. Keep that durable pre-commit contract synchronized
-        # with the directly increased target so a valid add is not rejected against
-        # a stale lower target during exact aggregate-exitability validation.
         token = str(getattr(self, "_roi_v52_candidate_token", "") or "")
         pending_map = robinhood_lifecycle._pending_map(self)
         if token and token in pending_map:
