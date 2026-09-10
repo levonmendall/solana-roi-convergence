@@ -34,13 +34,14 @@ from .robinhood_provider_failover import (
     install_robinhood_provider_failover,
     status as provider_failover_status,
 )
+from .robinhood_provider_runtime_proof import install_robinhood_provider_runtime_proof
 from .robinhood_usage_bounded_transport import (
     install_robinhood_usage_bounded_transport,
     status as usage_bounded_transport_status,
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v9-provider-failover"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v10-provider-runtime-proof"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -176,6 +177,10 @@ def install_robinhood_production_provider_finalizer(
     # Outermost provider wrapper: catches provider/budget failures emitted by the
     # guarded RPC path and coordinates the HTTP + WSS generation switch.
     install_robinhood_provider_failover()
+    # Runtime proof belongs inside this same Robinhood provider finalizer, not in the
+    # top-level production facade. It chain-verifies the configured preferred private
+    # provider before authoritative use/failback and records redacted traffic counters.
+    install_robinhood_provider_runtime_proof()
     _preserve_bounded_transport_aliases()
 
     current_run = plane_cls.run
