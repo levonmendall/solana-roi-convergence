@@ -24,7 +24,7 @@ from fastapi import Header, HTTPException, Query
 
 from . import certification_service_split as split
 
-REPLICATION_VERSION = "certification-incremental-replica-v4-pinned-schema-version"
+REPLICATION_VERSION = "certification-incremental-replica-v5-startup-prepared-bootstrap"
 CHANGE_TABLE = "certification_replication_changes"
 META_TABLE = "certification_replication_meta"
 TRIGGER_PREFIX = "roi_cert_rep_"
@@ -434,33 +434,36 @@ def _delta_payload(store: Any, *, from_watermark: int, epoch: str, schema_finger
     }
 
 
-def _wrap_bootstrap_snapshot_builder() -> None:
-    current = split._snapshot_store_to_file
-    if bool(getattr(current, "_roi_replication_bootstrap_prepare", False)):
-        return
+def _prepare_available_runtime_store(runtime_provider: Callable[[], Any]) -> dict[str, Any] | None:
+    """Prepare tracking while the runtime may safely own its normal store lock.
 
-    def snapshot_with_replication_identity(store: Any, snapshot: Path) -> tuple[int, int]:
-        prepare_bootstrap(store)
-        return current(store, snapshot)
-
-    setattr(snapshot_with_replication_identity, "_roi_replication_bootstrap_prepare", True)
-    setattr(snapshot_with_replication_identity, "_roi_original_snapshot_store_to_file", current)
-    split._snapshot_store_to_file = snapshot_with_replication_identity  # type: ignore[assignment]
+    This is intentionally separate from the SQLite snapshot-copy primitive. HTTP
+    bootstrap routes are not reachable until FastAPI startup has completed, so a
+    late-created runtime store is prepared before the first exceptional bootstrap
+    without making the pinned-read snapshot helper acquire the live store lock.
+    """
+    try:
+        runtime = runtime_provider()
+    except Exception:
+        return None
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return None
+    return prepare_bootstrap(store)
 
 
 def install_certification_incremental_replication(app: Any, runtime_provider: Callable[[], Any]) -> None:
-    # Composition may run before the runtime store exists. Actual replication
-    # requests remain fail-closed until a canonical store is present. The full
-    # bootstrap builder is wrapped unconditionally so a later-available store gets
-    # tracking metadata before its first exceptional snapshot.
-    _wrap_bootstrap_snapshot_builder()
-    try:
-        initial_runtime = runtime_provider()
-    except Exception:
-        initial_runtime = None
-    initial_store = getattr(initial_runtime, "store", None) if initial_runtime is not None else None
-    if initial_store is not None:
-        prepare_bootstrap(initial_store)
+    # Composition can precede creation of the canonical runtime store. Prepare it
+    # immediately when available and again at application startup for the late-store
+    # case. The snapshot copy primitive itself remains an unwrapped, lock-free pinned
+    # read transaction; normal replication requests remain fail-closed without store.
+    _prepare_available_runtime_store(runtime_provider)
+    startup_marker = "roi_certification_incremental_replication_startup_prepare"
+    if not bool(getattr(app.state, startup_marker, False)):
+        def prepare_certification_replication_on_startup() -> None:
+            _prepare_available_runtime_store(runtime_provider)
+        app.add_event_handler("startup", prepare_certification_replication_on_startup)
+        setattr(app.state, startup_marker, True)
 
     path = "/v1/operations/certification-db-delta"
     status_path = "/v1/operations/certification-db-replication"
@@ -502,6 +505,7 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
                     "ready": False,
                     "reason": "canonical_store_unavailable",
                     "full_snapshot_normal_cycle": False,
+                    "snapshot_copy_holds_runtime_store_lock": False,
                     "paper_only": True,
                     "live_money_authority": False,
                 }
@@ -515,6 +519,8 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
                 "max_delta_rows": _max_delta_rows(),
                 "max_delta_bytes": _max_delta_bytes(),
                 "schema_identity_scope": "tables_columns_views_indexes_user_triggers_and_schema_version",
+                "snapshot_copy_holds_runtime_store_lock": False,
+                "replication_prepared_before_http_bootstrap": True,
                 "strategy_thresholds_changed": False,
                 "certification_thresholds_changed": False,
                 "continuity_semantics_changed": False,
@@ -524,6 +530,7 @@ def install_certification_incremental_replication(app: Any, runtime_provider: Ca
 
     app.state.roi_certification_incremental_replication = True
     app.state.roi_certification_incremental_replication_version = REPLICATION_VERSION
+    app.state.roi_certification_snapshot_copy_holds_runtime_store_lock = False
 
 
 __all__ = [
@@ -533,6 +540,7 @@ __all__ = [
     "TRIGGER_PREFIX",
     "_current_watermark",
     "_delta_payload",
+    "_prepare_available_runtime_store",
     "install_certification_incremental_replication",
     "prepare_bootstrap",
 ]
