@@ -7,11 +7,14 @@ from functools import wraps
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
+import httpx
+
 from . import robinhood_chain_runtime as runtime
 from . import robinhood_provider_failover as failover
 
 
-RUNTIME_PROOF_VERSION = "robinhood-provider-runtime-proof-v2-read-capability"
+RUNTIME_PROOF_VERSION = "robinhood-provider-runtime-proof-v3-drpc-method-quarantine"
+DEFAULT_DRPC_METHOD_UNAVAILABLE_COOLDOWN_SECONDS = 900.0
 _INSTALLED = False
 _PROBE_LOCK = threading.Lock()
 _FAILURE_LOCK = threading.Lock()
@@ -41,6 +44,37 @@ def _preferred_provider() -> failover.ProviderEndpoint | None:
     if not preferred:
         return None
     return next((item for item in failover.providers() if item.name == preferred), None)
+
+
+def _drpc_method_unavailable_cooldown_seconds() -> float:
+    raw = os.getenv("ROBINHOOD_DRPC_METHOD_UNAVAILABLE_COOLDOWN_SECONDS")
+    try:
+        value = float(raw) if raw is not None else DEFAULT_DRPC_METHOD_UNAVAILABLE_COOLDOWN_SECONDS
+    except (TypeError, ValueError):
+        value = DEFAULT_DRPC_METHOD_UNAVAILABLE_COOLDOWN_SECONDS
+    return max(60.0, value)
+
+
+def _jsonrpc_error_code(exc: BaseException) -> int | None:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    try:
+        body = exc.response.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return None
+    try:
+        return int(error.get("code"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _drpc_method_unavailable(provider: failover.ProviderEndpoint, exc: BaseException) -> bool:
+    return _provider_kind(provider) == "drpc" and _jsonrpc_error_code(exc) == -32601
 
 
 def _mark_success_with_telemetry(name: str, *, transport_kind: str) -> None:
@@ -103,15 +137,35 @@ def _switch_from_with_verification_reset(
     return result
 
 
-def _record_probe_failure(provider: failover.ProviderEndpoint, exc_name: str) -> None:
+def _record_probe_failure(provider: failover.ProviderEndpoint, exc: BaseException) -> None:
+    jsonrpc_code = _jsonrpc_error_code(exc)
+    method_unavailable = _drpc_method_unavailable(provider, exc)
+    cooldown_seconds = (
+        _drpc_method_unavailable_cooldown_seconds()
+        if method_unavailable
+        else failover._cooldown_seconds()
+    )
+    reason = "jsonrpc_method_not_found" if method_unavailable else None
+    now_wall = time.time()
     with failover._LOCK:
         state = failover._state_for_locked(provider.name)
         state["http_failures"] = int(state.get("http_failures", 0) or 0) + 1
-        state["last_failure_type"] = str(exc_name)
-        state["last_failure_at"] = time.time()
-        state["cooldown_until"] = time.monotonic() + failover._cooldown_seconds()
+        state["last_failure_type"] = type(exc).__name__
+        state["last_failure_at"] = now_wall
+        state["last_capability_jsonrpc_code"] = jsonrpc_code
+        state["cooldown_until"] = time.monotonic() + cooldown_seconds
+        state["capability_quarantine_reason"] = reason
+        state["capability_quarantine_until"] = now_wall + cooldown_seconds if reason is not None else None
         state["chain_verified"] = False
         state["read_capability_verified"] = False
+    if method_unavailable:
+        print(
+            "ROBINHOOD_PROVIDER_CAPABILITY_QUARANTINED "
+            f"provider={provider.name} provider_kind=drpc "
+            f"reason={reason} jsonrpc_code=-32601 "
+            f"cooldown_seconds={cooldown_seconds:.0f}",
+            flush=True,
+        )
 
 
 def _record_provider_verified(
@@ -131,6 +185,9 @@ def _record_provider_verified(
         state["last_chain_verified_at"] = time.time()
         state["last_read_capability_verified_at"] = time.time()
         state["last_verified_block"] = int(latest_block)
+        state["last_capability_jsonrpc_code"] = None
+        state["capability_quarantine_reason"] = None
+        state["capability_quarantine_until"] = None
         if changed:
             failover._ACTIVE_NAME = provider.name
             failover._GENERATION += 1
@@ -195,7 +252,7 @@ async def _verify_preferred_if_needed(rpc_self: Any) -> bool:
             if latest_block < 0:
                 raise RuntimeError("InvalidRobinhoodBlockNumber")
         except Exception as exc:
-            _record_probe_failure(preferred, type(exc).__name__)
+            _record_probe_failure(preferred, exc)
             rpc_self.rpc_url = active.http if active is not None else old_url
             print(
                 "ROBINHOOD_PROVIDER_CAPABILITY_VERIFY_FAILED "
@@ -235,31 +292,35 @@ def _status_with_runtime_proof() -> dict[str, Any]:
     assert _ORIGINAL_STATUS is not None
     result = dict(_ORIGINAL_STATUS())
     active = failover.active_provider()
+    now_monotonic = time.monotonic()
     with failover._LOCK:
-        traffic = {
-            item.name: {
+        traffic: dict[str, dict[str, Any]] = {}
+        for item in failover.providers():
+            state = failover._state_for_locked(item.name)
+            quarantine_reason = state.get("capability_quarantine_reason")
+            cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
+            quarantined = bool(quarantine_reason) and cooldown_until > now_monotonic
+            traffic[item.name] = {
                 "provider_kind": _provider_kind(item),
-                "http_successes": int(failover._state_for_locked(item.name).get("http_successes", 0) or 0),
-                "ws_successes": int(failover._state_for_locked(item.name).get("ws_successes", 0) or 0),
-                "last_http_success_at": failover._state_for_locked(item.name).get("last_http_success_at"),
-                "last_ws_success_at": failover._state_for_locked(item.name).get("last_ws_success_at"),
-                "chain_verified": bool(failover._state_for_locked(item.name).get("chain_verified", False)),
-                "read_capability_verified": bool(
-                    failover._state_for_locked(item.name).get("read_capability_verified", False)
+                "http_successes": int(state.get("http_successes", 0) or 0),
+                "ws_successes": int(state.get("ws_successes", 0) or 0),
+                "last_http_success_at": state.get("last_http_success_at"),
+                "last_ws_success_at": state.get("last_ws_success_at"),
+                "chain_verified": bool(state.get("chain_verified", False)),
+                "read_capability_verified": bool(state.get("read_capability_verified", False)),
+                "chain_verifications": int(state.get("chain_verifications", 0) or 0),
+                "read_capability_verifications": int(state.get("read_capability_verifications", 0) or 0),
+                "last_chain_verified_at": state.get("last_chain_verified_at"),
+                "last_read_capability_verified_at": state.get("last_read_capability_verified_at"),
+                "last_verified_block": state.get("last_verified_block"),
+                "failbacks_to": int(state.get("failbacks_to", 0) or 0),
+                "capability_quarantined": quarantined,
+                "capability_quarantine_reason": quarantine_reason if quarantined else None,
+                "capability_quarantine_remaining_seconds": (
+                    max(0.0, round(cooldown_until - now_monotonic, 3)) if quarantined else 0.0
                 ),
-                "chain_verifications": int(failover._state_for_locked(item.name).get("chain_verifications", 0) or 0),
-                "read_capability_verifications": int(
-                    failover._state_for_locked(item.name).get("read_capability_verifications", 0) or 0
-                ),
-                "last_chain_verified_at": failover._state_for_locked(item.name).get("last_chain_verified_at"),
-                "last_read_capability_verified_at": failover._state_for_locked(item.name).get(
-                    "last_read_capability_verified_at"
-                ),
-                "last_verified_block": failover._state_for_locked(item.name).get("last_verified_block"),
-                "failbacks_to": int(failover._state_for_locked(item.name).get("failbacks_to", 0) or 0),
+                "last_capability_jsonrpc_code": state.get("last_capability_jsonrpc_code"),
             }
-            for item in failover.providers()
-        }
     with _FAILURE_LOCK:
         request_failures = {
             f"{kind}:{method}": count for (kind, method), count in sorted(_REQUEST_FAILURE_COUNTS.items())
@@ -274,6 +335,7 @@ def _status_with_runtime_proof() -> dict[str, Any]:
                 state["http_successes"] > 0 or state["ws_successes"] > 0 for state in traffic.values()
             ),
             "provider_request_failures": request_failures,
+            "drpc_method_unavailable_cooldown_seconds": _drpc_method_unavailable_cooldown_seconds(),
         }
     )
     return result
