@@ -15,9 +15,6 @@ the explicit composition root (not called from this facade):
 import asyncio
 
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
-from .robinhood_drpc_http_failure_diagnostic import (
-    install_robinhood_drpc_http_failure_diagnostic,
-)
 
 # Provider credentials must be materialized before importing the production
 # composition root because the legacy-compatible Robinhood ingestion substrate
@@ -35,13 +32,6 @@ from .production_system import (
     production_system,
 )
 from . import legacy_production_composition as _legacy_production
-
-# Diagnostic-only instrumentation is installed after the canonical production
-# composition has created the provider-finalizer chain. It wraps only the saved
-# raw provider RPC callable and emits method + HTTP status on dRPC failures; it
-# cannot grant provider, strategy, paper-entry, signing, submission, or live-money
-# authority and never logs an endpoint, key, headers, or response body.
-install_robinhood_drpc_http_failure_diagnostic()
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
