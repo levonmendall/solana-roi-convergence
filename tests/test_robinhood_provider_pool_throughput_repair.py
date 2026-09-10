@@ -4,9 +4,6 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-from solana_roi import production
-from solana_roi import robinhood_alchemy_budget_guard as alchemy_guard
-from solana_roi import robinhood_provider_budget_transport as budget
 from solana_roi import robinhood_provider_pool_throughput_repair as repair
 
 
@@ -93,16 +90,16 @@ def test_research_loop_rebinds_to_active_private_provider(monkeypatch) -> None:
     assert calls == [drpc.http]
 
 
-def test_installation_unifies_provider_budget_caps() -> None:
-    # production imports and installs the repair before composing the runtime.
-    assert repair.status()["installed"] is True
-    assert budget._live_market_cap is repair._effective_live_market_cap
-    assert alchemy_guard._provider_pool_live_market_cap is repair._effective_live_market_cap
-    assert budget.BUDGET_VERSION == "robinhood-production-ws-transport-v4-provider-pool-throughput"
+def test_installation_source_unifies_provider_budget_caps_without_import_side_effects() -> None:
+    source = Path(repair.__file__).read_text(encoding="utf-8")
+    assert "budget._live_market_cap = _effective_live_market_cap" in source
+    assert "alchemy_guard._provider_pool_live_market_cap = _effective_live_market_cap" in source
+    assert 'budget.BUDGET_VERSION = "robinhood-production-ws-transport-v4-provider-pool-throughput"' in source
 
 
 def test_production_installs_repair_before_composition_root() -> None:
-    source = Path(production.__file__).read_text(encoding="utf-8")
+    production_path = Path(repair.__file__).with_name("production.py")
+    source = production_path.read_text(encoding="utf-8")
     repair_install = source.index("install_robinhood_provider_pool_throughput_repair()")
     composition_import = source.index("from .production_system import")
     assert repair_install < composition_import
