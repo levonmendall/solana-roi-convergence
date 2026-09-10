@@ -42,6 +42,9 @@ def _build_source(path: Path) -> _Store:
             "INSERT INTO composite(a,b,value) VALUES (?,?,?)",
             [("a", "1", b"blob-a"), ("a", "2", b"blob-b"), ("b", "1", None)],
         )
+        store.db.execute("UPDATE sqlite_sequence SET seq=41 WHERE name='sample'")
+        store.db.execute("PRAGMA user_version=17")
+        store.db.execute("PRAGMA application_id=424242")
     return store
 
 
@@ -77,7 +80,7 @@ def _fake_open_json(store: _Store, *, mutate_after_first_sample_page: bool = Fal
     return open_json
 
 
-def test_logical_bootstrap_reconstructs_schema_and_rows_without_full_snapshot(
+def test_logical_bootstrap_reconstructs_schema_rows_and_sqlite_metadata_without_full_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -100,6 +103,8 @@ def test_logical_bootstrap_reconstructs_schema_and_rows_without_full_snapshot(
         )
         assert identity["last_transport"] == "bounded_logical_bootstrap"
         assert identity["bootstrap_rows"] >= 11
+        assert identity["sqlite_sequence_preserved"] is True
+        assert identity["sqlite_pragma_metadata_preserved"] is True
         assert destination.is_file()
 
         replica = sqlite3.connect(destination)
@@ -119,6 +124,12 @@ def test_logical_bootstrap_reconstructs_schema_and_rows_without_full_snapshot(
             assert replica.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='sample_audit'"
             ).fetchone()[0] == 1
+            assert replica.execute("SELECT seq FROM sqlite_sequence WHERE name='sample'").fetchone()[0] == 41
+            assert replica.execute("PRAGMA user_version").fetchone()[0] == 17
+            assert replica.execute("PRAGMA application_id").fetchone()[0] == 424242
+            inserted = replica.execute("INSERT INTO sample(value) VALUES ('after-bootstrap')")
+            assert inserted.lastrowid == 42
+            replica.rollback()
         finally:
             replica.close()
     finally:
