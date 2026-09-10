@@ -142,15 +142,21 @@ def test_runtime_status_counts_traffic_without_endpoint_or_secret(monkeypatch) -
     assert "alchemy.com" not in encoded
 
 
-def test_production_installs_runtime_proof_after_provider_composition() -> None:
+def test_runtime_proof_stays_inside_existing_robinhood_provider_finalizer() -> None:
     from pathlib import Path
 
-    production = Path(__file__).parents[1] / "src" / "solana_roi" / "production.py"
-    source = production.read_text(encoding="utf-8")
+    root = Path(__file__).parents[1] / "src" / "solana_roi"
+    production = (root / "production.py").read_text(encoding="utf-8")
+    finalizer = (root / "robinhood_production_provider_finalizer.py").read_text(encoding="utf-8")
 
-    assert source.index("configure_robinhood_drpc_backup()") < source.index(
+    # production.py remains the installer-free canonical facade.
+    assert "install_robinhood_provider_runtime_proof()" not in production
+    assert production.index("configure_robinhood_drpc_backup()") < production.index(
         "from .production_system import"
     )
-    assert source.index("from .production_system import") < source.index(
+
+    # Runtime proof is composed immediately after the existing outermost provider
+    # failover wrapper, preserving one Robinhood provider authority chain.
+    assert finalizer.index("install_robinhood_provider_failover()") < finalizer.index(
         "install_robinhood_provider_runtime_proof()"
-    )
+    ) < finalizer.index("_preserve_bounded_transport_aliases()")
