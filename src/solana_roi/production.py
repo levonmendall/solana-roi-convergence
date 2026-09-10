@@ -15,12 +15,19 @@ the explicit composition root (not called from this facade):
 import asyncio
 
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
+from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 
 # Keep authoritative certification-replica requests below the certifier's bounded
 # HTTP deadline. This changes only transport pagination; evidence, continuity, and
 # every strategy/certification threshold remain unchanged.
 configure_production_certification_delta_bound()
+
+# Replace ordinary full-history event-ledger verification with a validated durable
+# integrity anchor plus append-only tail verification before production composition
+# installs the cgroup-bounded verifier. Missing/corrupt anchors still fall back to
+# complete hash-chain verification; no integrity or authority gate is weakened.
+configure_incremental_event_integrity_repair()
 
 # Provider credentials must be materialized before importing the production
 # composition root because the legacy-compatible Robinhood ingestion substrate
