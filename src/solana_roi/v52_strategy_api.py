@@ -7,12 +7,14 @@ from .strategy_v52_authority import authority, authority_fingerprint, safety_man
 from .v52_authoritative_strategy import status as strategy_status
 from .v52_profit_confidence_completion import report as profit_confidence_report, status as profit_confidence_status
 from .v52_profit_confidence_finalization import status as profit_confidence_finalization_status
+from .v52_learning_governance import status as learning_governance_status
 
 STATUS_PATH = "/v1/strategy/authority"
 V52_STATUS_PATH = "/v1/strategy/v52"
 V51_CONTROL_PATH = "/v1/strategy/control/v51-authority"
 PERFORMANCE_24H_PATH = "/v1/strategy/v52/performance/24h"
 PERFORMANCE_7D_PATH = "/v1/strategy/v52/performance/7d"
+LEARNING_GOVERNANCE_PATH = "/v1/strategy/v52/learning-governance"
 _INSTALLED = False
 
 
@@ -34,14 +36,17 @@ def _payload() -> dict[str, Any]:
         "position_management": dict(policy["position_management"]),
         "detection_intelligence": dict(policy["detection_intelligence"]),
         "execution": dict(policy["execution"]),
+        "governance": dict(policy["governance"]),
         "strategy_runtime": strategy_status(),
         "profit_confidence_completion": profit_confidence_status(),
+        "learning_governance": learning_governance_status(),
         "profit_confidence_finalization": profit_confidence_finalization_status(),
         "performance_reports": {
             "24h": PERFORMANCE_24H_PATH,
             "7d": PERFORMANCE_7D_PATH,
             "read_only": True,
         },
+        "learning_governance_status_path": LEARNING_GOVERNANCE_PATH,
         "safety": safety,
         "canonical": True,
         "paper_only": bool(safety["paper_only"]),
@@ -100,11 +105,16 @@ def install_v52_strategy_api(app: Any) -> None:
         @app.get(PERFORMANCE_7D_PATH)
         def v52_performance_7d() -> dict[str, Any]:
             return profit_confidence_report(24 * 7)
+    if LEARNING_GOVERNANCE_PATH not in existing:
+        @app.get(LEARNING_GOVERNANCE_PATH)
+        def v52_learning_governance_status() -> dict[str, Any]:
+            return learning_governance_status()
 
     app.state.roi_strategy_authority_status = _payload
     app.state.roi_v51_control_authority_status = _v51_control_payload
     app.state.roi_v52_performance_24h = lambda: profit_confidence_report(24)
     app.state.roi_v52_performance_7d = lambda: profit_confidence_report(24 * 7)
+    app.state.roi_v52_learning_governance_status = learning_governance_status
     _INSTALLED = True
 
 
@@ -116,7 +126,9 @@ def status() -> dict[str, Any]:
         "v51_control_path": V51_CONTROL_PATH,
         "performance_24h_path": PERFORMANCE_24H_PATH,
         "performance_7d_path": PERFORMANCE_7D_PATH,
+        "learning_governance_path": LEARNING_GOVERNANCE_PATH,
         "performance_reports_read_only": True,
+        "learning_governance_status_read_only": True,
         "authoritative_strategy": "v5.2",
         "v51_control_final_decision_authority": False,
         "paper_only": True,
@@ -127,6 +139,7 @@ def status() -> dict[str, Any]:
 
 
 __all__ = [
+    "LEARNING_GOVERNANCE_PATH",
     "PERFORMANCE_24H_PATH",
     "PERFORMANCE_7D_PATH",
     "STATUS_PATH",
