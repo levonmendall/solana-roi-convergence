@@ -10,8 +10,10 @@ Normal cycles consume bounded, possibly multi-batch deltas transactionally.
 A successfully materialized logical replica is durable catch-up state. Transient
 transport failures and bounded catch-up exhaustion must never throw that exact state
 away and restart the expensive logical scan; the next cycle resumes from the last
-transactionally committed watermark. Only release/schema/epoch invalidation forces a
-fresh bootstrap.
+transactionally committed watermark. A code-release change by itself is not database
+incompatibility: exact-release truth is re-established on every authoritative delta
+response, while replication version/epoch/schema/watermark continuity decide whether
+the existing replica can catch up incrementally.
 """
 
 import fcntl
@@ -36,7 +38,7 @@ from .certification_incremental_replication import (
 )
 from .certification_logical_bootstrap_client import LogicalBootstrapRestartRequired, logical_bootstrap
 
-CLIENT_VERSION = "certification-incremental-replica-client-v6-resumable-catchup"
+CLIENT_VERSION = "certification-incremental-replica-client-v7-cross-release-compatible"
 DEFAULT_DELTA_TIMEOUT_SECONDS = 30.0
 DEFAULT_DELTA_BATCH_PAUSE_SECONDS = 0.05
 DEFAULT_COPY_CHUNK_BYTES = 8 * 1024 * 1024
@@ -50,7 +52,7 @@ TRANSACTION_SUBMISSION_AVAILABLE = False
 
 
 class ReplicaBootstrapRequired(RuntimeError):
-    """The authoritative release/schema/epoch identity requires a fresh replica."""
+    """The authoritative replication/schema/epoch identity requires a fresh replica."""
 
 
 class ReplicaDeltaTransportError(RuntimeError):
@@ -337,6 +339,9 @@ def _apply_delta(replica: Path, state: dict[str, Any], payload: dict[str, Any]) 
     caught_up = bool(payload.get("caught_up", True))
     next_state = dict(state)
     next_state["client_version"] = CLIENT_VERSION
+    payload_release = str(payload.get("release_commit") or "")
+    if payload_release:
+        next_state["release_commit"] = payload_release
     next_state["watermark"] = to_watermark
     next_state["catchup_complete"] = caught_up
     next_state["last_transport"] = "incremental_delta"
@@ -495,7 +500,6 @@ def synchronize_replica(*, base: str, token: str, expected_release: str) -> tupl
     if (
         state is None
         or not replica.is_file()
-        or str(state.get("release_commit") or "") != expected_release
         or str(state.get("replication_version") or "") != REPLICATION_VERSION
     ):
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
@@ -504,6 +508,10 @@ def synchronize_replica(*, base: str, token: str, expected_release: str) -> tupl
     except BaseException:
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
     try:
+        # A saved release mismatch is intentionally allowed here. The current
+        # authoritative response must still match expected_release exactly, and
+        # replication version/epoch/schema/watermark validation below remains
+        # fail-closed. A 409 or incompatible identity still forces bootstrap.
         result = _catch_up_deltas(
             replica,
             state,
@@ -511,6 +519,7 @@ def synchronize_replica(*, base: str, token: str, expected_release: str) -> tupl
             token=token,
             expected_release=expected_release,
         )
+        result["release_commit"] = expected_release
         result["catchup_complete"] = True
         _atomic_state(_state_path(replica), result)
         return replica, result
@@ -583,6 +592,9 @@ def status() -> dict[str, Any]:
         "full_snapshot_bootstrap_enabled": _allow_full_snapshot_recovery(),
         "full_snapshot_role": "explicit_recovery_only",
         "normal_cycle_transport": "bounded_incremental_delta",
+        "replica_compatibility_identity": "replication_version+epoch+schema_fingerprint+watermark",
+        "release_sha_is_artifact_truth_not_replica_identity": True,
+        "cross_release_incremental_catchup": True,
         "delta_batches_are_paginated": True,
         "delta_batch_pause_seconds": _delta_batch_pause(),
         "resumable_delta_catchup": True,
