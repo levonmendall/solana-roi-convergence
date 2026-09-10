@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -106,9 +107,7 @@ def test_critical_reserve_blocks_qualification_before_settlement(monkeypatch: py
     assert capacity.status()["provider_month_to_date_requests"]["chainstack"] == 10
 
 
-@pytest.mark.asyncio
-async def test_chainstack_429_is_retried_once_without_immediate_failover(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ROBINHOOD_PROVIDER_429_BACKOFF_SECONDS", "0.01")
+def test_chainstack_429_is_retried_once_without_immediate_failover(monkeypatch: pytest.MonkeyPatch) -> None:
     rpc = SimpleNamespace(rpc_url="https://robinhood-mainnet.core.chainstack.com/redacted")
     calls = 0
 
@@ -122,7 +121,7 @@ async def test_chainstack_429_is_retried_once_without_immediate_failover(monkeyp
         return "0x1"
 
     wrapped = capacity._guarded_rpc(original)
-    result = await wrapped(rpc, "eth_call", [{"to": "0x0", "data": "0x"}, "latest"])
+    result = asyncio.run(wrapped(rpc, "eth_call", [{"to": "0x0", "data": "0x"}, "latest"]))
 
     assert result == "0x1"
     assert calls == 2
