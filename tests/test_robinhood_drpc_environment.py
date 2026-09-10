@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from solana_roi import robinhood_drpc_environment as drpc
 from solana_roi import robinhood_provider_failover as failover
@@ -16,6 +19,28 @@ _ENV_NAMES = (
     "ROBINHOOD_BACKUP_WS_URL",
     "ROBINHOOD_PROVIDER_PRIMARY",
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_provider_environment() -> None:
+    """Restore direct os.environ mutations made by the production bootstrap.
+
+    The dRPC bootstrap intentionally materializes Render-held configuration into
+    process environment before production composition. pytest's monkeypatch can
+    only undo mutations it performed itself, so production-side writes must be
+    restored explicitly to keep later fail-closed provider tests independent.
+    """
+
+    before = {name: os.environ.get(name) for name in _ENV_NAMES}
+    try:
+        yield
+    finally:
+        for name, value in before.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        failover.reset_for_tests()
 
 
 def _clear(monkeypatch) -> None:
