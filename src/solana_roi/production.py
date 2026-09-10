@@ -15,7 +15,14 @@ the explicit composition root (not called from this facade):
 import asyncio
 
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
+from .memory_pressure_observability import install_memory_pressure_observability
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
+
+# Begin read-only cgroup/process attribution before the composition root constructs
+# the durable runtime. This lets production pressure events identify whether memory
+# is anonymous, file-backed, kernel/slab, mapped, or owned by another cgroup process.
+# It has no resource-control, persistence, strategy, or certification authority.
+install_memory_pressure_observability()
 
 # Keep authoritative certification-replica requests below the certifier's bounded
 # HTTP deadline. This changes only transport pagination; evidence, continuity, and
