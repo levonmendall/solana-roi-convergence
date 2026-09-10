@@ -15,7 +15,7 @@ from .certification_incremental_replication import REPLICATION_VERSION
 from .certification_logical_bootstrap import BOOTSTRAP_VERSION
 
 
-CLIENT_VERSION = "certification-logical-bootstrap-client-v1"
+CLIENT_VERSION = "certification-logical-bootstrap-client-v2-sqlite-metadata"
 
 
 class LogicalBootstrapRestartRequired(RuntimeError):
@@ -43,7 +43,7 @@ def _request(url: str, token: str) -> urllib.request.Request:
         headers={
             "Accept": "application/json",
             "X-Certification-Token": token,
-            "User-Agent": "solana-roi-isolated-certifier-logical-bootstrap/1",
+            "User-Agent": "solana-roi-isolated-certifier-logical-bootstrap/2",
         },
     )
 
@@ -83,6 +83,51 @@ def _validate_manifest(payload: dict[str, Any], expected_release: str) -> tuple[
     return epoch, fingerprint, watermark
 
 
+def _restore_sqlite_metadata(
+    connection: sqlite3.Connection,
+    *,
+    manifest: dict[str, Any],
+    table_names: set[str],
+) -> None:
+    """Restore metadata that logical row copies do not reconstruct exactly."""
+    sequences = manifest.get("sqlite_sequence", [])
+    pragmas = manifest.get("pragmas", {})
+    if not isinstance(sequences, list) or not isinstance(pragmas, dict):
+        raise RuntimeError("certification logical bootstrap SQLite metadata invalid")
+
+    if sequences:
+        sequence_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+        ).fetchone()
+        if sequence_exists is None:
+            raise RuntimeError("certification logical bootstrap sqlite_sequence missing")
+        connection.execute("DELETE FROM sqlite_sequence")
+        seen: set[str] = set()
+        for item in sequences:
+            if not isinstance(item, dict):
+                raise RuntimeError("certification logical bootstrap sequence row invalid")
+            name = str(item.get("name") or "")
+            seq = item.get("seq")
+            if name not in table_names or name in seen or not isinstance(seq, int) or isinstance(seq, bool):
+                raise RuntimeError("certification logical bootstrap sequence frontier invalid")
+            connection.execute("INSERT INTO sqlite_sequence(name,seq) VALUES (?,?)", (name, int(seq)))
+            seen.add(name)
+
+    user_version = pragmas.get("user_version", 0)
+    application_id = pragmas.get("application_id", 0)
+    if (
+        not isinstance(user_version, int)
+        or isinstance(user_version, bool)
+        or not isinstance(application_id, int)
+        or isinstance(application_id, bool)
+    ):
+        raise RuntimeError("certification logical bootstrap SQLite pragma metadata invalid")
+    if not (-2147483648 <= user_version <= 2147483647) or not (-2147483648 <= application_id <= 2147483647):
+        raise RuntimeError("certification logical bootstrap SQLite pragma metadata out of range")
+    connection.execute(f"PRAGMA user_version={int(user_version)}")
+    connection.execute(f"PRAGMA application_id={int(application_id)}")
+
+
 def logical_bootstrap(
     destination: Path,
     *,
@@ -107,6 +152,7 @@ def logical_bootstrap(
     total_rows = 0
     total_payload_bytes = 0
     table_count = 0
+    table_names: set[str] = set()
     try:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("PRAGMA journal_mode=DELETE")
@@ -119,8 +165,9 @@ def logical_bootstrap(
             create_sql = str(table.get("create_sql") or "")
             columns = table.get("columns")
             without_rowid = bool(table.get("without_rowid"))
-            if not name or not create_sql or not isinstance(columns, list) or not columns:
+            if not name or name in table_names or not create_sql or not isinstance(columns, list) or not columns:
                 raise RuntimeError("certification logical bootstrap table manifest incomplete")
+            table_names.add(name)
             column_names = [str(column) for column in columns]
             connection.execute(create_sql)
             connection.commit()
@@ -176,7 +223,7 @@ def logical_bootstrap(
                         decoded_rows.append(values)
                     else:
                         rowid = record.get("rowid")
-                        if not isinstance(rowid, int):
+                        if not isinstance(rowid, int) or isinstance(rowid, bool):
                             raise RuntimeError("certification logical bootstrap rowid invalid")
                         decoded_rows.append((rowid, *values))
                 if decoded_rows:
@@ -195,8 +242,10 @@ def logical_bootstrap(
                 cursor = next_cursor
 
         # Data loads occur before user triggers exist, so source-side effects are not
-        # re-fired. Explicit user indexes/views/triggers are recreated only after all
-        # canonical rows have been copied.
+        # re-fired. Restore metadata frontiers before user schema objects are attached.
+        _restore_sqlite_metadata(connection, manifest=manifest, table_names=table_names)
+        connection.commit()
+
         order = {"index": 0, "view": 1, "trigger": 2}
         ordered_schema = sorted(
             (item for item in post_schema if isinstance(item, dict)),
@@ -231,6 +280,8 @@ def logical_bootstrap(
         "bootstrap_rows": total_rows,
         "bootstrap_payload_bytes": total_payload_bytes,
         "bootstrap_tables": table_count,
+        "sqlite_sequence_preserved": True,
+        "sqlite_pragma_metadata_preserved": True,
         "last_transport": "bounded_logical_bootstrap",
         "paper_only": True,
         "live_money_authority": False,
