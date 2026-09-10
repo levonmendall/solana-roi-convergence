@@ -10,13 +10,14 @@ from . import v52_robinhood_position_lifecycle as robinhood_lifecycle
 from .strategy_v52_authority import (
     LIVE_MONEY_AUTHORITY,
     PAPER_ONLY,
+    detection_policy,
     execution_policy,
     position_policy as canonical_position_policy,
     target_sizing_policy,
 )
 from .v52_wallet_alpha_refinement import ContextualWalletScore, WalletAlphaRefinementLedger
 
-REFINEMENT_VERSION = "v52-adaptive-continuation-refinement-v1"
+REFINEMENT_VERSION = "v52-adaptive-continuation-refinement-v2-lineage-safe-overlay"
 ORDINARY_SCALE_FRACTION = 0.25
 EXCEPTIONAL_SCALE_FRACTION = 0.50
 BASE_RUNNER_FRACTION = 0.10
@@ -66,11 +67,12 @@ def _independent_count(payload: Mapping[str, Any]) -> int:
 
 
 def exceptional_continuation_evidence(payload: Mapping[str, Any]) -> bool:
-    """Return true only for unusually well-corroborated executable continuation.
+    """Require unusually strong evidence before the adaptive overlay can act.
 
-    This gate never grants entry by itself. The underlying v5.2 chooser must still
-    pass hard stops, exact quote/depth, latency, structural exitability and the
-    normal forward-evidence rules.
+    This gate never grants an entry by itself. The canonical v5.2 chooser still
+    owns hard stops, exact quote/depth, latency, structural exitability, and
+    forward-evidence qualification. The overlay may only re-evaluate a >40%
+    chase after these additional continuation conditions are present.
     """
     if _severity(payload) > 0.20:
         return False
@@ -80,7 +82,7 @@ def exceptional_continuation_evidence(payload: Mapping[str, Any]) -> bool:
         "pre_fomo",
         "active_fomo",
     }
-    broad_required = int(target_sizing_policy()["detection_intelligence.minimum_broad_independent_clusters"]) if "detection_intelligence.minimum_broad_independent_clusters" in target_sizing_policy() else 5
+    broad_required = int(detection_policy()["minimum_broad_independent_clusters"])
     corroborated = _independent_count(payload) >= max(5, broad_required)
     return bool(persistent and corroborated)
 
@@ -110,10 +112,22 @@ def opportunity_priority_score(
     risk_severity: float,
     wallet_multiplier: float = 1.0,
 ) -> float:
-    evidence = min(1.0, max(0.0, float(sample_count)) / max(1, int(target_sizing_policy()["minimum_forward_samples"])))
+    evidence = min(
+        1.0,
+        max(0.0, float(sample_count))
+        / max(1, int(target_sizing_policy()["minimum_forward_samples"])),
+    )
     risk_quality = max(0.0, 1.0 - float(risk_severity))
-    wallet_quality = max(1.0, min(MAX_WALLET_UTILIZATION_MULTIPLIER, float(wallet_multiplier)))
-    return float(expected_log_growth) * 100.0 + evidence * 2.0 + risk_quality + (wallet_quality - 1.0) * 4.0
+    wallet_quality = max(
+        1.0,
+        min(MAX_WALLET_UTILIZATION_MULTIPLIER, float(wallet_multiplier)),
+    )
+    return (
+        float(expected_log_growth) * 100.0
+        + evidence * 2.0
+        + risk_quality
+        + (wallet_quality - 1.0) * 4.0
+    )
 
 
 def rank_eligible_opportunities(candidates: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -132,11 +146,17 @@ def rank_eligible_opportunities(candidates: Iterable[Mapping[str, Any]]) -> list
         eligible.append(copied)
     return sorted(
         eligible,
-        key=lambda item: (-float(item["portfolio_priority_score"]), str(item.get("candidate_id") or "")),
+        key=lambda item: (
+            -float(item["portfolio_priority_score"]),
+            str(item.get("candidate_id") or ""),
+        ),
     )
 
 
-def _score_wallet(pre: Mapping[str, Any], profile: Mapping[str, Any]) -> ContextualWalletScore | None:
+def _score_wallet(
+    pre: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> ContextualWalletScore | None:
     if _WALLET_ALPHA is None:
         return None
     wallet = str(pre.get("wallet") or pre.get("trigger_wallet") or "")
@@ -168,10 +188,19 @@ def _apply_wallet_and_priority(
     if final > 0.0 and multiplier > 1.0 and old_target > 0.0:
         stage = str(authority.get("capture_stage") or "starter")
         if stage == "starter":
-            final = min(new_target, new_target * float(_contextual_position_policy()["starter_fraction_of_target"]))
+            final = min(
+                new_target,
+                new_target * float(_contextual_position_policy()["starter_fraction_of_target"]),
+            )
         else:
-            add_cap = new_target * float(_contextual_position_policy()["max_scale_fraction_of_target_per_add"])
-            final = min(add_cap, max(0.0, new_target - open_before), final * multiplier)
+            add_cap = new_target * float(
+                _contextual_position_policy()["max_scale_fraction_of_target_per_add"]
+            )
+            final = min(
+                add_cap,
+                max(0.0, new_target - open_before),
+                final * multiplier,
+            )
     priority = opportunity_priority_score(
         expected_log_growth=float(profile.get("best_expected_log_growth") or 0.0),
         sample_count=int(profile.get("sample_count") or 0),
@@ -183,8 +212,12 @@ def _apply_wallet_and_priority(
             "target_fraction": new_target,
             "final_fraction": final,
             "wallet_target_utilization_multiplier": multiplier,
-            "wallet_influence_validated": bool(wallet_score and wallet_score.eligible_for_strategy_influence),
-            "wallet_forward_samples": int(wallet_score.paired_forward_episodes) if wallet_score else 0,
+            "wallet_influence_validated": bool(
+                wallet_score and wallet_score.eligible_for_strategy_influence
+            ),
+            "wallet_forward_samples": (
+                int(wallet_score.paired_forward_episodes) if wallet_score else 0
+            ),
             "portfolio_priority_score": priority,
             "portfolio_ranking_only_after_eligibility": True,
         }
@@ -195,33 +228,76 @@ def _apply_wallet_and_priority(
     return final, profiles
 
 
-def _solana_choose(adapter: Any, pre: dict[str, Any], *, chase: float | None = None, latency: float | None = None) -> tuple[str | None, float, dict[str, Any]]:
+def _solana_choose(
+    adapter: Any,
+    pre: dict[str, Any],
+    *,
+    chase: float | None = None,
+    latency: float | None = None,
+) -> tuple[str | None, float, dict[str, Any]]:
     if _BASE_SOLANA_CHOOSE is None:
         raise RuntimeError("v52 adaptive Solana base unavailable")
     exceptional = exceptional_continuation_evidence(pre)
     chase_state = chase_classification(chase, exceptional=exceptional)
     if chase_state == "observe_only":
         return None, 0.0, {}
+
+    # The canonical chooser retains the hard 40% baseline. Only this guarded
+    # overlay may re-evaluate an exceptional 40-80% continuation, and it does so
+    # by presenting the canonical boundary to the base chooser while retaining
+    # the actual observed chase in the adaptive authority metadata below.
+    base_chase = (
+        NORMAL_CHASE_MAX
+        if chase_state == "exceptional_continuation"
+        else chase
+    )
     token = _EXCEPTIONAL_SCALE.set(exceptional)
     try:
-        lane, fraction, profiles = _BASE_SOLANA_CHOOSE(adapter, pre, chase=chase, latency=latency)
+        lane, fraction, profiles = _BASE_SOLANA_CHOOSE(
+            adapter,
+            pre,
+            chase=base_chase,
+            latency=latency,
+        )
+        copied = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in dict(profiles or {}).items()
+        }
+        if not lane or float(fraction or 0.0) <= 0.0:
+            return lane, float(fraction or 0.0), copied
+        final, copied = _apply_wallet_and_priority(
+            lane=lane,
+            pre=pre,
+            fraction=float(fraction),
+            profiles=copied,
+        )
     finally:
         _EXCEPTIONAL_SCALE.reset(token)
-    copied = {key: dict(value) if isinstance(value, dict) else value for key, value in dict(profiles or {}).items()}
-    if not lane or float(fraction or 0.0) <= 0.0:
-        return lane, float(fraction or 0.0), copied
-    final, copied = _apply_wallet_and_priority(lane=lane, pre=pre, fraction=float(fraction), profiles=copied)
+
     profile = dict(copied.get(lane) or {})
     auth = dict(profile.get("v52_authority") or {})
     auth["chase_classification"] = chase_state
+    auth["adaptive_observed_chase_fraction"] = (
+        float(chase) if chase is not None else None
+    )
+    auth["canonical_chase_boundary_preserved"] = float(
+        execution_policy()["chase_observe_only_above_fraction"]
+    )
     auth["exceptional_continuation_evidence"] = exceptional
-    auth["scale_cap_fraction_of_target"] = EXCEPTIONAL_SCALE_FRACTION if exceptional else ORDINARY_SCALE_FRACTION
+    auth["scale_cap_fraction_of_target"] = (
+        EXCEPTIONAL_SCALE_FRACTION if exceptional else ORDINARY_SCALE_FRACTION
+    )
     profile["v52_authority"] = auth
     copied[lane] = profile
     return (lane if final > 0.0 else None), final, copied
 
 
-def _fomo_decision(adapter: Any, *, observation: dict[str, Any], trial: dict[str, Any]) -> dict[str, Any]:
+def _fomo_decision(
+    adapter: Any,
+    *,
+    observation: dict[str, Any],
+    trial: dict[str, Any],
+) -> dict[str, Any]:
     if _BASE_FOMO_DECISION is None:
         raise RuntimeError("v52 adaptive FOMO base unavailable")
     state = fomo_paper._safe_json(observation.get("state_json"))
@@ -229,14 +305,24 @@ def _fomo_decision(adapter: Any, *, observation: dict[str, Any], trial: dict[str
     exceptional = exceptional_continuation_evidence(evidence)
     token = _EXCEPTIONAL_SCALE.set(exceptional)
     try:
-        result = dict(_BASE_FOMO_DECISION(adapter, observation=observation, trial=trial))
+        result = dict(
+            _BASE_FOMO_DECISION(adapter, observation=observation, trial=trial)
+        )
     finally:
         _EXCEPTIONAL_SCALE.reset(token)
-    authority = dict(result.get("v52_authority") or (result.get("profile") or {}).get("v52_authority") or {})
+    authority = dict(
+        result.get("v52_authority")
+        or (result.get("profile") or {}).get("v52_authority")
+        or {}
+    )
     authority["exceptional_continuation_evidence"] = exceptional
-    authority["scale_cap_fraction_of_target"] = EXCEPTIONAL_SCALE_FRACTION if exceptional else ORDINARY_SCALE_FRACTION
+    authority["scale_cap_fraction_of_target"] = (
+        EXCEPTIONAL_SCALE_FRACTION if exceptional else ORDINARY_SCALE_FRACTION
+    )
     authority["portfolio_priority_score"] = opportunity_priority_score(
-        expected_log_growth=float((result.get("profile") or {}).get("best_expected_log_growth") or 0.0),
+        expected_log_growth=float(
+            (result.get("profile") or {}).get("best_expected_log_growth") or 0.0
+        ),
         sample_count=int((result.get("profile") or {}).get("sample_count") or 0),
         risk_severity=_severity(evidence),
     )
@@ -247,7 +333,10 @@ def _fomo_decision(adapter: Any, *, observation: dict[str, Any], trial: dict[str
     return result
 
 
-def _robinhood_choose(self: Any, **kwargs: Any) -> tuple[str | None, float, dict[str, Any]]:
+def _robinhood_choose(
+    self: Any,
+    **kwargs: Any,
+) -> tuple[str | None, float, dict[str, Any]]:
     if _BASE_ROBINHOOD_CHOOSE is None:
         raise RuntimeError("v52 adaptive Robinhood base unavailable")
     exceptional = exceptional_continuation_evidence(kwargs)
@@ -256,12 +345,17 @@ def _robinhood_choose(self: Any, **kwargs: Any) -> tuple[str | None, float, dict
         lane, fraction, profiles = _BASE_ROBINHOOD_CHOOSE(self, **kwargs)
     finally:
         _EXCEPTIONAL_SCALE.reset(token)
-    copied = {key: dict(value) if isinstance(value, dict) else value for key, value in dict(profiles or {}).items()}
+    copied = {
+        key: dict(value) if isinstance(value, dict) else value
+        for key, value in dict(profiles or {}).items()
+    }
     if lane and lane in copied:
         profile = dict(copied[lane])
         authority = dict(profile.get("v52_authority") or {})
         authority["exceptional_continuation_evidence"] = exceptional
-        authority["scale_cap_fraction_of_target"] = EXCEPTIONAL_SCALE_FRACTION if exceptional else ORDINARY_SCALE_FRACTION
+        authority["scale_cap_fraction_of_target"] = (
+            EXCEPTIONAL_SCALE_FRACTION if exceptional else ORDINARY_SCALE_FRACTION
+        )
         authority["portfolio_priority_score"] = opportunity_priority_score(
             expected_log_growth=float(profile.get("best_expected_log_growth") or 0.0),
             sample_count=int(profile.get("sample_count") or 0),
@@ -281,11 +375,17 @@ async def _robinhood_settle(self: Any, trial: dict[str, Any]) -> None:
         with self.store._lock:
             row = self.store.db.execute(
                 "SELECT p.last_flow_state,p.last_risk_severity,p.derisk_stage "
-                "FROM v52_robinhood_position_lots l JOIN v52_robinhood_positions p ON p.id=l.position_id "
+                "FROM v52_robinhood_position_lots l "
+                "JOIN v52_robinhood_positions p ON p.id=l.position_id "
                 "WHERE l.trial_id=? LIMIT 1",
                 (trial_id,),
             ).fetchone()
-        if row is not None and int(row["derisk_stage"] or 0) >= 2 and str(row["last_flow_state"] or "") == "active_fomo" and float(row["last_risk_severity"] or 0.0) <= 0.20:
+        if (
+            row is not None
+            and int(row["derisk_stage"] or 0) >= 2
+            and str(row["last_flow_state"] or "") == "active_fomo"
+            and float(row["last_risk_severity"] or 0.0) <= 0.20
+        ):
             runner = MAX_DYNAMIC_RUNNER_FRACTION
     except Exception:
         runner = BASE_RUNNER_FRACTION
@@ -296,7 +396,22 @@ async def _robinhood_settle(self: Any, trial: dict[str, Any]) -> None:
         _RUNNER_FRACTION.reset(token)
 
 
-def install_v52_adaptive_continuation_refinement(wallet_alpha: WalletAlphaRefinementLedger) -> None:
+def _preserve_wrapper_lineage(wrapper: Any, predecessor: Any) -> None:
+    """Keep the exact predecessor contract visible through the adaptive layer."""
+    if not callable(predecessor):
+        raise RuntimeError("v52 adaptive predecessor unavailable")
+    setattr(wrapper, "__wrapped__", predecessor)
+    predecessor_module = getattr(predecessor, "__module__", None)
+    if predecessor_module:
+        setattr(wrapper, "__module__", predecessor_module)
+    for name, value in vars(predecessor).items():
+        if name.startswith("_roi_"):
+            setattr(wrapper, name, value)
+
+
+def install_v52_adaptive_continuation_refinement(
+    wallet_alpha: WalletAlphaRefinementLedger,
+) -> None:
     global _INSTALLED, _WALLET_ALPHA, _BASE_SOLANA_CHOOSE, _BASE_FOMO_DECISION
     global _BASE_ROBINHOOD_CHOOSE, _BASE_ROBINHOOD_SETTLE
     if _INSTALLED:
@@ -310,6 +425,11 @@ def install_v52_adaptive_continuation_refinement(wallet_alpha: WalletAlphaRefine
     _BASE_ROBINHOOD_CHOOSE = RobinhoodChainPaperPlane._v5_choose_lane_fraction
     _BASE_ROBINHOOD_SETTLE = RobinhoodChainPaperPlane._settle_one
 
+    _preserve_wrapper_lineage(_solana_choose, _BASE_SOLANA_CHOOSE)
+    _preserve_wrapper_lineage(_fomo_decision, _BASE_FOMO_DECISION)
+    _preserve_wrapper_lineage(_robinhood_choose, _BASE_ROBINHOOD_CHOOSE)
+    _preserve_wrapper_lineage(_robinhood_settle, _BASE_ROBINHOOD_SETTLE)
+
     authoritative.position_policy = _contextual_position_policy
     robinhood_lifecycle.position_policy = _contextual_position_policy
     solana_strategy._choose_lane_and_fraction = _solana_choose
@@ -317,11 +437,19 @@ def install_v52_adaptive_continuation_refinement(wallet_alpha: WalletAlphaRefine
     RobinhoodChainPaperPlane._v5_choose_lane_fraction = _robinhood_choose  # type: ignore[method-assign]
     RobinhoodChainPaperPlane._settle_one = _robinhood_settle  # type: ignore[method-assign]
 
-    for wrapper in (solana_strategy._choose_lane_and_fraction, fomo_paper._paper_decision, RobinhoodChainPaperPlane._v5_choose_lane_fraction):
+    for wrapper in (
+        solana_strategy._choose_lane_and_fraction,
+        fomo_paper._paper_decision,
+        RobinhoodChainPaperPlane._v5_choose_lane_fraction,
+    ):
         setattr(wrapper, "_roi_v52_final_authority", True)
         setattr(wrapper, "_roi_v52_adaptive_continuation_refinement", True)
     setattr(RobinhoodChainPaperPlane._settle_one, "_roi_v52_position_lifecycle", True)
-    setattr(RobinhoodChainPaperPlane._settle_one, "_roi_v52_adaptive_continuation_refinement", True)
+    setattr(
+        RobinhoodChainPaperPlane._settle_one,
+        "_roi_v52_adaptive_continuation_refinement",
+        True,
+    )
     _INSTALLED = True
 
 
@@ -335,7 +463,14 @@ def status() -> dict[str, Any]:
         "max_dynamic_runner_fraction": MAX_DYNAMIC_RUNNER_FRACTION,
         "normal_chase_max_fraction": NORMAL_CHASE_MAX,
         "absolute_chase_max_fraction": ABSOLUTE_CHASE_MAX,
-        "wallet_minimum_forward_samples": int(target_sizing_policy()["minimum_forward_samples"]),
+        "canonical_chase_observe_only_fraction": float(
+            execution_policy()["chase_observe_only_above_fraction"]
+        ),
+        "exceptional_chase_is_overlay_only": True,
+        "wrapper_lineage_preserved": True,
+        "wallet_minimum_forward_samples": int(
+            target_sizing_policy()["minimum_forward_samples"]
+        ),
         "wallet_max_target_utilization_multiplier": MAX_WALLET_UTILIZATION_MULTIPLIER,
         "portfolio_ranking_only_after_eligibility": True,
         "paper_only": PAPER_ONLY,
