@@ -153,6 +153,7 @@ def test_raw_cgroup_guard_fails_closed_if_reclaim_cannot_restore_headroom(tmp_pa
     source = tmp_path / "state.sqlite3"
     source.write_bytes(b"sqlite")
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "WRITEBACK_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(
         repair,
         "_cgroup_memory",
@@ -164,6 +165,7 @@ def test_raw_cgroup_guard_fails_closed_if_reclaim_cannot_restore_headroom(tmp_pa
         },
     )
     monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: True)
+    monkeypatch.setattr(repair, "_sync_sqlite_dirty_pages", lambda path: True)
     monkeypatch.setattr(repair, "_trim_process_heap", lambda: True)
     monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: False)
     monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
@@ -199,6 +201,55 @@ def test_sqlite_cache_release_includes_wal_and_shm(tmp_path, monkeypatch):
     assert seen == [str(source), str(source) + "-wal", str(source) + "-shm"]
 
 
+def test_dirty_writeback_fsyncs_db_wal_and_shm(tmp_path, monkeypatch):
+    source = tmp_path / "state.sqlite3"
+    source.write_bytes(b"db")
+    (tmp_path / "state.sqlite3-wal").write_bytes(b"wal")
+    (tmp_path / "state.sqlite3-shm").write_bytes(b"shm")
+    synced: list[int] = []
+    monkeypatch.setattr(repair.os, "fdatasync", lambda fd: synced.append(int(fd)))
+
+    assert repair._sync_sqlite_dirty_pages(source) is True
+    assert len(synced) == 3
+
+
+def test_dirty_writeback_precedes_cache_advice_under_pressure(tmp_path, monkeypatch):
+    source = tmp_path / "state.sqlite3"
+    source.write_bytes(b"sqlite")
+    states = iter(
+        [
+            {
+                "current_bytes": 1980 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 68 * MIB,
+                "fraction": 1980 / 2048,
+                "file_dirty_bytes": 256 * MIB,
+            },
+            {
+                "current_bytes": 1200 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 848 * MIB,
+                "fraction": 1200 / 2048,
+                "file_dirty_bytes": 0,
+            },
+        ]
+    )
+    order: list[str] = []
+    monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "WRITEBACK_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
+    monkeypatch.setattr(repair, "_sync_sqlite_dirty_pages", lambda path: order.append("writeback") or True)
+    monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: order.append("cache") or True)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: order.append("heap") or True)
+    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: False)
+    monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
+
+    result = repair._guard_raw_cgroup(source)
+
+    assert result["current_bytes"] == 1200 * MIB
+    assert order[:2] == ["writeback", "cache"]
+
+
 def test_install_patches_only_read_paths_and_preserves_authority_contract():
     repair.install_durable_bootstrap_memory_repair()
 
@@ -214,6 +265,8 @@ def test_install_patches_only_read_paths_and_preserves_authority_contract():
     assert status["cgroup_file_reclaim_best_effort"] is True
     assert status["cgroup_reclaim_swappiness_zero"] is True
     assert status["heap_trim_under_pressure"] is True
+    assert status["targeted_sqlite_dirty_writeback"] is True
+    assert status["writeback_changes_logical_state"] is False
     assert status["canonical_evidence_reset"] is False
     assert status["strategy_thresholds_changed"] is False
     assert status["certification_thresholds_changed"] is False
