@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -54,7 +53,7 @@ def test_first_full_verification_seeds_anchor_then_next_verification_hashes_tail
     store.append("price", "2026-09-10T00:00:02+00:00", {"n": 3})
 
     def forbidden_full_scan(_engine_like: object):
-        raise AssertionError("valid anchor must use the append-only tail, not full history")
+        raise AssertionError("valid engine-start anchor must use the append-only tail, not full history")
 
     monkeypatch.setattr(repair, "_ORIGINAL_BOUNDED_VERIFY", forbidden_full_scan)
     verified, head, latest = repair._verify_with_checkpoint(store)
@@ -140,6 +139,12 @@ def test_checkpoint_anchor_row_is_validated_not_blindly_trusted(
     store.close()
 
 
+def test_explicit_store_verify_contract_remains_complete_history() -> None:
+    source = Path("src/solana_roi/incremental_event_integrity_repair.py").read_text(encoding="utf-8")
+    assert "AppendOnlyEventStore.verify =" not in source
+    assert "explicit_store_verification\": \"complete_hash_chain" in source
+
+
 def test_production_configures_incremental_integrity_before_composition() -> None:
     source = Path("src/solana_roi/production.py").read_text(encoding="utf-8")
     configure_at = source.index("configure_incremental_event_integrity_repair()")
@@ -150,7 +155,8 @@ def test_production_configures_incremental_integrity_before_composition() -> Non
 
 def test_repair_status_preserves_paper_only_authority() -> None:
     status = repair.status()
-    assert status["ordinary_start_verification"] == "validated_anchor_plus_append_only_tail"
+    assert status["ordinary_engine_start_verification"] == "validated_anchor_plus_append_only_tail"
+    assert status["explicit_store_verification"] == "complete_hash_chain"
     assert status["first_run_or_invalid_anchor"] == "complete_hash_chain_fail_closed"
     assert status["explicit_full_integrity_audit_retained"] is True
     assert status["canonical_evidence_reset"] is False
