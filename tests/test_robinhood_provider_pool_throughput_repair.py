@@ -97,12 +97,19 @@ def test_installation_source_unifies_provider_budget_caps_without_import_side_ef
     assert 'budget.BUDGET_VERSION = "robinhood-production-ws-transport-v4-provider-pool-throughput"' in source
 
 
-def test_production_installs_repair_before_composition_root() -> None:
+def test_provider_finalizer_installs_repair_before_budget_transport() -> None:
+    finalizer_path = Path(repair.__file__).with_name("robinhood_production_provider_finalizer.py")
+    source = finalizer_path.read_text(encoding="utf-8")
+    repair_install = source.index("install_robinhood_provider_pool_throughput_repair()")
+    budget_install = source.index("install_robinhood_provider_budget_transport()")
+    assert repair_install < budget_install
+
+
+def test_production_facade_remains_installer_free() -> None:
     production_path = Path(repair.__file__).with_name("production.py")
     source = production_path.read_text(encoding="utf-8")
-    repair_install = source.index("install_robinhood_provider_pool_throughput_repair()")
-    composition_import = source.index("from .production_system import")
-    assert repair_install < composition_import
+    assert "install_robinhood_provider_pool_throughput_repair()" not in source
+    assert "from .production_system import" in source
 
 
 def test_throughput_repair_preserves_paper_only_authority() -> None:
