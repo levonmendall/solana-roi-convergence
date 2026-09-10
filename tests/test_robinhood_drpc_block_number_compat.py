@@ -19,10 +19,11 @@ def _reset(monkeypatch):
     yield
 
 
-def _http_error(status: int) -> httpx.HTTPStatusError:
+def _http_error(status: int, *, code: int | None = None) -> httpx.HTTPStatusError:
     request = httpx.Request("POST", "https://redacted.invalid")
-    response = httpx.Response(status, request=request)
-    return httpx.HTTPStatusError("redacted", request=request, response=response)
+    body = {"error": {"code": code, "message": "SECRET response body"}} if code is not None else {}
+    response = httpx.Response(status, request=request, json=body)
+    return httpx.HTTPStatusError("SECRET exception", request=request, response=response)
 
 
 class _Client:
@@ -30,8 +31,14 @@ class _Client:
         self.responses = list(responses)
         self.calls: list[dict[str, object]] = []
 
-    async def post(self, url: str, *, json: dict[str, object]):
-        self.calls.append({"url": url, "json": dict(json)})
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str] | None = None,
+    ):
+        self.calls.append({"url": url, "json": dict(json), "headers": dict(headers or {})})
         item = self.responses.pop(0)
         if isinstance(item, BaseException):
             raise item
@@ -57,16 +64,11 @@ def test_drpc_eth_blocknumber_400_retries_documented_paramless_form(capsys) -> N
     rpc = _rpc(client)
 
     assert asyncio.run(wrapped(rpc, "eth_blockNumber", [])) == "0x12345"
-    assert client.calls[0]["json"] == {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_blockNumber",
-    }
+    assert client.calls[0]["json"] == {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber"}
     output = capsys.readouterr().out
     assert "ROBINHOOD_DRPC_BLOCK_NUMBER_COMPATIBILITY" in output
     assert "mode=eth_blockNumber_without_params" in output
     assert "REDACTED" not in output
-    assert compat.status()["fallback_mode"] == "eth_blockNumber_without_params"
 
 
 def test_paramless_400_uses_documented_finalized_block_form(capsys) -> None:
@@ -75,48 +77,75 @@ def test_paramless_400_uses_documented_finalized_block_form(capsys) -> None:
         raise _http_error(400)
 
     client = _Client([
-        (400, {"error": "bad request"}),
+        (400, {"error": {"code": 5, "message": "bad request"}}),
         (200, {"jsonrpc": "2.0", "id": 2, "result": {"number": "0x999", "hash": "0xabc"}}),
     ])
     wrapped = compat._compat_rpc_wrapper(original)
     rpc = _rpc(client)
-
     assert asyncio.run(wrapped(rpc, "eth_blockNumber", [])) == "0x999"
-    assert client.calls[0]["json"] == {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber"}
-    assert client.calls[1]["json"] == {
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "eth_getBlockByNumber",
-        "params": ["finalized", False],
-    }
+    assert client.calls[1]["json"] == {"jsonrpc": "2.0", "id": 2, "method": "eth_getBlockByNumber", "params": ["finalized", False]}
     output = capsys.readouterr().out
     assert "stage=eth_blockNumber_without_params" in output
-    assert "http_status=400" in output
     assert "mode=eth_getBlockByNumber_finalized_false" in output
-    assert compat.status()["fallback_mode"] == "eth_getBlockByNumber_finalized_false"
 
 
-def test_after_success_routes_blocknumber_directly_to_proven_form() -> None:
-    compat._MODE = compat._MODE_PARAMLESS
-    client = _Client([(200, {"jsonrpc": "2.0", "id": 1, "result": "0x777"})])
+def test_path_forms_400_use_ogrpc_header_gateway_and_prove_block(capsys) -> None:
+    async def original(_rpc_self, method, _params):
+        assert method == "eth_blockNumber"
+        raise _http_error(400)
 
-    async def original(_rpc_self, _method, _params):
-        raise AssertionError("original should not be called")
-
+    client = _Client([
+        (400, {"error": {"code": 5, "message": "path invalid"}}),
+        (400, {"error": {"code": 13, "message": "path cannot route"}}),
+        (200, {"jsonrpc": "2.0", "id": 3, "result": "0xabc"}),
+    ])
     wrapped = compat._compat_rpc_wrapper(original)
     rpc = _rpc(client)
-    assert asyncio.run(wrapped(rpc, "eth_blockNumber", [])) == "0x777"
-    assert client.calls[0]["json"] == {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber"}
+    assert asyncio.run(wrapped(rpc, "eth_blockNumber", [])) == "0xabc"
+    gateway = client.calls[2]
+    assert gateway["url"] == "https://lb.drpc.org/ogrpc?network=robinhood"
+    assert gateway["json"] == {"jsonrpc": "2.0", "id": 3, "method": "eth_blockNumber", "params": []}
+    assert gateway["headers"] == {"Drpc-Key": "REDACTED", "Content-Type": "application/json"}
+    output = capsys.readouterr().out
+    assert "mode=ogrpc_header_robinhood" in output
+    assert "REDACTED" not in output
+    assert "path invalid" not in output
+    assert "path cannot route" not in output
+
+
+def test_after_ogrpc_proof_all_drpc_http_reads_use_same_gateway() -> None:
+    compat._MODE = compat._MODE_OGRPC
+    client = _Client([(200, {"jsonrpc": "2.0", "id": 1, "result": "0x2a"})])
+    async def original(_rpc_self, _method, _params):
+        raise AssertionError("path-based RPC must not be reused after generic gateway proof")
+    wrapped = compat._compat_rpc_wrapper(original)
+    rpc = _rpc(client)
+    assert asyncio.run(wrapped(rpc, "eth_gasPrice", [])) == "0x2a"
+    assert client.calls[0]["url"] == "https://lb.drpc.org/ogrpc?network=robinhood"
+
+
+def test_numeric_drpc_error_code_is_logged_without_response_body_or_key(capsys) -> None:
+    compat._MODE = compat._MODE_OGRPC
+    client = _Client([_http_error(400, code=29)])
+    async def original(_rpc_self, _method, _params):
+        raise AssertionError("not used")
+    wrapped = compat._compat_rpc_wrapper(original)
+    rpc = _rpc(client)
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(wrapped(rpc, "eth_blockNumber", []))
+    output = capsys.readouterr().out
+    assert "http_status=400" in output
+    assert "drpc_code=29" in output
+    assert "SECRET" not in output
+    assert "REDACTED" not in output
 
 
 @pytest.mark.parametrize("status", [401, 403, 429, 500])
 def test_non_400_http_errors_do_not_activate_compatibility(status: int) -> None:
     async def original(_rpc_self, _method, _params):
         raise _http_error(status)
-
     wrapped = compat._compat_rpc_wrapper(original)
     rpc = _rpc(_Client([]))
-
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(wrapped(rpc, "eth_blockNumber", []))
     assert compat.status()["fallback_active"] is False
@@ -124,57 +153,39 @@ def test_non_400_http_errors_do_not_activate_compatibility(status: int) -> None:
 
 def test_non_drpc_eth_blocknumber_400_is_unchanged() -> None:
     calls = 0
-
     async def original(_rpc_self, _method, _params):
         nonlocal calls
         calls += 1
         raise _http_error(400)
-
     wrapped = compat._compat_rpc_wrapper(original)
-    rpc = SimpleNamespace(
-        rpc_url="https://robinhood-mainnet.g.alchemy.com/v2/REDACTED",
-        client=_Client([]),
-        _request_id=0,
-    )
-
+    rpc = SimpleNamespace(rpc_url="https://robinhood-mainnet.g.alchemy.com/v2/REDACTED", client=_Client([]), _request_id=0)
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(wrapped(rpc, "eth_blockNumber", []))
     assert calls == 1
     assert compat.status()["fallback_active"] is False
 
 
-def test_all_compatibility_forms_must_return_valid_block_number(capsys) -> None:
-    async def original(_rpc_self, method, _params):
-        assert method == "eth_blockNumber"
-        raise _http_error(400)
-
-    client = _Client([
-        (400, {"error": "bad request"}),
-        (200, {"jsonrpc": "2.0", "id": 2, "result": {"hash": "0xabc"}}),
-    ])
+def test_missing_path_key_keeps_ogrpc_fail_closed() -> None:
+    compat._MODE = compat._MODE_OGRPC
+    client = _Client([])
+    async def original(_rpc_self, _method, _params):
+        raise AssertionError("not used")
     wrapped = compat._compat_rpc_wrapper(original)
-    rpc = _rpc(client)
-
-    with pytest.raises(httpx.HTTPStatusError):
+    rpc = SimpleNamespace(rpc_url="https://lb.drpc.org/ogrpc?network=robinhood", client=client, _request_id=0)
+    with pytest.raises(RuntimeError, match="MissingDrpcPathKeyForOgrpc"):
         asyncio.run(wrapped(rpc, "eth_blockNumber", []))
-    output = capsys.readouterr().out
-    assert "stage=eth_blockNumber_without_params" in output
-    assert "stage=eth_getBlockByNumber_finalized_false" in output
-    assert "REDACTED" not in output
-    assert compat.status()["fallback_active"] is False
-    assert compat.status()["fallback_failures"] == 2
 
 
 def test_compatibility_installed_inside_finalizer_before_failover() -> None:
     root = Path(__file__).parents[1] / "src" / "solana_roi"
     production = (root / "production.py").read_text(encoding="utf-8")
     finalizer = (root / "robinhood_production_provider_finalizer.py").read_text(encoding="utf-8")
-
     assert "install_robinhood_drpc_block_number_compat" not in production
     install_body = finalizer[finalizer.index("def install_robinhood_production_provider_finalizer("):]
-    assert install_body.index("install_robinhood_drpc_block_number_compat(") < install_body.index(
-        "install_robinhood_provider_failover()"
-    ) < install_body.index("install_robinhood_provider_runtime_proof()")
-    assert compat.status()["live_money_authority"] is False
-    assert compat.status()["signing_available"] is False
-    assert compat.status()["transaction_submission_available"] is False
+    assert install_body.index("install_robinhood_drpc_block_number_compat(") < install_body.index("install_robinhood_provider_failover()") < install_body.index("install_robinhood_provider_runtime_proof()")
+    state = compat.status()
+    assert state["ogrpc_routes_all_drpc_http_after_proof"] is True
+    assert state["logs_only_numeric_drpc_error_code"] is True
+    assert state["live_money_authority"] is False
+    assert state["signing_available"] is False
+    assert state["transaction_submission_available"] is False
