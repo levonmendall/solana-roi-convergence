@@ -345,29 +345,28 @@ def _background_target_rps_locked(kind: str) -> float:
 
 
 async def _pace_background(kind: str) -> None:
-    while True:
-        with _LOCK:
-            target_rps = _background_target_rps_locked(kind)
-            if target_rps <= 0:
-                _STATS["monthly_background_deferrals"] = int(
-                    _STATS.get("monthly_background_deferrals", 0) or 0
-                ) + 1
-                raise RobinhoodProviderBackgroundBudgetDeferred(
-                    "robinhood provider background monthly budget deferred"
-                )
-            interval = 1.0 / max(0.01, target_rps)
-            now = time.monotonic()
-            next_at = max(now, float(_NEXT_BACKGROUND_AT.get(kind, now)))
-            _NEXT_BACKGROUND_AT[kind] = next_at + interval
-            delay = max(0.0, next_at - now)
-        if delay <= 0:
-            return
-        with _LOCK:
+    with _LOCK:
+        target_rps = _background_target_rps_locked(kind)
+        if target_rps <= 0:
+            _STATS["monthly_background_deferrals"] = int(
+                _STATS.get("monthly_background_deferrals", 0) or 0
+            ) + 1
+            raise RobinhoodProviderBackgroundBudgetDeferred(
+                "robinhood provider background monthly budget deferred"
+            )
+        interval = 1.0 / max(0.01, target_rps)
+        now = time.monotonic()
+        scheduled_at = max(now, float(_NEXT_BACKGROUND_AT.get(kind, now)))
+        _NEXT_BACKGROUND_AT[kind] = scheduled_at + interval
+        delay = max(0.0, scheduled_at - now)
+        if delay > 0:
             _STATS["background_pacing_waits"] = int(_STATS.get("background_pacing_waits", 0) or 0) + 1
             _STATS["background_pacing_wait_seconds"] = float(
                 _STATS.get("background_pacing_wait_seconds", 0.0) or 0.0
             ) + delay
+    while delay > 0:
         await asyncio.sleep(min(delay, 1.0))
+        delay = max(0.0, scheduled_at - time.monotonic())
 
 
 async def _chainstack_rolling_limit() -> None:
@@ -522,6 +521,7 @@ def status() -> dict[str, Any]:
             "version": CAPACITY_BUDGET_VERSION,
             "installed": _INSTALLED,
             "month_utc": state["month"],
+            "usage_accounting_unit": "private_provider_request_attempts",
             "provider_monthly_request_limits": provider_limits,
             "combined_monthly_request_limit": _combined_limit(),
             "provider_month_to_date_requests": providers,
@@ -561,6 +561,7 @@ def reset_for_tests() -> None:
         _LAST_PERSIST_MONOTONIC = 0.0
         _CHAINSTACK_REQUEST_TIMES.clear()
         _NEXT_BACKGROUND_AT.clear()
+        _PRIORITY.set("qualification")
         for key in list(_STATS):
             if key in {"last_http_status", "last_http_error_provider_kind", "last_http_error_method"}:
                 _STATS[key] = None
