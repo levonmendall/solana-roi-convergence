@@ -3,16 +3,17 @@ from __future__ import annotations
 """Bounded read-only metadata probe for cleanup-target dependency proof.
 
 The probe intentionally avoids payload scans and mutation. It reports only schema,
-index/foreign-key topology, sqlite_stat1 estimates when already available, and
-rowid/sequence bounds that SQLite can resolve from B-tree edges. This makes it safe
-to run after canonical runtime readiness while the production disk lease is held.
+index/foreign-key topology, schema-level trigger/view dependencies, sqlite_stat1
+estimates when already available, and rowid/sequence bounds that SQLite can resolve
+from B-tree edges. This makes it safe to run after canonical runtime readiness while
+the production disk lease is held.
 """
 
 import sqlite3
 from pathlib import Path
 from typing import Any
 
-PROBE_VERSION = "cleanup-target-probe-v2-btree-edges"
+PROBE_VERSION = "cleanup-target-probe-v3-schema-dependencies"
 TARGET_TABLE = "anonymous_candidate_latency_failures"
 
 
@@ -50,6 +51,27 @@ def _foreign_keys(connection: sqlite3.Connection, table: str) -> list[dict[str, 
             "on_update": str(row[5]),
             "on_delete": str(row[6]),
             "match": str(row[7]),
+        }
+        for row in rows
+    ]
+
+
+def _schema_dependents(connection: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
+    # sqlite_master is schema metadata, not payload history. Searching it proves
+    # whether any trigger/view SQL names the cleanup target without scanning rows.
+    pattern = f"%{table.lower()}%"
+    rows = connection.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE type IN ('trigger','view') AND lower(COALESCE(sql,'')) LIKE ? "
+        "ORDER BY type,name",
+        (pattern,),
+    ).fetchall()
+    return [
+        {
+            "type": str(row[0]),
+            "name": str(row[1]),
+            "owner_table": str(row[2]) if row[2] is not None else None,
+            "sql": str(row[3]) if row[3] is not None else None,
         }
         for row in rows
     ]
@@ -183,6 +205,7 @@ def probe_cleanup_target(database_path: Path, table: str = TARGET_TABLE) -> dict
             "indexes": indexes,
             "foreign_keys": _foreign_keys(connection, table),
             "reverse_foreign_keys": reverse_foreign_keys,
+            "schema_dependents": _schema_dependents(connection, table),
             "sqlite_sequence": sequence,
             "sqlite_stat1": stat1,
             "rowid_bounds": rowid_bounds,
