@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -8,6 +10,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 
 from solana_roi import safe_retention_cleanup as cleanup
+from solana_roi import startup_retention_cleanup as startup_cleanup
 
 
 def _make_old(path: Path, *, age_seconds: float = 7200.0) -> None:
@@ -92,3 +95,34 @@ def test_install_exposes_read_only_scope_and_does_not_claim_ambiguous_deletion(t
     assert state["paper_only"] is True
     assert state["live_money_authority"] is False
     assert any(getattr(route, "path", None) == "/v1/operations/safe-retention-cleanup" for route in app.routes)
+
+
+def test_startup_cleanup_logs_exact_bounded_evidence(tmp_path: Path, caplog) -> None:
+    candidate = tmp_path / ".certification-export-old.sqlite3"
+    _make_old(candidate)
+    app = FastAPI()
+    runtime = SimpleNamespace(store=SimpleNamespace(path=tmp_path / "solana-roi.sqlite3"))
+    caplog.set_level(logging.INFO, logger="solana_roi.safe_retention")
+
+    state = startup_cleanup.run_safe_retention_cleanup(app, runtime)
+
+    records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("ROI_SAFE_RETENTION_CLEANUP ")
+    ]
+    assert len(records) == 1
+    evidence = json.loads(records[0].split(" ", 1)[1])
+    assert evidence["version"] == cleanup.CLEANUP_VERSION
+    assert evidence["scope"] == ["stale_certification_exports"]
+    assert evidence["examined"] == 1
+    assert evidence["removed"] == 1
+    assert evidence["skipped"] == 0
+    assert evidence["scan_truncated"] is False
+    assert evidence["outcomes"] == {"removed": 1}
+    assert evidence["error"] is None
+    assert evidence["paper_only"] is True
+    assert evidence["live_money_authority"] is False
+    assert evidence["signing_available"] is False
+    assert evidence["transaction_submission_available"] is False
+    assert state["startup_stale_export_cleanup"]["removed"] == 1
