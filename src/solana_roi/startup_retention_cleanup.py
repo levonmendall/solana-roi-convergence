@@ -180,6 +180,12 @@ def install_startup_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[
 
 
 # Compatibility alias for callers introduced before the lifecycle ownership repair.
-# It now wraps the startup lifespan; it never performs cleanup at import time.
+# It now owns both storage-maintenance layers: the disabled-by-default exact-dependency
+# executor is registered first, then the proven stale-export pass wraps startup. This
+# keeps destructive work behind the disk-ownership/bootstrap guard while preserving
+# the canonical production facade's zero-installer contract.
 def run_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, Any]:
+    from .production_cleanup_runtime_install import install_production_cleanup_runtime
+
+    install_production_cleanup_runtime(app)
     return install_startup_retention_cleanup(app, ingestion_runtime)
