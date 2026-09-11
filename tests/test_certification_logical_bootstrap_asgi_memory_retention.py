@@ -37,13 +37,13 @@ class _Store:
         self.db.close()
 
 
-def _memory_kib() -> dict[str, int]:
-    values = {"rss_kib": 0, "anon_kib": 0, "file_kib": 0}
+def _process_memory_kib() -> dict[str, int]:
+    values = {"rss_kib": 0, "rss_anon_kib": 0, "rss_file_kib": 0}
     try:
         fields = Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
     except OSError:
         return values
-    mapping = {"VmRSS:": "rss_kib", "RssAnon:": "anon_kib", "RssFile:": "file_kib"}
+    mapping = {"VmRSS:": "rss_kib", "RssAnon:": "rss_anon_kib", "RssFile:": "rss_file_kib"}
     for line in fields:
         parts = line.split()
         if len(parts) >= 2 and parts[0] in mapping:
@@ -104,25 +104,28 @@ def test_large_logical_bootstrap_page_releases_heap_only_after_asgi_send(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """Regression for post-ASGI-response anonymous-memory retention.
+    """Prove the real bootstrap endpoint retains response heap past _page().
 
-    The authoritative side must not run page cleanup before FastAPI/Starlette has
-    serialized and sent the page. This test drives the real logical-bootstrap HTTP
-    endpoint, records RssAnon and RssFile independently at each lifecycle boundary,
-    persists the received rows into a certifier-style SQLite replica, and proves that
-    large response allocations remain reclaimable after the final ASGI body send.
+    This test deliberately runs through FastAPI/ASGI rather than invoking _page()
+    directly. It records process anonymous RSS and cgroup anonymous/file memory
+    independently through SQLite fetch, Python row materialization, response creation,
+    JSON serialization, final ASGI send, certifier receipt/persistence, and cleanup.
 
-    Current main is expected to FAIL the final lifecycle assertion because _page()
-    invokes split._drop_file_cache() in its finally block before JSONResponse.render()
-    and http.response.body. The repair should move the cleanup lifecycle boundary
-    after serialization/send without changing pagination, evidence, or the 94% guard.
+    Current main must fail the final lifecycle assertion: _page() invokes
+    split._drop_file_cache() in its finally block, before the response object exists,
+    before JSON serialization, and before the final ASGI body send. The production
+    repair is allowed to move cleanup only; pagination, historical truth, and the 94%
+    fail-closed guard are intentionally outside this regression's authority.
     """
 
     release = "a" * 40
     token = "asgi-memory-regression-token"
     monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", release)
     monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", token)
-    monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_LOGICAL_BOOTSTRAP_PAGE_BYTES", str(16 * 1024 * 1024))
+    monkeypatch.setenv(
+        "SOLANA_ROI_CERTIFICATION_LOGICAL_BOOTSTRAP_PAGE_BYTES",
+        str(16 * 1024 * 1024),
+    )
     monkeypatch.setattr(bootstrap.split, "_release_commit", lambda: release)
 
     source = _build_source(tmp_path / "authoritative.sqlite3")
@@ -134,10 +137,15 @@ def test_large_logical_bootstrap_page_releases_heap_only_after_asgi_send(
     active_page = {"value": -1}
 
     def sample(phase: str) -> dict[str, Any]:
+        cgroup = durable_memory._cgroup_memory()
         record: dict[str, Any] = {
             "page": int(active_page["value"]),
             "phase": phase,
-            **_memory_kib(),
+            **_process_memory_kib(),
+            "cgroup_anon_kib": int(cgroup.get("anon_bytes") or 0) // 1024,
+            "cgroup_file_kib": int(cgroup.get("file_bytes") or 0) // 1024,
+            "cgroup_dirty_kib": int(cgroup.get("file_dirty_bytes") or 0) // 1024,
+            "cgroup_writeback_kib": int(cgroup.get("file_writeback_bytes") or 0) // 1024,
         }
         trace.append(record)
         return record
@@ -164,26 +172,30 @@ def test_large_logical_bootstrap_page_releases_heap_only_after_asgi_send(
     def observed_cleanup(path: Path) -> bool:
         sample("page_cleanup_start")
         released = durable_memory._release_sqlite_file_cache(Path(path))
-        # Model the pressure branch of the installed production cleanup hook. Doing
-        # this unconditionally makes the ordering proof stronger: even an eager heap
-        # trim cannot reclaim response objects that do not exist until ASGI serializes.
+        # Model the production pressure branch unconditionally. Even an eager trim at
+        # this point cannot reclaim JSON/body allocations that have not been created.
         durable_memory._trim_process_heap()
         sample("page_cleanup_complete")
         return released
 
     monkeypatch.setattr(bootstrap.split, "_drop_file_cache", observed_cleanup)
 
-    original_render = JSONResponse.render
+    class _ObservedJSONResponse(JSONResponse):
+        def __init__(self, *args, **kwargs) -> None:
+            sample("response_creation_start")
+            super().__init__(*args, **kwargs)
+            sample("response_creation_complete")
 
-    def observed_render(self, content):
-        sample("json_serialization_start")
-        body = original_render(self, content)
-        sample("json_serialization_complete")
-        return body
+        def render(self, content) -> bytes:
+            sample("json_serialization_start")
+            body = super().render(content)
+            sample("json_serialization_complete")
+            return body
 
-    monkeypatch.setattr(JSONResponse, "render", observed_render)
-
-    app = FastAPI()
+    # Register the observed response class before the real bootstrap route is added.
+    # This instruments FastAPI's actual serialization path instead of monkeypatching a
+    # class reference that the route may already have captured.
+    app = FastAPI(default_response_class=_ObservedJSONResponse)
     bootstrap.install_certification_logical_bootstrap(app, lambda: runtime)
 
     class _ObservedASGI:
@@ -240,7 +252,10 @@ def test_large_logical_bootstrap_page_releases_heap_only_after_asgi_send(
 
                 decoded_rows: list[tuple[Any, ...]] = []
                 for record in payload["rows"]:
-                    values = tuple(bootstrap_client._decode_value(value) for value in record["values"])
+                    values = tuple(
+                        bootstrap_client._decode_value(value)
+                        for value in record["values"]
+                    )
                     decoded_rows.append((int(record["rowid"]), *values))
                 replica.executemany(
                     "INSERT OR REPLACE INTO anonymous_candidate_latency_failures("
@@ -255,8 +270,6 @@ def test_large_logical_bootstrap_page_releases_heap_only_after_asgi_send(
                 if page_index < PAGE_COUNT - 1:
                     assert isinstance(cursor, str) and cursor
 
-                # Drop every certifier-side page object, then force allocator release.
-                # This distinguishes server/ASGI heap retention from SQLite file cache.
                 del decoded_rows
                 del payload
                 del response
@@ -281,56 +294,65 @@ def test_large_logical_bootstrap_page_releases_heap_only_after_asgi_send(
                 "row_materialization_complete",
                 "page_cleanup_complete",
                 "page_returned",
+                "response_creation_start",
                 "json_serialization_start",
                 "json_serialization_complete",
+                "response_creation_complete",
                 "response_final_send_after",
                 "asgi_application_returned",
                 "certifier_receipt",
                 "certifier_persisted",
                 "post_page_cleanup",
             }
-            assert required.issubset(by_phase), {"missing": sorted(required - set(by_phase)), "trace": records}
+            assert required.issubset(by_phase), {
+                "missing": sorted(required - set(by_phase)),
+                "trace": records,
+            }
 
             baseline = by_phase["pre_page_baseline"]
             sent = by_phase["response_final_send_after"]
             cleaned = by_phase["post_page_cleanup"]
-            retained_anon = int(sent["anon_kib"]) - int(baseline["anon_kib"])
-            retained_file = int(sent["file_kib"]) - int(baseline["file_kib"])
-            released_anon = int(sent["anon_kib"]) - int(cleaned["anon_kib"])
+            retained_anon = int(sent["rss_anon_kib"]) - int(baseline["rss_anon_kib"])
+            released_anon = int(sent["rss_anon_kib"]) - int(cleaned["rss_anon_kib"])
             if retained_anon >= ANON_RETENTION_PROOF_KIB:
                 retention_proofs += 1
             if released_anon >= ANON_RELEASE_PROOF_KIB:
                 release_proofs += 1
 
-            cleanup_after_send = phases.index("page_cleanup_complete") > phases.index("response_final_send_after")
+            cleanup_after_send = (
+                phases.index("page_cleanup_complete")
+                > phases.index("response_final_send_after")
+            )
             if not cleanup_after_send:
                 lifecycle_failures.append(page_index)
             summaries.append(
                 {
                     "page": page_index,
-                    "baseline_anon_kib": baseline["anon_kib"],
-                    "post_send_anon_kib": sent["anon_kib"],
-                    "post_cleanup_anon_kib": cleaned["anon_kib"],
-                    "post_send_file_kib": sent["file_kib"],
+                    "baseline_rss_anon_kib": baseline["rss_anon_kib"],
+                    "post_send_rss_anon_kib": sent["rss_anon_kib"],
+                    "post_cleanup_rss_anon_kib": cleaned["rss_anon_kib"],
                     "anon_retained_after_send_kib": retained_anon,
                     "anon_released_after_client_cleanup_kib": released_anon,
-                    "file_delta_at_send_kib": retained_file,
+                    "baseline_cgroup_anon_kib": baseline["cgroup_anon_kib"],
+                    "post_send_cgroup_anon_kib": sent["cgroup_anon_kib"],
+                    "post_send_cgroup_file_kib": sent["cgroup_file_kib"],
+                    "post_send_cgroup_dirty_kib": sent["cgroup_dirty_kib"],
+                    "post_send_cgroup_writeback_kib": sent["cgroup_writeback_kib"],
                     "cleanup_after_send": cleanup_after_send,
                 }
             )
 
-        print("ASGI_BOOTSTRAP_MEMORY_TRACE " + json.dumps(summaries, sort_keys=True), flush=True)
+        print(
+            "ASGI_BOOTSTRAP_MEMORY_TRACE " + json.dumps(summaries, sort_keys=True),
+            flush=True,
+        )
 
-        # Memory proof: large pages must visibly elevate anonymous memory after the
-        # final ASGI body send, and explicit post-page object/heap cleanup must release
-        # a material part of it. File-backed RSS is reported separately and never used
-        # as a substitute for this anonymous-memory proof.
+        # Anonymous-memory proof is independent of the separately reported cgroup
+        # file-cache metrics; file pressure cannot satisfy either assertion below.
         assert retention_proofs >= PAGE_COUNT - 1, summaries
         assert release_proofs >= PAGE_COUNT - 1, summaries
 
-        # Deterministic current-main failure: cleanup currently happens in _page()'s
-        # finally block, before JSON serialization and the final ASGI body send. The
-        # lifecycle repair is complete only when every page cleanup occurs afterwards.
+        # Current main is expected to fail only here once the memory proof succeeds.
         assert not lifecycle_failures, {
             "reason": "logical-bootstrap cleanup ran before final ASGI response send",
             "failing_pages": lifecycle_failures,
