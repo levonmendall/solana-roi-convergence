@@ -1,31 +1,36 @@
 from __future__ import annotations
 
-"""Temporarily suppress SQLite writer auto-checkpoints during logical bootstrap.
+"""Bound SQLite auto-checkpoint/cache pressure around certification bootstrap.
 
 The authoritative logical bootstrap is a bounded read-only scan, but SQLite's default
 writer-side ``wal_autocheckpoint`` threshold is about 1000 pages. On the production
 4 KiB database that repeatedly copied a ~4 MiB WAL back into the 1.7 GiB main file
-while the bootstrap reader was trying to evict clean cache. This lease changes only
-physical checkpoint cadence while bootstrap requests are active. It restores the
-writer's exact original setting on completion or inactivity and pauses fail-closed if
-the WAL reaches a bounded maintenance ceiling.
+while the bootstrap reader was trying to evict clean cache.
 
-The lease is installed only on the already-registered authoritative FastAPI bootstrap
-routes for the concrete production app. The underlying logical-bootstrap module
-functions remain unchanged so package imports, direct unit tests, and non-production
-stores never inherit production-only writer requirements.
+The lease changes only physical checkpoint cadence. It is primed after the canonical
+runtime has been restored but before runtime workers start, then refreshed by each
+bootstrap manifest/page request. This closes the observed gap in which live workers
+could repopulate the main-database file cache before the certifier's first request.
+The exact original SQLite setting is restored on completion or inactivity and the WAL
+remains bounded by a fail-closed maintenance ceiling.
+
+The underlying logical-bootstrap module functions remain unchanged so package imports,
+direct unit tests, and non-production stores never inherit production-only writer
+requirements.
 """
 
+import asyncio
 import os
 import sqlite3
 import threading
 import weakref
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import HTTPException
 
-LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v2-production-routes"
+LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v3-preworker-quiesce"
 DEFAULT_IDLE_SECONDS = 45.0
 MIN_IDLE_SECONDS = 35.0
 MAX_IDLE_SECONDS = 120.0
@@ -164,6 +169,8 @@ def _expire(store_ref: "weakref.ReferenceType[Any]", generation: int) -> None:
 
 
 def _sync_and_release(path: Path) -> None:
+    """Flush dirty SQLite files and advise away their cache without checkpointing."""
+
     sync = getattr(os, "fdatasync", None) or getattr(os, "fsync", None)
     fadvise = getattr(os, "posix_fadvise", None)
     advice = getattr(os, "POSIX_FADV_DONTNEED", None)
@@ -267,6 +274,43 @@ def refresh(store: Any) -> dict[str, Any]:
     )
 
 
+def prime_before_workers(store: Any) -> dict[str, Any]:
+    """Prime the lease and shed startup cache before live runtime workers begin.
+
+    Runtime construction can legitimately read a large historical working set. The
+    certifier's first manifest may arrive tens of seconds later. Without this handoff,
+    workers can auto-checkpoint into the main database during that gap and refill the
+    cgroup before bootstrap has a chance to acquire the route-level lease.
+
+    This function performs no checkpoint. It disables auto-checkpoint through the same
+    bounded lease used by the HTTP routes, syncs already-dirty SQLite files, advises
+    their cache away, and trims only unused process heap. If the certifier never
+    arrives, the ordinary 45-second inactivity timer restores the exact original
+    SQLite setting automatically.
+    """
+
+    state = refresh(store)
+    path = Path(getattr(store, "path", ""))
+    from . import durable_bootstrap_memory_repair as memory
+
+    before = memory._cgroup_memory()
+    _sync_and_release(path)
+    memory._trim_process_heap()
+    after = memory._cgroup_memory()
+    print(
+        "ROI_BOOTSTRAP_PREWORKER_QUIESCE "
+        f"before={before.get('current_bytes', 'unknown')} "
+        f"after={after.get('current_bytes', 'unknown')} "
+        f"file_before={before.get('file_bytes', 'unknown')} "
+        f"file_after={after.get('file_bytes', 'unknown')} "
+        f"dirty_before={before.get('file_dirty_bytes', 'unknown')} "
+        f"dirty_after={after.get('file_dirty_bytes', 'unknown')} "
+        f"wal_bytes={_wal_size_bytes(store)} checkpoint_attempted=false",
+        flush=True,
+    )
+    return state
+
+
 def set_manifest_tables(store: Any, manifest: dict[str, Any]) -> None:
     tables = manifest.get("tables")
     names = tuple(
@@ -358,11 +402,33 @@ def _runtime_provider_from_endpoint(endpoint: Any) -> Callable[[], Any] | None:
     return None
 
 
+def _install_preworker_quiesce() -> None:
+    """Wrap the already-composed worker chain without changing its authority markers."""
+
+    from . import render_runtime_bootstrap_repair as render_bootstrap
+
+    current_workers = render_bootstrap._run_runtime_workers
+    if bool(getattr(current_workers, "_roi_bootstrap_preworker_quiesce", False)):
+        return
+
+    @wraps(current_workers)
+    async def workers_with_bootstrap_quiesce(runtime: Any, stop: Any) -> Any:
+        store = getattr(runtime, "store", None)
+        if store is None:
+            raise RuntimeError("canonical runtime store unavailable before worker start")
+        await asyncio.to_thread(prime_before_workers, store)
+        return await current_workers(runtime, stop)
+
+    setattr(workers_with_bootstrap_quiesce, "_roi_bootstrap_preworker_quiesce", True)
+    setattr(workers_with_bootstrap_quiesce, "_roi_original_runtime_workers", current_workers)
+    render_bootstrap._run_runtime_workers = workers_with_bootstrap_quiesce
+
+
 def install_certification_bootstrap_autocheckpoint_lease(
     app: Any,
     runtime_provider: Callable[[], Any] | None = None,
 ) -> None:
-    """Wrap only this production app's registered bootstrap routes.
+    """Wrap this production app's routes and prime the lease before worker startup.
 
     When certification split runtime is disabled the bootstrap transport is not
     registered at all; that is an intentional inactive state, so the lease is a
@@ -445,6 +511,7 @@ def install_certification_bootstrap_autocheckpoint_lease(
 
     _replace_route_call(manifest_route, manifest_endpoint)
     _replace_route_call(page_route, page_endpoint)
+    _install_preworker_quiesce()
     _INSTALLED = True
     app.state.roi_certification_bootstrap_autocheckpoint_lease = True
     app.state.roi_certification_bootstrap_autocheckpoint_lease_active = True
@@ -455,8 +522,11 @@ def status() -> dict[str, Any]:
     return {
         "lease_version": LEASE_VERSION,
         "installed": _INSTALLED,
-        "scope": "authoritative_registered_bootstrap_routes_only",
+        "scope": "authoritative_preworker_plus_registered_bootstrap_routes",
         "module_global_logical_functions_mutated": False,
+        "preworker_lease_priming": True,
+        "preworker_checkpoint_enabled": False,
+        "preworker_sync_and_file_cache_release": True,
         "idle_seconds": _idle_seconds(),
         "max_wal_bytes": _max_wal_bytes(),
         "original_autocheckpoint_restored": True,
@@ -476,6 +546,7 @@ __all__ = [
     "finish",
     "finish_if_complete",
     "install_certification_bootstrap_autocheckpoint_lease",
+    "prime_before_workers",
     "refresh",
     "set_manifest_tables",
     "status",
