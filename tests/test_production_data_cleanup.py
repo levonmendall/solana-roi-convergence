@@ -9,6 +9,10 @@ import pytest
 from solana_roi import production_data_cleanup as cleanup
 
 
+RELEASE = "a" * 40
+BOUNDARY = "2026-09-11T12:00:00+00:00"
+
+
 def _db(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.execute("PRAGMA journal_mode=WAL")
@@ -54,6 +58,41 @@ def _db(path: Path) -> sqlite3.Connection:
     return db
 
 
+def _add_latency_history(db: sqlite3.Connection, *, include_epoch: bool = True) -> None:
+    db.executescript(
+        """
+        CREATE TABLE anonymous_candidate_latency_failures(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            failed_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            max_age_ms REAL NOT NULL
+        );
+        CREATE INDEX ix_anonymous_candidate_latency_failed_at
+            ON anonymous_candidate_latency_failures(failed_at);
+        """
+    )
+    if include_epoch:
+        db.execute(
+            "CREATE TABLE certification_release_epochs(release_commit TEXT PRIMARY KEY,started_at TEXT NOT NULL)"
+        )
+        db.execute(
+            "INSERT INTO certification_release_epochs(release_commit,started_at) VALUES(?,?)",
+            (RELEASE, BOUNDARY),
+        )
+    rows = (
+        ("2026-09-10T23:59:59+00:00", "old", "expired_before_entry", 3, 1000.0),
+        (BOUNDARY, "boundary", "expired_before_entry", 2, 900.0),
+        ("2026-09-11T12:00:01+00:00", "current", "expired_before_entry", 1, 800.0),
+    )
+    db.executemany(
+        "INSERT INTO anonymous_candidate_latency_failures(failed_at,reason,outcome,count,max_age_ms) VALUES(?,?,?,?,?)",
+        rows,
+    )
+    db.commit()
+
+
 def test_disabled_cli_does_not_touch_database(tmp_path: Path, monkeypatch, capsys) -> None:
     path = tmp_path / "production.sqlite3"
     _db(path).close()
@@ -65,6 +104,26 @@ def test_disabled_cli_does_not_touch_database(tmp_path: Path, monkeypatch, capsy
     assert json.loads(capsys.readouterr().out)["status"] == "disabled"
     assert path.stat().st_mtime_ns == before
     assert not (tmp_path / ".production-cleanup").exists()
+
+
+def test_preflight_measurement_never_scans_history(tmp_path: Path) -> None:
+    path = tmp_path / "production.sqlite3"
+    db = _db(path)
+    statements: list[str] = []
+    db.set_trace_callback(statements.append)
+
+    measured = cleanup._measure(path, db, full_integrity=False)
+
+    db.set_trace_callback(None)
+    db.close()
+    normalized = "\n".join(statements).upper()
+    assert "COUNT(" not in normalized
+    assert "PRAGMA INTEGRITY_CHECK" not in normalized
+    assert "PRAGMA FOREIGN_KEY_CHECK" not in normalized
+    assert measured["integrity"]["checked"] is False
+    assert measured["tables"]["events"]["rows"] == "not_scanned"
+    assert measured["anchors"]["event_head_id"] == 1
+    assert measured["anchors"]["paper_engine_checkpoint"]["last_engine_event_id"] == 1
 
 
 def test_authoritative_deletes_only_proven_exhaust(tmp_path: Path) -> None:
@@ -82,11 +141,13 @@ def test_authoritative_deletes_only_proven_exhaust(tmp_path: Path) -> None:
     assert result["status"] == "success"
     assert result["deleted_rows"]["acknowledged_replication_changes"] == 2
     assert result["deleted_rows"]["stale_risk_refresh_measurements"] == 1
+    assert result["deleted_rows"]["obsolete_anonymous_candidate_latency_failures"] == 0
     assert result["deleted_rows"]["synthetic_candidate_closure"]["v51_candidates"] == 1
     assert result["protected_set"]["events"].startswith("protected:")
     assert result["protected_set"]["paper_engine_checkpoint"].startswith("protected:")
     assert result["protected_set"]["wallet_intelligence_snapshots"].startswith("protected:")
     assert result["protected_set"]["unknown_future_state"].startswith("protected:")
+    assert result["before"]["integrity"]["checked"] is False
     assert result["after"]["integrity"]["ok"] is True
 
     db = sqlite3.connect(path)
@@ -102,6 +163,87 @@ def test_authoritative_deletes_only_proven_exhaust(tmp_path: Path) -> None:
     assert db.execute("SELECT COUNT(*) FROM v51_candidates WHERE candidate_id='synthetic'").fetchone()[0] == 0
     assert db.execute("SELECT COUNT(*) FROM v51_candidates WHERE candidate_id='real'").fetchone()[0] == 1
     db.close()
+
+
+def test_latency_cleanup_uses_exact_current_release_certification_boundary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "production.sqlite3"
+    db = _db(path)
+    _add_latency_history(db)
+    db.close()
+    monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", RELEASE)
+    monkeypatch.delenv("RENDER_GIT_COMMIT", raising=False)
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
+
+    result = cleanup.execute_cleanup(
+        path,
+        role="authoritative",
+        run_id="unit-latency-boundary-1",
+        acknowledged_watermark=None,
+    )
+
+    assert result["deleted_rows"]["obsolete_anonymous_candidate_latency_failures"] == 1
+    boundary = result["latency_certification_boundary"]
+    assert boundary["release_commit"] == RELEASE
+    assert boundary["prospective_start_at"] == BOUNDARY
+    assert boundary["predicate"] == "failed_at < prospective_start_at"
+    db = sqlite3.connect(path)
+    rows = db.execute(
+        "SELECT failed_at,reason FROM anonymous_candidate_latency_failures ORDER BY failed_at"
+    ).fetchall()
+    db.close()
+    assert rows == [
+        (BOUNDARY, "boundary"),
+        ("2026-09-11T12:00:01+00:00", "current"),
+    ]
+
+
+def test_latency_cleanup_fails_closed_without_current_release_epoch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "production.sqlite3"
+    db = _db(path)
+    _add_latency_history(db, include_epoch=False)
+    db.close()
+    monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", RELEASE)
+
+    with pytest.raises(cleanup.CleanupBlocked, match="certification_release_epochs"):
+        cleanup.execute_cleanup(
+            path,
+            role="authoritative",
+            run_id="unit-missing-latency-epoch-1",
+        )
+
+    db = sqlite3.connect(path)
+    assert db.execute("SELECT COUNT(*) FROM anonymous_candidate_latency_failures").fetchone()[0] == 3
+    assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM paper_engine_checkpoint").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM wallet_profiles").fetchone()[0] == 1
+    db.close()
+
+
+def test_latency_cleanup_rejects_non_replication_trigger_dependency(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "production.sqlite3"
+    db = _db(path)
+    _add_latency_history(db)
+    db.execute("CREATE TABLE audit_sink(id INTEGER PRIMARY KEY,note TEXT NOT NULL)")
+    db.execute(
+        "CREATE TRIGGER unexpected_latency_delete AFTER DELETE ON anonymous_candidate_latency_failures "
+        "BEGIN INSERT INTO audit_sink(note) VALUES('deleted'); END"
+    )
+    db.commit()
+    db.close()
+    monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", RELEASE)
+
+    with pytest.raises(cleanup.CleanupBlocked, match="non-replication trigger dependency"):
+        cleanup.execute_cleanup(
+            path,
+            role="authoritative",
+            run_id="unit-latency-trigger-1",
+        )
 
 
 def test_certifier_preserves_replica_rows_and_captures_durable_watermark(tmp_path: Path) -> None:
@@ -121,6 +263,7 @@ def test_certifier_preserves_replica_rows_and_captures_durable_watermark(tmp_pat
         "synthetic_candidate_closure": {},
         "acknowledged_replication_changes": 0,
         "stale_risk_refresh_measurements": 0,
+        "obsolete_anonymous_candidate_latency_failures": 0,
     }
     assert all(
         reason == "protected:certifier-replica-equivalence"

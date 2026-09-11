@@ -2,13 +2,13 @@ from __future__ import annotations
 
 """Fail-closed exact-dependency production cleanup executor.
 
-V4 deletes only categories whose production dependency is proven.  The cleanup
+V4 deletes only categories whose production dependency is proven. The cleanup
 preflight is deliberately history-bounded: it inspects SQLite schema metadata,
 page/file metrics, the current paper checkpoint, the event-ledger head, and the
 replication AUTOINCREMENT frontier without scanning protected historical tables.
 
 A full SQLite integrity + foreign-key check remains mandatory after physical
-compaction before a run can be marked successful.  If that final verification
+compaction before a run can be marked successful. If that final verification
 cannot complete safely, the run is blocked rather than declared complete.
 """
 
@@ -16,13 +16,15 @@ import hashlib
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import production_data_cleanup as base
+from .certification_epoch import release_commit_from_env
 from .safe_retention_cleanup import cleanup_stale_certification_exports
 
-CLEANUP_VERSION = "production-data-cleanup-v4-bounded-preflight"
+CLEANUP_VERSION = "production-data-cleanup-v4-bounded-preflight-latency-retention"
 ENABLED_ENV = base.ENABLED_ENV
 RUN_ID_ENV = base.RUN_ID_ENV
 ROLE_ENV = base.ROLE_ENV
@@ -32,6 +34,8 @@ CleanupBlocked = base.CleanupBlocked
 
 REPLICATION_TABLE = "certification_replication_changes"
 REPLICATION_COLUMNS = ("id", "table_name", "key_sql", "operation", "changed_at")
+LATENCY_FAILURE_TABLE = "anonymous_candidate_latency_failures"
+CERTIFICATION_EPOCH_TABLE = "certification_release_epochs"
 BATCH_SIZE = 5000
 
 PROTECTED_TABLES = frozenset(
@@ -51,6 +55,7 @@ PROTECTED_TABLES = frozenset(
         "program_coverage_observations",
         "risk_refresh_measurements",
         "certification_replication_meta",
+        CERTIFICATION_EPOCH_TABLE,
         "direct_solana_storage_maintenance",
         "v51_candidates",
         "v51_candidate_stage_events",
@@ -114,7 +119,6 @@ def _read_certifier_state(database_path: Path) -> dict[str, Any]:
 
 
 def _extract_schema_bounded(db: sqlite3.Connection) -> dict[str, base.TableShape]:
-    """Extract structural schema metadata without counting any table rows."""
     schema: dict[str, base.TableShape] = {}
     for table in base._user_tables(db):
         quoted = base._quote_identifier(table)
@@ -130,13 +134,7 @@ def _extract_schema_bounded(db: sqlite3.Connection) -> dict[str, base.TableShape
             (str(row[3]), str(row[2]), str(row[4]))
             for row in db.execute(f"PRAGMA foreign_key_list({quoted})").fetchall()
         )
-        schema[table] = base.TableShape(
-            table,
-            columns,
-            primary_key,
-            foreign_keys,
-            -1,
-        )
+        schema[table] = base.TableShape(table, columns, primary_key, foreign_keys, -1)
     return schema
 
 
@@ -159,7 +157,6 @@ def _measure_bounded(
     db: sqlite3.Connection,
     schema: dict[str, base.TableShape] | None = None,
 ) -> dict[str, Any]:
-    """Capture physical/structural metrics without scanning protected histories."""
     schema = schema or _extract_schema_bounded(db)
     return {
         "captured_at": base._utcnow(),
@@ -191,6 +188,8 @@ def _protected_plan(schema: dict[str, base.TableShape], *, role: str) -> dict[st
             plan[table] = "protected:certifier-replica-equivalence"
         elif table == REPLICATION_TABLE:
             plan[table] = "predicate-controlled:externally-proven-certifier-watermark"
+        elif table == LATENCY_FAILURE_TABLE:
+            plan[table] = "protected:active-certification-window;cleanup:preboundary-only"
         elif table == "v51_synthetic_provenance":
             plan[table] = "protected:synthetic-provenance-contract-not-yet-proven-on-release"
         elif table == "risk_refresh_measurements":
@@ -255,9 +254,7 @@ def _event_head_snapshot(
         "events",
         ("id", "event_type", "observed_at", "payload_json", "previous_hash", "lineage_hash"),
     )
-    first = db.execute(
-        "SELECT id FROM events ORDER BY id ASC LIMIT 1"
-    ).fetchone()
+    first = db.execute("SELECT id FROM events ORDER BY id ASC LIMIT 1").fetchone()
     head = db.execute(
         "SELECT id,event_type,observed_at,previous_hash,lineage_hash "
         "FROM events ORDER BY id DESC LIMIT 1"
@@ -319,8 +316,7 @@ def _replication_sequence_head(
     if sequence < 0:
         raise CleanupBlocked("replication AUTOINCREMENT sequence cannot be negative")
     max_row = db.execute(
-        f"SELECT id FROM {base._quote_identifier(REPLICATION_TABLE)} "
-        "ORDER BY id DESC LIMIT 1"
+        f"SELECT id FROM {base._quote_identifier(REPLICATION_TABLE)} ORDER BY id DESC LIMIT 1"
     ).fetchone()
     existing_max = int(max_row[0]) if max_row is not None else 0
     if existing_max > sequence:
@@ -389,12 +385,8 @@ def _delete_acknowledged_replication(
     ).fetchone()
     if stale is not None:
         raise CleanupBlocked("acknowledged replication rows remain after bounded pruning")
-    first_remaining = db.execute(
-        f"SELECT id FROM {quoted} ORDER BY id ASC LIMIT 1"
-    ).fetchone()
-    last_remaining = db.execute(
-        f"SELECT id FROM {quoted} ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    first_remaining = db.execute(f"SELECT id FROM {quoted} ORDER BY id ASC LIMIT 1").fetchone()
+    last_remaining = db.execute(f"SELECT id FROM {quoted} ORDER BY id DESC LIMIT 1").fetchone()
     return {
         "status": "pruned_to_externally_proven_certifier_watermark",
         "deleted": total,
@@ -406,6 +398,115 @@ def _delete_acknowledged_replication(
         "remaining_max_id": int(last_remaining[0]) if last_remaining is not None else None,
         "bounded_batch_size": int(batch_size),
     }
+
+
+def _latency_cleanup_context(
+    db: sqlite3.Connection,
+    schema: dict[str, base.TableShape],
+) -> dict[str, Any] | None:
+    """Prove the exact live-reader boundary before any authoritative mutation."""
+    table = LATENCY_FAILURE_TABLE
+    if table not in schema:
+        return None
+    base._required_columns(
+        schema,
+        table,
+        ("id", "failed_at", "reason", "outcome", "count", "max_age_ms"),
+    )
+    inbound = base._inbound_foreign_keys(schema, table)
+    if inbound:
+        raise CleanupBlocked(f"{table} has unexpected inbound foreign keys: {inbound}")
+
+    quoted = base._quote_identifier(table)
+    failed_at_index = None
+    for index_row in db.execute(f"PRAGMA index_list({quoted})").fetchall():
+        index_name = str(index_row[1])
+        index_info = db.execute(
+            f"PRAGMA index_info({base._quote_identifier(index_name)})"
+        ).fetchall()
+        if index_info and str(index_info[0][2]) == "failed_at":
+            failed_at_index = index_name
+            break
+    if failed_at_index is None:
+        raise CleanupBlocked(f"{table}.failed_at is not indexed")
+
+    trigger_names: list[str] = []
+    for row in db.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name",
+        (table,),
+    ).fetchall():
+        name = str(row[0])
+        sql = str(row[1] or "").lower()
+        if REPLICATION_TABLE not in sql:
+            raise CleanupBlocked(f"{table} has non-replication trigger dependency: {name}")
+        trigger_names.append(name)
+    views = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='view' AND lower(sql) LIKE ? ORDER BY name",
+        (f"%{table.lower()}%",),
+    ).fetchall()
+    if views:
+        raise CleanupBlocked(f"{table} has view dependencies: {[str(row[0]) for row in views]}")
+
+    base._required_columns(schema, CERTIFICATION_EPOCH_TABLE, ("release_commit", "started_at"))
+    release_commit = release_commit_from_env()
+    if release_commit is None:
+        raise CleanupBlocked("current release commit is unavailable; certification boundary cannot be proven")
+    row = db.execute(
+        f"SELECT started_at FROM {base._quote_identifier(CERTIFICATION_EPOCH_TABLE)} "
+        "WHERE release_commit=? LIMIT 1",
+        (release_commit,),
+    ).fetchone()
+    if row is None:
+        raise CleanupBlocked(f"current release certification epoch is missing for {release_commit}")
+    raw = str(row[0])
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise CleanupBlocked("current release certification epoch is not ISO-8601") from exc
+    if parsed.tzinfo is None:
+        raise CleanupBlocked("current release certification epoch is timezone-naive")
+    prospective_start_at = parsed.astimezone(timezone.utc).isoformat()
+    return {
+        "release_commit": release_commit,
+        "prospective_start_at": prospective_start_at,
+        "failed_at_index": failed_at_index,
+        "replication_triggers": trigger_names,
+        "predicate": "failed_at < prospective_start_at",
+    }
+
+
+def _delete_obsolete_latency_failures(
+    db: sqlite3.Connection,
+    schema: dict[str, base.TableShape],
+    context: dict[str, Any] | None,
+    *,
+    batch_size: int = BATCH_SIZE,
+) -> int:
+    if context is None or LATENCY_FAILURE_TABLE not in schema:
+        return 0
+    if batch_size <= 0:
+        raise CleanupBlocked("latency deletion batch size must be positive")
+    boundary = str(context["prospective_start_at"])
+    quoted = base._quote_identifier(LATENCY_FAILURE_TABLE)
+    total = 0
+    while True:
+        cursor = db.execute(
+            f"DELETE FROM {quoted} WHERE rowid IN ("
+            f"SELECT rowid FROM {quoted} WHERE failed_at<? ORDER BY failed_at,id LIMIT ?)",
+            (boundary, int(batch_size)),
+        )
+        deleted = int(cursor.rowcount if cursor.rowcount >= 0 else 0)
+        db.commit()
+        total += deleted
+        if deleted < batch_size:
+            break
+    stale = db.execute(
+        f"SELECT id FROM {quoted} WHERE failed_at<? ORDER BY failed_at DESC,id DESC LIMIT 1",
+        (boundary,),
+    ).fetchone()
+    if stale is not None:
+        raise CleanupBlocked("obsolete anonymous candidate latency failures remain after bounded deletion")
+    return total
 
 
 def _unproven_categories(schema: dict[str, base.TableShape]) -> dict[str, Any]:
@@ -421,9 +522,9 @@ def _unproven_categories(schema: dict[str, base.TableShape]) -> dict[str, Any]:
             "deleted": 0,
         },
         "anonymous_candidate_latency_failures": {
-            "status": "protected_pending_live_dependency_probe",
-            "table_present": "anonymous_candidate_latency_failures" in schema,
-            "deleted": 0,
+            "status": "predicate_proven_from_live_reader_and_release_epoch",
+            "table_present": LATENCY_FAILURE_TABLE in schema,
+            "deleted": "reported_after_execution",
         },
     }
 
@@ -439,7 +540,7 @@ def _deleted_total(value: Any) -> int:
 
 
 def _final_integrity(db: sqlite3.Connection) -> dict[str, Any]:
-    result = base._integrity(db)
+    result = base._full_integrity(db)
     return {**result, "mode": "full_post_compaction_required"}
 
 
@@ -492,6 +593,7 @@ def execute_cleanup(
         plan = _protected_plan(schema, role=role)
         protected_before = _protection_snapshot(db, schema, plan)
         certifier_state_before = _read_certifier_state(database_path) if role == "certifier" else None
+        latency_context = _latency_cleanup_context(db, schema) if role == "authoritative" else None
 
         report["preflight"] = {
             "writer_exclusion": "begin_immediate_acquired",
@@ -499,6 +601,7 @@ def execute_cleanup(
             "history_scaled_counts": False,
             "event_ledger_full_scan": False,
             "unknown_tables_default_protected": True,
+            "all_enabled_deletion_predicates_proven_before_mutation": True,
         }
         report["protected_set"] = plan
         report["protection_before"] = protected_before
@@ -510,6 +613,7 @@ def execute_cleanup(
         )
         report["before"] = before
         report["unproven_categories"] = _unproven_categories(schema)
+        report["latency_certification_boundary"] = latency_context
         base._atomic_json(report_path, report)
 
         if role == "certifier":
@@ -518,18 +622,21 @@ def execute_cleanup(
                 "deleted": 0,
                 "acknowledged_watermark": None,
             }
+            latency_deleted = 0
         else:
             replication = _delete_acknowledged_replication(
                 db,
                 schema,
                 acknowledged_watermark=acknowledged_watermark,
             )
+            # Keep DELETE replication changes above the already-pruned acknowledged frontier.
+            latency_deleted = _delete_obsolete_latency_failures(db, schema, latency_context)
 
         report["deleted_rows"] = {
             "certification_replication_changes": replication,
             "synthetic_candidate_history": 0,
             "risk_refresh_measurements": 0,
-            "anonymous_candidate_latency_failures": 0,
+            "anonymous_candidate_latency_failures": latency_deleted,
         }
         report["deleted_rows_total"] = _deleted_total(report["deleted_rows"])
         report["externally_proven_certifier_acknowledged_watermark"] = acknowledged_watermark
@@ -634,16 +741,20 @@ if __name__ == "__main__":
 __all__ = [
     "ACK_WATERMARK_ENV",
     "BATCH_SIZE",
+    "CERTIFICATION_EPOCH_TABLE",
     "CLEANUP_VERSION",
     "CleanupBlocked",
     "ENABLED_ENV",
+    "LATENCY_FAILURE_TABLE",
     "REPLICATION_TABLE",
     "ROLE_ENV",
     "RUN_ID_ENV",
     "TELEMETRY_HOURS_ENV",
     "_delete_acknowledged_replication",
+    "_delete_obsolete_latency_failures",
     "_event_head_snapshot",
     "_extract_schema_bounded",
+    "_latency_cleanup_context",
     "_measure_bounded",
     "_read_certifier_state",
     "_replication_sequence_head",
