@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: write
 
 jobs:
   reproduce:
@@ -23,7 +25,28 @@ jobs:
         run: |
           python -m pip install -r requirements.lock
           python -m pip install -e . --no-deps
-      - name: Prove post-ASGI-response anonymous-memory retention
+      - name: Run isolated ASGI memory regression and capture diagnostic
         run: |
-          set -o pipefail
-          python -m pytest -s -vv tests/test_certification_logical_bootstrap_asgi_memory_retention.py 2>&1 | tee asgi-bootstrap-memory-regression.log
+          set +e
+          python -m pytest -s -vv tests/test_certification_logical_bootstrap_asgi_memory_retention.py > asgi-bootstrap-memory-regression.log 2>&1
+          status=$?
+          printf '%s\n' "$status" > pytest-status.txt
+          grep -E 'ASGI_BOOTSTRAP_MEMORY_TRACE|AssertionError|logical-bootstrap cleanup|reason|FAILED|assert retention_proofs|assert release_proofs|assert not lifecycle_failures' asgi-bootstrap-memory-regression.log | tail -n 80 > diagnostic.txt || true
+          cat diagnostic.txt
+          exit 0
+      - name: Publish diagnostic to draft PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo 'Isolated ASGI bootstrap memory regression diagnostic from runner commit `${{ github.sha }}`:'
+            echo
+            echo '```text'
+            cat diagnostic.txt
+            echo '```'
+          } > diagnostic-comment.md
+          gh pr comment 366 --body-file diagnostic-comment.md
+      - name: Preserve regression result
+        if: always()
+        run: test "$(cat pytest-status.txt)" -eq 0
