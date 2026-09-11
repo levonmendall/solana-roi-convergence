@@ -160,12 +160,14 @@ def test_page_finalizer_clean_cache_release_does_not_write(tmp_path, monkeypatch
 def test_repair_preserves_paper_only_and_fail_closed_boundaries():
     state = repair.status()
 
-    assert state["repair_version"] == "durable-bootstrap-cgroup-memory-v7-page-finalizer-cache-release"
+    assert state["repair_version"] == "durable-bootstrap-cgroup-memory-v8-bootstrap-lease-wal-ownership"
     assert state["logical_bootstrap_page_wide_transaction"] is False
     assert state["passive_wal_checkpoint_under_pressure"] is True
     assert state["passive_wal_checkpoint_gated"] is True
     assert state["clean_cache_eviction_precedes_checkpoint"] is True
     assert state["dirty_writeback_alone_triggers_checkpoint"] is False
+    assert state["bootstrap_active_lease_owns_wal_checkpoint"] is True
+    assert state["bootstrap_guard_passive_checkpoint_enabled"] is False
     assert state["wal_checkpoint_max_attempts_per_guard"] == 1
     assert state["page_finalizer_checkpoint_enabled"] is False
     assert state["page_finalizer_clean_cache_release"] is True
