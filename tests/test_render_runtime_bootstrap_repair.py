@@ -147,7 +147,9 @@ def test_lifespan_yields_before_persistent_runtime_build_completes(monkeypatch):
 def test_production_installs_handoff_and_constant_time_status_route():
     from solana_roi import production
 
-    assert production.app.router.lifespan_context is repair._render_handoff_lifespan
+    lifespan = production.app.router.lifespan_context
+    assert bool(getattr(lifespan, "_roi_safe_retention_cleanup_lifespan", False)) is True
+    assert getattr(lifespan, "_roi_previous_lifespan", None) is repair._render_handoff_lifespan
     assert bool(getattr(production.app.state, "roi_runtime_bootstrap_handoff", False)) is True
     assert any(
         getattr(route, "path", None) == "/v1/runtime-bootstrap/status"
