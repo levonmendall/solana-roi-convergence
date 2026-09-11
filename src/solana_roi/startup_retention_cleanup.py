@@ -2,12 +2,14 @@ from __future__ import annotations
 
 """Lifecycle-owned one-shot production cleanup for proven stale artifacts.
 
-Importing this module is deliberately side-effect free.  The authoritative
-production facade registers one bounded cleanup handler on the FastAPI startup
-lifecycle so filesystem mutation cannot occur merely because a module is imported
-by a test, probe, worker, or tooling process.
+Importing this module is deliberately side-effect free. The authoritative
+production facade wraps the already-canonical FastAPI lifespan so the bounded
+cleanup executes once at real application startup, immediately before canonical
+workers are started. Filesystem mutation therefore cannot occur merely because a
+module is imported by a test, probe, worker, or tooling process.
 """
 
+from contextlib import asynccontextmanager
 import json
 import logging
 from typing import Any
@@ -87,12 +89,13 @@ def _emit_evidence(state: dict[str, Any]) -> None:
 
 
 def install_startup_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, Any]:
-    """Register exactly one guarded cleanup pass on the application startup event.
+    """Wrap the existing FastAPI lifespan with exactly one guarded cleanup pass.
 
-    Registration is non-mutating with respect to production storage.  The cleanup
+    Registration is non-mutating with respect to production storage. The cleanup
     itself remains the existing conservative stale-export cleanup and therefore
     preserves all paper-only, provenance, replication, wallet, event-ledger, and
-    strategy-authority boundaries.
+    strategy-authority boundaries. Unknown lifecycle shapes fail closed rather
+    than falling back to import-time mutation.
     """
 
     if bool(getattr(app.state, _REGISTRATION_ATTR, False)):
@@ -108,22 +111,34 @@ def install_startup_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[
         def safe_retention_cleanup_status() -> dict[str, Any]:
             return dict(getattr(app.state, "roi_safe_retention_cleanup", pending))
 
+    router = getattr(app, "router", None)
+    previous_lifespan = getattr(router, "lifespan_context", None)
+    if not callable(previous_lifespan):
+        raise RuntimeError("authoritative FastAPI lifespan is unavailable")
+
     def _startup_cleanup() -> None:
         try:
             state = dict(_run_cleanup(app, ingestion_runtime))
             state["startup_pending"] = False
         except Exception as exc:  # mutation ambiguity stays visible and fail-closed
             state = _failure_state(exc)
-            app.state.roi_safe_retention_cleanup = state
-            app.state.roi_safe_retention_cleanup_version = CLEANUP_VERSION
+        app.state.roi_safe_retention_cleanup = state
+        app.state.roi_safe_retention_cleanup_version = CLEANUP_VERSION
         _emit_evidence(state)
 
-    app.add_event_handler("startup", _startup_cleanup)
+    @asynccontextmanager
+    async def _retention_owned_lifespan(app_instance: Any):
+        _startup_cleanup()
+        async with previous_lifespan(app_instance) as lifespan_state:
+            yield lifespan_state
+
+    setattr(_retention_owned_lifespan, "_roi_safe_retention_cleanup_lifespan", True)
+    app.router.lifespan_context = _retention_owned_lifespan
     setattr(app.state, _REGISTRATION_ATTR, True)
     return dict(pending)
 
 
 # Compatibility alias for callers introduced before the lifecycle ownership repair.
-# It now registers the startup handler; it never performs cleanup at import time.
+# It now wraps the startup lifespan; it never performs cleanup at import time.
 def run_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, Any]:
     return install_startup_retention_cleanup(app, ingestion_runtime)
