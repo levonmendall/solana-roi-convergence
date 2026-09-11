@@ -19,8 +19,9 @@ from typing import Any, Awaitable, Callable
 from . import production_data_cleanup_v4 as cleanup
 from . import production_disk_ownership as disk_ownership
 from . import render_runtime_bootstrap_repair as bootstrap
+from .cleanup_target_probe import probe_cleanup_target
 
-INSTALL_VERSION = "production-data-cleanup-runtime-install-v3"
+INSTALL_VERSION = "production-data-cleanup-runtime-install-v4-readonly-target-probe"
 STATUS_PATH = "/v1/operations/production-data-cleanup"
 _REGISTRATION_ATTR = "roi_production_data_cleanup_runtime_registered"
 _LOG = logging.getLogger("solana_roi.production_data_cleanup")
@@ -160,6 +161,34 @@ def _mark_blocked(app: Any, exc: BaseException, *, phase: str) -> None:
     _emit("ROI_PRODUCTION_DATA_CLEANUP_BLOCKED", state)
 
 
+async def _establish_disabled_release(
+    app: Any,
+    database_path: Path,
+    lease: disk_ownership.RuntimeDiskLease,
+) -> dict[str, Any]:
+    marker = await asyncio.to_thread(
+        disk_ownership.mark_same_release_established,
+        database_path,
+        lease,
+    )
+    app.state.roi_production_disk_lease_establishment = marker
+    _emit("ROI_PRODUCTION_CLEANUP_RELEASE_ESTABLISHED", marker)
+
+    try:
+        probe = await asyncio.to_thread(probe_cleanup_target, database_path)
+    except Exception as exc:
+        probe = {
+            "status": "probe_failed",
+            "database_path": str(database_path),
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+            "read_only": True,
+        }
+    app.state.roi_cleanup_target_probe = probe
+    _emit("ROI_CLEANUP_TARGET_PROBE", probe)
+    return marker
+
+
 async def _run_cleanup_if_enabled(app: Any, database_path: Path) -> bool:
     """Return True only when normal runtime bootstrap may continue."""
     if not _env_true(cleanup.ENABLED_ENV):
@@ -209,24 +238,14 @@ async def _run_and_establish_disabled_release(
             if stop.is_set():
                 break
             if bootstrap._BOOTSTRAP_STATE.get("state") == "full_runtime":
-                marker = await asyncio.to_thread(
-                    disk_ownership.mark_same_release_established,
-                    database_path,
-                    lease,
-                )
-                app.state.roi_production_disk_lease_establishment = marker
+                await _establish_disabled_release(app, database_path, lease)
                 marker_written = True
                 break
             await asyncio.sleep(0.1)
         await task
     finally:
         if not marker_written and bootstrap._BOOTSTRAP_STATE.get("state") == "full_runtime":
-            marker = await asyncio.to_thread(
-                disk_ownership.mark_same_release_established,
-                database_path,
-                lease,
-            )
-            app.state.roi_production_disk_lease_establishment = marker
+            await _establish_disabled_release(app, database_path, lease)
 
 
 def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
@@ -303,6 +322,9 @@ def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
             )
             payload["lease_establishment"] = getattr(
                 app.state, "roi_production_disk_lease_establishment", None
+            )
+            payload["cleanup_target_probe"] = getattr(
+                app.state, "roi_cleanup_target_probe", None
             )
             return payload
 
