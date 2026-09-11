@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v5-statement-bootstrap-readers"
+REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v6-gated-wal-checkpoint"
 VERIFY_CACHE_RELEASE_ROWS = 4_096
 SQLITE_READER_CACHE_KIB = 2_048
 RAW_RECLAIM_FRACTION = 0.82
@@ -30,6 +30,7 @@ RAW_CRITICAL_RESERVE_BYTES = 128 * 1024 * 1024
 MIN_CGROUP_RECLAIM_BYTES = 64 * 1024 * 1024
 MAX_CGROUP_RECLAIM_BYTES = 1024 * 1024 * 1024
 DIRTY_WRITEBACK_TRIGGER_BYTES = 64 * 1024 * 1024
+WAL_CHECKPOINT_TRIGGER_BYTES = DIRTY_WRITEBACK_TRIGGER_BYTES
 RECLAIM_ATTEMPTS = 4
 RECLAIM_SETTLE_SECONDS = 0.05
 WRITEBACK_SETTLE_SECONDS = 0.10
@@ -122,11 +123,11 @@ def _wal_size_bytes(path: Path) -> int:
 
 
 def _passive_wal_checkpoint(path: Path) -> dict[str, Any]:
-    """Best-effort zero-wait WAL checkpoint used only while raw cgroup pressure is high.
+    """Best-effort zero-wait WAL checkpoint used only when pressure warrants it.
 
-    PASSIVE never waits for readers or writers.  A busy or failed checkpoint is
+    PASSIVE never waits for readers or writers. A busy or failed checkpoint is
     telemetry, not authority: the existing fail-closed raw-memory guard still decides
-    whether a canonical read may continue.  Checkpointing moves already-committed WAL
+    whether a canonical read may continue. Checkpointing moves already-committed WAL
     pages into the main database and does not change logical rows or strategy state.
     """
 
@@ -196,9 +197,33 @@ def _release_sqlite_file_cache(path: Path) -> bool:
     return released
 
 
+def _dirty_writeback_bytes(state: dict[str, int | float | None]) -> int:
+    dirty = state.get("file_dirty_bytes")
+    writeback = state.get("file_writeback_bytes")
+    return max(0, int(dirty)) if isinstance(dirty, int) else 0 + 0
+
+
 def _dirty_writeback_needed(state: dict[str, int | float | None]) -> bool:
     dirty = state.get("file_dirty_bytes")
-    return isinstance(dirty, int) and dirty >= DIRTY_WRITEBACK_TRIGGER_BYTES
+    writeback = state.get("file_writeback_bytes")
+    dirty_bytes = max(0, int(dirty)) if isinstance(dirty, int) else 0
+    writeback_bytes = max(0, int(writeback)) if isinstance(writeback, int) else 0
+    return dirty_bytes + writeback_bytes >= DIRTY_WRITEBACK_TRIGGER_BYTES
+
+
+def _wal_checkpoint_needed(path: Path, state: dict[str, int | float | None]) -> bool:
+    """Checkpoint only for a materially large WAL or material dirty/writeback pressure.
+
+    The WAL trigger deliberately reuses the existing 64 MiB dirty/writeback boundary
+    instead of introducing a looser production threshold. Small WALs under otherwise
+    clean pressure are left untouched so checkpoint writes cannot repopulate the main
+    database cache while the guard is trying to reclaim it.
+    """
+
+    return bool(
+        _wal_size_bytes(path) >= WAL_CHECKPOINT_TRIGGER_BYTES
+        or _dirty_writeback_needed(state)
+    )
 
 
 def _sync_sqlite_dirty_pages(path: Path) -> bool:
@@ -323,8 +348,6 @@ def _emit_reclaim_telemetry(
     wal_bytes_after: int,
     deferred: bool,
 ) -> None:
-    # Numeric resource telemetry plus bounded error class/message: no paths, tokens,
-    # payloads, market data, or canonical evidence contents.
     safe_checkpoint_error = (
         checkpoint_error.replace("\n", " ")[:160] if checkpoint_error is not None else "none"
     )
@@ -354,7 +377,7 @@ def _emit_reclaim_telemetry(
 
 
 def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
-    """Checkpoint WAL, flush dirty pages, reclaim clean cache, then fail closed."""
+    """Evict clean cache first, gate WAL checkpointing, then fail closed at 94%."""
 
     before = _cgroup_memory()
     if not _needs_reclaim(before):
@@ -371,31 +394,13 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
     checkpoint_error: str | None = None
     wal_bytes_before = _wal_size_bytes(path)
     wal_bytes_after = wal_bytes_before
+    checkpoint_considered = False
     attempts = 0
+
     for attempt in range(RECLAIM_ATTEMPTS):
         attempts = attempt + 1
-        checkpoint = _passive_wal_checkpoint(path)
-        if checkpoint.get("attempted"):
-            checkpoint_attempts += 1
-        if isinstance(checkpoint.get("busy"), int):
-            checkpoint_busy = int(checkpoint["busy"])
-        if isinstance(checkpoint.get("log_frames"), int):
-            checkpoint_log_frames = int(checkpoint["log_frames"])
-        if isinstance(checkpoint.get("checkpointed_frames"), int):
-            checkpointed_frames += max(0, int(checkpoint["checkpointed_frames"]))
-        if checkpoint.get("error"):
-            checkpoint_error = str(checkpoint["error"])
-        if isinstance(checkpoint.get("wal_bytes_after"), int):
-            wal_bytes_after = int(checkpoint["wal_bytes_after"])
 
-        checkpoint_wrote_pages = bool(
-            isinstance(checkpoint.get("checkpointed_frames"), int)
-            and int(checkpoint["checkpointed_frames"]) > 0
-        )
-        if _dirty_writeback_needed(after) or checkpoint_wrote_pages:
-            any_writeback_flush = _sync_sqlite_dirty_pages(path) or any_writeback_flush
-            if any_writeback_flush and WRITEBACK_SETTLE_SECONDS > 0:
-                time.sleep(WRITEBACK_SETTLE_SECONDS)
+        # First reclaim clean DB/WAL/SHM cache without creating new main-DB writes.
         _release_sqlite_file_cache(path)
         any_heap_trim = _trim_process_heap() or any_heap_trim
         any_cgroup_request = _request_cgroup_file_reclaim(after) or any_cgroup_request
@@ -420,6 +425,60 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
                 deferred=False,
             )
             return after
+
+        # At most one checkpoint per guard invocation. Repeated PASSIVE checkpoints
+        # under the same pressure episode can repopulate the main DB file cache.
+        if not checkpoint_considered and _wal_checkpoint_needed(path, after):
+            checkpoint_considered = True
+            checkpoint = _passive_wal_checkpoint(path)
+            if checkpoint.get("attempted"):
+                checkpoint_attempts += 1
+            if isinstance(checkpoint.get("busy"), int):
+                checkpoint_busy = int(checkpoint["busy"])
+            if isinstance(checkpoint.get("log_frames"), int):
+                checkpoint_log_frames = int(checkpoint["log_frames"])
+            if isinstance(checkpoint.get("checkpointed_frames"), int):
+                checkpointed_frames += max(0, int(checkpoint["checkpointed_frames"]))
+            if checkpoint.get("error"):
+                checkpoint_error = str(checkpoint["error"])
+            if isinstance(checkpoint.get("wal_bytes_after"), int):
+                wal_bytes_after = int(checkpoint["wal_bytes_after"])
+
+            checkpoint_wrote_pages = bool(
+                isinstance(checkpoint.get("checkpointed_frames"), int)
+                and int(checkpoint["checkpointed_frames"]) > 0
+            )
+            if _dirty_writeback_needed(after) or checkpoint_wrote_pages:
+                any_writeback_flush = _sync_sqlite_dirty_pages(path) or any_writeback_flush
+                if any_writeback_flush and WRITEBACK_SETTLE_SECONDS > 0:
+                    time.sleep(WRITEBACK_SETTLE_SECONDS)
+
+            # Checkpoint/flush may have populated cache; evict it once, then re-read
+            # cgroup truth. No safety threshold is relaxed if reclaim is ineffective.
+            _release_sqlite_file_cache(path)
+            any_heap_trim = _trim_process_heap() or any_heap_trim
+            any_cgroup_request = _request_cgroup_file_reclaim(after) or any_cgroup_request
+            if RECLAIM_SETTLE_SECONDS > 0:
+                time.sleep(RECLAIM_SETTLE_SECONDS * attempts)
+            after = _cgroup_memory()
+            if not _needs_reclaim(after):
+                _emit_reclaim_telemetry(
+                    before,
+                    after,
+                    attempts=attempts,
+                    cgroup_requested=any_cgroup_request,
+                    heap_trimmed=any_heap_trim,
+                    writeback_flushed=any_writeback_flush,
+                    checkpoint_attempts=checkpoint_attempts,
+                    checkpoint_busy=checkpoint_busy,
+                    checkpoint_log_frames=checkpoint_log_frames,
+                    checkpointed_frames=checkpointed_frames,
+                    checkpoint_error=checkpoint_error,
+                    wal_bytes_before=wal_bytes_before,
+                    wal_bytes_after=wal_bytes_after,
+                    deferred=False,
+                )
+                return after
 
     deferred = _critical(after)
     _emit_reclaim_telemetry(
@@ -583,12 +642,16 @@ def status() -> dict[str, Any]:
         "raw_reclaim_reserve_bytes": RAW_RECLAIM_RESERVE_BYTES,
         "raw_critical_reserve_bytes": RAW_CRITICAL_RESERVE_BYTES,
         "dirty_writeback_trigger_bytes": DIRTY_WRITEBACK_TRIGGER_BYTES,
+        "wal_checkpoint_trigger_bytes": WAL_CHECKPOINT_TRIGGER_BYTES,
         "reclaim_attempts": RECLAIM_ATTEMPTS,
         "cgroup_file_reclaim_best_effort": True,
         "cgroup_reclaim_swappiness_zero": True,
         "heap_trim_under_pressure": True,
         "targeted_sqlite_dirty_writeback": True,
+        "clean_cache_eviction_precedes_checkpoint": True,
         "passive_wal_checkpoint_under_pressure": True,
+        "passive_wal_checkpoint_gated": True,
+        "wal_checkpoint_max_attempts_per_guard": 1,
         "wal_checkpoint_busy_timeout_ms": 0,
         "wal_checkpoint_changes_logical_state": False,
         "writeback_changes_logical_state": False,
