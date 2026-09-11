@@ -200,15 +200,13 @@ def _release_sqlite_file_cache(path: Path) -> bool:
 def _dirty_writeback_bytes(state: dict[str, int | float | None]) -> int:
     dirty = state.get("file_dirty_bytes")
     writeback = state.get("file_writeback_bytes")
-    return max(0, int(dirty)) if isinstance(dirty, int) else 0 + 0
+    dirty_bytes = max(0, int(dirty)) if isinstance(dirty, int) else 0
+    writeback_bytes = max(0, int(writeback)) if isinstance(writeback, int) else 0
+    return dirty_bytes + writeback_bytes
 
 
 def _dirty_writeback_needed(state: dict[str, int | float | None]) -> bool:
-    dirty = state.get("file_dirty_bytes")
-    writeback = state.get("file_writeback_bytes")
-    dirty_bytes = max(0, int(dirty)) if isinstance(dirty, int) else 0
-    writeback_bytes = max(0, int(writeback)) if isinstance(writeback, int) else 0
-    return dirty_bytes + writeback_bytes >= DIRTY_WRITEBACK_TRIGGER_BYTES
+    return _dirty_writeback_bytes(state) >= DIRTY_WRITEBACK_TRIGGER_BYTES
 
 
 def _wal_checkpoint_needed(path: Path, state: dict[str, int | float | None]) -> bool:
