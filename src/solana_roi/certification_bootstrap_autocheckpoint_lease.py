@@ -9,6 +9,11 @@ while the bootstrap reader was trying to evict clean cache. This lease changes o
 physical checkpoint cadence while bootstrap requests are active. It restores the
 writer's exact original setting on completion or inactivity and pauses fail-closed if
 the WAL reaches a bounded maintenance ceiling.
+
+The lease is installed only on the already-registered authoritative FastAPI bootstrap
+routes for the concrete production app. The underlying logical-bootstrap module
+functions remain unchanged so package imports, direct unit tests, and non-production
+stores never inherit production-only writer requirements.
 """
 
 import os
@@ -16,11 +21,11 @@ import sqlite3
 import threading
 import weakref
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import HTTPException
 
-LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v1"
+LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v2-production-routes"
 DEFAULT_IDLE_SECONDS = 45.0
 MIN_IDLE_SECONDS = 35.0
 MAX_IDLE_SECONDS = 120.0
@@ -28,6 +33,8 @@ DEFAULT_MAX_WAL_BYTES = 64 * 1024 * 1024
 MIN_MAX_WAL_BYTES = 32 * 1024 * 1024
 MAX_MAX_WAL_BYTES = 256 * 1024 * 1024
 STATE_ATTR = "_roi_certification_bootstrap_autocheckpoint_lease"
+MANIFEST_PATH = "/v1/operations/certification-db-logical-bootstrap"
+PAGE_PATH = "/v1/operations/certification-db-logical-bootstrap-page"
 
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
@@ -38,8 +45,6 @@ CERTIFICATION_THRESHOLDS_CHANGED = False
 CANONICAL_EVIDENCE_RESET = False
 
 _INSTALLED = False
-_ORIGINAL_MANIFEST: Any = None
-_ORIGINAL_PAGE: Any = None
 
 
 def _idle_seconds() -> float:
@@ -309,46 +314,106 @@ def finish(store: Any, *, reason: str = "explicit") -> bool:
         return _restore_locked(store, state, reason=reason, cancel_timer=True)
 
 
-def _manifest_with_lease(store: Any) -> dict[str, Any]:
-    assert _ORIGINAL_MANIFEST is not None
-    refresh(store)
-    payload = _ORIGINAL_MANIFEST(store)
-    set_manifest_tables(store, payload)
-    return payload
+def _runtime_store(runtime_provider: Callable[[], Any]) -> Any:
+    try:
+        runtime = runtime_provider()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="canonical certification runtime unavailable") from exc
+    store = getattr(runtime, "store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="canonical certification store unavailable")
+    return store
 
 
-def _page_with_lease(store: Any, **kwargs: Any) -> dict[str, Any]:
-    assert _ORIGINAL_PAGE is not None
-    refresh(store)
-    payload = _ORIGINAL_PAGE(store, **kwargs)
-    finish_if_complete(store, payload)
-    return payload
+def _route(app: Any, path: str) -> Any:
+    route = next((candidate for candidate in app.routes if getattr(candidate, "path", None) == path), None)
+    if route is None:
+        raise RuntimeError(f"certification bootstrap route not found: {path}")
+    dependant = getattr(route, "dependant", None)
+    if dependant is None or not callable(getattr(dependant, "call", None)):
+        raise RuntimeError(f"certification bootstrap route callable unavailable: {path}")
+    return route
 
 
-def install_certification_bootstrap_autocheckpoint_lease(app: Any | None = None) -> None:
-    global _INSTALLED, _ORIGINAL_MANIFEST, _ORIGINAL_PAGE
-    if _INSTALLED:
-        if app is not None:
-            app.state.roi_certification_bootstrap_autocheckpoint_lease = True
-            app.state.roi_certification_bootstrap_autocheckpoint_lease_version = LEASE_VERSION
+def _replace_route_call(route: Any, endpoint: Callable[..., dict[str, Any]]) -> None:
+    route.endpoint = endpoint
+    route.dependant.call = endpoint
+
+
+def install_certification_bootstrap_autocheckpoint_lease(
+    app: Any,
+    runtime_provider: Callable[[], Any],
+) -> None:
+    """Wrap only this production app's registered bootstrap routes.
+
+    FastAPI has already compiled parameter/header dependencies for the original
+    endpoints, so replacing ``dependant.call`` preserves the exact HTTP contract
+    while avoiding any module-global mutation of logical ``_manifest``/``_page``.
+    """
+
+    global _INSTALLED
+    marker = "roi_certification_bootstrap_autocheckpoint_lease"
+    if bool(getattr(app.state, marker, False)):
         return
 
-    from . import certification_logical_bootstrap as logical
+    from . import certification_incremental_replication as replication
 
-    _ORIGINAL_MANIFEST = logical._manifest
-    _ORIGINAL_PAGE = logical._page
-    logical._manifest = _manifest_with_lease  # type: ignore[assignment]
-    logical._page = _page_with_lease  # type: ignore[assignment]
+    manifest_route = _route(app, MANIFEST_PATH)
+    page_route = _route(app, PAGE_PATH)
+    original_manifest = manifest_route.dependant.call
+    original_page = page_route.dependant.call
+
+    def manifest_endpoint(x_certification_token: str | None = None) -> dict[str, Any]:
+        # Authenticate before touching the canonical writer state.
+        replication._require_shared_token(x_certification_token)
+        store = _runtime_store(runtime_provider)
+        refresh(store)
+        payload = original_manifest(x_certification_token=x_certification_token)
+        set_manifest_tables(store, payload)
+        return payload
+
+    setattr(manifest_endpoint, "_roi_bootstrap_autocheckpoint_lease", True)
+    setattr(manifest_endpoint, "_roi_original_endpoint", original_manifest)
+
+    def page_endpoint(
+        table: str,
+        epoch: str,
+        schema_fingerprint: str,
+        cursor: str | None = None,
+        limit: int = 250,
+        x_certification_token: str | None = None,
+    ) -> dict[str, Any]:
+        # Authenticate before touching the canonical writer state.
+        replication._require_shared_token(x_certification_token)
+        store = _runtime_store(runtime_provider)
+        refresh(store)
+        payload = original_page(
+            table=table,
+            epoch=epoch,
+            schema_fingerprint=schema_fingerprint,
+            cursor=cursor,
+            limit=limit,
+            x_certification_token=x_certification_token,
+        )
+        finish_if_complete(store, payload)
+        return payload
+
+    setattr(page_endpoint, "_roi_bootstrap_autocheckpoint_lease", True)
+    setattr(page_endpoint, "_roi_original_endpoint", original_page)
+
+    _replace_route_call(manifest_route, manifest_endpoint)
+    _replace_route_call(page_route, page_endpoint)
     _INSTALLED = True
-    if app is not None:
-        app.state.roi_certification_bootstrap_autocheckpoint_lease = True
-        app.state.roi_certification_bootstrap_autocheckpoint_lease_version = LEASE_VERSION
+    app.state.roi_certification_bootstrap_autocheckpoint_lease = True
+    app.state.roi_certification_bootstrap_autocheckpoint_lease_version = LEASE_VERSION
 
 
 def status() -> dict[str, Any]:
     return {
         "lease_version": LEASE_VERSION,
         "installed": _INSTALLED,
+        "scope": "authoritative_registered_bootstrap_routes_only",
+        "module_global_logical_functions_mutated": False,
         "idle_seconds": _idle_seconds(),
         "max_wal_bytes": _max_wal_bytes(),
         "original_autocheckpoint_restored": True,
