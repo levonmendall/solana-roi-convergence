@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v7-page-finalizer-cache-release"
+REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v8-bootstrap-lease-wal-ownership"
 VERIFY_CACHE_RELEASE_ROWS = 4_096
 SQLITE_READER_CACHE_KIB = 2_048
 RAW_RECLAIM_FRACTION = 0.82
@@ -373,8 +373,18 @@ def _emit_reclaim_telemetry(
     )
 
 
-def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
-    """Evict clean cache, flush dirty cache, and fail closed at the exact 94% boundary."""
+def _guard_raw_cgroup(
+    path: Path,
+    *,
+    allow_wal_checkpoint: bool = True,
+) -> dict[str, int | float | None]:
+    """Evict/flush cache and fail closed at 94%, optionally deferring WAL ownership.
+
+    During logical bootstrap the active certification lease owns bounded WAL
+    maintenance. In that scope this guard must not issue a competing PASSIVE
+    checkpoint because doing so can repopulate the large main-database file cache.
+    Outside that scope the historical guarded PASSIVE path remains available.
+    """
 
     before = _cgroup_memory()
     if not _needs_reclaim(before):
@@ -455,9 +465,14 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
                 )
                 return after
 
-        # At most one checkpoint per guard invocation, and only for a materially large
-        # WAL. Cgroup-wide dirty bytes alone cannot trigger this write-amplifying step.
-        if not checkpoint_considered and _wal_checkpoint_needed(path, after):
+        # At most one checkpoint per guard invocation, and only outside an active
+        # bootstrap lease. The lease owns bounded zero-wait TRUNCATE maintenance while
+        # bootstrap is active; the guard still reclaims and still fails closed at 94%.
+        if (
+            allow_wal_checkpoint
+            and not checkpoint_considered
+            and _wal_checkpoint_needed(path, after)
+        ):
             checkpoint_considered = True
             checkpoint = _passive_wal_checkpoint(path)
             if checkpoint.get("attempted"):
@@ -595,13 +610,18 @@ def _guarded_pinned_reader(store: Any) -> sqlite3.Connection:
     The logical bootstrap transport is keyset-paginated and journal-reconciled, so
     this connection must not pin a page-wide WAL snapshot. Each bounded SELECT owns
     only its statement snapshot; the caller revalidates schema identity afterwards.
+    While the route-scoped bootstrap lease is active, that lease exclusively owns WAL
+    checkpoint maintenance; this reader's cgroup guard remains responsible for cache
+    reclaim and the unchanged fail-closed memory boundary.
     """
 
     source_path = Path(getattr(store, "path", ""))
     if not source_path.is_file():
         raise HTTPException(status_code=503, detail="canonical certification source unavailable")
+    lease_state = getattr(store, "_roi_certification_bootstrap_autocheckpoint_lease", None)
+    lease_active = isinstance(lease_state, dict) and bool(lease_state.get("active"))
     try:
-        _guard_raw_cgroup(source_path)
+        _guard_raw_cgroup(source_path, allow_wal_checkpoint=not lease_active)
     except MemoryError as exc:
         raise HTTPException(
             status_code=503,
@@ -620,7 +640,8 @@ def _drop_file_cache_with_sidecars(path: Path) -> bool:
 
     This hook runs after every logical-bootstrap manifest/page. It must therefore be
     write-amplification-free: dirty SQLite-backed pages may be synced so DONTNEED can
-    evict them, but WAL checkpoint authority stays exclusively in the raw-cgroup guard.
+    evict them. During active bootstrap the route lease owns WAL maintenance; outside
+    bootstrap the raw-cgroup guard retains its historical bounded checkpoint path.
     """
 
     path = Path(path)
@@ -689,6 +710,8 @@ def status() -> dict[str, Any]:
         "dirty_writeback_alone_triggers_checkpoint": False,
         "passive_wal_checkpoint_under_pressure": True,
         "passive_wal_checkpoint_gated": True,
+        "bootstrap_active_lease_owns_wal_checkpoint": True,
+        "bootstrap_guard_passive_checkpoint_enabled": False,
         "wal_checkpoint_max_attempts_per_guard": 1,
         "page_finalizer_checkpoint_enabled": False,
         "page_finalizer_clean_cache_release": True,
