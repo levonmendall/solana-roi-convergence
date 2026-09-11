@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -36,10 +37,53 @@ def _replication_schema(db: sqlite3.Connection) -> None:
 
 
 def _schema(db: sqlite3.Connection):
-    return cleanup.base.extract_schema(db)
+    return cleanup._extract_schema_bounded(db)
 
 
-def test_replication_pruning_uses_autoincrement_sequence_not_remaining_max(tmp_path: Path) -> None:
+def _protected_history_schema(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            previous_hash TEXT,
+            lineage_hash TEXT NOT NULL
+        );
+        CREATE TABLE paper_engine_checkpoint(
+            id INTEGER PRIMARY KEY,
+            saved_at TEXT NOT NULL,
+            last_engine_event_id INTEGER NOT NULL,
+            state_json TEXT NOT NULL,
+            state_sha256 TEXT NOT NULL
+        );
+        CREATE TABLE wallet_profiles(wallet TEXT PRIMARY KEY,tier TEXT NOT NULL);
+        CREATE TABLE future_unknown_table(id INTEGER PRIMARY KEY,value TEXT);
+        """
+    )
+    previous = None
+    for index in range(1, 101):
+        lineage = f"hash-{index}"
+        db.execute(
+            "INSERT INTO events(id,event_type,observed_at,payload_json,previous_hash,lineage_hash) "
+            "VALUES(?,?,?,?,?,?)",
+            (index, "price", f"2026-09-11T00:00:{index % 60:02d}+00:00", "{}", previous, lineage),
+        )
+        previous = lineage
+    state = "{}"
+    digest = hashlib.sha256(state.encode()).hexdigest()
+    db.execute(
+        "INSERT INTO paper_engine_checkpoint(id,saved_at,last_engine_event_id,state_json,state_sha256) "
+        "VALUES(1,'2026-09-11T00:10:00+00:00',100,?,?)",
+        (state, digest),
+    )
+    db.execute("INSERT INTO wallet_profiles VALUES('wallet-a','S')")
+    db.execute("INSERT INTO future_unknown_table VALUES(1,'keep')")
+    db.commit()
+
+
+def test_replication_pruning_uses_autoincrement_sequence_without_remaining_count(tmp_path: Path) -> None:
     path = tmp_path / "source.sqlite3"
     db = _db(path)
     try:
@@ -47,17 +91,21 @@ def test_replication_pruning_uses_autoincrement_sequence_not_remaining_max(tmp_p
         schema = _schema(db)
         assert cleanup._replication_sequence_head(db, schema) == 10
 
+        traced: list[str] = []
+        db.set_trace_callback(traced.append)
         result = cleanup._delete_acknowledged_replication(
             db, schema, acknowledged_watermark=7, batch_size=2
         )
+        db.set_trace_callback(None)
 
         assert result["status"] == "pruned_to_externally_proven_certifier_watermark"
         assert result["deleted"] == 7
         assert result["sequence_before"] == 10
         assert result["sequence_after"] == 10
-        assert result["remaining_rows"] == 3
+        assert result["remaining_rows"] == "not_scanned"
         assert result["remaining_min_id"] == 8
         assert result["remaining_max_id"] == 10
+        assert not any("COUNT(" in sql.upper() for sql in traced)
         assert db.execute(
             "SELECT seq FROM sqlite_sequence WHERE name='certification_replication_changes'"
         ).fetchone()[0] == 10
@@ -74,7 +122,9 @@ def test_replication_sequence_remains_after_all_rows_are_pruned(tmp_path: Path) 
             db, _schema(db), acknowledged_watermark=10, batch_size=3
         )
         assert result["deleted"] == 10
-        assert result["remaining_rows"] == 0
+        assert result["remaining_rows"] == "not_scanned"
+        assert result["remaining_min_id"] is None
+        assert result["remaining_max_id"] is None
         assert result["sequence_before"] == 10
         assert result["sequence_after"] == 10
         db.execute(
@@ -191,17 +241,19 @@ def test_certifier_state_requires_complete_bootstrap(tmp_path: Path) -> None:
         cleanup._read_certifier_state(database)
 
 
-def test_authoritative_plan_protects_unproven_synthetic_telemetry_and_unknown(tmp_path: Path) -> None:
+def test_authoritative_plan_protects_unproven_categories_and_unknown(tmp_path: Path) -> None:
     path = tmp_path / "source.sqlite3"
     db = _db(path)
     try:
         db.execute("CREATE TABLE v51_synthetic_provenance(surface TEXT,candidate_id TEXT,synthetic INTEGER)")
         db.execute("CREATE TABLE risk_refresh_measurements(id INTEGER PRIMARY KEY, completed_at TEXT)")
+        db.execute("CREATE TABLE anonymous_candidate_latency_failures(id INTEGER PRIMARY KEY, observed_at TEXT)")
         db.execute("CREATE TABLE future_unknown_table(id INTEGER PRIMARY KEY)")
         db.commit()
         plan = cleanup._protected_plan(_schema(db), role="authoritative")
         assert plan["v51_synthetic_provenance"].startswith("protected:")
         assert plan["risk_refresh_measurements"].startswith("protected:")
+        assert plan["anonymous_candidate_latency_failures"].startswith("protected:")
         assert plan["future_unknown_table"].startswith("protected:")
     finally:
         db.close()
@@ -219,3 +271,65 @@ def test_certifier_plan_protects_every_replica_table(tmp_path: Path) -> None:
         assert all(value == "protected:certifier-replica-equivalence" for value in plan.values())
     finally:
         db.close()
+
+
+def test_preflight_metadata_and_protection_do_not_count_protected_history(tmp_path: Path) -> None:
+    path = tmp_path / "source.sqlite3"
+    db = _db(path)
+    try:
+        _protected_history_schema(db)
+        traced: list[str] = []
+        db.set_trace_callback(traced.append)
+        schema = cleanup._extract_schema_bounded(db)
+        measured = cleanup._measure_bounded(path, db, schema)
+        plan = cleanup._protected_plan(schema, role="authoritative")
+        protected = cleanup._protection_snapshot(db, schema, plan)
+        db.set_trace_callback(None)
+
+        assert measured["row_counts"] == "not_scanned_history_bounded_preflight"
+        assert measured["integrity"]["ok"] is None
+        assert protected["protected_row_counts"] == "not_scanned_history_bounded_preflight"
+        assert protected["event_ledger_head"]["count"] == "not_scanned"
+        assert protected["event_ledger_head"]["min_id"] == 1
+        assert protected["event_ledger_head"]["max_id"] == 100
+        assert protected["paper_engine_checkpoint"]["current"]["last_engine_event_id"] == 100
+        history_sql = [sql.upper() for sql in traced if not sql.upper().startswith("PRAGMA")]
+        assert not any("COUNT(" in sql for sql in history_sql)
+        assert not any("MIN(" in sql or "MAX(" in sql for sql in history_sql)
+    finally:
+        db.close()
+
+
+def test_execute_orders_physical_compaction_before_full_integrity(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "source.sqlite3"
+    db = _db(path)
+    db.execute("CREATE TABLE current_state(id INTEGER PRIMARY KEY,value TEXT)")
+    db.execute("INSERT INTO current_state VALUES(1,'keep')")
+    db.commit()
+    db.close()
+
+    calls: list[str] = []
+
+    def compact(database_path: Path, connection: sqlite3.Connection):
+        assert database_path == path.resolve()
+        calls.append("compact")
+        return {"mode": "test", "wal_checkpoint": [0, 0, 0]}
+
+    def integrity(connection: sqlite3.Connection):
+        calls.append("integrity")
+        return {"ok": True, "integrity_check": ["ok"], "foreign_key_violations": []}
+
+    monkeypatch.setattr(cleanup.base, "_compact", compact)
+    monkeypatch.setattr(cleanup, "_final_integrity", integrity)
+
+    result = cleanup.execute_cleanup(
+        path,
+        role="authoritative",
+        run_id="bounded-ordering-1",
+    )
+
+    assert calls == ["compact", "integrity"]
+    assert result["status"] == "success"
+    assert result["preflight"]["history_scaled_counts"] is False
+    assert result["preflight"]["event_ledger_full_scan"] is False
+    assert result["after"]["integrity"]["ok"] is True

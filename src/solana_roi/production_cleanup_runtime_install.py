@@ -7,6 +7,12 @@ cross-process lease is acquired before runtime construction and held until shutd
 Cleanup is allowed only when this exact release SHA previously reached full runtime
 with cleanup disabled while holding that lease. That two-deploy handshake closes the
 Render blue/green overlap boundary before any destructive SQLite maintenance.
+
+The cleanup-target dependency probe is read-only and runs immediately after exclusive
+disk ownership is acquired. It must not wait for ``full_runtime`` because the very
+history-scaled bootstrap work that cleanup is intended to reduce can keep the runtime
+from reaching that state. The destructive-cleanup lease marker remains strictly tied
+to a prior successful ``full_runtime`` release.
 """
 
 import asyncio
@@ -21,7 +27,7 @@ from . import production_disk_ownership as disk_ownership
 from . import render_runtime_bootstrap_repair as bootstrap
 from .cleanup_target_probe import probe_cleanup_target
 
-INSTALL_VERSION = "production-data-cleanup-runtime-install-v4-readonly-target-probe"
+INSTALL_VERSION = "production-data-cleanup-runtime-install-v5-prebootstrap-target-probe"
 STATUS_PATH = "/v1/operations/production-data-cleanup"
 _REGISTRATION_ATTR = "roi_production_data_cleanup_runtime_registered"
 _LOG = logging.getLogger("solana_roi.production_data_cleanup")
@@ -135,6 +141,32 @@ def _emit(prefix: str, payload: dict[str, Any]) -> None:
     _LOG.warning("%s %s", prefix, raw)
 
 
+async def _run_target_probe(app: Any, database_path: Path) -> dict[str, Any]:
+    """Emit bounded dependency proof before history-heavy canonical bootstrap.
+
+    The probe opens SQLite read-only, scans schema metadata only, and uses B-tree edge
+    lookups for rowid bounds. A probe failure is visible but does not mutate storage or
+    prevent the normal disabled-cleanup runtime from continuing.
+    """
+    try:
+        probe = await asyncio.to_thread(probe_cleanup_target, database_path)
+    except Exception as exc:
+        probe = {
+            "status": "probe_failed",
+            "database_path": str(database_path),
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+            "read_only": True,
+            "phase": "post_disk_lease_prebootstrap",
+        }
+    else:
+        probe = dict(probe)
+        probe["phase"] = "post_disk_lease_prebootstrap"
+    app.state.roi_cleanup_target_probe = probe
+    _emit("ROI_CLEANUP_TARGET_PROBE", probe)
+    return probe
+
+
 def _mark_blocked(app: Any, exc: BaseException, *, phase: str) -> None:
     state = {
         "install_version": INSTALL_VERSION,
@@ -173,19 +205,6 @@ async def _establish_disabled_release(
     )
     app.state.roi_production_disk_lease_establishment = marker
     _emit("ROI_PRODUCTION_CLEANUP_RELEASE_ESTABLISHED", marker)
-
-    try:
-        probe = await asyncio.to_thread(probe_cleanup_target, database_path)
-    except Exception as exc:
-        probe = {
-            "status": "probe_failed",
-            "database_path": str(database_path),
-            "error_type": type(exc).__name__,
-            "error": str(exc)[:500],
-            "read_only": True,
-        }
-    app.state.roi_cleanup_target_probe = probe
-    _emit("ROI_CLEANUP_TARGET_PROBE", probe)
     return marker
 
 
@@ -273,6 +292,9 @@ def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
 
         app.state.roi_production_disk_ownership = lease.status()
         try:
+            # Dependency proof must happen before the history-scaled logical bootstrap
+            # that is currently capable of filling the 2 GiB cgroup with file cache.
+            await _run_target_probe(app, database_path)
             try:
                 allowed = await _run_cleanup_if_enabled(app, database_path)
             except asyncio.CancelledError:
@@ -335,5 +357,6 @@ __all__ = [
     "INSTALL_VERSION",
     "STATUS_PATH",
     "_run_cleanup_if_enabled",
+    "_run_target_probe",
     "install_production_cleanup_runtime",
 ]

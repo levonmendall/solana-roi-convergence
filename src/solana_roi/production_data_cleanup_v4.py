@@ -2,16 +2,14 @@ from __future__ import annotations
 
 """Fail-closed exact-dependency production cleanup executor.
 
-V4 is intentionally narrower than the earlier prototype: only a category whose
-production dependency is proven may be deleted.  At this release boundary the
-only database-row deletion with a complete proof contract is the authoritative
-certification replication journal through an externally proven certifier-applied
-watermark.  Synthetic candidate rows and old risk-refresh measurements are
-reported as protected/pending rather than guessed disposable.
+V4 deletes only categories whose production dependency is proven.  The cleanup
+preflight is deliberately history-bounded: it inspects SQLite schema metadata,
+page/file metrics, the current paper checkpoint, the event-ledger head, and the
+replication AUTOINCREMENT frontier without scanning protected historical tables.
 
-The certifier replica is never row-pruned by this executor.  Its durable
-``.state.json`` sidecar is the applied-through truth and must remain unchanged
-across compaction.
+A full SQLite integrity + foreign-key check remains mandatory after physical
+compaction before a run can be marked successful.  If that final verification
+cannot complete safely, the run is blocked rather than declared complete.
 """
 
 import hashlib
@@ -24,7 +22,7 @@ from typing import Any
 from . import production_data_cleanup as base
 from .safe_retention_cleanup import cleanup_stale_certification_exports
 
-CLEANUP_VERSION = "production-data-cleanup-v4"
+CLEANUP_VERSION = "production-data-cleanup-v4-bounded-preflight"
 ENABLED_ENV = base.ENABLED_ENV
 RUN_ID_ENV = base.RUN_ID_ENV
 ROLE_ENV = base.ROLE_ENV
@@ -36,9 +34,6 @@ REPLICATION_TABLE = "certification_replication_changes"
 REPLICATION_COLUMNS = ("id", "table_name", "key_sql", "operation", "changed_at")
 BATCH_SIZE = 5000
 
-# These tables carry current authority, portfolio/accounting state, current wallet
-# intelligence, active evidence, checkpoints, or lineage.  Unknown tables are also
-# protected automatically until a concrete deletion dependency is proven.
 PROTECTED_TABLES = frozenset(
     set(base.PROTECTED_TABLES)
     | {
@@ -118,6 +113,33 @@ def _read_certifier_state(database_path: Path) -> dict[str, Any]:
     }
 
 
+def _extract_schema_bounded(db: sqlite3.Connection) -> dict[str, base.TableShape]:
+    """Extract structural schema metadata without counting any table rows."""
+    schema: dict[str, base.TableShape] = {}
+    for table in base._user_tables(db):
+        quoted = base._quote_identifier(table)
+        info = db.execute(f"PRAGMA table_info({quoted})").fetchall()
+        columns = tuple(str(row[1]) for row in info)
+        primary_key = tuple(
+            str(row[1])
+            for row in sorted(
+                (row for row in info if int(row[5]) > 0), key=lambda row: int(row[5])
+            )
+        )
+        foreign_keys = tuple(
+            (str(row[3]), str(row[2]), str(row[4]))
+            for row in db.execute(f"PRAGMA foreign_key_list({quoted})").fetchall()
+        )
+        schema[table] = base.TableShape(
+            table,
+            columns,
+            primary_key,
+            foreign_keys,
+            -1,
+        )
+    return schema
+
+
 def _structural_schema_fingerprint(schema: dict[str, base.TableShape]) -> str:
     payload = {
         name: {
@@ -130,6 +152,36 @@ def _structural_schema_fingerprint(schema: dict[str, base.TableShape]) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _measure_bounded(
+    database_path: Path,
+    db: sqlite3.Connection,
+    schema: dict[str, base.TableShape] | None = None,
+) -> dict[str, Any]:
+    """Capture physical/structural metrics without scanning protected histories."""
+    schema = schema or _extract_schema_bounded(db)
+    return {
+        "captured_at": base._utcnow(),
+        "files": base._file_metrics(database_path),
+        "pragma": base._pragma_metrics(db),
+        "integrity": {
+            "ok": None,
+            "mode": "deferred_to_post_compaction_full_check",
+            "history_scan_performed": False,
+        },
+        "schema_fingerprint": _structural_schema_fingerprint(schema),
+        "table_count": len(schema),
+        "row_counts": "not_scanned_history_bounded_preflight",
+        "tables": {
+            name: {
+                "columns": list(shape.columns),
+                "primary_key": list(shape.primary_key),
+                "foreign_keys": [list(item) for item in shape.foreign_keys],
+            }
+            for name, shape in schema.items()
+        },
+    }
 
 
 def _protected_plan(schema: dict[str, base.TableShape], *, role: str) -> dict[str, str]:
@@ -161,37 +213,36 @@ def _paper_checkpoint_snapshot(
         table,
         ("id", "saved_at", "last_engine_event_id", "state_json", "state_sha256"),
     )
-    rows = db.execute(
+    row = db.execute(
         "SELECT id,saved_at,last_engine_event_id,state_json,state_sha256 "
-        "FROM paper_engine_checkpoint ORDER BY id"
-    ).fetchall()
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        raw = str(row[3])
-        expected = str(row[4])
-        if hashlib.sha256(raw.encode()).hexdigest() != expected:
-            raise CleanupBlocked("paper-engine checkpoint digest is invalid before cleanup")
-        event_id = int(row[2])
-        marker = None
-        if event_id:
-            if "events" not in schema:
-                raise CleanupBlocked("paper-engine checkpoint references missing event ledger")
-            event = db.execute(
-                "SELECT id,event_type,lineage_hash FROM events WHERE id=?", (event_id,)
-            ).fetchone()
-            if event is None:
-                raise CleanupBlocked("paper-engine checkpoint event marker is missing")
-            marker = [int(event[0]), str(event[1]), str(event[2])]
-        result.append(
-            {
-                "id": int(row[0]),
-                "saved_at": str(row[1]),
-                "last_engine_event_id": event_id,
-                "state_sha256": expected,
-                "event_marker": marker,
-            }
-        )
-    return {"rows": result}
+        "FROM paper_engine_checkpoint ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return {"current": None}
+    raw = str(row[3])
+    expected = str(row[4])
+    if hashlib.sha256(raw.encode()).hexdigest() != expected:
+        raise CleanupBlocked("paper-engine checkpoint digest is invalid before cleanup")
+    event_id = int(row[2])
+    marker = None
+    if event_id:
+        if "events" not in schema:
+            raise CleanupBlocked("paper-engine checkpoint references missing event ledger")
+        event = db.execute(
+            "SELECT id,event_type,lineage_hash FROM events WHERE id=?", (event_id,)
+        ).fetchone()
+        if event is None:
+            raise CleanupBlocked("paper-engine checkpoint event marker is missing")
+        marker = [int(event[0]), str(event[1]), str(event[2])]
+    return {
+        "current": {
+            "id": int(row[0]),
+            "saved_at": str(row[1]),
+            "last_engine_event_id": event_id,
+            "state_sha256": expected,
+            "event_marker": marker,
+        }
+    }
 
 
 def _event_head_snapshot(
@@ -204,15 +255,17 @@ def _event_head_snapshot(
         "events",
         ("id", "event_type", "observed_at", "payload_json", "previous_hash", "lineage_hash"),
     )
-    counts = db.execute("SELECT COUNT(*),MIN(id),MAX(id) FROM events").fetchone()
+    first = db.execute(
+        "SELECT id FROM events ORDER BY id ASC LIMIT 1"
+    ).fetchone()
     head = db.execute(
         "SELECT id,event_type,observed_at,previous_hash,lineage_hash "
         "FROM events ORDER BY id DESC LIMIT 1"
     ).fetchone()
     return {
-        "count": int(counts[0] or 0),
-        "min_id": int(counts[1]) if counts[1] is not None else None,
-        "max_id": int(counts[2]) if counts[2] is not None else None,
+        "count": "not_scanned",
+        "min_id": int(first[0]) if first is not None else None,
+        "max_id": int(head[0]) if head is not None else None,
         "head": (
             [int(head[0]), str(head[1]), str(head[2]), head[3], str(head[4])]
             if head is not None
@@ -226,14 +279,14 @@ def _protection_snapshot(
     schema: dict[str, base.TableShape],
     plan: dict[str, str],
 ) -> dict[str, Any]:
-    protected_rows = {
-        table: int(shape.rows)
-        for table, shape in schema.items()
-        if str(plan.get(table, "")).startswith("protected:")
-    }
     return {
         "structural_schema_sha256": _structural_schema_fingerprint(schema),
-        "protected_row_counts": protected_rows,
+        "protected_tables": sorted(
+            table
+            for table in schema
+            if str(plan.get(table, "")).startswith("protected:")
+        ),
+        "protected_row_counts": "not_scanned_history_bounded_preflight",
         "paper_engine_checkpoint": _paper_checkpoint_snapshot(db, schema),
         "event_ledger_head": _event_head_snapshot(db, schema),
     }
@@ -242,7 +295,7 @@ def _protection_snapshot(
 def _assert_protection_unchanged(before: dict[str, Any], after: dict[str, Any]) -> None:
     for key in (
         "structural_schema_sha256",
-        "protected_row_counts",
+        "protected_tables",
         "paper_engine_checkpoint",
         "event_ledger_head",
     ):
@@ -266,19 +319,14 @@ def _replication_sequence_head(
     if sequence < 0:
         raise CleanupBlocked("replication AUTOINCREMENT sequence cannot be negative")
     max_row = db.execute(
-        f"SELECT MAX(id) FROM {base._quote_identifier(REPLICATION_TABLE)}"
+        f"SELECT id FROM {base._quote_identifier(REPLICATION_TABLE)} "
+        "ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    existing_max = int(max_row[0] or 0)
+    existing_max = int(max_row[0]) if max_row is not None else 0
     if existing_max > sequence:
         raise CleanupBlocked(
             f"replication journal max id {existing_max} exceeds AUTOINCREMENT sequence {sequence}"
         )
-    unexpected = db.execute(
-        f"SELECT COUNT(*) FROM {base._quote_identifier(REPLICATION_TABLE)} "
-        "WHERE operation<>'UPSERT'"
-    ).fetchone()
-    if int(unexpected[0] or 0) != 0:
-        raise CleanupBlocked("replication journal contains unsupported operations")
     return sequence
 
 
@@ -335,26 +383,27 @@ def _delete_acknowledged_replication(
 
     sequence_after = _replication_sequence_head(db, schema)
     if sequence_after != sequence_before:
-        raise CleanupBlocked(
-            "replication journal AUTOINCREMENT sequence changed during pruning"
-        )
-    remaining = db.execute(
-        f"SELECT COUNT(*),MIN(id),MAX(id) FROM {quoted}"
-    ).fetchone()
+        raise CleanupBlocked("replication journal AUTOINCREMENT sequence changed during pruning")
     stale = db.execute(
-        f"SELECT COUNT(*) FROM {quoted} WHERE id<=?", (acknowledged,)
+        f"SELECT id FROM {quoted} WHERE id<=? ORDER BY id DESC LIMIT 1", (acknowledged,)
     ).fetchone()
-    if int(stale[0] or 0) != 0:
+    if stale is not None:
         raise CleanupBlocked("acknowledged replication rows remain after bounded pruning")
+    first_remaining = db.execute(
+        f"SELECT id FROM {quoted} ORDER BY id ASC LIMIT 1"
+    ).fetchone()
+    last_remaining = db.execute(
+        f"SELECT id FROM {quoted} ORDER BY id DESC LIMIT 1"
+    ).fetchone()
     return {
         "status": "pruned_to_externally_proven_certifier_watermark",
         "deleted": total,
         "acknowledged_watermark": acknowledged,
         "sequence_before": sequence_before,
         "sequence_after": sequence_after,
-        "remaining_rows": int(remaining[0] or 0),
-        "remaining_min_id": int(remaining[1]) if remaining[1] is not None else None,
-        "remaining_max_id": int(remaining[2]) if remaining[2] is not None else None,
+        "remaining_rows": "not_scanned",
+        "remaining_min_id": int(first_remaining[0]) if first_remaining is not None else None,
+        "remaining_max_id": int(last_remaining[0]) if last_remaining is not None else None,
         "bounded_batch_size": int(batch_size),
     }
 
@@ -371,6 +420,11 @@ def _unproven_categories(schema: dict[str, base.TableShape]) -> dict[str, Any]:
             "table_present": "risk_refresh_measurements" in schema,
             "deleted": 0,
         },
+        "anonymous_candidate_latency_failures": {
+            "status": "protected_pending_live_dependency_probe",
+            "table_present": "anonymous_candidate_latency_failures" in schema,
+            "deleted": 0,
+        },
     }
 
 
@@ -384,6 +438,11 @@ def _deleted_total(value: Any) -> int:
     return 0
 
 
+def _final_integrity(db: sqlite3.Connection) -> dict[str, Any]:
+    result = base._integrity(db)
+    return {**result, "mode": "full_post_compaction_required"}
+
+
 def execute_cleanup(
     database_path: Path,
     *,
@@ -392,7 +451,7 @@ def execute_cleanup(
     acknowledged_watermark: int | None = None,
     telemetry_hours: float = 24.0,
 ) -> dict[str, Any]:
-    del telemetry_hours  # retained for environment/CLI compatibility; V4 does not delete this telemetry.
+    del telemetry_hours
     role = role.strip().lower()
     if role not in {"authoritative", "certifier"}:
         raise CleanupBlocked("cleanup role must be authoritative or certifier")
@@ -420,23 +479,27 @@ def execute_cleanup(
         "live_money_authority": False,
         "signing_available": False,
         "transaction_submission_available": False,
+        "history_bounded_preflight": True,
     }
     base._atomic_json(report_path, report)
 
     db = base._connect(database_path)
     try:
-        # The outer runtime owns the persistent-disk flock. BEGIN IMMEDIATE is an
-        # independent SQLite-level assertion that no uncoordinated writer remains.
         db.execute("BEGIN IMMEDIATE")
         db.commit()
-        before = base._measure(database_path, db)
-        if not before["integrity"]["ok"]:
-            raise CleanupBlocked("pre-cleanup SQLite integrity/foreign-key check failed")
-        schema = base.extract_schema(db)
+        schema = _extract_schema_bounded(db)
+        before = _measure_bounded(database_path, db, schema)
         plan = _protected_plan(schema, role=role)
         protected_before = _protection_snapshot(db, schema, plan)
         certifier_state_before = _read_certifier_state(database_path) if role == "certifier" else None
 
+        report["preflight"] = {
+            "writer_exclusion": "begin_immediate_acquired",
+            "full_integrity_scan": "deferred_until_post_compaction",
+            "history_scaled_counts": False,
+            "event_ledger_full_scan": False,
+            "unknown_tables_default_protected": True,
+        }
         report["protected_set"] = plan
         report["protection_before"] = protected_before
         report["certifier_replica_state_before"] = certifier_state_before
@@ -466,6 +529,7 @@ def execute_cleanup(
             "certification_replication_changes": replication,
             "synthetic_candidate_history": 0,
             "risk_refresh_measurements": 0,
+            "anonymous_candidate_latency_failures": 0,
         }
         report["deleted_rows_total"] = _deleted_total(report["deleted_rows"])
         report["externally_proven_certifier_acknowledged_watermark"] = acknowledged_watermark
@@ -473,10 +537,12 @@ def execute_cleanup(
         base._atomic_json(report_path, report)
 
         compaction = base._compact(database_path, db)
-        after = base._measure(database_path, db)
-        if not after["integrity"]["ok"]:
+        schema_after = _extract_schema_bounded(db)
+        after = _measure_bounded(database_path, db, schema_after)
+        final_integrity = _final_integrity(db)
+        after["integrity"] = final_integrity
+        if not final_integrity["ok"]:
             raise CleanupBlocked("post-cleanup SQLite integrity/foreign-key check failed")
-        schema_after = base.extract_schema(db)
         plan_after = _protected_plan(schema_after, role=role)
         if plan_after != plan:
             raise CleanupBlocked("table protection plan changed during cleanup")
@@ -534,10 +600,19 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=(int(os.environ[ACK_WATERMARK_ENV]) if os.getenv(ACK_WATERMARK_ENV) else None),
     )
-    parser.add_argument("--telemetry-hours", type=float, default=float(os.getenv(TELEMETRY_HOURS_ENV, "24")))
+    parser.add_argument(
+        "--telemetry-hours",
+        type=float,
+        default=float(os.getenv(TELEMETRY_HOURS_ENV, "24")),
+    )
     args = parser.parse_args(argv)
     if not base._env_true(ENABLED_ENV):
-        print(json.dumps({"version": CLEANUP_VERSION, "status": "disabled", "enabled": False}, sort_keys=True))
+        print(
+            json.dumps(
+                {"version": CLEANUP_VERSION, "status": "disabled", "enabled": False},
+                sort_keys=True,
+            )
+        )
         return 0
     if not args.database:
         raise CleanupBlocked("cleanup enabled but database path is not configured")
@@ -567,6 +642,9 @@ __all__ = [
     "RUN_ID_ENV",
     "TELEMETRY_HOURS_ENV",
     "_delete_acknowledged_replication",
+    "_event_head_snapshot",
+    "_extract_schema_bounded",
+    "_measure_bounded",
     "_read_certifier_state",
     "_replication_sequence_head",
     "execute_cleanup",
