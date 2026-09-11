@@ -322,8 +322,12 @@ def _runtime_store(runtime_provider: Callable[[], Any]) -> Any:
     return store
 
 
+def _find_route(app: Any, path: str) -> Any | None:
+    return next((candidate for candidate in app.routes if getattr(candidate, "path", None) == path), None)
+
+
 def _route(app: Any, path: str) -> Any:
-    route = next((candidate for candidate in app.routes if getattr(candidate, "path", None) == path), None)
+    route = _find_route(app, path)
     if route is None:
         raise RuntimeError(f"certification bootstrap route not found: {path}")
     dependant = getattr(route, "dependant", None)
@@ -360,20 +364,35 @@ def install_certification_bootstrap_autocheckpoint_lease(
 ) -> None:
     """Wrap only this production app's registered bootstrap routes.
 
-    FastAPI has already compiled parameter/header dependencies for the original
-    endpoints, so replacing ``dependant.call`` preserves the exact HTTP contract
-    while avoiding any module-global mutation of logical ``_manifest``/``_page``.
-    The canonical composition root already owns the route registration; when it does
-    not pass the provider explicitly, recover that exact provider from the route's
-    closure rather than creating a second runtime/composition authority.
+    When certification split runtime is disabled the bootstrap transport is not
+    registered at all; that is an intentional inactive state, so the lease is a
+    no-op. If split runtime is enabled, both routes are mandatory and absence of
+    either one remains a hard composition failure. FastAPI has already compiled
+    parameter/header dependencies for the original endpoints, so replacing
+    ``dependant.call`` preserves the exact HTTP contract while avoiding module-global
+    mutation of logical ``_manifest``/``_page``.
     """
 
     global _INSTALLED
     marker = "roi_certification_bootstrap_autocheckpoint_lease"
-    if bool(getattr(app.state, marker, False)):
+    if bool(getattr(app.state, marker, False)) and bool(
+        getattr(app.state, "roi_certification_bootstrap_autocheckpoint_lease_active", False)
+    ):
         return
 
     from . import certification_incremental_replication as replication
+    from . import certification_service_split as split
+
+    manifest_candidate = _find_route(app, MANIFEST_PATH)
+    page_candidate = _find_route(app, PAGE_PATH)
+    if manifest_candidate is None and page_candidate is None and not split.split_runtime_enabled():
+        app.state.roi_certification_bootstrap_autocheckpoint_lease = False
+        app.state.roi_certification_bootstrap_autocheckpoint_lease_active = False
+        app.state.roi_certification_bootstrap_autocheckpoint_lease_version = LEASE_VERSION
+        return
+    if manifest_candidate is None or page_candidate is None:
+        missing = MANIFEST_PATH if manifest_candidate is None else PAGE_PATH
+        raise RuntimeError(f"certification bootstrap route not found: {missing}")
 
     manifest_route = _route(app, MANIFEST_PATH)
     page_route = _route(app, PAGE_PATH)
@@ -428,6 +447,7 @@ def install_certification_bootstrap_autocheckpoint_lease(
     _replace_route_call(page_route, page_endpoint)
     _INSTALLED = True
     app.state.roi_certification_bootstrap_autocheckpoint_lease = True
+    app.state.roi_certification_bootstrap_autocheckpoint_lease_active = True
     app.state.roi_certification_bootstrap_autocheckpoint_lease_version = LEASE_VERSION
 
 
