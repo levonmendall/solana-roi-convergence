@@ -14,16 +14,9 @@ the explicit composition root (not called from this facade):
 
 import asyncio
 
-from . import production_data_cleanup as _production_data_cleanup
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
 from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
-
-# Import-only operational ownership. The cleanup executor is deliberately reachable
-# from the canonical production root so repository-truth audits classify it as a
-# production capability, but importing it performs no cleanup. Destructive work still
-# requires the explicit disabled-by-default CLI gate, unique run id, role and database.
-_ = _production_data_cleanup
 
 # Keep authoritative certification-replica requests below the certifier's bounded
 # HTTP deadline. This changes only transport pagination; evidence, continuity, and
@@ -51,12 +44,19 @@ from .production_system import (
     ingestion_runtime,
     production_system,
 )
+from .production_cleanup_runtime_install import install_production_cleanup_runtime
 from .startup_retention_cleanup import run_safe_retention_cleanup
 from . import legacy_production_composition as _legacy_production
 
-# This call only registers the bounded cleanup on the already-canonical FastAPI
-# lifespan. Registration is storage-non-mutating; actual cleanup executes at real
-# application startup immediately before the canonical worker lifespan begins.
+# Register the disabled-by-default destructive cleanup inside the guarded background
+# bootstrap. When explicitly enabled, ASGI liveness remains available while the
+# canonical runtime and every DB-writing worker stay quiesced until cleanup succeeds;
+# a cleanup failure leaves the deep runtime failed closed.
+install_production_cleanup_runtime(app)
+
+# This call only registers the bounded stale-export cleanup on the already-canonical
+# FastAPI lifespan. Registration is storage-non-mutating; actual cleanup executes at
+# real application startup before entering the guarded Render handoff lifespan.
 run_safe_retention_cleanup(app, ingestion_runtime)
 
 # Backward-compatible observability constants; these are resource ceilings only.
