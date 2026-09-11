@@ -12,6 +12,9 @@ module is imported by a test, probe, worker, or tooling process.
 from contextlib import asynccontextmanager
 import json
 import logging
+import os
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .safe_retention_cleanup import CLEANUP_VERSION, install_safe_retention_cleanup as _run_cleanup
@@ -20,6 +23,7 @@ from .safe_retention_cleanup import CLEANUP_VERSION, install_safe_retention_clea
 _LOG = logging.getLogger("solana_roi.safe_retention")
 _STATUS_PATH = "/v1/operations/safe-retention-cleanup"
 _REGISTRATION_ATTR = "roi_safe_retention_cleanup_startup_registered"
+_DEFAULT_STORE_PATH = "data/solana-roi.sqlite3"
 
 
 def _pending_state() -> dict[str, Any]:
@@ -88,6 +92,35 @@ def _emit_evidence(state: dict[str, Any]) -> None:
     _LOG.info("ROI_SAFE_RETENTION_CLEANUP %s", payload)
 
 
+def _cleanup_runtime_view(ingestion_runtime: Any) -> Any:
+    """Return a path-only runtime view without constructing the canonical runtime.
+
+    In production ``ingestion_runtime`` is deliberately replaced by the Render
+    bootstrap guard. Calling it before the canonical lifespan would synchronously
+    construct the heavy runtime and defeat the liveness/memory handoff. The runtime
+    builder itself uses ``SOLANA_ROI_DB_PATH`` with ``data/solana-roi.sqlite3`` as
+    its default, so the cleanup resolves that exact same path contract directly.
+
+    A concrete runtime supplied by unit/replay callers may still provide ``store.path``;
+    in that case its explicit path wins. The returned object intentionally exposes
+    only the store path needed by the conservative stale-export cleanup.
+    """
+
+    store = getattr(ingestion_runtime, "store", None)
+    raw_path = getattr(store, "path", None)
+    source = "runtime_store"
+    if raw_path is None:
+        raw_path = os.getenv("SOLANA_ROI_DB_PATH", _DEFAULT_STORE_PATH).strip()
+        source = "environment_contract"
+    if not raw_path:
+        raise RuntimeError("canonical store path is unavailable")
+    path = Path(raw_path)
+    return SimpleNamespace(
+        store=SimpleNamespace(path=path),
+        retention_store_path_source=source,
+    )
+
+
 def install_startup_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, Any]:
     """Wrap the existing FastAPI lifespan with exactly one guarded cleanup pass.
 
@@ -118,8 +151,12 @@ def install_startup_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[
 
     def _startup_cleanup() -> None:
         try:
-            state = dict(_run_cleanup(app, ingestion_runtime))
+            cleanup_runtime = _cleanup_runtime_view(ingestion_runtime)
+            state = dict(_run_cleanup(app, cleanup_runtime))
             state["startup_pending"] = False
+            state["store_path_source"] = str(
+                getattr(cleanup_runtime, "retention_store_path_source", "unknown")
+            )
         except Exception as exc:  # mutation ambiguity stays visible and fail-closed
             state = _failure_state(exc)
         app.state.roi_safe_retention_cleanup = state
