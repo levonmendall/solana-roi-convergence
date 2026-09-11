@@ -97,7 +97,7 @@ def test_install_exposes_read_only_scope_and_does_not_claim_ambiguous_deletion(t
     assert any(getattr(route, "path", None) == "/v1/operations/safe-retention-cleanup" for route in app.routes)
 
 
-def test_startup_cleanup_logs_exact_bounded_evidence(tmp_path: Path, caplog) -> None:
+def test_startup_cleanup_logs_exact_bounded_evidence(tmp_path: Path, caplog, capsys) -> None:
     candidate = tmp_path / ".certification-export-old.sqlite3"
     _make_old(candidate)
     app = FastAPI()
@@ -112,7 +112,16 @@ def test_startup_cleanup_logs_exact_bounded_evidence(tmp_path: Path, caplog) -> 
         if record.getMessage().startswith("ROI_SAFE_RETENTION_CLEANUP ")
     ]
     assert len(records) == 1
-    evidence = json.loads(records[0].split(" ", 1)[1])
+    log_evidence = json.loads(records[0].split(" ", 1)[1])
+    stdout_lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("ROI_SAFE_RETENTION_CLEANUP ")
+    ]
+    assert len(stdout_lines) == 1
+    stdout_evidence = json.loads(stdout_lines[0].split(" ", 1)[1])
+    assert stdout_evidence == log_evidence
+    evidence = stdout_evidence
     assert evidence["version"] == cleanup.CLEANUP_VERSION
     assert evidence["scope"] == ["stale_certification_exports"]
     assert evidence["examined"] == 1

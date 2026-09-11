@@ -33,8 +33,11 @@ def run_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, An
             state.get("transaction_submission_available", False)
         ),
     }
-    _LOG.info(
-        "ROI_SAFE_RETENTION_CLEANUP %s",
-        json.dumps(evidence, sort_keys=True, separators=(",", ":")),
-    )
+    payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    # This function runs while the production module is imported, before Uvicorn
+    # configures application loggers.  A flushed stdout evidence line is therefore
+    # the authoritative startup record; the logger call remains supplemental once
+    # logging is configured by an embedding runtime or test harness.
+    print(f"ROI_SAFE_RETENTION_CLEANUP {payload}", flush=True)
+    _LOG.info("ROI_SAFE_RETENTION_CLEANUP %s", payload)
     return state
