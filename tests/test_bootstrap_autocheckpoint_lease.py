@@ -3,11 +3,13 @@ from __future__ import annotations
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from solana_roi import certification_bootstrap_autocheckpoint_lease as lease
+from solana_roi import certification_logical_bootstrap as logical
 
 
 class _Store:
@@ -51,6 +53,42 @@ def _autocheckpoint(store: _Store) -> int:
     return int(store.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
 
 
+def _fake_app_with_routes(runtime_provider, order: list[str]):
+    # Deliberately capture runtime_provider in each endpoint so the production lease
+    # can recover the exact provider without a second composition/runtime authority.
+    def manifest_endpoint(x_certification_token=None):
+        runtime_provider()
+        order.append("manifest")
+        return {"tables": [{"name": "evidence"}]}
+
+    def page_endpoint(
+        table,
+        epoch,
+        schema_fingerprint,
+        cursor=None,
+        limit=250,
+        x_certification_token=None,
+    ):
+        runtime_provider()
+        order.append("page")
+        return {"table": table, "done": True}
+
+    manifest_route = SimpleNamespace(
+        path=lease.MANIFEST_PATH,
+        endpoint=manifest_endpoint,
+        dependant=SimpleNamespace(call=manifest_endpoint),
+    )
+    page_route = SimpleNamespace(
+        path=lease.PAGE_PATH,
+        endpoint=page_endpoint,
+        dependant=SimpleNamespace(call=page_endpoint),
+    )
+    return SimpleNamespace(
+        routes=[manifest_route, page_route],
+        state=SimpleNamespace(),
+    ), manifest_route, page_route
+
+
 def test_refresh_disables_autocheckpoint_and_stale_timer_cannot_restore(tmp_path, monkeypatch):
     store = _Store(tmp_path / "state.sqlite3")
     original = _autocheckpoint(store)
@@ -71,7 +109,6 @@ def test_refresh_disables_autocheckpoint_and_stale_timer_cannot_restore(tmp_path
     assert second is not first
     assert _autocheckpoint(store) == 0
 
-    # A timer already entering its callback after cancel must be harmless.
     first.fire()
     assert _autocheckpoint(store) == 0
 
@@ -137,48 +174,59 @@ def test_wal_bound_restores_policy_runs_one_maintenance_checkpoint_and_pauses(tm
     store.close()
 
 
-def test_manifest_wrapper_acquires_lease_before_manifest_work(tmp_path, monkeypatch):
+def test_installer_wraps_only_registered_routes_and_preserves_logical_globals(tmp_path, monkeypatch):
     store = _Store(tmp_path / "state.sqlite3")
+    runtime = SimpleNamespace(store=store)
     order: list[str] = []
-    monkeypatch.setattr(lease, "refresh", lambda store: order.append("lease") or {})
-    monkeypatch.setattr(
-        lease,
-        "set_manifest_tables",
-        lambda store, payload: order.append("tables"),
-    )
-    monkeypatch.setattr(
-        lease,
-        "_ORIGINAL_MANIFEST",
-        lambda store: order.append("manifest") or {"tables": [{"name": "evidence"}]},
-    )
 
-    payload = lease._manifest_with_lease(store)
+    def runtime_provider():
+        return runtime
 
-    assert payload["tables"] == [{"name": "evidence"}]
-    assert order == ["lease", "manifest", "tables"]
+    app, manifest_route, page_route = _fake_app_with_routes(runtime_provider, order)
+    original_manifest_function = logical._manifest
+    original_page_function = logical._page
+
+    monkeypatch.setattr(
+        "solana_roi.certification_incremental_replication._require_shared_token",
+        lambda token: order.append("auth"),
+    )
+    monkeypatch.setattr(lease, "refresh", lambda target: order.append("lease") or {})
+    monkeypatch.setattr(lease, "set_manifest_tables", lambda target, payload: order.append("tables"))
+    monkeypatch.setattr(lease, "finish_if_complete", lambda target, payload: order.append("finish") or True)
+
+    # Match the canonical production call: provider is recovered from the already
+    # registered route closure instead of being supplied by another composition root.
+    lease.install_certification_bootstrap_autocheckpoint_lease(app)
+
+    assert logical._manifest is original_manifest_function
+    assert logical._page is original_page_function
+    assert getattr(manifest_route.dependant.call, "_roi_bootstrap_autocheckpoint_lease") is True
+    assert getattr(page_route.dependant.call, "_roi_bootstrap_autocheckpoint_lease") is True
+
+    manifest = manifest_route.dependant.call(x_certification_token="token")
+    assert manifest == {"tables": [{"name": "evidence"}]}
+    assert order == ["auth", "lease", "manifest", "tables"]
+
+    order.clear()
+    page = page_route.dependant.call(
+        table="evidence",
+        epoch="epoch-12345678",
+        schema_fingerprint="f" * 64,
+        cursor=None,
+        limit=1,
+        x_certification_token="token",
+    )
+    assert page == {"table": "evidence", "done": True}
+    assert order == ["auth", "lease", "page", "finish"]
+    assert app.state.roi_certification_bootstrap_autocheckpoint_lease is True
+    assert app.state.roi_certification_bootstrap_autocheckpoint_lease_version == lease.LEASE_VERSION
     store.close()
 
 
-def test_page_wrapper_refreshes_before_read_and_restores_on_final_page(tmp_path, monkeypatch):
-    store = _Store(tmp_path / "state.sqlite3")
-    order: list[str] = []
-    monkeypatch.setattr(lease, "refresh", lambda store: order.append("lease") or {})
-    monkeypatch.setattr(
-        lease,
-        "_ORIGINAL_PAGE",
-        lambda store, **kwargs: order.append("page") or {"table": "final", "done": True},
-    )
-    monkeypatch.setattr(
-        lease,
-        "finish_if_complete",
-        lambda store, payload: order.append("finish") or True,
-    )
-
-    payload = lease._page_with_lease(store, table_name="final")
-
-    assert payload == {"table": "final", "done": True}
-    assert order == ["lease", "page", "finish"]
-    store.close()
+def test_installer_rejects_missing_registered_routes():
+    app = SimpleNamespace(routes=[], state=SimpleNamespace())
+    with pytest.raises(RuntimeError, match="bootstrap route not found"):
+        lease.install_certification_bootstrap_autocheckpoint_lease(app, lambda: None)
 
 
 def test_finish_if_complete_only_restores_for_manifest_final_table(tmp_path, monkeypatch):
@@ -204,6 +252,8 @@ def test_lease_safety_contract_and_retry_window():
     assert lease.DEFAULT_MAX_WAL_BYTES == 64 * 1024 * 1024
     assert state["wal_bound_fail_closed"] is True
     assert state["original_autocheckpoint_restored"] is True
+    assert state["scope"] == "authoritative_registered_bootstrap_routes_only"
+    assert state["module_global_logical_functions_mutated"] is False
     assert state["strategy_thresholds_changed"] is False
     assert state["certification_thresholds_changed"] is False
     assert state["canonical_evidence_reset"] is False
