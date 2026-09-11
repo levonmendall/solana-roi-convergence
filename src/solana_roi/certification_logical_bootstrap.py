@@ -21,7 +21,7 @@ from fastapi import BackgroundTasks, Header, HTTPException, Query
 from . import certification_incremental_replication as replication
 from . import certification_service_split as split
 
-BOOTSTRAP_VERSION = "certification-logical-bootstrap-v4-adaptive-memory-bound"
+BOOTSTRAP_VERSION = "certification-logical-bootstrap-v5-async-post-response-cleanup"
 DEFAULT_PAGE_ROWS = 250
 MAX_PAGE_ROWS = 500
 DEFAULT_PAGE_BYTES = 4 * 1024 * 1024
@@ -382,20 +382,26 @@ def _page(
         reader.close()
 
 
+async def _post_response_cleanup(source_path: Path) -> None:
+    """Run cleanup after response send without Starlette's sync worker-thread pool."""
+
+    split._drop_file_cache(source_path)
+
+
 def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable[[], Any]) -> None:
     manifest_path = "/v1/operations/certification-db-logical-bootstrap"
     page_path = "/v1/operations/certification-db-logical-bootstrap-page"
     existing = {getattr(route, "path", None) for route in app.routes}
     if manifest_path not in existing:
         @app.get(manifest_path)
-        def certification_db_logical_bootstrap(
+        async def certification_db_logical_bootstrap(
             x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
         ) -> dict[str, Any]:
             replication._require_shared_token(x_certification_token)
             return _manifest(_runtime_store(runtime_provider))
     if page_path not in existing:
         @app.get(page_path)
-        def certification_db_logical_bootstrap_page(
+        async def certification_db_logical_bootstrap_page(
             background_tasks: BackgroundTasks,
             table: str = Query(min_length=1, max_length=256),
             epoch: str = Query(min_length=8, max_length=128),
@@ -420,8 +426,10 @@ def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable
                 # No response will be serialized/sent, so immediate cleanup is safe.
                 split._drop_file_cache(source_path)
                 raise
-            # FastAPI/Starlette executes BackgroundTasks after the response body send.
-            background_tasks.add_task(split._drop_file_cache, source_path)
+            # BackgroundTasks executes this coroutine only after the final response body
+            # has been sent, and because it is async Starlette never enters AnyIO's
+            # sync worker-thread pool for the cleanup.
+            background_tasks.add_task(_post_response_cleanup, source_path)
             return payload
     app.state.roi_certification_logical_bootstrap = True
     app.state.roi_certification_logical_bootstrap_version = BOOTSTRAP_VERSION

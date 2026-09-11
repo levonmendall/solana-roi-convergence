@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import sqlite3
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 from solana_roi import certification_bootstrap_autocheckpoint_lease as lease
 from solana_roi import certification_logical_bootstrap as logical
@@ -60,13 +62,15 @@ def _fake_app_with_routes(runtime_provider, order: list[str]):
         return {"tables": [{"name": "evidence"}]}
 
     def page_endpoint(
-        table,
-        epoch,
-        schema_fingerprint,
+        background_tasks=None,
+        table=None,
+        epoch=None,
+        schema_fingerprint=None,
         cursor=None,
         limit=250,
         x_certification_token=None,
     ):
+        assert isinstance(background_tasks, BackgroundTasks)
         runtime_provider()
         order.append("page")
         return {"table": table, "done": True}
@@ -199,19 +203,26 @@ def test_installer_wraps_only_registered_routes_and_preserves_logical_globals(tm
     assert logical._page is original_page_function
     assert getattr(manifest_route.dependant.call, "_roi_bootstrap_autocheckpoint_lease") is True
     assert getattr(page_route.dependant.call, "_roi_bootstrap_autocheckpoint_lease") is True
+    assert inspect.iscoroutinefunction(manifest_route.dependant.call)
+    assert inspect.iscoroutinefunction(page_route.dependant.call)
 
-    manifest = manifest_route.dependant.call(x_certification_token="token")
+    manifest = asyncio.run(
+        manifest_route.dependant.call(x_certification_token="token")
+    )
     assert manifest == {"tables": [{"name": "evidence"}]}
     assert order == ["auth", "lease", "manifest", "tables"]
 
     order.clear()
-    page = page_route.dependant.call(
-        table="evidence",
-        epoch="epoch-12345678",
-        schema_fingerprint="f" * 64,
-        cursor=None,
-        limit=1,
-        x_certification_token="token",
+    page = asyncio.run(
+        page_route.dependant.call(
+            background_tasks=BackgroundTasks(),
+            table="evidence",
+            epoch="epoch-12345678",
+            schema_fingerprint="f" * 64,
+            cursor=None,
+            limit=1,
+            x_certification_token="token",
+        )
     )
     assert page == {"table": "evidence", "done": True}
     assert order == ["auth", "lease", "page", "finish"]
@@ -271,6 +282,9 @@ def test_lease_safety_contract_and_retry_window():
     assert state["original_autocheckpoint_restored"] is True
     assert state["scope"] == "authoritative_preworker_plus_registered_bootstrap_routes"
     assert state["module_global_logical_functions_mutated"] is False
+    assert state["route_wrappers_async"] is True
+    assert state["background_tasks_forwarded"] is True
+    assert state["anyio_sync_worker_route_wrapper"] is False
     assert state["preworker_lease_priming"] is True
     assert state["preworker_checkpoint_enabled"] is False
     assert state["preworker_sync_and_file_cache_release"] is True
