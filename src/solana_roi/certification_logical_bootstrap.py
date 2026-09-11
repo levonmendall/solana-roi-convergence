@@ -16,7 +16,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import Header, HTTPException, Query
+from fastapi import BackgroundTasks, Header, HTTPException, Query
 
 from . import certification_incremental_replication as replication
 from . import certification_service_split as split
@@ -282,7 +282,6 @@ def _page(
     limit: int,
 ) -> dict[str, Any]:
     reader = _pinned_reader(store)
-    source_path = Path(getattr(store, "path", ""))
     try:
         _validate_identity(reader, epoch, fingerprint)
         tables = {str(table["name"]): table for table in replication._ordinary_tables(reader)}
@@ -381,7 +380,6 @@ def _page(
         }
     finally:
         reader.close()
-        split._drop_file_cache(source_path)
 
 
 def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable[[], Any]) -> None:
@@ -398,6 +396,7 @@ def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable
     if page_path not in existing:
         @app.get(page_path)
         def certification_db_logical_bootstrap_page(
+            background_tasks: BackgroundTasks,
             table: str = Query(min_length=1, max_length=256),
             epoch: str = Query(min_length=8, max_length=128),
             schema_fingerprint: str = Query(min_length=32, max_length=128),
@@ -406,14 +405,24 @@ def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable
             x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
         ) -> dict[str, Any]:
             replication._require_shared_token(x_certification_token)
-            return _page(
-                _runtime_store(runtime_provider),
-                table_name=table,
-                epoch=epoch,
-                fingerprint=schema_fingerprint,
-                cursor=cursor,
-                limit=limit,
-            )
+            store = _runtime_store(runtime_provider)
+            source_path = Path(getattr(store, "path", ""))
+            try:
+                payload = _page(
+                    store,
+                    table_name=table,
+                    epoch=epoch,
+                    fingerprint=schema_fingerprint,
+                    cursor=cursor,
+                    limit=limit,
+                )
+            except Exception:
+                # No response will be serialized/sent, so immediate cleanup is safe.
+                split._drop_file_cache(source_path)
+                raise
+            # FastAPI/Starlette executes BackgroundTasks after the response body send.
+            background_tasks.add_task(split._drop_file_cache, source_path)
+            return payload
     app.state.roi_certification_logical_bootstrap = True
     app.state.roi_certification_logical_bootstrap_version = BOOTSTRAP_VERSION
 
