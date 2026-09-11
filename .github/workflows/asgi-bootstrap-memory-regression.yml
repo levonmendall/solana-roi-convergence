@@ -16,6 +16,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Use current diagnostic PR test
+        run: |
+          git fetch origin diagnostic/asgi-bootstrap-memory-retention --depth=1
+          git checkout FETCH_HEAD -- tests/test_certification_logical_bootstrap_asgi_memory_retention.py
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11.16'
@@ -40,7 +44,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           {
-            echo 'Isolated ASGI bootstrap memory regression diagnostic from runner commit `${{ github.sha }}`:'
+            echo 'Isolated ASGI bootstrap memory regression diagnostic from runner commit `${{ github.sha }}` using current PR #366 test:'
             echo
             echo '```text'
             cat diagnostic.txt
