@@ -191,6 +191,7 @@ def test_installer_wraps_only_registered_routes_and_preserves_logical_globals(tm
     monkeypatch.setattr(lease, "refresh", lambda target: order.append("lease") or {})
     monkeypatch.setattr(lease, "set_manifest_tables", lambda target, payload: order.append("tables"))
     monkeypatch.setattr(lease, "finish_if_complete", lambda target, payload: order.append("finish") or True)
+    monkeypatch.setattr(lease, "_install_preworker_quiesce", lambda: None)
 
     lease.install_certification_bootstrap_autocheckpoint_lease(app)
 
@@ -268,8 +269,11 @@ def test_lease_safety_contract_and_retry_window():
     assert lease.DEFAULT_MAX_WAL_BYTES == 64 * 1024 * 1024
     assert state["wal_bound_fail_closed"] is True
     assert state["original_autocheckpoint_restored"] is True
-    assert state["scope"] == "authoritative_registered_bootstrap_routes_only"
+    assert state["scope"] == "authoritative_preworker_plus_registered_bootstrap_routes"
     assert state["module_global_logical_functions_mutated"] is False
+    assert state["preworker_lease_priming"] is True
+    assert state["preworker_checkpoint_enabled"] is False
+    assert state["preworker_sync_and_file_cache_release"] is True
     assert state["strategy_thresholds_changed"] is False
     assert state["certification_thresholds_changed"] is False
     assert state["canonical_evidence_reset"] is False
