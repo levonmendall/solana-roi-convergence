@@ -1,8 +1,9 @@
 {
-  "policy_version": "v51-module-reachability-130-v5-non-authoritative-service-roots",
+  "policy_version": "v51-module-reachability-131-v6-cleanup-capable-certifier-root",
   "production_root": "solana_roi.production",
   "non_authoritative_service_roots": [
     "solana_roi.certifier_service",
+    "solana_roi.certifier_cleanup_service",
     "solana_roi.certifier_job"
   ],
   "test_only": [
