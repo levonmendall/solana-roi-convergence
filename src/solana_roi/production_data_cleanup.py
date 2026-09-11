@@ -235,7 +235,15 @@ def _bounded_anchors(db: sqlite3.Connection, schema: dict[str, TableShape]) -> d
         row = db.execute(
             "SELECT id,last_engine_event_id,state_sha256 FROM paper_engine_checkpoint WHERE id=1 LIMIT 1"
         ).fetchone()
-        anchors["paper_engine_checkpoint"] = dict(row) if row is not None else None
+        anchors["paper_engine_checkpoint"] = (
+            {
+                "id": row[0],
+                "last_engine_event_id": row[1],
+                "state_sha256": row[2],
+            }
+            if row is not None
+            else None
+        )
     if "certification_replication_changes" in schema:
         _required_columns(schema, "certification_replication_changes", ("id",))
         anchors["replication_head_id"] = _edge_value(
@@ -717,7 +725,6 @@ def main(argv: list[str] | None = None) -> int:
         default=float(os.getenv(TELEMETRY_HOURS_ENV, "24")),
     )
     args = parser.parse_args(argv)
-
     if not _env_true(ENABLED_ENV):
         print(
             json.dumps(
