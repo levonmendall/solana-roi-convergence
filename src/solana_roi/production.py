@@ -44,12 +44,13 @@ from .production_system import (
     ingestion_runtime,
     production_system,
 )
-from .startup_retention_cleanup import run_safe_retention_cleanup
+from .startup_retention_cleanup import install_startup_retention_cleanup
 from . import legacy_production_composition as _legacy_production
 
-# One-shot bounded startup maintenance only. This is not a compatibility installer
-# and cannot alter strategy, authority, candidate selection, or certification rules.
-run_safe_retention_cleanup(app, ingestion_runtime)
+# Register one bounded maintenance pass on the actual FastAPI startup lifecycle.
+# Registration itself never mutates production storage, and the cleanup cannot
+# alter strategy, authority, candidate selection, or certification rules.
+install_startup_retention_cleanup(app, ingestion_runtime)
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
