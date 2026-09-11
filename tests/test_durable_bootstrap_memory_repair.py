@@ -65,7 +65,7 @@ def test_bounded_restore_still_fails_on_hash_chain_corruption(tmp_path, monkeypa
     store.close()
 
 
-def test_raw_cgroup_guard_reclaims_before_critical_boundary(tmp_path, monkeypatch):
+def test_raw_cgroup_guard_reclaims_clean_cache_before_checkpoint(tmp_path, monkeypatch):
     source = tmp_path / "state.sqlite3"
     source.write_bytes(b"sqlite")
     states = iter(
@@ -75,27 +75,36 @@ def test_raw_cgroup_guard_reclaims_before_critical_boundary(tmp_path, monkeypatc
                 "max_bytes": 2 * GIB,
                 "headroom_bytes": 248 * MIB,
                 "fraction": (1800 * MIB) / (2 * GIB),
+                "file_dirty_bytes": 0,
+                "file_writeback_bytes": 0,
             },
             {
                 "current_bytes": 1000 * MIB,
                 "max_bytes": 2 * GIB,
                 "headroom_bytes": 1048 * MIB,
                 "fraction": (1000 * MIB) / (2 * GIB),
+                "file_dirty_bytes": 0,
+                "file_writeback_bytes": 0,
             },
         ]
     )
-    releases: list[str] = []
+    order: list[str] = []
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
-    monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: releases.append(str(path)) or True)
-    monkeypatch.setattr(repair, "_trim_process_heap", lambda: True)
-    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: True)
+    monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: order.append("cache") or True)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: order.append("heap") or True)
+    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: order.append("cgroup") or True)
+    monkeypatch.setattr(
+        repair,
+        "_passive_wal_checkpoint",
+        lambda path: (_ for _ in ()).throw(AssertionError("checkpoint must be skipped")),
+    )
     monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
 
     result = repair._guard_raw_cgroup(source)
 
     assert result["fraction"] < 0.50
-    assert releases == [str(source)]
+    assert order == ["cache", "heap", "cgroup"]
 
 
 def test_raw_cgroup_guard_retries_reclaim_until_headroom_returns(tmp_path, monkeypatch):
@@ -123,7 +132,7 @@ def test_raw_cgroup_guard_retries_reclaim_until_headroom_returns(tmp_path, monke
             },
         ]
     )
-    calls = {"cache": 0, "heap": 0, "cgroup": 0}
+    calls = {"cache": 0, "heap": 0, "cgroup": 0, "checkpoint": 0}
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
     monkeypatch.setattr(
@@ -141,12 +150,155 @@ def test_raw_cgroup_guard_retries_reclaim_until_headroom_returns(tmp_path, monke
         "_request_cgroup_file_reclaim",
         lambda state: calls.__setitem__("cgroup", calls["cgroup"] + 1) or True,
     )
+    monkeypatch.setattr(
+        repair,
+        "_passive_wal_checkpoint",
+        lambda path: calls.__setitem__("checkpoint", calls["checkpoint"] + 1),
+    )
     monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
 
     result = repair._guard_raw_cgroup(source)
 
     assert result["current_bytes"] == 1400 * MIB
-    assert calls == {"cache": 2, "heap": 2, "cgroup": 2}
+    assert calls == {"cache": 2, "heap": 2, "cgroup": 2, "checkpoint": 0}
+
+
+def test_raw_cgroup_guard_skips_checkpoint_for_small_wal_and_negligible_writeback(tmp_path, monkeypatch):
+    source = tmp_path / "state.sqlite3"
+    source.write_bytes(b"sqlite")
+    (tmp_path / "state.sqlite3-wal").write_bytes(b"x" * 4096)
+    state = {
+        "current_bytes": 1750 * MIB,
+        "max_bytes": 2 * GIB,
+        "headroom_bytes": 298 * MIB,
+        "fraction": 1750 / 2048,
+        "file_dirty_bytes": 1 * MIB,
+        "file_writeback_bytes": 1 * MIB,
+    }
+    calls = {"checkpoint": 0}
+    monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "_cgroup_memory", lambda: dict(state))
+    monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: True)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: True)
+    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: False)
+    monkeypatch.setattr(
+        repair,
+        "_passive_wal_checkpoint",
+        lambda path: calls.__setitem__("checkpoint", calls["checkpoint"] + 1),
+    )
+    monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
+
+    result = repair._guard_raw_cgroup(source)
+
+    assert result["fraction"] == 1750 / 2048
+    assert calls["checkpoint"] == 0
+
+
+def test_raw_cgroup_guard_runs_one_checkpoint_when_writeback_warrants_it(tmp_path, monkeypatch):
+    source = tmp_path / "state.sqlite3"
+    source.write_bytes(b"sqlite")
+    states = iter(
+        [
+            {
+                "current_bytes": 1900 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 148 * MIB,
+                "fraction": 1900 / 2048,
+                "file_dirty_bytes": 96 * MIB,
+                "file_writeback_bytes": 0,
+            },
+            {
+                "current_bytes": 1850 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 198 * MIB,
+                "fraction": 1850 / 2048,
+                "file_dirty_bytes": 96 * MIB,
+                "file_writeback_bytes": 8 * MIB,
+            },
+            {
+                "current_bytes": 1300 * MIB,
+                "max_bytes": 2 * GIB,
+                "headroom_bytes": 748 * MIB,
+                "fraction": 1300 / 2048,
+                "file_dirty_bytes": 0,
+                "file_writeback_bytes": 0,
+            },
+        ]
+    )
+    order: list[str] = []
+
+    def checkpoint(path):
+        order.append("checkpoint")
+        return {
+            "attempted": True,
+            "busy": 0,
+            "log_frames": 8,
+            "checkpointed_frames": 8,
+            "error": None,
+            "wal_bytes_before": 8192,
+            "wal_bytes_after": 8192,
+        }
+
+    monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "WRITEBACK_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
+    monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: order.append("cache") or True)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: order.append("heap") or True)
+    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: order.append("cgroup") or False)
+    monkeypatch.setattr(repair, "_passive_wal_checkpoint", checkpoint)
+    monkeypatch.setattr(repair, "_sync_sqlite_dirty_pages", lambda path: order.append("writeback") or True)
+    monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
+
+    result = repair._guard_raw_cgroup(source)
+
+    assert result["current_bytes"] == 1300 * MIB
+    assert order[:4] == ["cache", "heap", "cgroup", "checkpoint"]
+    assert order.count("checkpoint") == 1
+    assert "writeback" in order
+    assert order.index("cache") < order.index("checkpoint")
+
+
+def test_raw_cgroup_guard_runs_one_checkpoint_when_wal_is_large(tmp_path, monkeypatch):
+    source = tmp_path / "state.sqlite3"
+    source.write_bytes(b"sqlite")
+    state_high = {
+        "current_bytes": 1800 * MIB,
+        "max_bytes": 2 * GIB,
+        "headroom_bytes": 248 * MIB,
+        "fraction": 1800 / 2048,
+        "file_dirty_bytes": 0,
+        "file_writeback_bytes": 0,
+    }
+    states = iter([dict(state_high), dict(state_high), {**_healthy_memory(), "file_dirty_bytes": 0, "file_writeback_bytes": 0}])
+    calls = {"checkpoint": 0}
+
+    monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "WRITEBACK_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
+    monkeypatch.setattr(repair, "_wal_size_bytes", lambda path: repair.WAL_CHECKPOINT_TRIGGER_BYTES)
+    monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: True)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: True)
+    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: False)
+    monkeypatch.setattr(repair, "_sync_sqlite_dirty_pages", lambda path: True)
+    monkeypatch.setattr(
+        repair,
+        "_passive_wal_checkpoint",
+        lambda path: calls.__setitem__("checkpoint", calls["checkpoint"] + 1) or {
+            "attempted": True,
+            "busy": 0,
+            "log_frames": 1,
+            "checkpointed_frames": 1,
+            "error": None,
+            "wal_bytes_before": repair.WAL_CHECKPOINT_TRIGGER_BYTES,
+            "wal_bytes_after": repair.WAL_CHECKPOINT_TRIGGER_BYTES,
+        },
+    )
+    monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
+
+    result = repair._guard_raw_cgroup(source)
+
+    assert result["current_bytes"] == 100 * MIB
+    assert calls["checkpoint"] == 1
 
 
 def test_raw_cgroup_guard_fails_closed_if_reclaim_cannot_restore_headroom(tmp_path, monkeypatch):
@@ -162,6 +314,8 @@ def test_raw_cgroup_guard_fails_closed_if_reclaim_cannot_restore_headroom(tmp_pa
             "max_bytes": 2 * GIB,
             "headroom_bytes": 98 * MIB,
             "fraction": (1950 * MIB) / (2 * GIB),
+            "file_dirty_bytes": 0,
+            "file_writeback_bytes": 0,
         },
     )
     monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: True)
@@ -213,41 +367,22 @@ def test_dirty_writeback_fsyncs_db_wal_and_shm(tmp_path, monkeypatch):
     assert len(synced) == 3
 
 
-def test_dirty_writeback_precedes_cache_advice_under_pressure(tmp_path, monkeypatch):
-    source = tmp_path / "state.sqlite3"
-    source.write_bytes(b"sqlite")
-    states = iter(
-        [
-            {
-                "current_bytes": 1980 * MIB,
-                "max_bytes": 2 * GIB,
-                "headroom_bytes": 68 * MIB,
-                "fraction": 1980 / 2048,
-                "file_dirty_bytes": 256 * MIB,
-            },
-            {
-                "current_bytes": 1200 * MIB,
-                "max_bytes": 2 * GIB,
-                "headroom_bytes": 848 * MIB,
-                "fraction": 1200 / 2048,
-                "file_dirty_bytes": 0,
-            },
-        ]
-    )
-    order: list[str] = []
-    monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
-    monkeypatch.setattr(repair, "WRITEBACK_SETTLE_SECONDS", 0.0)
-    monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
-    monkeypatch.setattr(repair, "_sync_sqlite_dirty_pages", lambda path: order.append("writeback") or True)
-    monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: order.append("cache") or True)
-    monkeypatch.setattr(repair, "_trim_process_heap", lambda: order.append("heap") or True)
-    monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: False)
-    monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
+def test_dirty_writeback_gate_counts_kernel_writeback_not_only_dirty_pages():
+    state = {
+        "file_dirty_bytes": 8 * MIB,
+        "file_writeback_bytes": repair.DIRTY_WRITEBACK_TRIGGER_BYTES,
+    }
+    assert repair._dirty_writeback_needed(state) is True
 
-    result = repair._guard_raw_cgroup(source)
 
-    assert result["current_bytes"] == 1200 * MIB
-    assert order[:2] == ["writeback", "cache"]
+def test_critical_fail_closed_boundary_remains_94_percent():
+    assert repair.RAW_CRITICAL_FRACTION == 0.94
+    assert repair._critical(
+        {
+            "fraction": 0.94,
+            "headroom_bytes": repair.RAW_CRITICAL_RESERVE_BYTES + 1,
+        }
+    ) is True
 
 
 def test_install_patches_only_read_paths_and_preserves_authority_contract():
@@ -260,12 +395,17 @@ def test_install_patches_only_read_paths_and_preserves_authority_contract():
     assert getattr(logical._pinned_reader, "_roi_durable_bootstrap_memory_bounded", False)
     assert getattr(split._drop_file_cache, "_roi_sqlite_sidecar_cache_release", False)
     status = repair.status()
+    assert status["repair_version"] == "durable-bootstrap-cgroup-memory-v6-gated-wal-checkpoint"
+    assert status["raw_critical_fraction"] == 0.94
     assert status["full_hash_chain_verification_preserved"] is True
     assert status["logical_bootstrap_keyset_semantics_preserved"] is True
     assert status["cgroup_file_reclaim_best_effort"] is True
     assert status["cgroup_reclaim_swappiness_zero"] is True
     assert status["heap_trim_under_pressure"] is True
     assert status["targeted_sqlite_dirty_writeback"] is True
+    assert status["clean_cache_eviction_precedes_checkpoint"] is True
+    assert status["passive_wal_checkpoint_gated"] is True
+    assert status["wal_checkpoint_max_attempts_per_guard"] == 1
     assert status["writeback_changes_logical_state"] is False
     assert status["canonical_evidence_reset"] is False
     assert status["strategy_thresholds_changed"] is False
