@@ -47,38 +47,37 @@ jobs:
           assert 'return _page(' in old_route, 'page route no longer returns _page directly'
           assert 'BackgroundTasks' not in old_route, 'page route already repaired'
 
-          new_route = '''        @app.get(page_path)
-        def certification_db_logical_bootstrap_page(
-            background_tasks: BackgroundTasks,
-            table: str = Query(min_length=1, max_length=256),
-            epoch: str = Query(min_length=8, max_length=128),
-            schema_fingerprint: str = Query(min_length=32, max_length=128),
-            cursor: str | None = Query(default=None, max_length=4096),
-            limit: int = Query(default=DEFAULT_PAGE_ROWS, ge=1, le=MAX_PAGE_ROWS),
-            x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
-        ) -> dict[str, Any]:
-            replication._require_shared_token(x_certification_token)
-            store = _runtime_store(runtime_provider)
-            source_path = Path(getattr(store, "path", ""))
-            try:
-                payload = _page(
-                    store,
-                    table_name=table,
-                    epoch=epoch,
-                    fingerprint=schema_fingerprint,
-                    cursor=cursor,
-                    limit=limit,
-                )
-            except Exception:
-                # No response will be serialized/sent, so immediate cleanup is safe.
-                split._drop_file_cache(source_path)
-                raise
-            # FastAPI/Starlette executes BackgroundTasks only after the response body
-            # has been serialized and sent. This is the earliest safe heap/cache
-            # release point for successful logical-bootstrap pages.
-            background_tasks.add_task(split._drop_file_cache, source_path)
-            return payload
-'''
+          new_route = (
+              '        @app.get(page_path)\n'
+              '        def certification_db_logical_bootstrap_page(\n'
+              '            background_tasks: BackgroundTasks,\n'
+              '            table: str = Query(min_length=1, max_length=256),\n'
+              '            epoch: str = Query(min_length=8, max_length=128),\n'
+              '            schema_fingerprint: str = Query(min_length=32, max_length=128),\n'
+              '            cursor: str | None = Query(default=None, max_length=4096),\n'
+              '            limit: int = Query(default=DEFAULT_PAGE_ROWS, ge=1, le=MAX_PAGE_ROWS),\n'
+              '            x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),\n'
+              '        ) -> dict[str, Any]:\n'
+              '            replication._require_shared_token(x_certification_token)\n'
+              '            store = _runtime_store(runtime_provider)\n'
+              '            source_path = Path(getattr(store, "path", ""))\n'
+              '            try:\n'
+              '                payload = _page(\n'
+              '                    store,\n'
+              '                    table_name=table,\n'
+              '                    epoch=epoch,\n'
+              '                    fingerprint=schema_fingerprint,\n'
+              '                    cursor=cursor,\n'
+              '                    limit=limit,\n'
+              '                )\n'
+              '            except Exception:\n'
+              '                # No response will be serialized/sent, so immediate cleanup is safe.\n'
+              '                split._drop_file_cache(source_path)\n'
+              '                raise\n'
+              '            # FastAPI/Starlette executes BackgroundTasks after the response body send.\n'
+              '            background_tasks.add_task(split._drop_file_cache, source_path)\n'
+              '            return payload\n'
+          )
           text = text[:route_start] + new_route + text[route_end:]
           path.write_text(text, encoding='utf-8')
           PY
