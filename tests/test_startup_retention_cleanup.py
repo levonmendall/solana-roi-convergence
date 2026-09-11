@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 from solana_roi import startup_retention_cleanup as retention
@@ -9,7 +11,15 @@ class _FakeApp:
     def __init__(self) -> None:
         self.state = SimpleNamespace()
         self.routes: list[SimpleNamespace] = []
-        self.startup_handlers: list[object] = []
+        self.lifecycle_events: list[str] = []
+
+        @asynccontextmanager
+        async def _base_lifespan(app):
+            self.lifecycle_events.append("base_start")
+            yield {"canonical": True}
+            self.lifecycle_events.append("base_stop")
+
+        self.router = SimpleNamespace(lifespan_context=_base_lifespan)
 
     def get(self, path: str):
         def _decorator(func):
@@ -17,10 +27,6 @@ class _FakeApp:
             return func
 
         return _decorator
-
-    def add_event_handler(self, event_type: str, handler) -> None:
-        assert event_type == "startup"
-        self.startup_handlers.append(handler)
 
 
 def _completed_state() -> dict[str, object]:
@@ -54,10 +60,20 @@ def _completed_state() -> dict[str, object]:
     }
 
 
-def test_registration_is_storage_non_mutating_until_startup(monkeypatch) -> None:
+def _run_lifespan(app: _FakeApp) -> None:
+    async def _run() -> None:
+        async with app.router.lifespan_context(app) as state:
+            assert state == {"canonical": True}
+            app.lifecycle_events.append("serving")
+
+    asyncio.run(_run())
+
+
+def test_registration_is_storage_non_mutating_until_real_lifespan(monkeypatch) -> None:
     calls: list[object] = []
 
     def _fake_cleanup(app, ingestion_runtime):
+        app.lifecycle_events.append("cleanup")
         calls.append(ingestion_runtime)
         state = _completed_state()
         app.state.roi_safe_retention_cleanup = state
@@ -71,18 +87,18 @@ def test_registration_is_storage_non_mutating_until_startup(monkeypatch) -> None
 
     assert calls == []
     assert registered["startup_pending"] is True
-    assert len(app.startup_handlers) == 1
     assert [route.path for route in app.routes] == ["/v1/operations/safe-retention-cleanup"]
 
-    app.startup_handlers[0]()
+    _run_lifespan(app)
 
     assert calls == [runtime]
+    assert app.lifecycle_events == ["cleanup", "base_start", "serving", "base_stop"]
     assert app.state.roi_safe_retention_cleanup["startup_pending"] is False
     assert app.state.roi_safe_retention_cleanup["paper_only"] is True
     assert app.state.roi_safe_retention_cleanup["live_money_authority"] is False
 
 
-def test_duplicate_registration_does_not_add_or_run_a_second_cleanup(monkeypatch) -> None:
+def test_duplicate_registration_does_not_wrap_or_run_a_second_cleanup(monkeypatch) -> None:
     calls: list[object] = []
 
     def _fake_cleanup(app, ingestion_runtime):
@@ -96,28 +112,31 @@ def test_duplicate_registration_does_not_add_or_run_a_second_cleanup(monkeypatch
     runtime = object()
 
     retention.install_startup_retention_cleanup(app, runtime)
+    first_wrapper = app.router.lifespan_context
     retention.install_startup_retention_cleanup(app, runtime)
 
     assert calls == []
-    assert len(app.startup_handlers) == 1
+    assert app.router.lifespan_context is first_wrapper
     assert len(app.routes) == 1
 
-    app.startup_handlers[0]()
+    _run_lifespan(app)
 
     assert calls == [runtime]
 
 
 def test_startup_failure_is_observed_without_weakening_authority(monkeypatch) -> None:
     def _raise_cleanup(app, ingestion_runtime):
+        app.lifecycle_events.append("cleanup_failed")
         raise RuntimeError("cleanup failed")
 
     monkeypatch.setattr(retention, "_run_cleanup", _raise_cleanup)
     app = _FakeApp()
 
     retention.install_startup_retention_cleanup(app, object())
-    app.startup_handlers[0]()
+    _run_lifespan(app)
 
     state = app.state.roi_safe_retention_cleanup
+    assert app.lifecycle_events == ["cleanup_failed", "base_start", "serving", "base_stop"]
     assert state["startup_pending"] is False
     assert state["startup_error"] == "RuntimeError:cleanup failed"
     assert state["paper_only"] is True
