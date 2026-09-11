@@ -398,7 +398,7 @@ def test_install_patches_only_read_paths_and_preserves_authority_contract():
     assert getattr(logical._pinned_reader, "_roi_durable_bootstrap_memory_bounded", False)
     assert getattr(split._drop_file_cache, "_roi_sqlite_sidecar_cache_release", False)
     status = repair.status()
-    assert status["repair_version"] == "durable-bootstrap-cgroup-memory-v7-page-finalizer-cache-release"
+    assert status["repair_version"] == "durable-bootstrap-cgroup-memory-v8-bootstrap-lease-wal-ownership"
     assert status["raw_critical_fraction"] == 0.94
     assert status["full_hash_chain_verification_preserved"] is True
     assert status["logical_bootstrap_keyset_semantics_preserved"] is True
@@ -409,6 +409,8 @@ def test_install_patches_only_read_paths_and_preserves_authority_contract():
     assert status["clean_cache_eviction_precedes_checkpoint"] is True
     assert status["dirty_writeback_alone_triggers_checkpoint"] is False
     assert status["passive_wal_checkpoint_gated"] is True
+    assert status["bootstrap_active_lease_owns_wal_checkpoint"] is True
+    assert status["bootstrap_guard_passive_checkpoint_enabled"] is False
     assert status["wal_checkpoint_max_attempts_per_guard"] == 1
     assert status["page_finalizer_checkpoint_enabled"] is False
     assert status["page_finalizer_clean_cache_release"] is True
