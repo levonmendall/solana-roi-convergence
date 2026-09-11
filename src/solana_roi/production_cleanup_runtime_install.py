@@ -16,11 +16,11 @@ import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import production_data_cleanup as cleanup
+from . import production_data_cleanup_v4 as cleanup
 from . import production_disk_ownership as disk_ownership
 from . import render_runtime_bootstrap_repair as bootstrap
 
-INSTALL_VERSION = "production-data-cleanup-runtime-install-v2"
+INSTALL_VERSION = "production-data-cleanup-runtime-install-v3"
 STATUS_PATH = "/v1/operations/production-data-cleanup"
 _REGISTRATION_ATTR = "roi_production_data_cleanup_runtime_registered"
 _LOG = logging.getLogger("solana_roi.production_data_cleanup")
