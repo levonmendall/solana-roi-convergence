@@ -14,9 +14,6 @@ the explicit composition root (not called from this facade):
 
 import asyncio
 
-from .certification_bootstrap_autocheckpoint_lease import (
-    install_certification_bootstrap_autocheckpoint_lease,
-)
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
 from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
@@ -49,13 +46,6 @@ from .production_system import (
 )
 from .startup_retention_cleanup import run_safe_retention_cleanup
 from . import legacy_production_composition as _legacy_production
-
-# Logical bootstrap is already mounted by the canonical production composition.
-# Patch only its module-level manifest/page call targets so each request disables
-# the writer's default ~1000-page auto-checkpoint before the raw-cgroup guard runs.
-# The lease restores the exact original setting on completion or inactivity and
-# pauses fail-closed for bounded WAL maintenance.
-install_certification_bootstrap_autocheckpoint_lease(app)
 
 # This call only registers the bounded stale-export cleanup on the already-canonical
 # FastAPI lifespan. Registration is storage-non-mutating; actual cleanup executes at
