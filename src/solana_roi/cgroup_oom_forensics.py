@@ -3,18 +3,21 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 
-FORENSICS_VERSION = "cgroup-oom-forensics-v1-bounded-durable-snapshot"
+FORENSICS_VERSION = "cgroup-oom-forensics-v2-bounded-thread-census"
 SAMPLE_INTERVAL_SECONDS = 5.0
 CURRENT_FILENAME = "runtime-memory-forensics.json"
 PREVIOUS_FILENAME = "runtime-memory-forensics.previous.json"
+THREAD_CENSUS_MAX_NAMES = 20
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -99,6 +102,46 @@ def _process_rss_bytes() -> int | None:
         return max(0, resident_pages * int(os.sysconf("SC_PAGE_SIZE")))
     except (OSError, UnicodeError, ValueError, IndexError):
         return None
+
+
+def _normalized_thread_name(name: str) -> str:
+    """Collapse generated numeric thread ids while retaining the owning target/name."""
+    return re.sub(r"\d+", "*", str(name or "<unnamed>"))
+
+
+def _thread_census() -> dict[str, Any]:
+    """Return a bounded, read-only census of currently live Python threads.
+
+    Python 3.14 default thread names may include a generated ordinal plus the target
+    function. Normalizing digit runs groups those otherwise-unique names while
+    preserving the target suffix, which lets exact-live forensics identify the owner
+    of a runaway thread family without dumping thousands of stacks or names.
+    """
+    threads = tuple(threading.enumerate())
+    exact_counts = Counter(str(getattr(thread, "name", "") or "<unnamed>") for thread in threads)
+    normalized_counts = Counter(
+        _normalized_thread_name(str(getattr(thread, "name", "") or "<unnamed>"))
+        for thread in threads
+    )
+
+    def top_rows(counts: Counter[str]) -> list[dict[str, Any]]:
+        rows = sorted(counts.items(), key=lambda item: (-int(item[1]), str(item[0])))
+        return [{"name": name, "count": int(count)} for name, count in rows[:THREAD_CENSUS_MAX_NAMES]]
+
+    return {
+        "python_active_count": len(threads),
+        "daemon_count": sum(1 for thread in threads if bool(getattr(thread, "daemon", False))),
+        "non_daemon_count": sum(1 for thread in threads if not bool(getattr(thread, "daemon", False))),
+        "distinct_exact_names": len(exact_counts),
+        "distinct_normalized_names": len(normalized_counts),
+        "normalization": "digit_runs_to_asterisk",
+        "max_names": THREAD_CENSUS_MAX_NAMES,
+        "top_exact_names": top_rows(exact_counts),
+        "top_normalized_names": top_rows(normalized_counts),
+        "exact_names_truncated": len(exact_counts) > THREAD_CENSUS_MAX_NAMES,
+        "normalized_names_truncated": len(normalized_counts) > THREAD_CENSUS_MAX_NAMES,
+        "read_only": True,
+    }
 
 
 def _db_path() -> Path | None:
@@ -211,6 +254,7 @@ def capture_snapshot(reason: str = "periodic") -> dict[str, Any]:
         "process_epoch": _PROCESS_EPOCH,
         "pid": os.getpid(),
         "active_phases": active_phases,
+        "thread_census": _thread_census(),
         "memory_current_bytes": current,
         "memory_max_bytes": maximum,
         "memory_peak_bytes": peak,
@@ -314,6 +358,8 @@ def status() -> dict[str, Any]:
         "last_persist_error": persist_error,
         "bounded_persistence": True,
         "history_files_max": 2,
+        "thread_census_bounded": True,
+        "thread_census_max_names": THREAD_CENSUS_MAX_NAMES,
         "read_only_observability": True,
         "certification_thresholds_changed": CERTIFICATION_THRESHOLDS_CHANGED,
         "economic_thresholds_changed": ECONOMIC_THRESHOLDS_CHANGED,
@@ -328,6 +374,9 @@ def status() -> dict[str, Any]:
 __all__ = [
     "FORENSICS_VERSION",
     "SAMPLE_INTERVAL_SECONDS",
+    "THREAD_CENSUS_MAX_NAMES",
+    "_normalized_thread_name",
+    "_thread_census",
     "capture_snapshot",
     "install_cgroup_oom_forensics",
     "phase",
