@@ -1,21 +1,68 @@
 from __future__ import annotations
 
-"""One-shot production startup maintenance for already-proven stale artifacts."""
+"""Lifecycle-owned one-shot production cleanup for proven stale artifacts.
+
+Importing this module is deliberately side-effect free.  The authoritative
+production facade registers one bounded cleanup handler on the FastAPI startup
+lifecycle so filesystem mutation cannot occur merely because a module is imported
+by a test, probe, worker, or tooling process.
+"""
 
 import json
 import logging
 from typing import Any
 
-from .safe_retention_cleanup import install_safe_retention_cleanup as _run_cleanup
+from .safe_retention_cleanup import CLEANUP_VERSION, install_safe_retention_cleanup as _run_cleanup
 
 
 _LOG = logging.getLogger("solana_roi.safe_retention")
+_STATUS_PATH = "/v1/operations/safe-retention-cleanup"
+_REGISTRATION_ATTR = "roi_safe_retention_cleanup_startup_registered"
 
 
-def run_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, Any]:
-    """Run guarded artifact cleanup and emit bounded production evidence."""
+def _pending_state() -> dict[str, Any]:
+    return {
+        "version": CLEANUP_VERSION,
+        "installed": False,
+        "startup_pending": True,
+        "startup_stale_export_cleanup": {
+            "version": CLEANUP_VERSION,
+            "examined": 0,
+            "removed": 0,
+            "skipped": 0,
+            "bounded": True,
+            "paper_only": True,
+            "live_money_authority": False,
+            "signing_available": False,
+            "transaction_submission_available": False,
+        },
+        "scope": ["stale_certification_exports"],
+        "candidate_selection_changed": False,
+        "provenance_ambiguous_data_deleted": False,
+        "replication_journal_deleted": False,
+        "robinhood_history_deleted": False,
+        "event_ledger_deleted": False,
+        "wallet_history_deleted": False,
+        "strategy_thresholds_changed": False,
+        "paper_only": True,
+        "live_money_authority": False,
+        "signing_available": False,
+        "transaction_submission_available": False,
+    }
 
-    state = _run_cleanup(app, ingestion_runtime)
+
+def _failure_state(exc: Exception) -> dict[str, Any]:
+    state = _pending_state()
+    state["startup_pending"] = False
+    state["startup_error"] = f"{type(exc).__name__}:{exc}"
+    state["startup_stale_export_cleanup"] = {
+        **dict(state["startup_stale_export_cleanup"]),
+        "error": state["startup_error"],
+    }
+    return state
+
+
+def _emit_evidence(state: dict[str, Any]) -> None:
     cleanup = dict(state.get("startup_stale_export_cleanup") or {})
     evidence = {
         "version": state.get("version"),
@@ -25,7 +72,8 @@ def run_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, An
         "skipped": int(cleanup.get("skipped") or 0),
         "scan_truncated": bool(cleanup.get("scan_truncated", False)),
         "outcomes": dict(cleanup.get("outcomes") or {}),
-        "error": cleanup.get("error"),
+        "error": cleanup.get("error") or state.get("startup_error"),
+        "startup_pending": bool(state.get("startup_pending", False)),
         "paper_only": bool(state.get("paper_only", True)),
         "live_money_authority": bool(state.get("live_money_authority", False)),
         "signing_available": bool(state.get("signing_available", False)),
@@ -34,10 +82,48 @@ def run_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, An
         ),
     }
     payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
-    # This function runs while the production module is imported, before Uvicorn
-    # configures application loggers.  A flushed stdout evidence line is therefore
-    # the authoritative startup record; the logger call remains supplemental once
-    # logging is configured by an embedding runtime or test harness.
     print(f"ROI_SAFE_RETENTION_CLEANUP {payload}", flush=True)
     _LOG.info("ROI_SAFE_RETENTION_CLEANUP %s", payload)
-    return state
+
+
+def install_startup_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, Any]:
+    """Register exactly one guarded cleanup pass on the application startup event.
+
+    Registration is non-mutating with respect to production storage.  The cleanup
+    itself remains the existing conservative stale-export cleanup and therefore
+    preserves all paper-only, provenance, replication, wallet, event-ledger, and
+    strategy-authority boundaries.
+    """
+
+    if bool(getattr(app.state, _REGISTRATION_ATTR, False)):
+        return dict(getattr(app.state, "roi_safe_retention_cleanup", _pending_state()))
+
+    pending = _pending_state()
+    app.state.roi_safe_retention_cleanup = pending
+    app.state.roi_safe_retention_cleanup_version = CLEANUP_VERSION
+
+    existing = {getattr(route, "path", None) for route in getattr(app, "routes", ())}
+    if _STATUS_PATH not in existing:
+        @app.get(_STATUS_PATH)
+        def safe_retention_cleanup_status() -> dict[str, Any]:
+            return dict(getattr(app.state, "roi_safe_retention_cleanup", pending))
+
+    def _startup_cleanup() -> None:
+        try:
+            state = dict(_run_cleanup(app, ingestion_runtime))
+            state["startup_pending"] = False
+        except Exception as exc:  # mutation ambiguity stays visible and fail-closed
+            state = _failure_state(exc)
+            app.state.roi_safe_retention_cleanup = state
+            app.state.roi_safe_retention_cleanup_version = CLEANUP_VERSION
+        _emit_evidence(state)
+
+    app.add_event_handler("startup", _startup_cleanup)
+    setattr(app.state, _REGISTRATION_ATTR, True)
+    return dict(pending)
+
+
+# Compatibility alias for callers introduced before the lifecycle ownership repair.
+# It now registers the startup handler; it never performs cleanup at import time.
+def run_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, Any]:
+    return install_startup_retention_cleanup(app, ingestion_runtime)
