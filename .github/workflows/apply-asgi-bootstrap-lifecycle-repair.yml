@@ -1,0 +1,119 @@
+name: Apply ASGI Bootstrap Lifecycle Repair
+
+on:
+  push:
+    branches:
+      - diagnostic/asgi-bootstrap-memory-retention-runner
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diagnostic/asgi-bootstrap-memory-retention
+          fetch-depth: 0
+      - name: Apply smallest post-send cleanup repair
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/solana_roi/certification_logical_bootstrap.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_import = 'from fastapi import Header, HTTPException, Query\n'
+          new_import = 'from fastapi import BackgroundTasks, Header, HTTPException, Query\n'
+          assert text.count(old_import) == 1
+          text = text.replace(old_import, new_import, 1)
+
+          page_start = text.index('def _page(')
+          install_start = text.index('\ndef install_certification_logical_bootstrap(', page_start)
+          page = text[page_start:install_start]
+          source_line = '    source_path = Path(getattr(store, "path", ""))\n'
+          old_finally = '    finally:\n        reader.close()\n        split._drop_file_cache(source_path)\n'
+          assert page.count(source_line) == 1
+          assert page.count(old_finally) == 1
+          page = page.replace(source_line, '', 1)
+          page = page.replace(old_finally, '    finally:\n        reader.close()\n', 1)
+          text = text[:page_start] + page + text[install_start:]
+
+          old_route = '''        @app.get(page_path)
+          def certification_db_logical_bootstrap_page(
+              table: str = Query(min_length=1, max_length=256),
+              epoch: str = Query(min_length=8, max_length=128),
+              schema_fingerprint: str = Query(min_length=32, max_length=128),
+              cursor: str | None = Query(default=None, max_length=4096),
+              limit: int = Query(default=DEFAULT_PAGE_ROWS, ge=1, le=MAX_PAGE_ROWS),
+              x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
+          ) -> dict[str, Any]:
+              replication._require_shared_token(x_certification_token)
+              return _page(
+                  _runtime_store(runtime_provider),
+                  table_name=table,
+                  epoch=epoch,
+                  fingerprint=schema_fingerprint,
+                  cursor=cursor,
+                  limit=limit,
+              )
+          '''
+          new_route = '''        @app.get(page_path)
+          def certification_db_logical_bootstrap_page(
+              background_tasks: BackgroundTasks,
+              table: str = Query(min_length=1, max_length=256),
+              epoch: str = Query(min_length=8, max_length=128),
+              schema_fingerprint: str = Query(min_length=32, max_length=128),
+              cursor: str | None = Query(default=None, max_length=4096),
+              limit: int = Query(default=DEFAULT_PAGE_ROWS, ge=1, le=MAX_PAGE_ROWS),
+              x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
+          ) -> dict[str, Any]:
+              replication._require_shared_token(x_certification_token)
+              store = _runtime_store(runtime_provider)
+              source_path = Path(getattr(store, "path", ""))
+              try:
+                  payload = _page(
+                      store,
+                      table_name=table,
+                      epoch=epoch,
+                      fingerprint=schema_fingerprint,
+                      cursor=cursor,
+                      limit=limit,
+                  )
+              except Exception:
+                  # No response will be serialized/sent, so immediate cleanup is safe.
+                  split._drop_file_cache(source_path)
+                  raise
+              # FastAPI/Starlette executes BackgroundTasks only after the response body
+              # has been serialized and sent. This is the earliest safe heap/cache
+              # release point for successful logical-bootstrap pages.
+              background_tasks.add_task(split._drop_file_cache, source_path)
+              return payload
+          '''
+          assert text.count(old_route) == 1, 'page route shape changed; refusing blind repair'
+          text = text.replace(old_route, new_route, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+          git diff --check
+          git diff -- src/solana_roi/certification_logical_bootstrap.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.16'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install exact locked dependencies
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Require ASGI memory regression to turn green before push
+        run: python -m pytest -s -vv tests/test_certification_logical_bootstrap_asgi_memory_retention.py
+      - name: Commit verified lifecycle repair to diagnostic PR
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/solana_roi/certification_logical_bootstrap.py
+          git commit -m 'Defer logical bootstrap cleanup until ASGI response send'
+          git push origin HEAD:diagnostic/asgi-bootstrap-memory-retention
