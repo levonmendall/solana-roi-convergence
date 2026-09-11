@@ -4,7 +4,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Any
 
-COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight-v21-certification-service-split-v22-certification-snapshot-cgroup-memory-v23-durable-bootstrap-cgroup-memory"
+COMPOSITION_VERSION = "v52-production-composition-root-authoritative-v1-over-v51-compatible-runtime-v13-batch9-finalized-v14-same-release-continuity-successor-v15-production-proof-read-boundary-v16-target-scoped-successor-evidence-v17-storage-maintenance-lock-isolation-v18-bounded-context-runtime-memory-v19-rpc-task-terminal-ownership-v20-certification-single-flight-v21-certification-service-split-v22-certification-snapshot-cgroup-memory-v23-durable-bootstrap-cgroup-memory-v24-bootstrap-autocheckpoint-lease"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -234,6 +234,12 @@ class ProductionSystem:
             "certification_service_split_version": getattr(
                 self.app.state, "roi_certification_service_split_version", None
             ),
+            "certification_bootstrap_autocheckpoint_lease": bool(
+                getattr(self.app.state, "roi_certification_bootstrap_autocheckpoint_lease", False)
+            ),
+            "certification_bootstrap_autocheckpoint_lease_version": getattr(
+                self.app.state, "roi_certification_bootstrap_autocheckpoint_lease_version", None
+            ),
             "certification_snapshot_chunk_transfer": bool(
                 getattr(self.app.state, "roi_certification_snapshot_chunk_transfer", False)
             ),
@@ -335,6 +341,10 @@ def build_production_system() -> ProductionSystem:
     from . import legacy_production_composition as _legacy_production_composition
     from . import render_runtime_bootstrap_repair as _render_runtime_bootstrap
     from .batch9_finalization_repair import install_batch9_finalization_repair
+    from .certification_bootstrap_autocheckpoint_lease import (
+        LEASE_VERSION as CERTIFICATION_BOOTSTRAP_AUTOCHECKPOINT_LEASE_VERSION,
+        install_certification_bootstrap_autocheckpoint_lease,
+    )
     from .certification_chunk_transfer import install_authoritative_snapshot_chunk_transfer
     from .certification_generation_runtime_repair import install_certification_generation_runtime_repair
     from .certification_proof_memory_repair import install_certification_proof_memory_repair
@@ -419,6 +429,15 @@ def build_production_system() -> ProductionSystem:
         CERTIFICATION_SNAPSHOT_CGROUP_MEMORY_REPAIR_VERSION
     )
     install_certification_service_split(app, ingestion_runtime)
+    # The split installer has now registered bounded logical-bootstrap routes. Patch
+    # their module-level manifest/page targets here, inside the one canonical
+    # composition root, so the writer's default auto-checkpoint is leased only while
+    # bootstrap requests are active and is restored on completion/inactivity.
+    install_certification_bootstrap_autocheckpoint_lease(app)
+    app.state.roi_certification_bootstrap_autocheckpoint_lease = True
+    app.state.roi_certification_bootstrap_autocheckpoint_lease_version = (
+        CERTIFICATION_BOOTSTRAP_AUTOCHECKPOINT_LEASE_VERSION
+    )
     install_authoritative_snapshot_chunk_transfer(app, ingestion_runtime)
     app.state.roi_certification_snapshot_chunk_transfer = True
     app.state.roi_certification_snapshot_chunk_transfer_version = "certification-snapshot-chunk-transfer-v1"
