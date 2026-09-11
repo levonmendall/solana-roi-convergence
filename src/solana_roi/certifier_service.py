@@ -610,3 +610,10 @@ def isolated_certifier_status(x_certification_token: str | None = Header(default
 
 
 __all__ = ["SERVICE_VERSION", "_download_snapshot", "_validate_sqlite_snapshot", "app", "health"]
+
+# Render's existing service command is fixed to ``solana_roi.certifier_service:app``.
+# Import the cleanup wrapper only after this module has completely defined its app,
+# worker, authentication, and state contracts. The wrapper mutates only the app's
+# lifespan/status surface, so the existing service command gains the same disk-lease
+# and fail-closed cleanup ownership without changing certification logic or authority.
+from . import certifier_cleanup_service as _certifier_cleanup_service  # noqa: E402,F401
