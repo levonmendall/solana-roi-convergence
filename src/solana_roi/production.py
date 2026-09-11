@@ -44,15 +44,8 @@ from .production_system import (
     ingestion_runtime,
     production_system,
 )
-from .production_cleanup_runtime_install import install_production_cleanup_runtime
 from .startup_retention_cleanup import run_safe_retention_cleanup
 from . import legacy_production_composition as _legacy_production
-
-# Register the disabled-by-default destructive cleanup inside the guarded background
-# bootstrap. When explicitly enabled, ASGI liveness remains available while the
-# canonical runtime and every DB-writing worker stay quiesced until cleanup succeeds;
-# a cleanup failure leaves the deep runtime failed closed.
-install_production_cleanup_runtime(app)
 
 # This call only registers the bounded stale-export cleanup on the already-canonical
 # FastAPI lifespan. Registration is storage-non-mutating; actual cleanup executes at
