@@ -44,13 +44,12 @@ from .production_system import (
     ingestion_runtime,
     production_system,
 )
-from .startup_retention_cleanup import run_safe_retention_cleanup
+from .startup_retention_cleanup import register_startup_retention_cleanup
 from . import legacy_production_composition as _legacy_production
 
-# This call only registers the bounded cleanup on the already-canonical FastAPI
-# lifespan. Registration is storage-non-mutating; actual cleanup executes at real
-# application startup immediately before the canonical worker lifespan begins.
-run_safe_retention_cleanup(app, ingestion_runtime)
+# Register one bounded cleanup on the canonical FastAPI lifespan. Registration is
+# storage-non-mutating; actual cleanup executes only at real application startup.
+register_startup_retention_cleanup(app, ingestion_runtime)
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
