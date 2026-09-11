@@ -12,17 +12,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .certification_epoch import release_commit_from_env
 from .safe_retention_cleanup import cleanup_stale_certification_exports
 
-CLEANUP_VERSION = "production-data-cleanup-v2"
+CLEANUP_VERSION = "production-data-cleanup-v3-bounded-preflight"
 ENABLED_ENV = "SOLANA_ROI_PRODUCTION_CLEANUP_ENABLED"
 RUN_ID_ENV = "SOLANA_ROI_PRODUCTION_CLEANUP_RUN_ID"
 ROLE_ENV = "SOLANA_ROI_PRODUCTION_CLEANUP_ROLE"
 ACK_WATERMARK_ENV = "SOLANA_ROI_PRODUCTION_CLEANUP_ACK_WATERMARK"
 TELEMETRY_HOURS_ENV = "SOLANA_ROI_PRODUCTION_CLEANUP_TELEMETRY_HOURS"
 
-# V2 is intentionally conservative. These tables are current authority, current
-# portfolio/accounting, wallet intelligence, live evidence, or immutable lineage.
+LATENCY_FAILURE_TABLE = "anonymous_candidate_latency_failures"
+CERTIFICATION_EPOCH_TABLE = "certification_release_epochs"
+
+# These tables are current authority, current portfolio/accounting, wallet
+# intelligence, live evidence, release/certification state, or immutable lineage.
 # Any table not explicitly covered by a proven deletion predicate is protected too.
 PROTECTED_TABLES = frozenset(
     {
@@ -39,6 +43,7 @@ PROTECTED_TABLES = frozenset(
         "program_coverage_observations",
         "price_marks",
         "_certification_replica_meta",
+        CERTIFICATION_EPOCH_TABLE,
     }
 )
 SYNTHETIC_ROOT = "v51_synthetic_provenance"
@@ -49,7 +54,13 @@ SYNTHETIC_TABLES = (
     "v51_candidates",
 )
 PREDICATE_TABLES = frozenset(
-    {"certification_replication_changes", "risk_refresh_measurements", SYNTHETIC_ROOT, *SYNTHETIC_TABLES}
+    {
+        "certification_replication_changes",
+        "risk_refresh_measurements",
+        LATENCY_FAILURE_TABLE,
+        SYNTHETIC_ROOT,
+        *SYNTHETIC_TABLES,
+    }
 )
 
 
@@ -59,7 +70,7 @@ class TableShape:
     columns: tuple[str, ...]
     primary_key: tuple[str, ...]
     foreign_keys: tuple[tuple[str, str, str], ...]
-    rows: int
+    rows: str = "not_scanned"
 
 
 class CleanupBlocked(RuntimeError):
@@ -115,8 +126,9 @@ def _shape(db: sqlite3.Connection, table: str) -> TableShape:
         (str(row[3]), str(row[2]), str(row[4]))
         for row in db.execute(f"PRAGMA foreign_key_list({quoted})").fetchall()
     )
-    rows = int(db.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
-    return TableShape(table, columns, primary_key, foreign_keys, rows)
+    # Deliberately do not COUNT(*) here. Schema extraction is part of cleanup
+    # preflight and must remain O(number of schema objects), not O(history).
+    return TableShape(table, columns, primary_key, foreign_keys)
 
 
 def extract_schema(db: sqlite3.Connection) -> dict[str, TableShape]:
@@ -175,13 +187,22 @@ def _file_metrics(database_path: Path) -> dict[str, int]:
     }
 
 
-def _integrity(db: sqlite3.Connection) -> dict[str, Any]:
+def _full_integrity(db: sqlite3.Connection) -> dict[str, Any]:
     integrity_rows = [str(row[0]) for row in db.execute("PRAGMA integrity_check").fetchall()]
     fk_rows = [tuple(row) for row in db.execute("PRAGMA foreign_key_check").fetchall()]
     return {
+        "checked": True,
         "integrity_check": integrity_rows,
         "foreign_key_violations": fk_rows,
         "ok": integrity_rows == ["ok"] and not fk_rows,
+    }
+
+
+def _deferred_integrity() -> dict[str, Any]:
+    return {
+        "checked": False,
+        "ok": None,
+        "reason": "full integrity and foreign-key scans deferred until after deletion and compaction",
     }
 
 
@@ -191,14 +212,52 @@ def _schema_fingerprint(schema: dict[str, TableShape]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def _measure(database_path: Path, db: sqlite3.Connection) -> dict[str, Any]:
+def _edge_value(db: sqlite3.Connection, table: str, column: str) -> Any:
+    quoted_table = _quote_identifier(table)
+    quoted_column = _quote_identifier(column)
+    row = db.execute(
+        f"SELECT {quoted_column} FROM {quoted_table} ORDER BY {quoted_column} DESC LIMIT 1"
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _bounded_anchors(db: sqlite3.Connection, schema: dict[str, TableShape]) -> dict[str, Any]:
+    anchors: dict[str, Any] = {}
+    if "events" in schema:
+        _required_columns(schema, "events", ("id",))
+        anchors["event_head_id"] = _edge_value(db, "events", "id")
+    if "paper_engine_checkpoint" in schema:
+        _required_columns(
+            schema,
+            "paper_engine_checkpoint",
+            ("id", "last_engine_event_id", "state_sha256"),
+        )
+        row = db.execute(
+            "SELECT id,last_engine_event_id,state_sha256 FROM paper_engine_checkpoint WHERE id=1 LIMIT 1"
+        ).fetchone()
+        anchors["paper_engine_checkpoint"] = dict(row) if row is not None else None
+    if "certification_replication_changes" in schema:
+        _required_columns(schema, "certification_replication_changes", ("id",))
+        anchors["replication_head_id"] = _edge_value(
+            db, "certification_replication_changes", "id"
+        )
+    return anchors
+
+
+def _measure(
+    database_path: Path,
+    db: sqlite3.Connection,
+    *,
+    full_integrity: bool,
+) -> dict[str, Any]:
     schema = extract_schema(db)
     return {
         "captured_at": _utcnow(),
         "files": _file_metrics(database_path),
         "pragma": _pragma_metrics(db),
-        "integrity": _integrity(db),
+        "integrity": _full_integrity(db) if full_integrity else _deferred_integrity(),
         "schema_fingerprint": _schema_fingerprint(schema),
+        "anchors": _bounded_anchors(db, schema),
         "tables": {
             name: {
                 "rows": shape.rows,
@@ -228,7 +287,7 @@ def _durable_certifier_watermark(db: sqlite3.Connection, schema: dict[str, Table
         return None
     _required_columns(schema, table, ("key", "value", "updated_at"))
     row = db.execute(
-        f"SELECT value FROM {_quote_identifier(table)} WHERE key='source_watermark'"
+        f"SELECT value FROM {_quote_identifier(table)} WHERE key='source_watermark' LIMIT 1"
     ).fetchone()
     if row is None:
         return None
@@ -289,8 +348,8 @@ def _delete_synthetic_candidates(
         "INSERT OR IGNORE INTO _roi_cleanup_synthetic(surface,candidate_id) "
         f"SELECT surface,candidate_id FROM {root} WHERE synthetic=1"
     )
-    count = int(db.execute("SELECT COUNT(*) FROM _roi_cleanup_synthetic").fetchone()[0])
-    if count == 0:
+    found = db.execute("SELECT 1 FROM _roi_cleanup_synthetic LIMIT 1").fetchone()
+    if found is None:
         return {table: 0 for table in SYNTHETIC_TABLES if table in schema} | {SYNTHETIC_ROOT: 0}
 
     deleted: dict[str, int] = {}
@@ -334,18 +393,21 @@ def _delete_acknowledged_replication(
     if inbound:
         raise CleanupBlocked(f"replication journal has unexpected inbound foreign keys: {inbound}")
     quoted = _quote_identifier(table)
-    row = db.execute(f"SELECT MAX(id) FROM {quoted}").fetchone()
-    source_head = int(row[0] or 0)
+    head = db.execute(f"SELECT id FROM {quoted} ORDER BY id DESC LIMIT 1").fetchone()
+    source_head = int(head[0] if head else 0)
     if acknowledged_watermark > source_head:
         raise CleanupBlocked(
             f"acknowledged watermark {acknowledged_watermark} exceeds source journal head {source_head}"
         )
-    return _delete_batched(
+    deleted = _delete_batched(
         db,
         f"DELETE FROM {quoted} WHERE rowid IN ("
         f"SELECT rowid FROM {quoted} WHERE id<=? ORDER BY id LIMIT ?)",
         (int(acknowledged_watermark),),
     )
+    if db.execute(f"SELECT 1 FROM {quoted} WHERE id<=? LIMIT 1", (int(acknowledged_watermark),)).fetchone():
+        raise CleanupBlocked("acknowledged replication rows remain after bounded deletion")
+    return deleted
 
 
 def _delete_stale_measurements(
@@ -365,6 +427,108 @@ def _delete_stale_measurements(
         f"SELECT rowid FROM {quoted} WHERE completed_at<? ORDER BY id LIMIT ?)",
         (cutoff,),
     )
+
+
+def _first_indexed_column(db: sqlite3.Connection, table: str, column: str) -> str | None:
+    quoted = _quote_identifier(table)
+    for index_row in db.execute(f"PRAGMA index_list({quoted})").fetchall():
+        index_name = str(index_row[1])
+        info = db.execute(f"PRAGMA index_info({_quote_identifier(index_name)})").fetchall()
+        if info and str(info[0][2]) == column:
+            return index_name
+    return None
+
+
+def _certification_boundary(
+    db: sqlite3.Connection, schema: dict[str, TableShape]
+) -> tuple[str, str]:
+    _required_columns(schema, CERTIFICATION_EPOCH_TABLE, ("release_commit", "started_at"))
+    release_commit = release_commit_from_env()
+    if release_commit is None:
+        raise CleanupBlocked("current release commit is unavailable; certification boundary cannot be proven")
+    row = db.execute(
+        f"SELECT started_at FROM {_quote_identifier(CERTIFICATION_EPOCH_TABLE)} "
+        "WHERE release_commit=? LIMIT 1",
+        (release_commit,),
+    ).fetchone()
+    if row is None:
+        raise CleanupBlocked(
+            f"current release certification epoch is missing for {release_commit}"
+        )
+    raw = str(row[0])
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise CleanupBlocked("current release certification epoch is not ISO-8601") from exc
+    if parsed.tzinfo is None:
+        raise CleanupBlocked("current release certification epoch is timezone-naive")
+    return release_commit, parsed.astimezone(timezone.utc).isoformat()
+
+
+def _replication_only_triggers(db: sqlite3.Connection, table: str) -> list[str]:
+    rows = db.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name",
+        (table,),
+    ).fetchall()
+    names: list[str] = []
+    for row in rows:
+        name = str(row[0])
+        sql = str(row[1] or "").lower()
+        if "certification_replication_changes" not in sql:
+            raise CleanupBlocked(
+                f"{table} has non-replication trigger dependency: {name}"
+            )
+        names.append(name)
+    views = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='view' AND lower(sql) LIKE ? ORDER BY name",
+        (f"%{table.lower()}%",),
+    ).fetchall()
+    if views:
+        raise CleanupBlocked(
+            f"{table} has view dependencies: {[str(row[0]) for row in views]}"
+        )
+    return names
+
+
+def _delete_obsolete_latency_failures(
+    db: sqlite3.Connection,
+    schema: dict[str, TableShape],
+) -> tuple[int, dict[str, Any] | None]:
+    table = LATENCY_FAILURE_TABLE
+    if table not in schema:
+        return 0, None
+    _required_columns(
+        schema,
+        table,
+        ("id", "failed_at", "reason", "outcome", "count", "max_age_ms"),
+    )
+    inbound = _inbound_foreign_keys(schema, table)
+    if inbound:
+        raise CleanupBlocked(f"{table} has unexpected inbound foreign keys: {inbound}")
+    index_name = _first_indexed_column(db, table, "failed_at")
+    if index_name is None:
+        raise CleanupBlocked(f"{table}.failed_at is not indexed")
+    triggers = _replication_only_triggers(db, table)
+    release_commit, prospective_start_at = _certification_boundary(db, schema)
+    quoted = _quote_identifier(table)
+    deleted = _delete_batched(
+        db,
+        f"DELETE FROM {quoted} WHERE rowid IN ("
+        f"SELECT rowid FROM {quoted} WHERE failed_at<? ORDER BY failed_at LIMIT ?)",
+        (prospective_start_at,),
+    )
+    if db.execute(
+        f"SELECT 1 FROM {quoted} WHERE failed_at<? LIMIT 1",
+        (prospective_start_at,),
+    ).fetchone():
+        raise CleanupBlocked("obsolete anonymous candidate latency failures remain after cleanup")
+    return deleted, {
+        "release_commit": release_commit,
+        "prospective_start_at": prospective_start_at,
+        "failed_at_index": index_name,
+        "replication_triggers": triggers,
+        "predicate": "failed_at < prospective_start_at",
+    }
 
 
 def _protected_plan(schema: dict[str, TableShape], *, role: str) -> dict[str, str]:
@@ -454,12 +618,11 @@ def execute_cleanup(
     db = _connect(database_path)
     try:
         # Acquiring and releasing an immediate transaction proves no other writer is
-        # active. The command is intended to run before service worker startup.
+        # active. The command runs under the service-wide persistent-disk lease before
+        # normal database-writing workers are released.
         db.execute("BEGIN IMMEDIATE")
         db.commit()
-        before = _measure(database_path, db)
-        if not before["integrity"]["ok"]:
-            raise CleanupBlocked("pre-cleanup SQLite integrity/foreign-key check failed")
+        before = _measure(database_path, db, full_integrity=False)
         schema = extract_schema(db)
         report["protected_set"] = _protected_plan(schema, role=role)
         report["durable_source_watermark"] = _durable_certifier_watermark(db, schema)
@@ -467,11 +630,14 @@ def execute_cleanup(
         _atomic_json(report_path, report)
 
         if role == "certifier":
-            # The certifier is the proof of durable apply. It must remain byte/logically
-            # equivalent to the source aggregate while its watermark is captured.
+            # Certifier maintenance preserves logical replica equivalence. It may
+            # reclaim WAL/freelist space but does not independently discard source
+            # rows or certification evidence.
             synthetic: dict[str, int] = {}
             replication = 0
             stale_measurements = 0
+            latency_failures = 0
+            latency_boundary = None
         else:
             synthetic = _delete_synthetic_candidates(db, schema)
             replication = _delete_acknowledged_replication(
@@ -483,18 +649,21 @@ def execute_cleanup(
             ).isoformat()
             stale_measurements = _delete_stale_measurements(db, schema, cutoff=cutoff)
             report["telemetry_cutoff"] = cutoff
+            latency_failures, latency_boundary = _delete_obsolete_latency_failures(db, schema)
 
         report["deleted_rows"] = {
             "synthetic_candidate_closure": synthetic,
             "acknowledged_replication_changes": replication,
             "stale_risk_refresh_measurements": stale_measurements,
+            "obsolete_anonymous_candidate_latency_failures": latency_failures,
         }
+        report["latency_certification_boundary"] = latency_boundary
         report["acknowledged_watermark"] = acknowledged_watermark
         report["orphan_files"] = cleanup_stale_certification_exports(database_path)
         _atomic_json(report_path, report)
 
         compaction = _compact(database_path, db)
-        after = _measure(database_path, db)
+        after = _measure(database_path, db, full_integrity=True)
         if not after["integrity"]["ok"]:
             raise CleanupBlocked("post-cleanup SQLite integrity/foreign-key check failed")
         report["compaction"] = compaction
