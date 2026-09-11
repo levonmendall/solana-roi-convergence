@@ -29,7 +29,7 @@ from . import production_data_cleanup_v4 as cleanup
 from . import production_disk_ownership as disk_ownership
 from .certification_replica_client import _replica_path
 
-SERVICE_VERSION = "isolated-certifier-cleanup-entrypoint-v1"
+SERVICE_VERSION = "isolated-certifier-cleanup-entrypoint-v2-path-telemetry"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -175,14 +175,16 @@ async def lifespan(app: Any) -> AsyncIterator[None]:
     lease: disk_ownership.RuntimeDiskLease | None = None
     marker_task: asyncio.Task[None] | None = None
     enabled = _env_true(cleanup.ENABLED_ENV)
-    _set_state(
+    waiting = _set_state(
         enabled=enabled,
         status="waiting_for_runtime_disk_ownership",
         database_path=str(database_path),
     )
+    _emit("ROI_CERTIFIER_CLEANUP_RUNTIME", waiting)
     try:
         lease = await disk_ownership.acquire_runtime_disk_lease(database_path, stop=stop)
-        _set_state(disk_ownership=lease.status())
+        owned = _set_state(disk_ownership=lease.status())
+        _emit("ROI_CERTIFIER_CLEANUP_RUNTIME", owned)
         if enabled:
             _set_state(status="cleanup_preflight_or_execution")
             try:
@@ -202,7 +204,7 @@ async def lifespan(app: Any) -> AsyncIterator[None]:
                 yield
                 return
 
-            completed = _set_state(**_summary(result))
+            _set_state(**_summary(result))
             _emit("ROI_CERTIFIER_PRODUCTION_DATA_CLEANUP", result)
             async with _ORIGINAL_LIFESPAN(app):
                 yield
