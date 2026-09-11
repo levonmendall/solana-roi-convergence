@@ -25,6 +25,13 @@ def _database(path: Path) -> None:
                 failure_id INTEGER NOT NULL REFERENCES {TARGET_TABLE}(id),
                 note TEXT NOT NULL
             );
+            CREATE VIEW recent_latency_failures AS
+                SELECT id,candidate_id FROM {TARGET_TABLE};
+            CREATE TRIGGER latency_failure_note_cleanup
+                AFTER DELETE ON {TARGET_TABLE}
+                BEGIN
+                    DELETE FROM latency_failure_notes WHERE failure_id=OLD.id;
+                END;
             INSERT INTO {TARGET_TABLE}(candidate_id, observed_at, reason)
             VALUES ('candidate-a', '2026-09-11T00:00:00Z', 'timeout'),
                    ('candidate-b', '2026-09-11T00:01:00Z', 'timeout');
@@ -47,6 +54,7 @@ def test_probe_reports_schema_dependencies_and_bounds_without_mutation(tmp_path:
     assert result["table"] == TARGET_TABLE
     assert result["read_only"] is True
     assert result["payload_rows_scanned"] is False
+    assert result["rowid_bounds_use_single_aggregate_btree_edges"] is True
     assert [column["name"] for column in result["columns"]] == [
         "id",
         "candidate_id",
@@ -56,6 +64,8 @@ def test_probe_reports_schema_dependencies_and_bounds_without_mutation(tmp_path:
     assert any(index["name"] == "idx_latency_failures_observed_at" for index in result["indexes"])
     assert result["foreign_keys"] == []
     assert any(item["table"] == "latency_failure_notes" for item in result["reverse_foreign_keys"])
+    dependent_names = {item["name"] for item in result["schema_dependents"]}
+    assert dependent_names == {"latency_failure_note_cleanup", "recent_latency_failures"}
     assert result["sqlite_sequence"] == 2
     assert result["rowid_bounds"] == {"min": 1, "max": 2}
     assert result["sqlite_stat1"]
