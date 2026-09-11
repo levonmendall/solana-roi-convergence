@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-"""Bound SQLite auto-checkpoint/cache pressure around certification bootstrap.
+"""Bound SQLite checkpoint/cache pressure around certification bootstrap.
 
-The authoritative logical bootstrap is a bounded read-only scan, but SQLite's default
-writer-side ``wal_autocheckpoint`` threshold is about 1000 pages. On the production
-4 KiB database that repeatedly copied a ~4 MiB WAL back into the 1.7 GiB main file
-while the bootstrap reader was trying to evict clean cache.
+The authoritative logical bootstrap is a bounded read-only scan, while the canonical
+writer uses SQLite WAL. Production proved two distinct failure modes:
 
-The lease changes only physical checkpoint cadence. It is primed after the canonical
-runtime has been restored but before runtime workers start, then refreshed by each
-bootstrap manifest/page request. This closes the observed gap in which live workers
-could repopulate the main-database file cache before the certifier's first request.
-The exact original SQLite setting is restored on completion or inactivity and the WAL
-remains bounded by a fail-closed maintenance ceiling.
+* the default ``wal_autocheckpoint`` cadence repeatedly copied a small WAL back into
+  the large main database while bootstrap was trying to shed file cache; and
+* after that cadence was suppressed, an already-large physical WAL could cross the
+  bounded maintenance ceiling before the certifier's first request.
 
-The underlying logical-bootstrap module functions remain unchanged so package imports,
-direct unit tests, and non-production stores never inherit production-only writer
-requirements.
+This module changes only physical checkpoint cadence. It primes a temporary lease after
+the canonical runtime is restored but before live workers start, refreshes that lease on
+bootstrap requests, restores the exact original setting on completion/inactivity, and
+uses a zero-wait TRUNCATE checkpoint only when the configured WAL ceiling is reached.
+A busy, failed, or non-shrinking maintenance attempt remains fail-closed with HTTP 503.
+No strategy, certification, evidence, signing, submission, or live-money authority is
+changed.
 """
 
 import asyncio
@@ -30,7 +30,7 @@ from typing import Any, Callable
 
 from fastapi import HTTPException
 
-LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v3-preworker-quiesce"
+LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v4-wal-ceiling-truncate-recovery"
 DEFAULT_IDLE_SECONDS = 45.0
 MIN_IDLE_SECONDS = 35.0
 MAX_IDLE_SECONDS = 120.0
@@ -115,6 +115,23 @@ def _set_autocheckpoint_locked(store: Any, pages: int) -> None:
     store.db.execute(f"PRAGMA wal_autocheckpoint={max(0, int(pages))}")
 
 
+def _ensure_state_locked(store: Any) -> dict[str, Any]:
+    state = _state(store)
+    if state is None:
+        state = {
+            "active": False,
+            "generation": 0,
+            "original_pages": None,
+            "timer": None,
+            "table_names": (),
+            "restore_reason": None,
+            "last_maintenance_wal_before": None,
+            "last_maintenance_wal_after": None,
+        }
+        setattr(store, STATE_ATTR, state)
+    return state
+
+
 def _cancel_timer(state: dict[str, Any]) -> None:
     timer = state.get("timer")
     if timer is not None:
@@ -125,7 +142,13 @@ def _cancel_timer(state: dict[str, Any]) -> None:
     state["timer"] = None
 
 
-def _restore_locked(store: Any, state: dict[str, Any], *, reason: str, cancel_timer: bool = True) -> bool:
+def _restore_locked(
+    store: Any,
+    state: dict[str, Any],
+    *,
+    reason: str,
+    cancel_timer: bool = True,
+) -> bool:
     if cancel_timer:
         _cancel_timer(state)
     if not bool(state.get("active")):
@@ -194,14 +217,59 @@ def _sync_and_release(path: Path) -> None:
             os.close(fd)
 
 
-def _maintenance_checkpoint_locked(store: Any) -> tuple[int | None, int | None, int | None, str | None]:
+def _maintenance_checkpoint_locked(
+    store: Any,
+) -> tuple[int | None, int | None, int | None, str | None]:
+    """Attempt one zero-wait TRUNCATE checkpoint at the explicit WAL ceiling.
+
+    PASSIVE can copy every committed frame yet leave the physical WAL file allocated,
+    which caused the same byte ceiling to re-trigger forever in production. TRUNCATE
+    resets the file only when SQLite can obtain the required locks immediately. The
+    connection's prior busy timeout is restored exactly afterwards. Any busy result or
+    error is telemetry and remains fail-closed at the caller.
+    """
+
+    original_timeout: int | None = None
     try:
-        row = store.db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        timeout_row = store.db.execute("PRAGMA busy_timeout").fetchone()
+        original_timeout = int(timeout_row[0]) if timeout_row is not None else 0
+        store.db.execute("PRAGMA busy_timeout=0")
+        row = store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if row is None or len(row) < 3:
-            return None, None, None, None
+            return None, None, None, "RuntimeError:wal checkpoint result unavailable"
         return int(row[0]), int(row[1]), int(row[2]), None
-    except (sqlite3.Error, AttributeError) as exc:
+    except (sqlite3.Error, AttributeError, RuntimeError, TypeError, ValueError) as exc:
         return None, None, None, f"{type(exc).__name__}:{exc}"
+    finally:
+        if original_timeout is not None:
+            try:
+                store.db.execute(f"PRAGMA busy_timeout={max(0, original_timeout)}")
+            except (sqlite3.Error, AttributeError):
+                pass
+
+
+def _schedule_lease_locked(store: Any, state: dict[str, Any], *, wal_bytes: int) -> dict[str, Any]:
+    if not bool(state.get("active")):
+        original = _read_autocheckpoint_locked(store)
+        _set_autocheckpoint_locked(store, 0)
+        state["original_pages"] = original
+        state["active"] = True
+        state["restore_reason"] = None
+        print(
+            "ROI_BOOTSTRAP_AUTOCHECKPOINT_LEASE "
+            f"event=acquire original_pages={original} idle_seconds={_idle_seconds():.3f} "
+            f"wal_bound_bytes={_max_wal_bytes()} wal_bytes={wal_bytes}",
+            flush=True,
+        )
+
+    _cancel_timer(state)
+    state["generation"] = int(state.get("generation") or 0) + 1
+    generation = int(state["generation"])
+    timer = threading.Timer(_idle_seconds(), _expire, args=(weakref.ref(store), generation))
+    timer.daemon = True
+    state["timer"] = timer
+    timer.start()
+    return dict(state)
 
 
 def refresh(store: Any) -> dict[str, Any]:
@@ -212,81 +280,63 @@ def refresh(store: Any) -> dict[str, Any]:
     if lock is None or not path.is_file() or not hasattr(store, "db"):
         raise HTTPException(status_code=503, detail="certification bootstrap checkpoint lease unavailable")
 
-    maintenance: tuple[int | None, int | None, int | None, str | None] | None = None
     maintenance_wal = 0
+    maintenance: tuple[int | None, int | None, int | None, str | None] | None = None
     with lock:
-        state = _state(store)
-        if state is None:
-            state = {
-                "active": False,
-                "generation": 0,
-                "original_pages": None,
-                "timer": None,
-                "table_names": (),
-                "restore_reason": None,
-            }
-            setattr(store, STATE_ATTR, state)
-
+        state = _ensure_state_locked(store)
         maintenance_wal = _wal_size_bytes(store)
-        if maintenance_wal >= _max_wal_bytes():
-            if bool(state.get("active")):
-                _restore_locked(store, state, reason="wal_bound", cancel_timer=True)
-            maintenance = _maintenance_checkpoint_locked(store)
-        else:
-            if not bool(state.get("active")):
-                original = _read_autocheckpoint_locked(store)
-                _set_autocheckpoint_locked(store, 0)
-                state["original_pages"] = original
-                state["active"] = True
-                state["restore_reason"] = None
-                print(
-                    "ROI_BOOTSTRAP_AUTOCHECKPOINT_LEASE "
-                    f"event=acquire original_pages={original} idle_seconds={_idle_seconds():.3f} "
-                    f"wal_bound_bytes={_max_wal_bytes()} wal_bytes={maintenance_wal}",
-                    flush=True,
-                )
+        if maintenance_wal < _max_wal_bytes():
+            return _schedule_lease_locked(store, state, wal_bytes=maintenance_wal)
 
-            _cancel_timer(state)
-            state["generation"] = int(state.get("generation") or 0) + 1
-            generation = int(state["generation"])
-            timer = threading.Timer(_idle_seconds(), _expire, args=(weakref.ref(store), generation))
-            timer.daemon = True
-            state["timer"] = timer
-            timer.start()
-            return dict(state)
+        if bool(state.get("active")):
+            _restore_locked(store, state, reason="wal_bound", cancel_timer=True)
+        maintenance = _maintenance_checkpoint_locked(store)
 
     assert maintenance is not None
     _sync_and_release(path)
     busy, log_frames, checkpointed_frames, error = maintenance
+    wal_after = _wal_size_bytes(store)
+    recovered = bool(error is None and busy == 0 and wal_after < _max_wal_bytes())
     print(
         "ROI_BOOTSTRAP_AUTOCHECKPOINT_LEASE "
-        "event=wal_maintenance_pause "
-        f"wal_bytes={maintenance_wal} wal_bound_bytes={_max_wal_bytes()} "
+        f"event={'wal_maintenance_recovered' if recovered else 'wal_maintenance_pause'} "
+        f"wal_bytes_before={maintenance_wal} wal_bytes_after={wal_after} "
+        f"wal_bound_bytes={_max_wal_bytes()} "
         f"busy={busy if busy is not None else 'unknown'} "
         f"log_frames={log_frames if log_frames is not None else 'unknown'} "
         f"checkpointed_frames={checkpointed_frames if checkpointed_frames is not None else 'unknown'} "
         f"error={(error or 'none').replace(chr(10), ' ')[:160]}",
         flush=True,
     )
-    raise HTTPException(
-        status_code=503,
-        detail="certification logical bootstrap paused: bounded WAL checkpoint maintenance",
-    )
+
+    if not recovered:
+        raise HTTPException(
+            status_code=503,
+            detail="certification logical bootstrap paused: bounded WAL checkpoint maintenance",
+        )
+
+    with lock:
+        state = _ensure_state_locked(store)
+        current_wal = _wal_size_bytes(store)
+        state["last_maintenance_wal_before"] = int(maintenance_wal)
+        state["last_maintenance_wal_after"] = int(current_wal)
+        if current_wal >= _max_wal_bytes():
+            raise HTTPException(
+                status_code=503,
+                detail="certification logical bootstrap paused: WAL refilled during bounded maintenance",
+            )
+        return _schedule_lease_locked(store, state, wal_bytes=current_wal)
 
 
 def prime_before_workers(store: Any) -> dict[str, Any]:
     """Prime the lease and shed startup cache before live runtime workers begin.
 
     Runtime construction can legitimately read a large historical working set. The
-    certifier's first manifest may arrive tens of seconds later. Without this handoff,
-    workers can auto-checkpoint into the main database during that gap and refill the
-    cgroup before bootstrap has a chance to acquire the route-level lease.
-
-    This function performs no checkpoint. It disables auto-checkpoint through the same
-    bounded lease used by the HTTP routes, syncs already-dirty SQLite files, advises
-    their cache away, and trims only unused process heap. If the certifier never
-    arrives, the ordinary 45-second inactivity timer restores the exact original
-    SQLite setting automatically.
+    certifier's first manifest may arrive later. This handoff acquires the same bounded
+    lease used by the HTTP routes before workers can auto-checkpoint into the main DB.
+    If the inherited WAL already exceeds the ceiling, ``refresh`` first performs one
+    zero-wait ceiling-maintenance TRUNCATE and proceeds only after the physical WAL is
+    proven below the unchanged bound.
     """
 
     state = refresh(store)
@@ -305,7 +355,8 @@ def prime_before_workers(store: Any) -> dict[str, Any]:
         f"file_after={after.get('file_bytes', 'unknown')} "
         f"dirty_before={before.get('file_dirty_bytes', 'unknown')} "
         f"dirty_after={after.get('file_dirty_bytes', 'unknown')} "
-        f"wal_bytes={_wal_size_bytes(store)} checkpoint_attempted=false",
+        f"wal_bytes={_wal_size_bytes(store)} "
+        "unconditional_checkpoint_attempted=false ceiling_maintenance_enabled=true",
         flush=True,
     )
     return state
@@ -313,11 +364,15 @@ def prime_before_workers(store: Any) -> dict[str, Any]:
 
 def set_manifest_tables(store: Any, manifest: dict[str, Any]) -> None:
     tables = manifest.get("tables")
-    names = tuple(
-        str(item.get("name") or "")
-        for item in tables
-        if isinstance(item, dict) and str(item.get("name") or "")
-    ) if isinstance(tables, list) else ()
+    names = (
+        tuple(
+            str(item.get("name") or "")
+            for item in tables
+            if isinstance(item, dict) and str(item.get("name") or "")
+        )
+        if isinstance(tables, list)
+        else ()
+    )
     lock = getattr(store, "_lock", None)
     if lock is None:
         return
@@ -403,7 +458,7 @@ def _runtime_provider_from_endpoint(endpoint: Any) -> Callable[[], Any] | None:
 
 
 def _install_preworker_quiesce() -> None:
-    """Wrap the already-composed worker chain without changing its authority markers."""
+    """Wrap the already-composed worker chain without changing authority markers."""
 
     from . import render_runtime_bootstrap_repair as render_bootstrap
 
@@ -428,16 +483,7 @@ def install_certification_bootstrap_autocheckpoint_lease(
     app: Any,
     runtime_provider: Callable[[], Any] | None = None,
 ) -> None:
-    """Wrap this production app's routes and prime the lease before worker startup.
-
-    When certification split runtime is disabled the bootstrap transport is not
-    registered at all; that is an intentional inactive state, so the lease is a
-    no-op. If split runtime is enabled, both routes are mandatory and absence of
-    either one remains a hard composition failure. FastAPI has already compiled
-    parameter/header dependencies for the original endpoints, so replacing
-    ``dependant.call`` preserves the exact HTTP contract while avoiding module-global
-    mutation of logical ``_manifest``/``_page``.
-    """
+    """Wrap the production bootstrap routes and prime the lease before workers."""
 
     global _INSTALLED
     marker = "roi_certification_bootstrap_autocheckpoint_lease"
@@ -526,9 +572,14 @@ def status() -> dict[str, Any]:
         "module_global_logical_functions_mutated": False,
         "preworker_lease_priming": True,
         "preworker_checkpoint_enabled": False,
+        "preworker_unconditional_checkpoint_enabled": False,
+        "preworker_ceiling_maintenance_enabled": True,
         "preworker_sync_and_file_cache_release": True,
         "idle_seconds": _idle_seconds(),
         "max_wal_bytes": _max_wal_bytes(),
+        "maintenance_checkpoint_mode": "truncate_zero_wait_at_ceiling_only",
+        "maintenance_success_reacquires_lease": True,
+        "maintenance_busy_or_error_fail_closed": True,
         "original_autocheckpoint_restored": True,
         "wal_bound_fail_closed": True,
         "strategy_thresholds_changed": STRATEGY_THRESHOLDS_CHANGED,
