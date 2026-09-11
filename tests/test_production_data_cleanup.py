@@ -14,82 +14,20 @@ def _db(path: Path) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(
         """
-        CREATE TABLE events(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type TEXT NOT NULL,
-            observed_at TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            previous_hash TEXT,
-            lineage_hash TEXT NOT NULL
-        );
-        CREATE TABLE paper_engine_checkpoint(
-            id INTEGER PRIMARY KEY CHECK(id=1),
-            saved_at TEXT NOT NULL,
-            last_engine_event_id INTEGER NOT NULL,
-            state_json TEXT NOT NULL,
-            state_sha256 TEXT NOT NULL
-        );
-        CREATE TABLE wallet_profiles(wallet TEXT PRIMARY KEY, tier TEXT NOT NULL);
-        CREATE TABLE wallet_intelligence_snapshots(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            wallet TEXT NOT NULL,
-            entity_id TEXT NOT NULL,
-            observed_at TEXT NOT NULL
-        );
-        CREATE TABLE adaptive_wallet_cohorts(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy_version TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL
-        );
-        CREATE TABLE _certification_replica_meta(
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE certification_replication_changes(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_name TEXT NOT NULL,
-            change_type TEXT NOT NULL,
-            row_json TEXT NOT NULL,
-            primary_key_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE risk_refresh_measurements(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_mint TEXT NOT NULL,
-            completed_at TEXT NOT NULL,
-            complete INTEGER NOT NULL,
-            fresh INTEGER NOT NULL
-        );
-        CREATE TABLE v51_synthetic_provenance(
-            surface TEXT NOT NULL,
-            candidate_id TEXT NOT NULL,
-            synthetic INTEGER NOT NULL,
-            PRIMARY KEY(surface,candidate_id)
-        );
-        CREATE TABLE v51_candidates(
-            surface TEXT NOT NULL,
-            candidate_id TEXT NOT NULL,
-            PRIMARY KEY(surface,candidate_id)
-        );
-        CREATE TABLE v51_candidate_stage_events(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            surface TEXT NOT NULL,
-            candidate_id TEXT NOT NULL
-        );
-        CREATE TABLE v51_candidate_current_state(
-            surface TEXT NOT NULL,
-            candidate_id TEXT NOT NULL,
-            stage TEXT NOT NULL,
-            PRIMARY KEY(surface,candidate_id,stage)
-        );
-        CREATE TABLE v51_candidate_pipeline_audit(
-            surface TEXT NOT NULL,
-            candidate_id TEXT NOT NULL,
-            stage TEXT NOT NULL,
-            PRIMARY KEY(surface,candidate_id,stage)
-        );
-        CREATE TABLE unknown_future_state(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT,event_type TEXT NOT NULL,observed_at TEXT NOT NULL,payload_json TEXT NOT NULL,previous_hash TEXT,lineage_hash TEXT NOT NULL);
+        CREATE TABLE paper_engine_checkpoint(id INTEGER PRIMARY KEY CHECK(id=1),saved_at TEXT NOT NULL,last_engine_event_id INTEGER NOT NULL,state_json TEXT NOT NULL,state_sha256 TEXT NOT NULL);
+        CREATE TABLE wallet_profiles(wallet TEXT PRIMARY KEY,tier TEXT NOT NULL);
+        CREATE TABLE wallet_intelligence_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT,wallet TEXT NOT NULL,entity_id TEXT NOT NULL,observed_at TEXT NOT NULL);
+        CREATE TABLE adaptive_wallet_cohorts(id INTEGER PRIMARY KEY AUTOINCREMENT,strategy_version TEXT NOT NULL UNIQUE,status TEXT NOT NULL);
+        CREATE TABLE _certification_replica_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL);
+        CREATE TABLE certification_replication_changes(id INTEGER PRIMARY KEY AUTOINCREMENT,table_name TEXT NOT NULL,change_type TEXT NOT NULL,row_json TEXT NOT NULL,primary_key_json TEXT NOT NULL,created_at TEXT NOT NULL);
+        CREATE TABLE risk_refresh_measurements(id INTEGER PRIMARY KEY AUTOINCREMENT,token_mint TEXT NOT NULL,completed_at TEXT NOT NULL,complete INTEGER NOT NULL,fresh INTEGER NOT NULL);
+        CREATE TABLE v51_synthetic_provenance(surface TEXT NOT NULL,candidate_id TEXT NOT NULL,synthetic INTEGER NOT NULL,PRIMARY KEY(surface,candidate_id));
+        CREATE TABLE v51_candidates(surface TEXT NOT NULL,candidate_id TEXT NOT NULL,PRIMARY KEY(surface,candidate_id));
+        CREATE TABLE v51_candidate_stage_events(id INTEGER PRIMARY KEY AUTOINCREMENT,surface TEXT NOT NULL,candidate_id TEXT NOT NULL);
+        CREATE TABLE v51_candidate_current_state(surface TEXT NOT NULL,candidate_id TEXT NOT NULL,stage TEXT NOT NULL,PRIMARY KEY(surface,candidate_id,stage));
+        CREATE TABLE v51_candidate_pipeline_audit(surface TEXT NOT NULL,candidate_id TEXT NOT NULL,stage TEXT NOT NULL,PRIMARY KEY(surface,candidate_id,stage));
+        CREATE TABLE unknown_future_state(id INTEGER PRIMARY KEY,value TEXT NOT NULL);
         """
     )
     db.execute("INSERT INTO events(event_type,observed_at,payload_json,previous_hash,lineage_hash) VALUES('price','2026-09-11T00:00:00+00:00','{}',NULL,'abc')")
@@ -102,7 +40,7 @@ def _db(path: Path) -> sqlite3.Connection:
     for idx in range(1, 4):
         db.execute(
             "INSERT INTO certification_replication_changes(id,table_name,change_type,row_json,primary_key_json,created_at) VALUES(?,?,?,?,?,?)",
-            (idx, 'cert_table', 'insert', '{}', '{}', '2026-09-10T00:00:00+00:00'),
+            (idx, "cert_table", "insert", "{}", "{}", "2026-09-10T00:00:00+00:00"),
         )
     db.execute("INSERT INTO risk_refresh_measurements(token_mint,completed_at,complete,fresh) VALUES('old','2026-09-01T00:00:00+00:00',1,1)")
     db.execute("INSERT INTO risk_refresh_measurements(token_mint,completed_at,complete,fresh) VALUES('new','2999-09-11T00:00:00+00:00',1,1)")
@@ -118,23 +56,20 @@ def _db(path: Path) -> sqlite3.Connection:
 
 def test_disabled_cli_does_not_touch_database(tmp_path: Path, monkeypatch, capsys) -> None:
     path = tmp_path / "production.sqlite3"
-    db = _db(path)
-    db.close()
+    _db(path).close()
     before = path.stat().st_mtime_ns
     monkeypatch.delenv(cleanup.ENABLED_ENV, raising=False)
 
     assert cleanup.main(["--database", str(path), "--role", "authoritative", "--run-id", "disabled-test"]) == 0
 
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "disabled"
+    assert json.loads(capsys.readouterr().out)["status"] == "disabled"
     assert path.stat().st_mtime_ns == before
     assert not (tmp_path / ".production-cleanup").exists()
 
 
-def test_executor_preserves_protected_and_unknown_state_and_deletes_only_proven_exhaust(tmp_path: Path) -> None:
+def test_authoritative_deletes_only_proven_exhaust(tmp_path: Path) -> None:
     path = tmp_path / "production.sqlite3"
-    db = _db(path)
-    db.close()
+    _db(path).close()
 
     result = cleanup.execute_cleanup(
         path,
@@ -169,31 +104,51 @@ def test_executor_preserves_protected_and_unknown_state_and_deletes_only_proven_
     db.close()
 
 
-def test_certifier_refuses_replication_journal_pruning(tmp_path: Path) -> None:
+def test_certifier_preserves_replica_rows_and_captures_durable_watermark(tmp_path: Path) -> None:
     path = tmp_path / "certifier.sqlite3"
-    db = _db(path)
+    _db(path).close()
+
+    result = cleanup.execute_cleanup(
+        path,
+        role="certifier",
+        run_id="unit-certifier-1",
+        acknowledged_watermark=1,
+    )
+
+    assert result["status"] == "success"
+    assert result["durable_source_watermark"] == 2
+    assert result["deleted_rows"] == {
+        "synthetic_candidate_closure": {},
+        "acknowledged_replication_changes": 0,
+        "stale_risk_refresh_measurements": 0,
+    }
+    assert all(
+        reason == "protected:certifier-replica-equivalence"
+        for reason in result["protected_set"].values()
+    )
+    db = sqlite3.connect(path)
+    assert db.execute("SELECT COUNT(*) FROM certification_replication_changes").fetchone()[0] == 3
+    assert db.execute("SELECT COUNT(*) FROM risk_refresh_measurements").fetchone()[0] == 2
+    assert db.execute("SELECT COUNT(*) FROM v51_candidates").fetchone()[0] == 2
     db.close()
-
-    with pytest.raises(cleanup.CleanupBlocked, match="authoritative-only"):
-        cleanup.execute_cleanup(path, role="certifier", run_id="unit-certifier-1", acknowledged_watermark=1)
-
-    report = json.loads((tmp_path / ".production-cleanup" / "unit-certifier-1.json").read_text())
-    assert report["status"] == "blocked"
 
 
 def test_watermark_cannot_exceed_authoritative_journal_head(tmp_path: Path) -> None:
     path = tmp_path / "production.sqlite3"
-    db = _db(path)
-    db.close()
+    _db(path).close()
 
     with pytest.raises(cleanup.CleanupBlocked, match="exceeds source journal head"):
-        cleanup.execute_cleanup(path, role="authoritative", run_id="unit-watermark-1", acknowledged_watermark=99)
+        cleanup.execute_cleanup(
+            path,
+            role="authoritative",
+            run_id="unit-watermark-1",
+            acknowledged_watermark=99,
+        )
 
 
 def test_success_run_id_is_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "production.sqlite3"
-    db = _db(path)
-    db.close()
+    _db(path).close()
 
     first = cleanup.execute_cleanup(path, role="authoritative", run_id="unit-idempotent-1")
     second = cleanup.execute_cleanup(path, role="authoritative", run_id="unit-idempotent-1")
@@ -207,14 +162,17 @@ def test_schema_drift_fails_closed_before_target_delete(tmp_path: Path) -> None:
     path = tmp_path / "production.sqlite3"
     db = _db(path)
     db.execute("ALTER TABLE certification_replication_changes RENAME TO old_changes")
-    db.execute(
-        "CREATE TABLE certification_replication_changes(id INTEGER PRIMARY KEY, table_name TEXT NOT NULL)"
-    )
+    db.execute("CREATE TABLE certification_replication_changes(id INTEGER PRIMARY KEY,table_name TEXT NOT NULL)")
     db.commit()
     db.close()
 
     with pytest.raises(cleanup.CleanupBlocked, match="schema mismatch"):
-        cleanup.execute_cleanup(path, role="authoritative", run_id="unit-schema-drift-1", acknowledged_watermark=1)
+        cleanup.execute_cleanup(
+            path,
+            role="authoritative",
+            run_id="unit-schema-drift-1",
+            acknowledged_watermark=1,
+        )
 
     db = sqlite3.connect(path)
     assert db.execute("SELECT COUNT(*) FROM old_changes").fetchone()[0] == 3
