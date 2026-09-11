@@ -2,13 +2,9 @@ from __future__ import annotations
 
 """Bounded, fail-closed cleanup for production artifacts proven safe to expire.
 
-This module deliberately has no strategy, execution, signing, submission, or
-certification-authority capability.  It only:
-
-* installs the existing bounded ephemeral-candidate reaper; and
-* removes old, regular certification-export files after conservative filesystem
-  identity/open-file checks.
-
+This module deliberately has no strategy, candidate-selection, execution, signing,
+submission, or certification-authority capability. It removes only old regular
+certification-export files after conservative filesystem identity/open-file checks.
 Anything whose provenance, active-reference status, or replication acknowledgement
 is not proven remains untouched.
 """
@@ -27,6 +23,7 @@ except ImportError:  # pragma: no cover - non-POSIX portability guard
 
 CLEANUP_VERSION = "safe-retention-cleanup-v1"
 STALE_EXPORT_AGE_SECONDS = 3600.0
+MAX_DIRECTORY_ENTRIES = 2048
 MAX_STALE_EXPORT_CANDIDATES = 256
 _EXPORT_PREFIX = ".certification-export-"
 _EXPORT_SUFFIX = ".sqlite3"
@@ -38,12 +35,7 @@ def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
 
 
 def _held_open_by_this_process(identity: os.stat_result) -> bool | None:
-    """Return whether this process already has the inode open; None means unknown.
-
-    The certification snapshot response is served by this process.  Refusing to
-    unlink an inode already present in /proc/self/fd prevents cleanup from racing a
-    still-active FileResponse.  If /proc cannot be inspected, callers fail closed.
-    """
+    """Return whether this process already has the inode open; None means unknown."""
 
     fd_dir = Path("/proc/self/fd")
     try:
@@ -100,14 +92,11 @@ def _unlink_stale_export(candidate: Path, *, directory: Path, now: float) -> tup
     if fcntl is None:
         return False, "flock_unavailable"
 
-    flags = os.O_RDONLY
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         return False, "nofollow_unavailable"
-    flags |= int(nofollow)
-
     try:
-        fd = os.open(candidate, flags)
+        fd = os.open(candidate, os.O_RDONLY | int(nofollow))
     except OSError:
         return False, "open_failed"
     try:
@@ -145,6 +134,29 @@ def _unlink_stale_export(candidate: Path, *, directory: Path, now: float) -> tup
         os.close(fd)
 
 
+def _bounded_export_candidates(directory: Path) -> tuple[list[Path], bool]:
+    candidates: list[Path] = []
+    truncated = False
+    examined_entries = 0
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                examined_entries += 1
+                if examined_entries > MAX_DIRECTORY_ENTRIES:
+                    truncated = True
+                    break
+                if not entry.name.startswith(_EXPORT_PREFIX):
+                    continue
+                candidates.append(directory / entry.name)
+                if len(candidates) >= MAX_STALE_EXPORT_CANDIDATES:
+                    truncated = True
+                    break
+    except OSError:
+        raise
+    candidates.sort(key=lambda item: item.name)
+    return candidates, truncated
+
+
 def cleanup_stale_certification_exports(store_path: Path, *, now: float | None = None) -> dict[str, Any]:
     """Perform one bounded pass over stale snapshot exports beside the live store."""
 
@@ -156,6 +168,7 @@ def cleanup_stale_certification_exports(store_path: Path, *, now: float | None =
         "removed": 0,
         "skipped": 0,
         "bounded": True,
+        "directory_entry_limit": MAX_DIRECTORY_ENTRIES,
         "candidate_limit": MAX_STALE_EXPORT_CANDIDATES,
         "paper_only": True,
         "live_money_authority": False,
@@ -163,13 +176,11 @@ def cleanup_stale_certification_exports(store_path: Path, *, now: float | None =
         "transaction_submission_available": False,
     }
     try:
-        candidates = sorted(
-            (candidate for candidate in directory.iterdir() if candidate.name.startswith(_EXPORT_PREFIX)),
-            key=lambda item: item.name,
-        )[:MAX_STALE_EXPORT_CANDIDATES]
+        candidates, truncated = _bounded_export_candidates(directory)
     except OSError as exc:
         result["error"] = f"{type(exc).__name__}:{exc}"
         return result
+    result["scan_truncated"] = bool(truncated)
 
     at = time.time() if now is None else float(now)
     reasons: dict[str, int] = {}
@@ -186,11 +197,7 @@ def cleanup_stale_certification_exports(store_path: Path, *, now: float | None =
 
 
 def install_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str, Any]:
-    """Install bounded ongoing reaping and execute one guarded stale-file pass."""
-
-    from .ephemeral_candidate_retention import install_ephemeral_candidate_retention
-
-    install_ephemeral_candidate_retention()
+    """Execute one guarded stale-export pass and expose read-only evidence."""
 
     store = getattr(ingestion_runtime, "store", None)
     raw_path = getattr(store, "path", None)
@@ -210,9 +217,9 @@ def install_safe_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[str
     state = {
         "version": CLEANUP_VERSION,
         "installed": True,
-        "ephemeral_reaper_installed": True,
         "startup_stale_export_cleanup": cleanup,
-        "scope": ["expired_ephemeral_state_and_queue", "stale_certification_exports"],
+        "scope": ["stale_certification_exports"],
+        "candidate_selection_changed": False,
         "provenance_ambiguous_data_deleted": False,
         "replication_journal_deleted": False,
         "robinhood_history_deleted": False,
