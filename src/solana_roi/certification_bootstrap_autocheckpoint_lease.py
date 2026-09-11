@@ -129,8 +129,6 @@ def _restore_locked(store: Any, state: dict[str, Any], *, reason: str, cancel_ti
     try:
         _set_autocheckpoint_locked(store, original)
     except (sqlite3.Error, AttributeError, RuntimeError):
-        # Store teardown may race the inactivity callback. There is no live writer to
-        # restore once its SQLite connection is already closed.
         state["active"] = False
         state["restore_reason"] = f"{reason}:store_unavailable"
         return False
@@ -162,7 +160,6 @@ def _expire(store_ref: "weakref.ReferenceType[Any]", generation: int) -> None:
                 return
             _restore_locked(store, state, reason="idle_timeout", cancel_timer=False)
     except Exception:
-        # Expiry is a safety restoration best effort during possible store teardown.
         return
 
 
@@ -340,15 +337,35 @@ def _replace_route_call(route: Any, endpoint: Callable[..., dict[str, Any]]) -> 
     route.dependant.call = endpoint
 
 
+def _runtime_provider_from_endpoint(endpoint: Any) -> Callable[[], Any] | None:
+    closure = getattr(endpoint, "__closure__", None)
+    freevars = getattr(getattr(endpoint, "__code__", None), "co_freevars", ())
+    if not closure or not freevars:
+        return None
+    for name, cell in zip(freevars, closure):
+        if name != "runtime_provider":
+            continue
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        if callable(value):
+            return value
+    return None
+
+
 def install_certification_bootstrap_autocheckpoint_lease(
     app: Any,
-    runtime_provider: Callable[[], Any],
+    runtime_provider: Callable[[], Any] | None = None,
 ) -> None:
     """Wrap only this production app's registered bootstrap routes.
 
     FastAPI has already compiled parameter/header dependencies for the original
     endpoints, so replacing ``dependant.call`` preserves the exact HTTP contract
     while avoiding any module-global mutation of logical ``_manifest``/``_page``.
+    The canonical composition root already owns the route registration; when it does
+    not pass the provider explicitly, recover that exact provider from the route's
+    closure rather than creating a second runtime/composition authority.
     """
 
     global _INSTALLED
@@ -363,10 +380,17 @@ def install_certification_bootstrap_autocheckpoint_lease(
     original_manifest = manifest_route.dependant.call
     original_page = page_route.dependant.call
 
+    provider = runtime_provider
+    if provider is None:
+        provider = _runtime_provider_from_endpoint(original_manifest)
+    if provider is None:
+        provider = _runtime_provider_from_endpoint(original_page)
+    if provider is None:
+        raise RuntimeError("certification bootstrap runtime provider unavailable")
+
     def manifest_endpoint(x_certification_token: str | None = None) -> dict[str, Any]:
-        # Authenticate before touching the canonical writer state.
         replication._require_shared_token(x_certification_token)
-        store = _runtime_store(runtime_provider)
+        store = _runtime_store(provider)
         refresh(store)
         payload = original_manifest(x_certification_token=x_certification_token)
         set_manifest_tables(store, payload)
@@ -383,9 +407,8 @@ def install_certification_bootstrap_autocheckpoint_lease(
         limit: int = 250,
         x_certification_token: str | None = None,
     ) -> dict[str, Any]:
-        # Authenticate before touching the canonical writer state.
         replication._require_shared_token(x_certification_token)
-        store = _runtime_store(runtime_provider)
+        store = _runtime_store(provider)
         refresh(store)
         payload = original_page(
             table=table,
