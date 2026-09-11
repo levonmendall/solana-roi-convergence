@@ -132,7 +132,11 @@ def install_startup_retention_cleanup(app: Any, ingestion_runtime: Any) -> dict[
         async with previous_lifespan(app_instance) as lifespan_state:
             yield lifespan_state
 
+    # Preserve explicit composition provenance so architecture regressions can prove
+    # that the canonical Render handoff lifespan remains the wrapped predecessor
+    # without requiring the final router callable to have identical object identity.
     setattr(_retention_owned_lifespan, "_roi_safe_retention_cleanup_lifespan", True)
+    setattr(_retention_owned_lifespan, "_roi_previous_lifespan", previous_lifespan)
     app.router.lifespan_context = _retention_owned_lifespan
     setattr(app.state, _REGISTRATION_ATTR, True)
     return dict(pending)
