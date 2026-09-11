@@ -4,6 +4,8 @@ import sqlite3
 
 from solana_roi import durable_bootstrap_memory_repair as repair
 
+MIB = 1024 * 1024
+
 
 def test_passive_wal_checkpoint_reports_committed_frames(tmp_path):
     database = tmp_path / "certification.db"
@@ -76,29 +78,64 @@ def test_cgroup_memory_reports_file_writeback(tmp_path):
     assert state["anon_bytes"] == 170_000_000
 
 
-def test_drop_file_cache_checkpoints_then_flushes_before_release(tmp_path, monkeypatch):
+def test_page_finalizer_never_checkpoints_and_releases_clean_cache_first(tmp_path, monkeypatch):
     database = tmp_path / "certification.db"
     database.touch()
     calls: list[str] = []
+    states = iter(
+        [
+            {
+                "fraction": 0.90,
+                "headroom_bytes": 200 * MIB,
+                "file_dirty_bytes": 96 * MIB,
+                "file_writeback_bytes": 0,
+            },
+            {
+                "fraction": 0.60,
+                "headroom_bytes": 800 * MIB,
+                "file_dirty_bytes": 0,
+                "file_writeback_bytes": 0,
+            },
+        ]
+    )
 
-    def checkpoint(path):
-        assert path == database
-        calls.append("checkpoint")
-        return {
-            "attempted": True,
-            "busy": 0,
-            "log_frames": 9,
-            "checkpointed_frames": 9,
-            "error": None,
-            "wal_bytes_before": 4096,
-            "wal_bytes_after": 4096,
-        }
-
-    monkeypatch.setattr(repair, "_passive_wal_checkpoint", checkpoint)
+    monkeypatch.setattr(
+        repair,
+        "_passive_wal_checkpoint",
+        lambda path: (_ for _ in ()).throw(AssertionError("page finalizer must not checkpoint")),
+    )
+    monkeypatch.setattr(
+        repair,
+        "_release_sqlite_file_cache",
+        lambda path: calls.append("release") or True,
+    )
     monkeypatch.setattr(
         repair,
         "_sync_sqlite_dirty_pages",
         lambda path: calls.append("flush") or True,
+    )
+    monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
+    monkeypatch.setattr(repair, "WRITEBACK_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(repair, "_trim_process_heap", lambda: calls.append("heap") or True)
+
+    assert repair._drop_file_cache_with_sidecars(database) is True
+    assert calls == ["release", "flush", "release"]
+
+
+def test_page_finalizer_clean_cache_release_does_not_write(tmp_path, monkeypatch):
+    database = tmp_path / "certification.db"
+    database.touch()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        repair,
+        "_passive_wal_checkpoint",
+        lambda path: (_ for _ in ()).throw(AssertionError("page finalizer must not checkpoint")),
+    )
+    monkeypatch.setattr(
+        repair,
+        "_sync_sqlite_dirty_pages",
+        lambda path: (_ for _ in ()).throw(AssertionError("clean cache must not be flushed")),
     )
     monkeypatch.setattr(
         repair,
@@ -108,22 +145,30 @@ def test_drop_file_cache_checkpoints_then_flushes_before_release(tmp_path, monke
     monkeypatch.setattr(
         repair,
         "_cgroup_memory",
-        lambda: {"fraction": 0.1, "headroom_bytes": 10**9},
+        lambda: {
+            "fraction": 0.1,
+            "headroom_bytes": 10**9,
+            "file_dirty_bytes": 0,
+            "file_writeback_bytes": 0,
+        },
     )
 
     assert repair._drop_file_cache_with_sidecars(database) is True
-    assert calls == ["checkpoint", "flush", "release"]
+    assert calls == ["release"]
 
 
 def test_repair_preserves_paper_only_and_fail_closed_boundaries():
     state = repair.status()
 
-    assert state["repair_version"] == "durable-bootstrap-cgroup-memory-v6-gated-wal-checkpoint"
+    assert state["repair_version"] == "durable-bootstrap-cgroup-memory-v7-page-finalizer-cache-release"
     assert state["logical_bootstrap_page_wide_transaction"] is False
     assert state["passive_wal_checkpoint_under_pressure"] is True
     assert state["passive_wal_checkpoint_gated"] is True
     assert state["clean_cache_eviction_precedes_checkpoint"] is True
+    assert state["dirty_writeback_alone_triggers_checkpoint"] is False
     assert state["wal_checkpoint_max_attempts_per_guard"] == 1
+    assert state["page_finalizer_checkpoint_enabled"] is False
+    assert state["page_finalizer_clean_cache_release"] is True
     assert state["raw_critical_fraction"] == 0.94
     assert state["wal_checkpoint_busy_timeout_ms"] == 0
     assert state["wal_checkpoint_changes_logical_state"] is False

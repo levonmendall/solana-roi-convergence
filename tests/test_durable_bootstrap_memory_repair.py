@@ -194,7 +194,7 @@ def test_raw_cgroup_guard_skips_checkpoint_for_small_wal_and_negligible_writebac
     assert calls["checkpoint"] == 0
 
 
-def test_raw_cgroup_guard_runs_one_checkpoint_when_writeback_warrants_it(tmp_path, monkeypatch):
+def test_raw_cgroup_guard_flushes_dirty_cache_without_checkpoint_for_small_wal(tmp_path, monkeypatch):
     source = tmp_path / "state.sqlite3"
     source.write_bytes(b"sqlite")
     states = iter(
@@ -227,35 +227,25 @@ def test_raw_cgroup_guard_runs_one_checkpoint_when_writeback_warrants_it(tmp_pat
     )
     order: list[str] = []
 
-    def checkpoint(path):
-        order.append("checkpoint")
-        return {
-            "attempted": True,
-            "busy": 0,
-            "log_frames": 8,
-            "checkpointed_frames": 8,
-            "error": None,
-            "wal_bytes_before": 8192,
-            "wal_bytes_after": 8192,
-        }
-
     monkeypatch.setattr(repair, "RECLAIM_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(repair, "WRITEBACK_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(repair, "_cgroup_memory", lambda: next(states))
+    monkeypatch.setattr(repair, "_wal_size_bytes", lambda path: 4 * MIB)
     monkeypatch.setattr(repair, "_release_sqlite_file_cache", lambda path: order.append("cache") or True)
     monkeypatch.setattr(repair, "_trim_process_heap", lambda: order.append("heap") or True)
     monkeypatch.setattr(repair, "_request_cgroup_file_reclaim", lambda state: order.append("cgroup") or False)
-    monkeypatch.setattr(repair, "_passive_wal_checkpoint", checkpoint)
+    monkeypatch.setattr(
+        repair,
+        "_passive_wal_checkpoint",
+        lambda path: (_ for _ in ()).throw(AssertionError("small WAL must not checkpoint")),
+    )
     monkeypatch.setattr(repair, "_sync_sqlite_dirty_pages", lambda path: order.append("writeback") or True)
     monkeypatch.setattr(repair, "_emit_reclaim_telemetry", lambda *args, **kwargs: None)
 
     result = repair._guard_raw_cgroup(source)
 
     assert result["current_bytes"] == 1300 * MIB
-    assert order[:4] == ["cache", "heap", "cgroup", "checkpoint"]
-    assert order.count("checkpoint") == 1
-    assert "writeback" in order
-    assert order.index("cache") < order.index("checkpoint")
+    assert order == ["cache", "heap", "cgroup", "writeback", "cache", "cgroup"]
 
 
 def test_raw_cgroup_guard_runs_one_checkpoint_when_wal_is_large(tmp_path, monkeypatch):
@@ -375,6 +365,19 @@ def test_dirty_writeback_gate_counts_kernel_writeback_not_only_dirty_pages():
     assert repair._dirty_writeback_needed(state) is True
 
 
+def test_dirty_writeback_alone_does_not_justify_wal_checkpoint(tmp_path):
+    source = tmp_path / "state.sqlite3"
+    source.write_bytes(b"db")
+    (tmp_path / "state.sqlite3-wal").write_bytes(b"wal")
+    state = {
+        "file_dirty_bytes": 256 * MIB,
+        "file_writeback_bytes": 32 * MIB,
+    }
+
+    assert repair._dirty_writeback_needed(state) is True
+    assert repair._wal_checkpoint_needed(source, state) is False
+
+
 def test_critical_fail_closed_boundary_remains_94_percent():
     assert repair.RAW_CRITICAL_FRACTION == 0.94
     assert repair._critical(
@@ -395,7 +398,7 @@ def test_install_patches_only_read_paths_and_preserves_authority_contract():
     assert getattr(logical._pinned_reader, "_roi_durable_bootstrap_memory_bounded", False)
     assert getattr(split._drop_file_cache, "_roi_sqlite_sidecar_cache_release", False)
     status = repair.status()
-    assert status["repair_version"] == "durable-bootstrap-cgroup-memory-v6-gated-wal-checkpoint"
+    assert status["repair_version"] == "durable-bootstrap-cgroup-memory-v7-page-finalizer-cache-release"
     assert status["raw_critical_fraction"] == 0.94
     assert status["full_hash_chain_verification_preserved"] is True
     assert status["logical_bootstrap_keyset_semantics_preserved"] is True
@@ -404,8 +407,11 @@ def test_install_patches_only_read_paths_and_preserves_authority_contract():
     assert status["heap_trim_under_pressure"] is True
     assert status["targeted_sqlite_dirty_writeback"] is True
     assert status["clean_cache_eviction_precedes_checkpoint"] is True
+    assert status["dirty_writeback_alone_triggers_checkpoint"] is False
     assert status["passive_wal_checkpoint_gated"] is True
     assert status["wal_checkpoint_max_attempts_per_guard"] == 1
+    assert status["page_finalizer_checkpoint_enabled"] is False
+    assert status["page_finalizer_clean_cache_release"] is True
     assert status["writeback_changes_logical_state"] is False
     assert status["canonical_evidence_reset"] is False
     assert status["strategy_thresholds_changed"] is False
