@@ -44,7 +44,13 @@ from .production_system import (
     ingestion_runtime,
     production_system,
 )
+from .safe_retention_cleanup import install_safe_retention_cleanup
 from . import legacy_production_composition as _legacy_production
+
+# Delete only certification export artifacts whose age, type, identity and open-file
+# state are all proven safe. Ambiguous artifacts fail closed and all economic,
+# replication, wallet, event-ledger and Robinhood history remain untouched.
+install_safe_retention_cleanup(app, ingestion_runtime)
 
 # Backward-compatible observability constants; these are resource ceilings only.
 DIRECT_WS_MAX_QUEUE = 64
