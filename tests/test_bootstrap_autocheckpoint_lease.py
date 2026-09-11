@@ -54,8 +54,6 @@ def _autocheckpoint(store: _Store) -> int:
 
 
 def _fake_app_with_routes(runtime_provider, order: list[str]):
-    # Deliberately capture runtime_provider in each endpoint so the production lease
-    # can recover the exact provider without a second composition/runtime authority.
     def manifest_endpoint(x_certification_token=None):
         runtime_provider()
         order.append("manifest")
@@ -194,8 +192,6 @@ def test_installer_wraps_only_registered_routes_and_preserves_logical_globals(tm
     monkeypatch.setattr(lease, "set_manifest_tables", lambda target, payload: order.append("tables"))
     monkeypatch.setattr(lease, "finish_if_complete", lambda target, payload: order.append("finish") or True)
 
-    # Match the canonical production call: provider is recovered from the already
-    # registered route closure instead of being supplied by another composition root.
     lease.install_certification_bootstrap_autocheckpoint_lease(app)
 
     assert logical._manifest is original_manifest_function
@@ -219,12 +215,32 @@ def test_installer_wraps_only_registered_routes_and_preserves_logical_globals(tm
     assert page == {"table": "evidence", "done": True}
     assert order == ["auth", "lease", "page", "finish"]
     assert app.state.roi_certification_bootstrap_autocheckpoint_lease is True
+    assert app.state.roi_certification_bootstrap_autocheckpoint_lease_active is True
     assert app.state.roi_certification_bootstrap_autocheckpoint_lease_version == lease.LEASE_VERSION
     store.close()
 
 
-def test_installer_rejects_missing_registered_routes():
+def test_installer_noops_when_split_runtime_disabled_and_routes_absent(monkeypatch):
     app = SimpleNamespace(routes=[], state=SimpleNamespace())
+    monkeypatch.setattr(
+        "solana_roi.certification_service_split.split_runtime_enabled",
+        lambda: False,
+    )
+
+    lease.install_certification_bootstrap_autocheckpoint_lease(app, lambda: None)
+
+    assert app.state.roi_certification_bootstrap_autocheckpoint_lease is False
+    assert app.state.roi_certification_bootstrap_autocheckpoint_lease_active is False
+    assert app.state.roi_certification_bootstrap_autocheckpoint_lease_version == lease.LEASE_VERSION
+
+
+def test_installer_fails_closed_when_split_runtime_enabled_and_routes_absent(monkeypatch):
+    app = SimpleNamespace(routes=[], state=SimpleNamespace())
+    monkeypatch.setattr(
+        "solana_roi.certification_service_split.split_runtime_enabled",
+        lambda: True,
+    )
+
     with pytest.raises(RuntimeError, match="bootstrap route not found"):
         lease.install_certification_bootstrap_autocheckpoint_lease(app, lambda: None)
 
