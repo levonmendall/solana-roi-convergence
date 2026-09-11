@@ -12,7 +12,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-PROBE_VERSION = "cleanup-target-probe-v1"
+PROBE_VERSION = "cleanup-target-probe-v2-btree-edges"
 TARGET_TABLE = "anonymous_candidate_latency_failures"
 
 
@@ -55,6 +55,18 @@ def _foreign_keys(connection: sqlite3.Connection, table: str) -> list[dict[str, 
     ]
 
 
+def _single_edge(connection: sqlite3.Connection, table: str, aggregate: str) -> int | None:
+    # SQLite's MIN/MAX optimization applies when the statement contains a single
+    # MIN or MAX aggregate. Keep the two edges separate so this cannot devolve into
+    # a history-scaled table scan on a large cleanup target.
+    if aggregate not in {"MIN", "MAX"}:
+        raise ValueError("unsupported rowid aggregate")
+    row = connection.execute(
+        f"SELECT {aggregate}(rowid) FROM {_quote(table)}"
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
 def probe_cleanup_target(database_path: Path, table: str = TARGET_TABLE) -> dict[str, Any]:
     database_path = Path(database_path)
     result: dict[str, Any] = {
@@ -63,6 +75,7 @@ def probe_cleanup_target(database_path: Path, table: str = TARGET_TABLE) -> dict
         "table": table,
         "read_only": True,
         "payload_rows_scanned": False,
+        "rowid_bounds_use_single_aggregate_btree_edges": True,
     }
     if not database_path.exists() or not database_path.is_file():
         return {**result, "status": "database_missing"}
@@ -142,12 +155,9 @@ def probe_cleanup_target(database_path: Path, table: str = TARGET_TABLE) -> dict
         rowid_bounds = None
         without_rowid = "WITHOUT ROWID" in create_sql.upper()
         if not without_rowid:
-            bounds = connection.execute(
-                f"SELECT MIN(rowid),MAX(rowid) FROM {_quote(table)}"
-            ).fetchone()
             rowid_bounds = {
-                "min": int(bounds[0]) if bounds and bounds[0] is not None else None,
-                "max": int(bounds[1]) if bounds and bounds[1] is not None else None,
+                "min": _single_edge(connection, table, "MIN"),
+                "max": _single_edge(connection, table, "MAX"),
             }
 
         return {
