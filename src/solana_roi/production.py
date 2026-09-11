@@ -47,8 +47,9 @@ from .production_system import (
 from .startup_retention_cleanup import run_safe_retention_cleanup
 from . import legacy_production_composition as _legacy_production
 
-# One-shot bounded startup maintenance only. This is not a compatibility installer
-# and cannot alter strategy, authority, candidate selection, or certification rules.
+# This call only registers the bounded cleanup on the already-canonical FastAPI
+# lifespan. Registration is storage-non-mutating; actual cleanup executes at real
+# application startup immediately before the canonical worker lifespan begins.
 run_safe_retention_cleanup(app, ingestion_runtime)
 
 # Backward-compatible observability constants; these are resource ceilings only.

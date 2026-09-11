@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -97,14 +98,36 @@ def test_install_exposes_read_only_scope_and_does_not_claim_ambiguous_deletion(t
     assert any(getattr(route, "path", None) == "/v1/operations/safe-retention-cleanup" for route in app.routes)
 
 
-def test_startup_cleanup_logs_exact_bounded_evidence(tmp_path: Path, caplog, capsys) -> None:
+def test_startup_cleanup_logs_exact_bounded_evidence_only_when_lifespan_enters(tmp_path: Path, caplog, capsys) -> None:
     candidate = tmp_path / ".certification-export-old.sqlite3"
     _make_old(candidate)
     app = FastAPI()
     runtime = SimpleNamespace(store=SimpleNamespace(path=tmp_path / "solana-roi.sqlite3"))
     caplog.set_level(logging.INFO, logger="solana_roi.safe_retention")
 
-    state = startup_cleanup.run_safe_retention_cleanup(app, runtime)
+    pending = startup_cleanup.run_safe_retention_cleanup(app, runtime)
+
+    # Registration belongs to composition/import and must not mutate storage or emit
+    # cleanup evidence. The old export remains until a real application lifespan starts.
+    assert pending["startup_pending"] is True
+    assert pending["startup_stale_export_cleanup"]["removed"] == 0
+    assert candidate.exists()
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("ROI_SAFE_RETENTION_CLEANUP ")
+    ] == []
+    assert [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("ROI_SAFE_RETENTION_CLEANUP ")
+    ] == []
+
+    async def _enter_lifespan() -> None:
+        async with app.router.lifespan_context(app):
+            pass
+
+    asyncio.run(_enter_lifespan())
 
     records = [
         record.getMessage()
@@ -130,8 +153,12 @@ def test_startup_cleanup_logs_exact_bounded_evidence(tmp_path: Path, caplog, cap
     assert evidence["scan_truncated"] is False
     assert evidence["outcomes"] == {"removed": 1}
     assert evidence["error"] is None
+    assert evidence["startup_pending"] is False
     assert evidence["paper_only"] is True
     assert evidence["live_money_authority"] is False
     assert evidence["signing_available"] is False
     assert evidence["transaction_submission_available"] is False
+    assert not candidate.exists()
+    state = app.state.roi_safe_retention_cleanup
+    assert state["startup_pending"] is False
     assert state["startup_stale_export_cleanup"]["removed"] == 1
