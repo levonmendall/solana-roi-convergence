@@ -1,0 +1,29 @@
+name: ASGI Bootstrap Memory Regression
+
+on:
+  push:
+    branches:
+      - diagnostic/asgi-bootstrap-memory-retention-runner
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.16'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install exact locked dependencies
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Prove post-ASGI-response anonymous-memory retention
+        run: |
+          set -o pipefail
+          python -m pytest -s -vv tests/test_certification_logical_bootstrap_asgi_memory_retention.py 2>&1 | tee asgi-bootstrap-memory-regression.log
