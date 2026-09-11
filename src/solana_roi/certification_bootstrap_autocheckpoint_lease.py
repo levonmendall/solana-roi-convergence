@@ -20,6 +20,7 @@ changed.
 """
 
 import asyncio
+import inspect
 import os
 import sqlite3
 import threading
@@ -28,9 +29,9 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
-LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v4-wal-ceiling-truncate-recovery"
+LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v5-async-route-wrapper"
 DEFAULT_IDLE_SECONDS = 45.0
 MIN_IDLE_SECONDS = 35.0
 MAX_IDLE_SECONDS = 120.0
@@ -435,9 +436,18 @@ def _route(app: Any, path: str) -> Any:
     return route
 
 
-def _replace_route_call(route: Any, endpoint: Callable[..., dict[str, Any]]) -> None:
+def _replace_route_call(route: Any, endpoint: Callable[..., Any]) -> None:
     route.endpoint = endpoint
     route.dependant.call = endpoint
+
+
+async def _call_endpoint_inline(endpoint: Callable[..., Any], **kwargs: Any) -> Any:
+    """Invoke a registered endpoint without entering Starlette/AnyIO's sync worker pool."""
+
+    result = endpoint(**kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 def _runtime_provider_from_endpoint(endpoint: Any) -> Callable[[], Any] | None:
@@ -519,18 +529,24 @@ def install_certification_bootstrap_autocheckpoint_lease(
     if provider is None:
         raise RuntimeError("certification bootstrap runtime provider unavailable")
 
-    def manifest_endpoint(x_certification_token: str | None = None) -> dict[str, Any]:
+    async def manifest_endpoint(
+        x_certification_token: str | None = None,
+    ) -> dict[str, Any]:
         replication._require_shared_token(x_certification_token)
         store = _runtime_store(provider)
         refresh(store)
-        payload = original_manifest(x_certification_token=x_certification_token)
+        payload = await _call_endpoint_inline(
+            original_manifest,
+            x_certification_token=x_certification_token,
+        )
         set_manifest_tables(store, payload)
         return payload
 
     setattr(manifest_endpoint, "_roi_bootstrap_autocheckpoint_lease", True)
     setattr(manifest_endpoint, "_roi_original_endpoint", original_manifest)
 
-    def page_endpoint(
+    async def page_endpoint(
+        background_tasks: BackgroundTasks,
         table: str,
         epoch: str,
         schema_fingerprint: str,
@@ -541,7 +557,9 @@ def install_certification_bootstrap_autocheckpoint_lease(
         replication._require_shared_token(x_certification_token)
         store = _runtime_store(provider)
         refresh(store)
-        payload = original_page(
+        payload = await _call_endpoint_inline(
+            original_page,
+            background_tasks=background_tasks,
             table=table,
             epoch=epoch,
             schema_fingerprint=schema_fingerprint,
@@ -570,6 +588,9 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "scope": "authoritative_preworker_plus_registered_bootstrap_routes",
         "module_global_logical_functions_mutated": False,
+        "route_wrappers_async": True,
+        "background_tasks_forwarded": True,
+        "anyio_sync_worker_route_wrapper": False,
         "preworker_lease_priming": True,
         "preworker_checkpoint_enabled": False,
         "preworker_unconditional_checkpoint_enabled": False,
