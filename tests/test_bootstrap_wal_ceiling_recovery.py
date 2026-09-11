@@ -56,7 +56,7 @@ def test_ceiling_maintenance_recovery_reacquires_lease(tmp_path, monkeypatch):
     monkeypatch.setattr(lease.threading, "Timer", _FakeTimer)
 
     wal_values = iter([lease.DEFAULT_MAX_WAL_BYTES + 4096, 0, 0])
-    monkeypatch.setattr(lease, "_wal_size_bytes", lambda target: next(wal_values))
+    monkeypatch.setattr(lease, "_wal_size_bytes", lambda target: next(wal_values, 0))
     checkpoints: list[str] = []
     monkeypatch.setattr(
         lease,
