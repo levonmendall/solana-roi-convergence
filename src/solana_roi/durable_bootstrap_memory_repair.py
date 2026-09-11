@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v6-gated-wal-checkpoint"
+REPAIR_VERSION = "durable-bootstrap-cgroup-memory-v7-page-finalizer-cache-release"
 VERIFY_CACHE_RELEASE_ROWS = 4_096
 SQLITE_READER_CACHE_KIB = 2_048
 RAW_RECLAIM_FRACTION = 0.82
@@ -123,7 +123,7 @@ def _wal_size_bytes(path: Path) -> int:
 
 
 def _passive_wal_checkpoint(path: Path) -> dict[str, Any]:
-    """Best-effort zero-wait WAL checkpoint used only when pressure warrants it.
+    """Best-effort zero-wait WAL checkpoint used only when WAL pressure warrants it.
 
     PASSIVE never waits for readers or writers. A busy or failed checkpoint is
     telemetry, not authority: the existing fail-closed raw-memory guard still decides
@@ -210,18 +210,17 @@ def _dirty_writeback_needed(state: dict[str, int | float | None]) -> bool:
 
 
 def _wal_checkpoint_needed(path: Path, state: dict[str, int | float | None]) -> bool:
-    """Checkpoint only for a materially large WAL or material dirty/writeback pressure.
+    """Checkpoint only when the WAL itself is materially large.
 
-    The WAL trigger deliberately reuses the existing 64 MiB dirty/writeback boundary
-    instead of introducing a looser production threshold. Small WALs under otherwise
-    clean pressure are left untouched so checkpoint writes cannot repopulate the main
-    database cache while the guard is trying to reclaim it.
+    Production proved that cgroup-wide dirty/writeback bytes are not sufficient proof
+    that SQLite WAL pressure is the source of those pages. Dirty main-database cache is
+    flushed separately. A tiny WAL must never cause a checkpoint merely because other
+    file-backed pages are dirty, because the checkpoint can repopulate the main DB
+    cache while the guard is trying to reclaim it.
     """
 
-    return bool(
-        _wal_size_bytes(path) >= WAL_CHECKPOINT_TRIGGER_BYTES
-        or _dirty_writeback_needed(state)
-    )
+    del state
+    return _wal_size_bytes(path) >= WAL_CHECKPOINT_TRIGGER_BYTES
 
 
 def _sync_sqlite_dirty_pages(path: Path) -> bool:
@@ -375,7 +374,7 @@ def _emit_reclaim_telemetry(
 
 
 def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
-    """Evict clean cache first, gate WAL checkpointing, then fail closed at 94%."""
+    """Evict clean cache, flush dirty cache, and fail closed at the exact 94% boundary."""
 
     before = _cgroup_memory()
     if not _needs_reclaim(before):
@@ -392,6 +391,7 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
     checkpoint_error: str | None = None
     wal_bytes_before = _wal_size_bytes(path)
     wal_bytes_after = wal_bytes_before
+    writeback_considered = False
     checkpoint_considered = False
     attempts = 0
 
@@ -424,8 +424,39 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
             )
             return after
 
-        # At most one checkpoint per guard invocation. Repeated PASSIVE checkpoints
-        # under the same pressure episode can repopulate the main DB file cache.
+        # Dirty cgroup cache is flushed directly. It is not evidence that the WAL is
+        # large enough to justify copying committed frames into the main DB file.
+        if not writeback_considered and _dirty_writeback_needed(after):
+            writeback_considered = True
+            any_writeback_flush = _sync_sqlite_dirty_pages(path) or any_writeback_flush
+            if any_writeback_flush and WRITEBACK_SETTLE_SECONDS > 0:
+                time.sleep(WRITEBACK_SETTLE_SECONDS)
+            _release_sqlite_file_cache(path)
+            any_cgroup_request = _request_cgroup_file_reclaim(after) or any_cgroup_request
+            if RECLAIM_SETTLE_SECONDS > 0:
+                time.sleep(RECLAIM_SETTLE_SECONDS * attempts)
+            after = _cgroup_memory()
+            if not _needs_reclaim(after):
+                _emit_reclaim_telemetry(
+                    before,
+                    after,
+                    attempts=attempts,
+                    cgroup_requested=any_cgroup_request,
+                    heap_trimmed=any_heap_trim,
+                    writeback_flushed=any_writeback_flush,
+                    checkpoint_attempts=checkpoint_attempts,
+                    checkpoint_busy=checkpoint_busy,
+                    checkpoint_log_frames=checkpoint_log_frames,
+                    checkpointed_frames=checkpointed_frames,
+                    checkpoint_error=checkpoint_error,
+                    wal_bytes_before=wal_bytes_before,
+                    wal_bytes_after=wal_bytes_after,
+                    deferred=False,
+                )
+                return after
+
+        # At most one checkpoint per guard invocation, and only for a materially large
+        # WAL. Cgroup-wide dirty bytes alone cannot trigger this write-amplifying step.
         if not checkpoint_considered and _wal_checkpoint_needed(path, after):
             checkpoint_considered = True
             checkpoint = _passive_wal_checkpoint(path)
@@ -446,7 +477,7 @@ def _guard_raw_cgroup(path: Path) -> dict[str, int | float | None]:
                 isinstance(checkpoint.get("checkpointed_frames"), int)
                 and int(checkpoint["checkpointed_frames"]) > 0
             )
-            if _dirty_writeback_needed(after) or checkpoint_wrote_pages:
+            if checkpoint_wrote_pages:
                 any_writeback_flush = _sync_sqlite_dirty_pages(path) or any_writeback_flush
                 if any_writeback_flush and WRITEBACK_SETTLE_SECONDS > 0:
                     time.sleep(WRITEBACK_SETTLE_SECONDS)
@@ -585,15 +616,23 @@ def _guarded_pinned_reader(store: Any) -> sqlite3.Connection:
 
 
 def _drop_file_cache_with_sidecars(path: Path) -> bool:
+    """Release page-read cache without checkpointing from the page finalizer.
+
+    This hook runs after every logical-bootstrap manifest/page. It must therefore be
+    write-amplification-free: dirty SQLite-backed pages may be synced so DONTNEED can
+    evict them, but WAL checkpoint authority stays exclusively in the raw-cgroup guard.
+    """
+
     path = Path(path)
-    checkpoint = _passive_wal_checkpoint(path)
-    if bool(
-        isinstance(checkpoint.get("checkpointed_frames"), int)
-        and int(checkpoint["checkpointed_frames"]) > 0
-    ):
-        _sync_sqlite_dirty_pages(path)
     released = _release_sqlite_file_cache(path)
-    if _needs_reclaim(_cgroup_memory()):
+    state = _cgroup_memory()
+    if _dirty_writeback_needed(state):
+        flushed = _sync_sqlite_dirty_pages(path)
+        if flushed and WRITEBACK_SETTLE_SECONDS > 0:
+            time.sleep(WRITEBACK_SETTLE_SECONDS)
+        released = _release_sqlite_file_cache(path) or released
+        state = _cgroup_memory()
+    if _needs_reclaim(state):
         _trim_process_heap()
     return released
 
@@ -647,9 +686,12 @@ def status() -> dict[str, Any]:
         "heap_trim_under_pressure": True,
         "targeted_sqlite_dirty_writeback": True,
         "clean_cache_eviction_precedes_checkpoint": True,
+        "dirty_writeback_alone_triggers_checkpoint": False,
         "passive_wal_checkpoint_under_pressure": True,
         "passive_wal_checkpoint_gated": True,
         "wal_checkpoint_max_attempts_per_guard": 1,
+        "page_finalizer_checkpoint_enabled": False,
+        "page_finalizer_clean_cache_release": True,
         "wal_checkpoint_busy_timeout_ms": 0,
         "wal_checkpoint_changes_logical_state": False,
         "writeback_changes_logical_state": False,
