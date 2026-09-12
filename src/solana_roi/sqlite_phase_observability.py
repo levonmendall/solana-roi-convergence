@@ -33,7 +33,14 @@ def _read_key_values(path: Path) -> dict[str, int]:
 
 
 def _proc_io() -> dict[str, int]:
-    return _read_key_values(Path("/proc/self/io"))
+    values: dict[str, int] = {}
+    try:
+        for line in Path("/proc/self/io").read_text(encoding="utf-8").splitlines():
+            key, raw = line.split(":", 1)
+            values[key.strip()] = int(raw.strip())
+    except (OSError, ValueError):
+        return values
+    return values
 
 
 def _thread_count() -> int | None:
