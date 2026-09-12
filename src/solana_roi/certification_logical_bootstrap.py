@@ -17,11 +17,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import BackgroundTasks, Header, HTTPException, Query
+from starlette.concurrency import run_in_threadpool
 
 from . import certification_incremental_replication as replication
 from . import certification_service_split as split
 
-BOOTSTRAP_VERSION = "certification-logical-bootstrap-v5-async-post-response-cleanup"
+BOOTSTRAP_VERSION = "certification-logical-bootstrap-v6-bounded-route-offload"
 DEFAULT_PAGE_ROWS = 250
 MAX_PAGE_ROWS = 500
 DEFAULT_PAGE_BYTES = 4 * 1024 * 1024
@@ -383,9 +384,9 @@ def _page(
 
 
 async def _post_response_cleanup(source_path: Path) -> None:
-    """Run cleanup after response send without Starlette's sync worker-thread pool."""
+    """Run cleanup after response send without blocking the ASGI event loop."""
 
-    split._drop_file_cache(source_path)
+    await run_in_threadpool(split._drop_file_cache, source_path)
 
 
 def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable[[], Any]) -> None:
@@ -398,7 +399,8 @@ def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable
             x_certification_token: str | None = Header(default=None, alias="X-Certification-Token"),
         ) -> dict[str, Any]:
             replication._require_shared_token(x_certification_token)
-            return _manifest(_runtime_store(runtime_provider))
+            store = _runtime_store(runtime_provider)
+            return await run_in_threadpool(_manifest, store)
     if page_path not in existing:
         @app.get(page_path)
         async def certification_db_logical_bootstrap_page(
@@ -414,7 +416,8 @@ def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable
             store = _runtime_store(runtime_provider)
             source_path = Path(getattr(store, "path", ""))
             try:
-                payload = _page(
+                payload = await run_in_threadpool(
+                    _page,
                     store,
                     table_name=table,
                     epoch=epoch,
@@ -423,12 +426,13 @@ def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable
                     limit=limit,
                 )
             except Exception:
-                # No response will be serialized/sent, so immediate cleanup is safe.
-                split._drop_file_cache(source_path)
+                # No response will be serialized/sent, so immediate cleanup is safe,
+                # but cleanup itself must stay off the ASGI event loop.
+                await run_in_threadpool(split._drop_file_cache, source_path)
                 raise
             # BackgroundTasks executes this coroutine only after the final response body
-            # has been sent, and because it is async Starlette never enters AnyIO's
-            # sync worker-thread pool for the cleanup.
+            # has been sent; the coroutine then uses the same shared bounded worker pool
+            # for file-cache cleanup rather than blocking the event loop.
             background_tasks.add_task(_post_response_cleanup, source_path)
             return payload
     app.state.roi_certification_logical_bootstrap = True
