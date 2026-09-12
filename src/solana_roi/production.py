@@ -16,6 +16,7 @@ import asyncio
 
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
 from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
+from .logical_bootstrap_page_cache_repair import configure_logical_bootstrap_page_cache_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 
 # Keep authoritative certification-replica requests below the certifier's bounded
@@ -34,6 +35,12 @@ configure_incremental_event_integrity_repair()
 # reads its provider environment during construction. This is environment-only
 # bootstrap: it grants no strategy, signing, submission, or live-money authority.
 configure_robinhood_drpc_backup()
+
+# Quiesce each logical-bootstrap page's SQLite read cache in the same bounded worker
+# that materialized the page, before the next certifier request can refault more of
+# the canonical database. The existing post-send cleanup and unchanged 94% raw-cgroup
+# fail-closed guard remain authoritative.
+configure_logical_bootstrap_page_cache_repair()
 
 from .production_system import (
     COMPOSITION_STATUS_PATH,
