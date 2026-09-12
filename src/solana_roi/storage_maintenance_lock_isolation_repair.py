@@ -12,8 +12,8 @@ from . import continuity_storage_capacity_repair as storage_capacity
 from . import direct_solana as direct_solana_module
 
 
-REPAIR_VERSION = "storage-maintenance-lock-isolation-v2-bounded-rowid-cursor"
-BOUNDED_IO_VERSION = "storage-maintenance-bounded-rowid-cursor-v2-time-budget"
+REPAIR_VERSION = "storage-maintenance-lock-isolation-v3-bounded-dual-rowid-cursors"
+BOUNDED_IO_VERSION = "storage-maintenance-bounded-dual-rowid-cursors-v3-time-budget"
 MAINTENANCE_BUSY_TIMEOUT_MS = 250
 DELETE_CHUNK_ROWS = 400
 PAPER_ONLY = True
@@ -65,10 +65,28 @@ def _ensure_state(connection: sqlite3.Connection) -> None:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS direct_solana_storage_maintenance_cursor ("
             "id INTEGER PRIMARY KEY CHECK(id=1), "
+            "queue_scan_rowid INTEGER NOT NULL DEFAULT 0, "
             "metric_scan_rowid INTEGER NOT NULL DEFAULT 0, "
+            "last_queue_scan_rows INTEGER NOT NULL DEFAULT 0, "
             "last_scan_rows INTEGER NOT NULL DEFAULT 0, "
             "last_scan_at TEXT)"
         )
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(direct_solana_storage_maintenance_cursor)"
+            ).fetchall()
+        }
+        if "queue_scan_rowid" not in columns:
+            connection.execute(
+                "ALTER TABLE direct_solana_storage_maintenance_cursor "
+                "ADD COLUMN queue_scan_rowid INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_queue_scan_rows" not in columns:
+            connection.execute(
+                "ALTER TABLE direct_solana_storage_maintenance_cursor "
+                "ADD COLUMN last_queue_scan_rows INTEGER NOT NULL DEFAULT 0"
+            )
         connection.execute(
             "INSERT OR IGNORE INTO direct_solana_storage_maintenance_cursor(id) VALUES (1)"
         )
@@ -95,7 +113,16 @@ def _record_error(connection: sqlite3.Connection, message: str) -> None:
         return
 
 
-def _delete_metric_rowids(connection: sqlite3.Connection, rowids: list[int]) -> int:
+def _delete_rowids(
+    connection: sqlite3.Connection,
+    table: str,
+    rowids: list[int],
+) -> int:
+    if table not in {
+        "direct_solana_hydration_queue",
+        "direct_solana_hydration_metrics",
+    }:
+        raise ValueError("unsupported storage-maintenance table")
     deleted = 0
     for start in range(0, len(rowids), DELETE_CHUNK_ROWS):
         chunk = rowids[start : start + DELETE_CHUNK_ROWS]
@@ -103,7 +130,7 @@ def _delete_metric_rowids(connection: sqlite3.Connection, rowids: list[int]) -> 
             continue
         placeholders = ",".join("?" for _ in chunk)
         cur = connection.execute(
-            f"DELETE FROM direct_solana_hydration_metrics WHERE rowid IN ({placeholders})",
+            f"DELETE FROM {table} WHERE rowid IN ({placeholders})",
             tuple(chunk),
         )
         deleted += int(cur.rowcount or 0)
@@ -111,15 +138,15 @@ def _delete_metric_rowids(connection: sqlite3.Connection, rowids: list[int]) -> 
 
 
 def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
-    """Prune disposable operational rows with bounded SQLite work.
+    """Prune disposable operational rows with history-independent SQLite work.
 
     Maintenance stays on its dedicated WAL connection and never takes the canonical
-    evidence-store Python lock. Hydration-metric retention now advances a durable
-    physical-row cursor through at most the existing maintenance batch per pass,
-    rather than scanning/sorting the complete historical metric table each time.
-    The eligibility predicate is unchanged: only non-historical rows older than the
-    same retention cutoff can be deleted. The cursor wraps at end-of-table so every
-    surviving and newly appended row remains eligible for future inspection.
+    evidence-store Python lock. Both operational-retention tables advance durable
+    physical-row cursors through at most the existing maintenance batch per pass.
+    Eligibility predicates are unchanged: queue deletion remains limited to old
+    terminal rows, and metric deletion remains limited to old non-historical rows.
+    Each cursor wraps at end-of-table so surviving and newly appended rows remain
+    reachable on later maintenance passes.
     """
 
     _state_inc("prune_attempts")
@@ -134,41 +161,71 @@ def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
     try:
         _ensure_state(connection)
         with connection:
-            queue_cur = connection.execute(
-                "DELETE FROM direct_solana_hydration_queue WHERE signature IN ("
-                "SELECT signature FROM direct_solana_hydration_queue "
-                "WHERE status IN ('complete','failed') AND updated_at<? "
-                "ORDER BY updated_at, signature LIMIT ?)",
-                (queue_cutoff, storage_capacity.MAINTENANCE_BATCH_ROWS),
-            )
-            queue_rows = int(queue_cur.rowcount or 0)
-
             cursor_row = connection.execute(
-                "SELECT metric_scan_rowid FROM direct_solana_storage_maintenance_cursor WHERE id=1"
+                "SELECT queue_scan_rowid, metric_scan_rowid "
+                "FROM direct_solana_storage_maintenance_cursor WHERE id=1"
             ).fetchone()
-            cursor = int(cursor_row[0]) if cursor_row is not None else 0
-            scan_rows = connection.execute(
+            queue_cursor = int(cursor_row[0]) if cursor_row is not None else 0
+            metric_cursor = int(cursor_row[1]) if cursor_row is not None else 0
+
+            queue_scan_rows = connection.execute(
+                "SELECT rowid, status, updated_at "
+                "FROM direct_solana_hydration_queue WHERE rowid>? "
+                "ORDER BY rowid LIMIT ?",
+                (queue_cursor, storage_capacity.MAINTENANCE_BATCH_ROWS),
+            ).fetchall()
+            eligible_queue_rowids = [
+                int(row[0])
+                for row in queue_scan_rows
+                if str(row[1]) in {"complete", "failed"}
+                and str(row[2]) < queue_cutoff
+            ]
+            queue_rows = _delete_rowids(
+                connection,
+                "direct_solana_hydration_queue",
+                eligible_queue_rowids,
+            )
+            next_queue_cursor = (
+                int(queue_scan_rows[-1][0])
+                if queue_scan_rows
+                and len(queue_scan_rows) >= storage_capacity.MAINTENANCE_BATCH_ROWS
+                else 0
+            )
+
+            metric_scan_rows = connection.execute(
                 "SELECT rowid, hydrated_at, historical_recovery "
                 "FROM direct_solana_hydration_metrics WHERE rowid>? "
                 "ORDER BY rowid LIMIT ?",
-                (cursor, storage_capacity.MAINTENANCE_BATCH_ROWS),
+                (metric_cursor, storage_capacity.MAINTENANCE_BATCH_ROWS),
             ).fetchall()
-            eligible_rowids = [
+            eligible_metric_rowids = [
                 int(row[0])
-                for row in scan_rows
+                for row in metric_scan_rows
                 if int(row[2] or 0) == 0 and str(row[1]) < metric_cutoff
             ]
-            metric_rows = _delete_metric_rowids(connection, eligible_rowids)
-
-            next_cursor = (
-                int(scan_rows[-1][0])
-                if scan_rows and len(scan_rows) >= storage_capacity.MAINTENANCE_BATCH_ROWS
+            metric_rows = _delete_rowids(
+                connection,
+                "direct_solana_hydration_metrics",
+                eligible_metric_rowids,
+            )
+            next_metric_cursor = (
+                int(metric_scan_rows[-1][0])
+                if metric_scan_rows
+                and len(metric_scan_rows) >= storage_capacity.MAINTENANCE_BATCH_ROWS
                 else 0
             )
+
             connection.execute(
                 "UPDATE direct_solana_storage_maintenance_cursor SET "
-                "metric_scan_rowid=?, last_scan_rows=?, last_scan_at=? WHERE id=1",
-                (next_cursor, len(scan_rows), now.isoformat()),
+                "queue_scan_rowid=?, metric_scan_rowid=?, "
+                "last_queue_scan_rows=?, last_scan_rows=?, last_scan_at=? WHERE id=1",
+                (
+                    next_queue_cursor,
+                    next_metric_cursor,
+                    len(queue_scan_rows),
+                    len(metric_scan_rows),
+                    now.isoformat(),
+                ),
             )
             connection.execute(
                 "UPDATE direct_solana_storage_maintenance SET "
@@ -184,7 +241,10 @@ def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
         # the in-process evidence lock. The worker will retry on its normal cadence.
         _state_inc("prune_busy_deferrals")
         _state_error(exc)
-        _record_error(connection, f"{type(exc).__name__}: isolated storage maintenance deferred")
+        _record_error(
+            connection,
+            f"{type(exc).__name__}: isolated storage maintenance deferred",
+        )
         return 0, 0
     finally:
         connection.close()
@@ -203,7 +263,8 @@ def _checkpoint_wal_isolated(self: Any) -> tuple[int, int, int] | None:
         with connection:
             connection.execute(
                 "UPDATE direct_solana_storage_maintenance SET last_checkpoint_at=?, "
-                "last_checkpoint_busy=?, last_checkpoint_log=?, last_checkpointed=?, last_error=NULL WHERE id=1",
+                "last_checkpoint_busy=?, last_checkpoint_log=?, last_checkpointed=?, "
+                "last_error=NULL WHERE id=1",
                 (now.isoformat(), result[0], result[1], result[2]),
             )
         _state_error(None)
@@ -211,7 +272,10 @@ def _checkpoint_wal_isolated(self: Any) -> tuple[int, int, int] | None:
     except sqlite3.OperationalError as exc:
         _state_inc("checkpoint_busy_deferrals")
         _state_error(exc)
-        _record_error(connection, f"{type(exc).__name__}: isolated WAL checkpoint deferred")
+        _record_error(
+            connection,
+            f"{type(exc).__name__}: isolated WAL checkpoint deferred",
+        )
         return None
     finally:
         connection.close()
@@ -220,11 +284,10 @@ def _checkpoint_wal_isolated(self: Any) -> tuple[int, int, int] | None:
 async def _bounded_storage_maintenance_worker(self: Any, stop: asyncio.Event) -> None:
     """Run at most one bounded maintenance batch per normal 60-second interval.
 
-    The former drain mode retried every 100 ms while any old rows remained, turning
+    The former drain mode retried every 100 ms while old rows remained, turning
     startup backlog size into sustained database I/O and dirty/writeback pressure.
-    Retention semantics are unchanged: each pass still applies the same predicates
-    and the durable metric cursor guarantees later batches remain reachable. Only
-    the housekeeping I/O rate is bounded so backlog cannot monopolize the cgroup.
+    Retention semantics are unchanged. Only housekeeping I/O rate is bounded so
+    backlog cannot monopolize the cgroup.
     """
 
     next_checkpoint = 0.0
@@ -239,10 +302,16 @@ async def _bounded_storage_maintenance_worker(self: Any, stop: asyncio.Event) ->
             if queue_rows or metric_rows:
                 drained_since_checkpoint = True
             now_mono = time.monotonic()
-            drain_complete = not queue_rows and not metric_rows and drained_since_checkpoint
+            drain_complete = (
+                not queue_rows
+                and not metric_rows
+                and drained_since_checkpoint
+            )
             if now_mono >= next_checkpoint or drain_complete:
                 await asyncio.to_thread(storage_capacity._checkpoint_wal, self)
-                next_checkpoint = now_mono + storage_capacity.WAL_CHECKPOINT_INTERVAL_SECONDS
+                next_checkpoint = (
+                    now_mono + storage_capacity.WAL_CHECKPOINT_INTERVAL_SECONDS
+                )
                 drained_since_checkpoint = False
         except asyncio.CancelledError:
             raise
@@ -251,7 +320,8 @@ async def _bounded_storage_maintenance_worker(self: Any, stop: asyncio.Event) ->
                 await asyncio.to_thread(storage_capacity._ensure_maintenance_state, self)
                 with self.store._lock, self.store.db:
                     self.store.db.execute(
-                        "UPDATE direct_solana_storage_maintenance SET last_error=? WHERE id=1",
+                        "UPDATE direct_solana_storage_maintenance "
+                        "SET last_error=? WHERE id=1",
                         (f"{type(exc).__name__}: storage maintenance failed",),
                     )
             except Exception:
@@ -295,22 +365,38 @@ def install_storage_maintenance_lock_isolation() -> None:
     current_worker = storage_capacity._storage_maintenance_worker
     prune_ok = bool(
         (
-            getattr(current_prune, "_roi_storage_maintenance_lock_isolation", False)
+            getattr(
+                current_prune,
+                "_roi_storage_maintenance_lock_isolation",
+                False,
+            )
             and getattr(current_prune, "_roi_storage_maintenance_bounded_io", False)
         )
         or getattr(current_prune, "_roi_sqlite_phase_observed", False)
     )
     checkpoint_ok = bool(
-        getattr(current_checkpoint, "_roi_storage_maintenance_lock_isolation", False)
+        getattr(
+            current_checkpoint,
+            "_roi_storage_maintenance_lock_isolation",
+            False,
+        )
         or getattr(current_checkpoint, "_roi_sqlite_phase_observed", False)
     )
     worker_ok = bool(
-        getattr(current_worker, "_roi_storage_maintenance_bounded_cadence", False)
+        getattr(
+            current_worker,
+            "_roi_storage_maintenance_bounded_cadence",
+            False,
+        )
     )
     if not (prune_ok and checkpoint_ok and worker_ok):
-        storage_capacity._prune_operational_rows_once = _prune_operational_rows_once_isolated
+        storage_capacity._prune_operational_rows_once = (
+            _prune_operational_rows_once_isolated
+        )
         storage_capacity._checkpoint_wal = _checkpoint_wal_isolated
-        storage_capacity._storage_maintenance_worker = _bounded_storage_maintenance_worker
+        storage_capacity._storage_maintenance_worker = (
+            _bounded_storage_maintenance_worker
+        )
     with _STATE_LOCK:
         _STATE["installed"] = True
 
@@ -331,10 +417,13 @@ def status() -> dict[str, Any]:
         "bounded_io_version": BOUNDED_IO_VERSION,
         "maintenance_connection": "dedicated_sqlite_wal_connection",
         "maintenance_busy_timeout_ms": MAINTENANCE_BUSY_TIMEOUT_MS,
+        "queue_scan_mode": "durable_rowid_keyset",
+        "queue_scan_max_rows_per_pass": storage_capacity.MAINTENANCE_BATCH_ROWS,
         "metric_scan_mode": "durable_rowid_keyset",
         "metric_scan_max_rows_per_pass": storage_capacity.MAINTENANCE_BATCH_ROWS,
         "backlog_drain_interval_seconds": storage_capacity.MAINTENANCE_IDLE_SECONDS,
         "aggressive_100ms_backlog_drain_disabled": True,
+        "queue_deletion_predicate_changed": False,
         "metric_deletion_predicate_changed": False,
         "canonical_store_python_lock_acquired_by_retention_prune": False,
         "canonical_store_python_lock_acquired_by_wal_checkpoint": False,
