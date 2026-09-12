@@ -11,7 +11,7 @@ from typing import Any
 from .observation_store import ObservationEventStore
 
 
-REPAIR_VERSION = "shadow-price-tracked-mints-incremental-state-v2"
+REPAIR_VERSION = "shadow-price-tracked-mints-incremental-state-v3-monotonic"
 BOOTSTRAP_BATCH_ROWS = 5_000
 STATE_PRUNE_BATCH_ROWS = 1_000
 STATE_PRUNE_INTERVAL_SECONDS = 60.0
@@ -80,7 +80,8 @@ def _ensure_state(store: ObservationEventStore) -> None:
             f"INSERT INTO {_STATE_TABLE}(token_mint, observed_at, source_rowid) "
             "VALUES (NEW.token_mint, NEW.observed_at, NEW.rowid) "
             "ON CONFLICT(token_mint) DO UPDATE SET "
-            "observed_at=excluded.observed_at, source_rowid=excluded.source_rowid; "
+            "observed_at=excluded.observed_at, source_rowid=excluded.source_rowid "
+            f"WHERE excluded.source_rowid > {_STATE_TABLE}.source_rowid; "
             "END"
         )
 
@@ -184,7 +185,8 @@ def _advance_bootstrap(
             store.db.executemany(
                 f"INSERT INTO {_STATE_TABLE}(token_mint, observed_at, source_rowid) "
                 "VALUES (?, ?, ?) ON CONFLICT(token_mint) DO UPDATE SET "
-                "observed_at=excluded.observed_at, source_rowid=excluded.source_rowid",
+                "observed_at=excluded.observed_at, source_rowid=excluded.source_rowid "
+                f"WHERE excluded.source_rowid > {_STATE_TABLE}.source_rowid",
                 recent,
             )
         store.db.execute(
