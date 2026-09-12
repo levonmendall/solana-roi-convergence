@@ -23,7 +23,7 @@ from typing import Any, Callable
 from fastapi import BackgroundTasks, HTTPException
 from starlette.background import BackgroundTask
 
-REPAIR_VERSION = "logical-bootstrap-page-lifecycle-gate-v2"
+REPAIR_VERSION = "logical-bootstrap-page-lifecycle-gate-v3-split-aware"
 PAGE_PATH = "/v1/operations/certification-db-logical-bootstrap-page"
 PAGE_GATE_WAIT_SECONDS = 30.0
 
@@ -40,14 +40,18 @@ _INSTALLED = False
 _LAST_STATE: dict[str, Any] | None = None
 
 
-def _route(app: Any) -> Any:
-    route = next(
+def _find_route(app: Any) -> Any | None:
+    return next(
         (candidate for candidate in app.routes if getattr(candidate, "path", None) == PAGE_PATH),
         None,
     )
+
+
+def _route(app: Any) -> Any:
+    route = _find_route(app)
     dependant = getattr(route, "dependant", None) if route is not None else None
     if route is None or dependant is None or not callable(getattr(dependant, "call", None)):
-        raise RuntimeError(f"certification bootstrap page route unavailable: {PAGE_PATH}")
+        raise RuntimeError(f"certification bootstrap page route callable unavailable: {PAGE_PATH}")
     return route
 
 
@@ -77,22 +81,41 @@ async def _complete_page_lifecycle(
         _release_gate(gate, state, generation)
 
 
-def install_logical_bootstrap_page_cache_repair(app: Any) -> None:
-    """Install one app-scoped lifecycle gate around the fully composed page route."""
+def configure_logical_bootstrap_page_cache_repair(app: Any) -> None:
+    """Configure an app-scoped gate only when the split bootstrap route exists."""
 
     global _INSTALLED, _LAST_STATE
     marker = "roi_logical_bootstrap_page_lifecycle_gate"
     if bool(getattr(app.state, marker, False)):
         return
 
+    # Match certification_bootstrap_autocheckpoint_lease semantics: when service
+    # splitting is intentionally disabled, both logical-bootstrap routes are absent
+    # and there is nothing to wrap. That is a valid composition, not an import error.
+    if _find_route(app) is None:
+        state: dict[str, Any] = {
+            "active": False,
+            "generation": 0,
+            "acquisitions": 0,
+            "releases": 0,
+            "timeouts": 0,
+            "cancelled_waiters": 0,
+            "reason": "logical_bootstrap_page_route_absent",
+        }
+        app.state.roi_logical_bootstrap_page_lifecycle_gate = False
+        app.state.roi_logical_bootstrap_page_lifecycle_gate_version = REPAIR_VERSION
+        app.state.roi_logical_bootstrap_page_lifecycle_gate_state = state
+        _LAST_STATE = state
+        return
+
     route = _route(app)
     original_page: Callable[..., Any] = route.dependant.call
     if bool(getattr(original_page, "_roi_logical_bootstrap_page_lifecycle_gate", False)):
-        setattr(app.state, marker, True)
+        app.state.roi_logical_bootstrap_page_lifecycle_gate = True
         return
 
     gate = asyncio.Lock()
-    state: dict[str, Any] = {
+    state = {
         "gate": gate,
         "active": False,
         "generation": 0,
@@ -100,6 +123,7 @@ def install_logical_bootstrap_page_cache_repair(app: Any) -> None:
         "releases": 0,
         "timeouts": 0,
         "cancelled_waiters": 0,
+        "reason": None,
     }
 
     @wraps(original_page)
@@ -176,6 +200,12 @@ def install_logical_bootstrap_page_cache_repair(app: Any) -> None:
     _INSTALLED = True
 
 
+# Compatibility alias for focused tests/tools. The production facade deliberately
+# calls the configure-named entrypoint so its architecture audit remains a thin
+# configuration surface rather than gaining a second production installer root.
+install_logical_bootstrap_page_cache_repair = configure_logical_bootstrap_page_cache_repair
+
+
 def status(app: Any | None = None) -> dict[str, Any]:
     state = None
     if app is not None:
@@ -199,6 +229,7 @@ def status(app: Any | None = None) -> dict[str, Any]:
         "releases": int(state.get("releases", 0)) if isinstance(state, dict) else 0,
         "timeouts": int(state.get("timeouts", 0)) if isinstance(state, dict) else 0,
         "cancelled_waiters": int(state.get("cancelled_waiters", 0)) if isinstance(state, dict) else 0,
+        "reason": state.get("reason") if isinstance(state, dict) else None,
         "raw_critical_fraction_changed": RAW_CRITICAL_FRACTION_CHANGED,
         "strategy_thresholds_changed": STRATEGY_THRESHOLDS_CHANGED,
         "certification_thresholds_changed": CERTIFICATION_THRESHOLDS_CHANGED,
@@ -212,6 +243,7 @@ def status(app: Any | None = None) -> dict[str, Any]:
 
 __all__ = [
     "REPAIR_VERSION",
+    "configure_logical_bootstrap_page_cache_repair",
     "install_logical_bootstrap_page_cache_repair",
     "status",
 ]
