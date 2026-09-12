@@ -10,8 +10,10 @@ from . import continuity_storage_capacity_repair as storage_capacity
 from . import direct_solana as direct_solana_module
 
 
-REPAIR_VERSION = "storage-maintenance-lock-isolation-v1"
+REPAIR_VERSION = "storage-maintenance-lock-isolation-v2-bounded-rowid-cursor"
+BOUNDED_IO_VERSION = "storage-maintenance-bounded-rowid-cursor-v1"
 MAINTENANCE_BUSY_TIMEOUT_MS = 250
+DELETE_CHUNK_ROWS = 400
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -58,6 +60,16 @@ def _ensure_state(connection: sqlite3.Connection) -> None:
         connection.execute(
             "INSERT OR IGNORE INTO direct_solana_storage_maintenance(id) VALUES (1)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS direct_solana_storage_maintenance_cursor ("
+            "id INTEGER PRIMARY KEY CHECK(id=1), "
+            "metric_scan_rowid INTEGER NOT NULL DEFAULT 0, "
+            "last_scan_rows INTEGER NOT NULL DEFAULT 0, "
+            "last_scan_at TEXT)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO direct_solana_storage_maintenance_cursor(id) VALUES (1)"
+        )
 
 
 def _state_inc(name: str) -> None:
@@ -81,14 +93,31 @@ def _record_error(connection: sqlite3.Connection, message: str) -> None:
         return
 
 
-def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
-    """Prune disposable operational rows without acquiring the canonical store lock.
+def _delete_metric_rowids(connection: sqlite3.Connection, rowids: list[int]) -> int:
+    deleted = 0
+    for start in range(0, len(rowids), DELETE_CHUNK_ROWS):
+        chunk = rowids[start : start + DELETE_CHUNK_ROWS]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" for _ in chunk)
+        cur = connection.execute(
+            f"DELETE FROM direct_solana_hydration_metrics WHERE rowid IN ({placeholders})",
+            tuple(chunk),
+        )
+        deleted += int(cur.rowcount or 0)
+    return deleted
 
-    The production store uses one Python RLock around its shared SQLite connection.
-    Retention maintenance is not candidate/evidence authority, so it must not hold
-    that lock while scanning a large persistent database. A dedicated WAL connection
-    lets canonical readers proceed concurrently and defers quickly if another writer
-    currently owns SQLite's write lock.
+
+def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
+    """Prune disposable operational rows with bounded SQLite work.
+
+    Maintenance stays on its dedicated WAL connection and never takes the canonical
+    evidence-store Python lock. Hydration-metric retention now advances a durable
+    physical-row cursor through at most the existing maintenance batch per pass,
+    rather than scanning/sorting the complete historical metric table each time.
+    The eligibility predicate is unchanged: only non-historical rows older than the
+    same retention cutoff can be deleted. The cursor wraps at end-of-table so every
+    surviving and newly appended row remains eligible for future inspection.
     """
 
     _state_inc("prune_attempts")
@@ -110,15 +139,35 @@ def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
                 "ORDER BY updated_at, signature LIMIT ?)",
                 (queue_cutoff, storage_capacity.MAINTENANCE_BATCH_ROWS),
             )
-            metric_cur = connection.execute(
-                "DELETE FROM direct_solana_hydration_metrics WHERE signature IN ("
-                "SELECT signature FROM direct_solana_hydration_metrics "
-                "WHERE historical_recovery=0 AND hydrated_at<? "
-                "ORDER BY hydrated_at, signature LIMIT ?)",
-                (metric_cutoff, storage_capacity.MAINTENANCE_BATCH_ROWS),
-            )
             queue_rows = int(queue_cur.rowcount or 0)
-            metric_rows = int(metric_cur.rowcount or 0)
+
+            cursor_row = connection.execute(
+                "SELECT metric_scan_rowid FROM direct_solana_storage_maintenance_cursor WHERE id=1"
+            ).fetchone()
+            cursor = int(cursor_row[0]) if cursor_row is not None else 0
+            scan_rows = connection.execute(
+                "SELECT rowid, hydrated_at, historical_recovery "
+                "FROM direct_solana_hydration_metrics WHERE rowid>? "
+                "ORDER BY rowid LIMIT ?",
+                (cursor, storage_capacity.MAINTENANCE_BATCH_ROWS),
+            ).fetchall()
+            eligible_rowids = [
+                int(row[0])
+                for row in scan_rows
+                if int(row[2] or 0) == 0 and str(row[1]) < metric_cutoff
+            ]
+            metric_rows = _delete_metric_rowids(connection, eligible_rowids)
+
+            next_cursor = (
+                int(scan_rows[-1][0])
+                if scan_rows and len(scan_rows) >= storage_capacity.MAINTENANCE_BATCH_ROWS
+                else 0
+            )
+            connection.execute(
+                "UPDATE direct_solana_storage_maintenance_cursor SET "
+                "metric_scan_rowid=?, last_scan_rows=?, last_scan_at=? WHERE id=1",
+                (next_cursor, len(scan_rows), now.isoformat()),
+            )
             connection.execute(
                 "UPDATE direct_solana_storage_maintenance SET "
                 "queue_rows_pruned=queue_rows_pruned+?, metric_rows_pruned=metric_rows_pruned+?, "
@@ -172,6 +221,11 @@ setattr(
     True,
 )
 setattr(
+    _prune_operational_rows_once_isolated,
+    "_roi_storage_maintenance_bounded_io",
+    True,
+)
+setattr(
     _checkpoint_wal_isolated,
     "_roi_storage_maintenance_lock_isolation",
     True,
@@ -179,12 +233,13 @@ setattr(
 
 
 def install_storage_maintenance_lock_isolation() -> None:
-    """Remove housekeeping work from the canonical evidence-store Python lock."""
+    """Compose isolated, bounded housekeeping plus read-only phase attribution."""
 
     current_prune = storage_capacity._prune_operational_rows_once
     current_checkpoint = storage_capacity._checkpoint_wal
     already_installed = bool(
         getattr(current_prune, "_roi_storage_maintenance_lock_isolation", False)
+        and getattr(current_prune, "_roi_storage_maintenance_bounded_io", False)
         and getattr(current_checkpoint, "_roi_storage_maintenance_lock_isolation", False)
     )
     if not already_installed:
@@ -193,6 +248,13 @@ def install_storage_maintenance_lock_isolation() -> None:
     with _STATE_LOCK:
         _STATE["installed"] = True
 
+    # This existing canonical composition installer is the final owner of the
+    # maintenance functions. Install read-only phase attribution only after those
+    # final delegates exist so instrumentation cannot be overwritten by composition.
+    from .sqlite_phase_observability import install_sqlite_phase_observability
+
+    install_sqlite_phase_observability()
+
 
 def status() -> dict[str, Any]:
     with _STATE_LOCK:
@@ -200,8 +262,12 @@ def status() -> dict[str, Any]:
     return {
         **state,
         "repair_version": REPAIR_VERSION,
+        "bounded_io_version": BOUNDED_IO_VERSION,
         "maintenance_connection": "dedicated_sqlite_wal_connection",
         "maintenance_busy_timeout_ms": MAINTENANCE_BUSY_TIMEOUT_MS,
+        "metric_scan_mode": "durable_rowid_keyset",
+        "metric_scan_max_rows_per_pass": storage_capacity.MAINTENANCE_BATCH_ROWS,
+        "metric_deletion_predicate_changed": False,
         "canonical_store_python_lock_acquired_by_retention_prune": False,
         "canonical_store_python_lock_acquired_by_wal_checkpoint": False,
         "canonical_evidence_pruned": CANONICAL_EVIDENCE_PRUNED,
@@ -214,6 +280,8 @@ def status() -> dict[str, Any]:
 
 
 __all__ = [
+    "BOUNDED_IO_VERSION",
+    "DELETE_CHUNK_ROWS",
     "MAINTENANCE_BUSY_TIMEOUT_MS",
     "REPAIR_VERSION",
     "_checkpoint_wal_isolated",
