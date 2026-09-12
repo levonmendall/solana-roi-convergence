@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,11 @@ from typing import Any
 from .observation_store import ObservationEventStore
 
 
-REPAIR_VERSION = "shadow-price-tracked-mints-incremental-state-v1"
+REPAIR_VERSION = "shadow-price-tracked-mints-incremental-state-v2"
 BOOTSTRAP_BATCH_ROWS = 5_000
+STATE_PRUNE_BATCH_ROWS = 1_000
+STATE_PRUNE_INTERVAL_SECONDS = 60.0
+STEADY_TELEMETRY_INTERVAL_SECONDS = 60.0
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -22,7 +26,10 @@ _STATE_TABLE = "shadow_price_tracked_mints_state"
 _META_TABLE = "shadow_price_tracked_mints_meta"
 _TRIGGER = "trg_shadow_price_track_first_touch"
 _INSTALL_LOCK = threading.Lock()
+_TELEMETRY_LOCK = threading.Lock()
 _INSTALLED = False
+_LAST_PRUNE_MONOTONIC = 0.0
+_LAST_STEADY_TELEMETRY_MONOTONIC = 0.0
 _ORIGINAL_TRACKED_MINTS = ObservationEventStore.tracked_mints
 
 
@@ -66,9 +73,7 @@ def _ensure_state(store: ObservationEventStore) -> None:
             "last_batch_rows INTEGER NOT NULL DEFAULT 0, "
             "last_batch_at TEXT)"
         )
-        store.db.execute(
-            f"INSERT OR IGNORE INTO {_META_TABLE}(id) VALUES (1)"
-        )
+        store.db.execute(f"INSERT OR IGNORE INTO {_META_TABLE}(id) VALUES (1)")
         store.db.execute(
             f"CREATE TRIGGER IF NOT EXISTS {_TRIGGER} "
             "AFTER INSERT ON token_first_touches BEGIN "
@@ -129,6 +134,9 @@ def _read_source_batch(
         ).fetchall()
     finally:
         reader.close()
+        # Bootstrap is the only time we must inspect pre-repair history. Release the
+        # canonical DB's clean file cache after each bounded batch so migration work
+        # cannot accumulate toward the 2 GiB cgroup ceiling.
         _release_db_file_cache(path)
 
 
@@ -187,6 +195,42 @@ def _advance_bootstrap(
     return complete, len(rows), next_cursor
 
 
+def _prune_expired_state_if_due(
+    store: ObservationEventStore,
+    *,
+    cutoff: str,
+) -> int:
+    global _LAST_PRUNE_MONOTONIC
+    now_mono = time.monotonic()
+    with _TELEMETRY_LOCK:
+        if now_mono - _LAST_PRUNE_MONOTONIC < STATE_PRUNE_INTERVAL_SECONDS:
+            return 0
+        _LAST_PRUNE_MONOTONIC = now_mono
+    with store._lock, store.db:
+        cursor = store.db.execute(
+            f"DELETE FROM {_STATE_TABLE} WHERE rowid IN ("
+            f"SELECT rowid FROM {_STATE_TABLE} WHERE observed_at<? "
+            "ORDER BY observed_at LIMIT ?)",
+            (cutoff, STATE_PRUNE_BATCH_ROWS),
+        )
+    return int(cursor.rowcount or 0)
+
+
+def _should_emit_telemetry(*, ready: bool, batch_rows: int) -> bool:
+    global _LAST_STEADY_TELEMETRY_MONOTONIC
+    if not ready or batch_rows:
+        return True
+    now_mono = time.monotonic()
+    with _TELEMETRY_LOCK:
+        if (
+            now_mono - _LAST_STEADY_TELEMETRY_MONOTONIC
+            < STEADY_TELEMETRY_INTERVAL_SECONDS
+        ):
+            return False
+        _LAST_STEADY_TELEMETRY_MONOTONIC = now_mono
+        return True
+
+
 def _bounded_tracked_mints(
     self: ObservationEventStore,
     *,
@@ -197,10 +241,11 @@ def _bounded_tracked_mints(
     from .sqlite_phase_observability import emit_phase, resource_snapshot
 
     before = resource_snapshot(self)
-    started = __import__("time").perf_counter()
+    started = time.perf_counter()
     ready = False
     batch_rows = 0
     cursor = 0
+    pruned_rows = 0
     try:
         ready, batch_rows, cursor = _advance_bootstrap(
             self,
@@ -211,6 +256,7 @@ def _bounded_tracked_mints(
             return []
 
         cutoff = (as_of - timedelta(seconds=float(horizon_seconds))).isoformat()
+        pruned_rows = _prune_expired_state_if_due(self, cutoff=cutoff)
         with self._lock:
             rows = self.db.execute(
                 f"SELECT token_mint FROM {_STATE_TABLE} WHERE observed_at>=? "
@@ -219,21 +265,23 @@ def _bounded_tracked_mints(
             ).fetchall()
         return [str(row["token_mint"]) for row in rows]
     finally:
-        after = resource_snapshot(self)
-        emit_phase(
-            "shadow-price-clock:tracked-mints",
-            before=before,
-            after=after,
-            duration_ms=(__import__("time").perf_counter() - started) * 1000.0,
-            detail={
-                "bootstrap_ready": ready,
-                "bootstrap_batch_rows": batch_rows,
-                "bootstrap_cursor": cursor,
-                "horizon_seconds": float(horizon_seconds),
-                "limit": int(limit),
-                "history_scaled_query_removed": True,
-            },
-        )
+        if _should_emit_telemetry(ready=ready, batch_rows=batch_rows):
+            after = resource_snapshot(self)
+            emit_phase(
+                "shadow-price-clock:tracked-mints",
+                before=before,
+                after=after,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                detail={
+                    "bootstrap_ready": ready,
+                    "bootstrap_batch_rows": batch_rows,
+                    "bootstrap_cursor": cursor,
+                    "expired_state_rows_pruned": pruned_rows,
+                    "horizon_seconds": float(horizon_seconds),
+                    "limit": int(limit),
+                    "history_scaled_query_removed": True,
+                },
+            )
 
 
 setattr(_bounded_tracked_mints, "_roi_shadow_tracked_mints_bounded", True)
@@ -258,6 +306,9 @@ def status(store: ObservationEventStore | None = None) -> dict[str, Any]:
         "startup_full_history_index_build": False,
         "history_scaled_per_tick_query_removed": True,
         "bootstrap_fail_closed_until_exact": True,
+        "state_prune_batch_rows": STATE_PRUNE_BATCH_ROWS,
+        "state_prune_interval_seconds": STATE_PRUNE_INTERVAL_SECONDS,
+        "steady_telemetry_interval_seconds": STEADY_TELEMETRY_INTERVAL_SECONDS,
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
         "signing_available": SIGNING_AVAILABLE,
@@ -275,6 +326,7 @@ def status(store: ObservationEventStore | None = None) -> dict[str, Any]:
 __all__ = [
     "BOOTSTRAP_BATCH_ROWS",
     "REPAIR_VERSION",
+    "STATE_PRUNE_BATCH_ROWS",
     "_advance_bootstrap",
     "_bounded_tracked_mints",
     "install_shadow_price_tracking_state_repair",
