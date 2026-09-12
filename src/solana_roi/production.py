@@ -16,6 +16,7 @@ import asyncio
 
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
 from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
+from .logical_bootstrap_page_cache_repair import configure_logical_bootstrap_page_cache_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 
 # Keep authoritative certification-replica requests below the certifier's bounded
@@ -46,6 +47,13 @@ from .production_system import (
 )
 from .startup_retention_cleanup import run_safe_retention_cleanup
 from . import legacy_production_composition as _legacy_production
+
+# The production system has now composed the complete logical-bootstrap route stack.
+# When service splitting is enabled, configure one lifecycle gate around that final
+# page endpoint so the next page waits for the prior post-send cache cleanup. When
+# splitting is intentionally disabled the route is absent and configuration is a
+# documented no-op. No authority or resource threshold changes here.
+configure_logical_bootstrap_page_cache_repair(app)
 
 # This call only registers the bounded stale-export cleanup on the already-canonical
 # FastAPI lifespan. Registration is storage-non-mutating; actual cleanup executes at
