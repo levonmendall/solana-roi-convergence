@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from solana_roi import continuity_storage_capacity_repair as storage_capacity
 from solana_roi import sqlite_phase_observability as phase_observability
 from solana_roi.continuity_storage_capacity_repair import MAINTENANCE_BATCH_ROWS
 from solana_roi.direct_solana import DirectSolanaJournal
@@ -132,6 +134,28 @@ def test_bounded_isolated_prune_preserves_historical_and_recent_rows(tmp_path: P
     assert historical == 37
     assert recent == 41
     store.db.close()
+
+
+def test_storage_maintenance_backlog_cannot_spin_at_startup(monkeypatch) -> None:
+    """A historical backlog gets one bounded batch per normal maintenance interval."""
+    observed_timeouts: list[float] = []
+    stop = asyncio.Event()
+    plane = SimpleNamespace(store=SimpleNamespace())
+
+    monkeypatch.setattr(storage_capacity, "_prune_operational_rows_once", lambda _self: (1, 1))
+    monkeypatch.setattr(storage_capacity, "_checkpoint_wal", lambda _self: (0, 0, 0))
+
+    async def fake_wait_for(awaitable, *, timeout: float):
+        observed_timeouts.append(float(timeout))
+        if hasattr(awaitable, "close"):
+            awaitable.close()
+        stop.set()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(storage_capacity.asyncio, "wait_for", fake_wait_for)
+    asyncio.run(storage_capacity._storage_maintenance_worker(plane, stop))
+
+    assert observed_timeouts == [storage_capacity.MAINTENANCE_IDLE_SECONDS]
 
 
 def test_phase_snapshot_separates_cache_writeback_wal_io_and_process_bounds(
