@@ -30,8 +30,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import BackgroundTasks, HTTPException
+from starlette.concurrency import run_in_threadpool
 
-LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v5-async-route-wrapper"
+LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v6-bounded-sync-offload"
 DEFAULT_IDLE_SECONDS = 45.0
 MIN_IDLE_SECONDS = 35.0
 MAX_IDLE_SECONDS = 120.0
@@ -442,9 +443,11 @@ def _replace_route_call(route: Any, endpoint: Callable[..., Any]) -> None:
 
 
 async def _call_endpoint_inline(endpoint: Callable[..., Any], **kwargs: Any) -> Any:
-    """Invoke a registered endpoint without entering Starlette/AnyIO's sync worker pool."""
+    """Keep async endpoints on-loop and run synchronous endpoint bodies in AnyIO's bounded pool."""
 
-    result = endpoint(**kwargs)
+    if inspect.iscoroutinefunction(endpoint):
+        return await endpoint(**kwargs)
+    result = await run_in_threadpool(endpoint, **kwargs)
     if inspect.isawaitable(result):
         return await result
     return result
@@ -590,7 +593,7 @@ def status() -> dict[str, Any]:
         "module_global_logical_functions_mutated": False,
         "route_wrappers_async": True,
         "background_tasks_forwarded": True,
-        "anyio_sync_worker_route_wrapper": False,
+        "anyio_sync_worker_route_wrapper": True,
         "preworker_lease_priming": True,
         "preworker_checkpoint_enabled": False,
         "preworker_unconditional_checkpoint_enabled": False,
