@@ -32,7 +32,7 @@ from typing import Any, Callable
 from fastapi import BackgroundTasks, HTTPException
 from starlette.concurrency import run_in_threadpool
 
-LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v6-bounded-sync-offload"
+LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v7-route-lifecycle-offload"
 DEFAULT_IDLE_SECONDS = 45.0
 MIN_IDLE_SECONDS = 35.0
 MAX_IDLE_SECONDS = 120.0
@@ -537,12 +537,12 @@ def install_certification_bootstrap_autocheckpoint_lease(
     ) -> dict[str, Any]:
         replication._require_shared_token(x_certification_token)
         store = _runtime_store(provider)
-        refresh(store)
+        await run_in_threadpool(refresh, store)
         payload = await _call_endpoint_inline(
             original_manifest,
             x_certification_token=x_certification_token,
         )
-        set_manifest_tables(store, payload)
+        await run_in_threadpool(set_manifest_tables, store, payload)
         return payload
 
     setattr(manifest_endpoint, "_roi_bootstrap_autocheckpoint_lease", True)
@@ -559,7 +559,7 @@ def install_certification_bootstrap_autocheckpoint_lease(
     ) -> dict[str, Any]:
         replication._require_shared_token(x_certification_token)
         store = _runtime_store(provider)
-        refresh(store)
+        await run_in_threadpool(refresh, store)
         payload = await _call_endpoint_inline(
             original_page,
             background_tasks=background_tasks,
@@ -570,7 +570,7 @@ def install_certification_bootstrap_autocheckpoint_lease(
             limit=limit,
             x_certification_token=x_certification_token,
         )
-        finish_if_complete(store, payload)
+        await run_in_threadpool(finish_if_complete, store, payload)
         return payload
 
     setattr(page_endpoint, "_roi_bootstrap_autocheckpoint_lease", True)
@@ -594,6 +594,7 @@ def status() -> dict[str, Any]:
         "route_wrappers_async": True,
         "background_tasks_forwarded": True,
         "anyio_sync_worker_route_wrapper": True,
+        "lease_route_state_offloop": True,
         "preworker_lease_priming": True,
         "preworker_checkpoint_enabled": False,
         "preworker_unconditional_checkpoint_enabled": False,
