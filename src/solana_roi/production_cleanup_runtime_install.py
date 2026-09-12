@@ -27,12 +27,15 @@ from . import production_disk_ownership as disk_ownership
 from . import render_runtime_bootstrap_repair as bootstrap
 from .cleanup_target_probe import probe_cleanup_target
 
-INSTALL_VERSION = "production-data-cleanup-runtime-install-v5-prebootstrap-target-probe"
+INSTALL_VERSION = "production-data-cleanup-runtime-install-v6-full-runtime-worker-proof"
 STATUS_PATH = "/v1/operations/production-data-cleanup"
 _REGISTRATION_ATTR = "roi_production_data_cleanup_runtime_registered"
 _LOG = logging.getLogger("solana_roi.production_data_cleanup")
+FULL_RUNTIME_SETTLE_SECONDS = 0.50
 
 BootstrapCallable = Callable[[asyncio.Event], Awaitable[None]]
+WorkerCallable = Callable[[Any, asyncio.Event], Awaitable[None]]
+_ORIGINAL_RUNTIME_WORKERS: WorkerCallable | None = None
 
 
 def _env_true(name: str) -> bool:
@@ -58,6 +61,7 @@ def _disabled_state() -> dict[str, Any]:
         "same_release_lease_establishment_required": True,
         "runtime_quiesced_until_cleanup_complete": True,
         "liveness_available_during_cleanup": True,
+        "full_runtime_requires_live_worker_chain": True,
         "paper_only": True,
         "live_money_authority": False,
         "signing_available": False,
@@ -128,6 +132,7 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
         "same_release_lease_establishment_required": True,
         "runtime_quiesced_until_cleanup_complete": True,
         "liveness_available_during_cleanup": True,
+        "full_runtime_requires_live_worker_chain": True,
         "paper_only": True,
         "live_money_authority": False,
         "signing_available": False,
@@ -139,6 +144,90 @@ def _emit(prefix: str, payload: dict[str, Any]) -> None:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     print(f"{prefix} {raw}", flush=True)
     _LOG.warning("%s %s", prefix, raw)
+
+
+async def _runtime_workers_with_full_runtime_marker(runtime: Any, stop: asyncio.Event) -> None:
+    """Publish ``full_runtime`` only after the final composed worker chain stays live.
+
+    The production cleanup installer is registered after the production composition
+    root is complete, so the delegate captured here is the final worker chain: Batch 9,
+    certification publishers/split, WAL lease and the canonical Solana workers. Run
+    that chain as one owned task and require it to remain alive for a short bounded
+    settle interval. A chain that exits or raises during startup never establishes the
+    cleanup eligibility state.
+    """
+
+    original = _ORIGINAL_RUNTIME_WORKERS
+    if original is None:
+        raise RuntimeError("cleanup full-runtime marker missing canonical worker chain")
+
+    worker_task = asyncio.create_task(
+        original(runtime, stop),
+        name="canonical-runtime-workers-full-runtime-proof",
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            {worker_task},
+            timeout=FULL_RUNTIME_SETTLE_SECONDS,
+        )
+        if worker_task in done:
+            await worker_task
+            return
+
+        if (
+            not stop.is_set()
+            and str(bootstrap._BOOTSTRAP_STATE.get("state") or "") == "ready"
+        ):
+            observed_at = bootstrap._utcnow_iso()
+            bootstrap._BOOTSTRAP_STATE["state"] = "full_runtime"
+            bootstrap._BOOTSTRAP_STATE["full_runtime_at"] = observed_at
+            _emit(
+                "ROI_RUNTIME_BOOTSTRAP_FULL_RUNTIME",
+                {
+                    "state": "full_runtime",
+                    "observed_at": observed_at,
+                    "worker_chain_alive_after_settle": True,
+                    "settle_seconds": FULL_RUNTIME_SETTLE_SECONDS,
+                    "paper_only": True,
+                    "live_money_authority": False,
+                    "signing_available": False,
+                    "transaction_submission_available": False,
+                },
+            )
+        await worker_task
+    finally:
+        if not worker_task.done():
+            worker_task.cancel()
+            await asyncio.gather(worker_task, return_exceptions=True)
+
+
+setattr(
+    _runtime_workers_with_full_runtime_marker,
+    "_roi_cleanup_full_runtime_worker_marker",
+    True,
+)
+
+
+def _install_full_runtime_worker_marker() -> None:
+    """Wrap the final composed worker chain without changing worker semantics."""
+
+    global _ORIGINAL_RUNTIME_WORKERS
+    current = bootstrap._run_runtime_workers
+    if bool(getattr(current, "_roi_cleanup_full_runtime_worker_marker", False)):
+        return
+    _ORIGINAL_RUNTIME_WORKERS = current
+    try:
+        _runtime_workers_with_full_runtime_marker.__dict__.update(
+            getattr(current, "__dict__", {})
+        )
+    except Exception:
+        pass
+    setattr(
+        _runtime_workers_with_full_runtime_marker,
+        "_roi_cleanup_full_runtime_worker_marker",
+        True,
+    )
+    bootstrap._run_runtime_workers = _runtime_workers_with_full_runtime_marker
 
 
 async def _run_target_probe(app: Any, database_path: Path) -> dict[str, Any]:
@@ -181,6 +270,7 @@ def _mark_blocked(app: Any, exc: BaseException, *, phase: str) -> None:
         "runtime_quiesced_until_cleanup_complete": True,
         "runtime_started_after_cleanup": False,
         "liveness_available_during_cleanup": True,
+        "full_runtime_requires_live_worker_chain": True,
         "paper_only": True,
         "live_money_authority": False,
         "signing_available": False,
@@ -274,11 +364,16 @@ def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
             getattr(app.state, "roi_production_data_cleanup", _disabled_state())
         )
 
+    # Production composition is complete before this installer runs. Wrap that exact
+    # final worker chain so the same-release cleanup handshake has a real, reachable
+    # full-runtime proof instead of relying on a test-only injected state.
+    _install_full_runtime_worker_marker()
     original: BootstrapCallable = bootstrap._bootstrap_and_run
 
     async def _cleanup_owned_bootstrap(stop: asyncio.Event) -> None:
         database_path = _database_path_from_environment()
         bootstrap._BOOTSTRAP_STATE["state"] = "waiting_for_runtime_disk_ownership"
+        bootstrap._BOOTSTRAP_STATE["full_runtime_at"] = None
         try:
             lease = await disk_ownership.acquire_runtime_disk_lease(
                 database_path,
@@ -348,15 +443,19 @@ def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
             payload["cleanup_target_probe"] = getattr(
                 app.state, "roi_cleanup_target_probe", None
             )
+            payload["full_runtime_at"] = bootstrap._BOOTSTRAP_STATE.get("full_runtime_at")
             return payload
 
     return dict(initial)
 
 
 __all__ = [
+    "FULL_RUNTIME_SETTLE_SECONDS",
     "INSTALL_VERSION",
     "STATUS_PATH",
+    "_install_full_runtime_worker_marker",
     "_run_cleanup_if_enabled",
     "_run_target_probe",
+    "_runtime_workers_with_full_runtime_marker",
     "install_production_cleanup_runtime",
 ]
