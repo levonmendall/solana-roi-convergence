@@ -18,6 +18,7 @@ from .certification_delta_production_bounds import configure_production_certific
 from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
 from .logical_bootstrap_page_cache_repair import configure_logical_bootstrap_page_cache_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
+from .shadow_price_tracking_state_repair import configure_shadow_price_tracking_state_repair
 from .wallet_discovery_background_status_repair import configure_wallet_discovery_background_status_repair
 
 # Keep authoritative certification-replica requests below the certifier's bounded
@@ -42,6 +43,14 @@ configure_robinhood_drpc_backup()
 # hot path while preserving explicit status endpoints, proposal selection, forward
 # evidence, strategy thresholds, and all paper-only authority boundaries.
 configure_wallet_discovery_background_status_repair()
+
+# The shadow price clock previously scanned and sorted token_first_touches every
+# second. Configure its durable recent-mint state before production composition so
+# the clock reconstructs exact state through bounded rowid-keyset batches, then serves
+# steady-state ticks from a small indexed table. This is the same pre-composition
+# configurator pattern used by other startup hot-path repairs; production authority
+# remains exclusively in production_system.
+configure_shadow_price_tracking_state_repair()
 
 from .production_system import (
     COMPOSITION_STATUS_PATH,
