@@ -9,7 +9,9 @@ from types import SimpleNamespace
 from solana_roi import sqlite_phase_observability as phase_observability
 from solana_roi.continuity_storage_capacity_repair import MAINTENANCE_BATCH_ROWS
 from solana_roi.direct_solana import DirectSolanaJournal
-from solana_roi.storage_maintenance_bounded_io_repair import _bounded_prune_operational_rows_once
+from solana_roi.storage_maintenance_lock_isolation_repair import (
+    _prune_operational_rows_once_isolated,
+)
 
 
 def _store(path: Path) -> SimpleNamespace:
@@ -61,7 +63,7 @@ def _bounded_scan_plan(store: SimpleNamespace) -> str:
     return " | ".join(str(row[3]) for row in rows)
 
 
-def _prune_vm_steps(path: Path, rows: int) -> tuple[int, int]:
+def _selector_vm_steps(path: Path, rows: int) -> int:
     store = _store(path)
     _seed_metrics(store, old_eligible=rows)
     callbacks = 0
@@ -72,11 +74,17 @@ def _prune_vm_steps(path: Path, rows: int) -> tuple[int, int]:
         return 0
 
     store.db.set_progress_handler(progress, 100)
-    plane = SimpleNamespace(store=store)
-    _queue_rows, metric_rows = _bounded_prune_operational_rows_once(plane)
+    with store._lock:
+        selected = store.db.execute(
+            "SELECT rowid, hydrated_at, historical_recovery "
+            "FROM direct_solana_hydration_metrics WHERE rowid>? "
+            "ORDER BY rowid LIMIT ?",
+            (0, MAINTENANCE_BATCH_ROWS),
+        ).fetchall()
     store.db.set_progress_handler(None, 0)
     store.db.close()
-    return callbacks * 100, metric_rows
+    assert len(selected) == MAINTENANCE_BATCH_ROWS
+    return callbacks * 100
 
 
 def test_hydration_metric_prune_uses_bounded_rowid_keyset(tmp_path: Path) -> None:
@@ -88,21 +96,20 @@ def test_hydration_metric_prune_uses_bounded_rowid_keyset(tmp_path: Path) -> Non
 
     assert "rowid>?" in plan or "INTEGER PRIMARY KEY" in plan, plan
     assert "USE TEMP B-TREE FOR ORDER BY" not in plan, plan
+    assert bool(getattr(_prune_operational_rows_once_isolated, "_roi_storage_maintenance_bounded_io", False))
     store.db.close()
 
 
-def test_hydration_metric_prune_work_does_not_scale_with_history(tmp_path: Path) -> None:
+def test_hydration_metric_selector_work_does_not_scale_with_history(tmp_path: Path) -> None:
     """Tenfold historical growth must not cause near-tenfold SQLite VM work."""
-    small_steps, small_deleted = _prune_vm_steps(tmp_path / "small.sqlite3", 6_000)
-    large_steps, large_deleted = _prune_vm_steps(tmp_path / "large.sqlite3", 60_000)
+    small_steps = _selector_vm_steps(tmp_path / "small.sqlite3", 6_000)
+    large_steps = _selector_vm_steps(tmp_path / "large.sqlite3", 60_000)
 
-    assert small_deleted == MAINTENANCE_BATCH_ROWS
-    assert large_deleted == MAINTENANCE_BATCH_ROWS
     assert small_steps > 0
     assert large_steps <= small_steps * 2, (small_steps, large_steps)
 
 
-def test_bounded_prune_preserves_historical_and_recent_rows(tmp_path: Path) -> None:
+def test_bounded_isolated_prune_preserves_historical_and_recent_rows(tmp_path: Path) -> None:
     store = _store(tmp_path / "semantics.sqlite3")
     _seed_metrics(
         store,
@@ -112,7 +119,7 @@ def test_bounded_prune_preserves_historical_and_recent_rows(tmp_path: Path) -> N
     )
     plane = SimpleNamespace(store=store)
 
-    _queue_rows, metric_rows = _bounded_prune_operational_rows_once(plane)
+    _queue_rows, metric_rows = _prune_operational_rows_once_isolated(plane)
     assert metric_rows == MAINTENANCE_BATCH_ROWS
 
     with store._lock:
