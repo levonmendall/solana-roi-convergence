@@ -54,12 +54,20 @@ from .production_system import (
 )
 from .sqlite_phase_observability import install_sqlite_phase_observability
 from .startup_retention_cleanup import run_safe_retention_cleanup
+from .storage_maintenance_bounded_io_repair import install_storage_maintenance_bounded_io_repair
 from . import legacy_production_composition as _legacy_production
+
+# The production storage-maintenance worker already exists in the composed runtime.
+# Replace only its history-scaled hydration-metric selector with a durable rowid
+# cursor that inspects at most one existing maintenance batch per pass. The deletion
+# predicate, retention horizon, worker, guard, historical recovery protection, and
+# all economic/certification authority remain unchanged.
+install_storage_maintenance_bounded_io_repair()
 
 # Attribute startup cgroup file cache, dirty/writeback, WAL growth and process I/O to
 # the exact long-lived worker/SQLite phase before ASGI lifespan starts those workers.
-# This is read-only observability: no worker, retention, strategy, guard, or authority
-# behavior is changed.
+# Install after the bounded-I/O repair so telemetry surrounds the production function
+# that will actually execute.
 install_sqlite_phase_observability()
 
 # The production system has now composed the complete logical-bootstrap route stack.
