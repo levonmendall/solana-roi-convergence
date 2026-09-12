@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,6 +137,97 @@ def test_async_bootstrap_endpoint_stays_on_existing_loop() -> None:
     asyncio.run(scenario())
 
 
+def test_blocking_lease_refresh_does_not_block_manifest_asgi_loop(monkeypatch) -> None:
+    async def scenario() -> None:
+        started = threading.Event()
+        release = threading.Event()
+        refresh_threads: list[int] = []
+        ticks = 0
+        stop_tick = asyncio.Event()
+        loop_thread = threading.get_ident()
+        store = object()
+
+        def runtime_provider():
+            return SimpleNamespace(store=store)
+
+        def manifest_endpoint(x_certification_token=None):
+            return {"tables": [{"name": "evidence"}]}
+
+        def page_endpoint(**kwargs):
+            return {"table": kwargs.get("table"), "done": False}
+
+        manifest_route = SimpleNamespace(
+            path=lease.MANIFEST_PATH,
+            endpoint=manifest_endpoint,
+            dependant=SimpleNamespace(call=manifest_endpoint),
+        )
+        page_route = SimpleNamespace(
+            path=lease.PAGE_PATH,
+            endpoint=page_endpoint,
+            dependant=SimpleNamespace(call=page_endpoint),
+        )
+        app = SimpleNamespace(routes=[manifest_route, page_route], state=SimpleNamespace())
+
+        def blocking_refresh(target):
+            assert target is store
+            refresh_threads.append(threading.get_ident())
+            started.set()
+            assert release.wait(timeout=5.0)
+            return {}
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while not stop_tick.is_set():
+                ticks += 1
+                await asyncio.sleep(0.002)
+
+        monkeypatch.setattr(lease, "refresh", blocking_refresh)
+        monkeypatch.setattr(lease, "set_manifest_tables", lambda target, payload: None)
+        monkeypatch.setattr(lease, "finish_if_complete", lambda target, payload: False)
+        monkeypatch.setattr(lease, "_install_preworker_quiesce", lambda: None)
+        monkeypatch.setattr(
+            "solana_roi.certification_incremental_replication._require_shared_token",
+            lambda token: None,
+        )
+        lease.install_certification_bootstrap_autocheckpoint_lease(app, runtime_provider)
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        manifest_task = asyncio.create_task(
+            manifest_route.dependant.call(x_certification_token="token")
+        )
+        try:
+            for _ in range(500):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.002)
+            assert started.is_set(), "bootstrap lease refresh never entered bounded worker"
+
+            ticks_at_start = ticks
+            await asyncio.sleep(0.03)
+            assert ticks > ticks_at_start + 2, "ASGI loop stalled behind bootstrap lease refresh"
+            assert not manifest_task.done()
+            assert refresh_threads == [refresh_threads[0]]
+            assert refresh_threads[0] != loop_thread
+
+            release.set()
+            assert await asyncio.wait_for(manifest_task, timeout=2.0) == {
+                "tables": [{"name": "evidence"}]
+            }
+        finally:
+            release.set()
+            stop_tick.set()
+            await heartbeat_task
+
+    asyncio.run(scenario())
+
+
+def test_route_lifecycle_state_mutations_are_bounded_offloop() -> None:
+    source = inspect.getsource(lease.install_certification_bootstrap_autocheckpoint_lease)
+    assert "await run_in_threadpool(refresh, store)" in source
+    assert "await run_in_threadpool(set_manifest_tables, store, payload)" in source
+    assert "await run_in_threadpool(finish_if_complete, store, payload)" in source
+
+
 def test_offloop_helper_cannot_reintroduce_nested_event_loop_or_per_call_to_thread() -> None:
     source = inspect.getsource(lease._call_endpoint_inline)
     assert "asyncio.run" not in source
@@ -146,6 +238,7 @@ def test_offloop_helper_cannot_reintroduce_nested_event_loop_or_per_call_to_thre
 def test_offloop_repair_preserves_paper_only_authority() -> None:
     state = lease.status()
     assert state["anyio_sync_worker_route_wrapper"] is True
+    assert state["lease_route_state_offloop"] is True
     assert state["paper_only"] is True
     assert state["live_money_authority"] is False
     assert state["signing_available"] is False
