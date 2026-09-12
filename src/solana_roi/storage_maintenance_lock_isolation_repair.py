@@ -12,8 +12,8 @@ from . import continuity_storage_capacity_repair as storage_capacity
 from . import direct_solana as direct_solana_module
 
 
-REPAIR_VERSION = "storage-maintenance-lock-isolation-v3-bounded-dual-rowid-cursors"
-BOUNDED_IO_VERSION = "storage-maintenance-bounded-dual-rowid-cursors-v3-time-budget"
+REPAIR_VERSION = "storage-maintenance-lock-isolation-v4-bounded-dual-rowid-cursors-deferred-checkpoint"
+BOUNDED_IO_VERSION = "storage-maintenance-bounded-dual-rowid-cursors-v4-time-budget"
 MAINTENANCE_BUSY_TIMEOUT_MS = 250
 DELETE_CHUNK_ROWS = 400
 PAPER_ONLY = True
@@ -282,37 +282,26 @@ def _checkpoint_wal_isolated(self: Any) -> tuple[int, int, int] | None:
 
 
 async def _bounded_storage_maintenance_worker(self: Any, stop: asyncio.Event) -> None:
-    """Run at most one bounded maintenance batch per normal 60-second interval.
+    """Bound housekeeping cadence and keep startup free of forced WAL truncate.
 
     The former drain mode retried every 100 ms while old rows remained, turning
     startup backlog size into sustained database I/O and dirty/writeback pressure.
-    Retention semantics are unchanged. Only housekeeping I/O rate is bounded so
-    backlog cannot monopolize the cgroup.
+    Pruning now runs only on the normal 60-second maintenance cadence, while this
+    housekeeping-owned TRUNCATE checkpoint first becomes eligible after the existing
+    300-second interval. WAL-capacity recovery during bootstrap remains owned by the
+    separate autocheckpoint lease. Retention semantics and durability are unchanged.
     """
 
-    next_checkpoint = 0.0
-    drained_since_checkpoint = False
+    next_checkpoint = time.monotonic() + storage_capacity.WAL_CHECKPOINT_INTERVAL_SECONDS
     while not stop.is_set():
-        queue_rows = 0
-        metric_rows = 0
         try:
-            queue_rows, metric_rows = await asyncio.to_thread(
-                storage_capacity._prune_operational_rows_once, self
-            )
-            if queue_rows or metric_rows:
-                drained_since_checkpoint = True
+            await asyncio.to_thread(storage_capacity._prune_operational_rows_once, self)
             now_mono = time.monotonic()
-            drain_complete = (
-                not queue_rows
-                and not metric_rows
-                and drained_since_checkpoint
-            )
-            if now_mono >= next_checkpoint or drain_complete:
+            if now_mono >= next_checkpoint:
                 await asyncio.to_thread(storage_capacity._checkpoint_wal, self)
                 next_checkpoint = (
                     now_mono + storage_capacity.WAL_CHECKPOINT_INTERVAL_SECONDS
                 )
-                drained_since_checkpoint = False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -355,6 +344,11 @@ setattr(
     "_roi_storage_maintenance_bounded_cadence",
     True,
 )
+setattr(
+    _bounded_storage_maintenance_worker,
+    "_roi_storage_maintenance_startup_checkpoint_deferred",
+    True,
+)
 
 
 def install_storage_maintenance_lock_isolation() -> None:
@@ -386,6 +380,11 @@ def install_storage_maintenance_lock_isolation() -> None:
         getattr(
             current_worker,
             "_roi_storage_maintenance_bounded_cadence",
+            False,
+        )
+        and getattr(
+            current_worker,
+            "_roi_storage_maintenance_startup_checkpoint_deferred",
             False,
         )
     )
@@ -423,6 +422,9 @@ def status() -> dict[str, Any]:
         "metric_scan_max_rows_per_pass": storage_capacity.MAINTENANCE_BATCH_ROWS,
         "backlog_drain_interval_seconds": storage_capacity.MAINTENANCE_IDLE_SECONDS,
         "aggressive_100ms_backlog_drain_disabled": True,
+        "startup_forced_wal_checkpoint": False,
+        "checkpoint_on_backlog_drain_complete": False,
+        "wal_checkpoint_interval_seconds": storage_capacity.WAL_CHECKPOINT_INTERVAL_SECONDS,
         "queue_deletion_predicate_changed": False,
         "metric_deletion_predicate_changed": False,
         "canonical_store_python_lock_acquired_by_retention_prune": False,
@@ -443,6 +445,7 @@ __all__ = [
     "REPAIR_VERSION",
     "_bounded_storage_maintenance_worker",
     "_checkpoint_wal_isolated",
+    "_ensure_state",
     "_prune_operational_rows_once_isolated",
     "install_storage_maintenance_lock_isolation",
     "status",
