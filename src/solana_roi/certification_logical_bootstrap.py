@@ -386,7 +386,10 @@ def _page(
 async def _post_response_cleanup(source_path: Path) -> None:
     """Run cleanup after response send without blocking the ASGI event loop."""
 
+    from . import durable_bootstrap_memory_repair as durable_memory
+
     await run_in_threadpool(split._drop_file_cache, source_path)
+    await run_in_threadpool(durable_memory._trim_process_heap)
 
 
 def install_certification_logical_bootstrap(app: Any, runtime_provider: Callable[[], Any]) -> None:
