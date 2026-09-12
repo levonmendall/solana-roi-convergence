@@ -18,6 +18,7 @@ from .certification_delta_production_bounds import configure_production_certific
 from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
 from .logical_bootstrap_page_cache_repair import configure_logical_bootstrap_page_cache_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
+from .wallet_discovery_background_status_repair import configure_wallet_discovery_background_status_repair
 
 # Keep authoritative certification-replica requests below the certifier's bounded
 # HTTP deadline. This changes only transport pagination; evidence, continuity, and
@@ -35,6 +36,12 @@ configure_incremental_event_integrity_repair()
 # reads its provider environment during construction. This is environment-only
 # bootstrap: it grants no strategy, signing, submission, or live-money authority.
 configure_robinhood_drpc_backup()
+
+# The autonomous wallet discovery worker does not consume the status payload returned
+# by run_once(). Keep those history-scaled research/status reads out of the background
+# hot path while preserving explicit status endpoints, proposal selection, forward
+# evidence, strategy thresholds, and all paper-only authority boundaries.
+configure_wallet_discovery_background_status_repair()
 
 from .production_system import (
     COMPOSITION_STATUS_PATH,
