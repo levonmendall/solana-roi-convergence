@@ -11,7 +11,7 @@ from typing import Any
 from .observation_store import ObservationEventStore
 
 
-REPAIR_VERSION = "shadow-price-tracked-mints-incremental-state-v3-monotonic"
+REPAIR_VERSION = "shadow-price-tracked-mints-incremental-state-v4-once"
 BOOTSTRAP_BATCH_ROWS = 5_000
 STATE_PRUNE_BATCH_ROWS = 1_000
 STATE_PRUNE_INTERVAL_SECONDS = 60.0
@@ -25,6 +25,7 @@ CERTIFICATION_THRESHOLDS_CHANGED = False
 _STATE_TABLE = "shadow_price_tracked_mints_state"
 _META_TABLE = "shadow_price_tracked_mints_meta"
 _TRIGGER = "trg_shadow_price_track_first_touch"
+_STORE_READY_ATTR = "_roi_shadow_price_tracking_state_ready"
 _INSTALL_LOCK = threading.Lock()
 _TELEMETRY_LOCK = threading.Lock()
 _INSTALLED = False
@@ -52,38 +53,44 @@ def _release_db_file_cache(path: Path) -> None:
 
 
 def _ensure_state(store: ObservationEventStore) -> None:
-    with store._lock, store.db:
-        store.db.execute(
-            f"CREATE TABLE IF NOT EXISTS {_STATE_TABLE} ("
-            "token_mint TEXT PRIMARY KEY, "
-            "observed_at TEXT NOT NULL, "
-            "source_rowid INTEGER NOT NULL UNIQUE)"
-        )
-        store.db.execute(
-            f"CREATE INDEX IF NOT EXISTS ix_{_STATE_TABLE}_observed "
-            f"ON {_STATE_TABLE}(observed_at DESC, token_mint)"
-        )
-        store.db.execute(
-            f"CREATE TABLE IF NOT EXISTS {_META_TABLE} ("
-            "id INTEGER PRIMARY KEY CHECK(id=1), "
-            "bootstrap_rowid INTEGER NOT NULL DEFAULT 0, "
-            "bootstrap_complete INTEGER NOT NULL DEFAULT 0, "
-            "bootstrap_horizon_seconds REAL NOT NULL DEFAULT 0, "
-            "bootstrap_floor_at TEXT, "
-            "last_batch_rows INTEGER NOT NULL DEFAULT 0, "
-            "last_batch_at TEXT)"
-        )
-        store.db.execute(f"INSERT OR IGNORE INTO {_META_TABLE}(id) VALUES (1)")
-        store.db.execute(
-            f"CREATE TRIGGER IF NOT EXISTS {_TRIGGER} "
-            "AFTER INSERT ON token_first_touches BEGIN "
-            f"INSERT INTO {_STATE_TABLE}(token_mint, observed_at, source_rowid) "
-            "VALUES (NEW.token_mint, NEW.observed_at, NEW.rowid) "
-            "ON CONFLICT(token_mint) DO UPDATE SET "
-            "observed_at=excluded.observed_at, source_rowid=excluded.source_rowid "
-            f"WHERE excluded.source_rowid > {_STATE_TABLE}.source_rowid; "
-            "END"
-        )
+    if bool(getattr(store, _STORE_READY_ATTR, False)):
+        return
+    with store._lock:
+        if bool(getattr(store, _STORE_READY_ATTR, False)):
+            return
+        with store.db:
+            store.db.execute(
+                f"CREATE TABLE IF NOT EXISTS {_STATE_TABLE} ("
+                "token_mint TEXT PRIMARY KEY, "
+                "observed_at TEXT NOT NULL, "
+                "source_rowid INTEGER NOT NULL UNIQUE)"
+            )
+            store.db.execute(
+                f"CREATE INDEX IF NOT EXISTS ix_{_STATE_TABLE}_observed "
+                f"ON {_STATE_TABLE}(observed_at DESC, token_mint)"
+            )
+            store.db.execute(
+                f"CREATE TABLE IF NOT EXISTS {_META_TABLE} ("
+                "id INTEGER PRIMARY KEY CHECK(id=1), "
+                "bootstrap_rowid INTEGER NOT NULL DEFAULT 0, "
+                "bootstrap_complete INTEGER NOT NULL DEFAULT 0, "
+                "bootstrap_horizon_seconds REAL NOT NULL DEFAULT 0, "
+                "bootstrap_floor_at TEXT, "
+                "last_batch_rows INTEGER NOT NULL DEFAULT 0, "
+                "last_batch_at TEXT)"
+            )
+            store.db.execute(f"INSERT OR IGNORE INTO {_META_TABLE}(id) VALUES (1)")
+            store.db.execute(
+                f"CREATE TRIGGER IF NOT EXISTS {_TRIGGER} "
+                "AFTER INSERT ON token_first_touches BEGIN "
+                f"INSERT INTO {_STATE_TABLE}(token_mint, observed_at, source_rowid) "
+                "VALUES (NEW.token_mint, NEW.observed_at, NEW.rowid) "
+                "ON CONFLICT(token_mint) DO UPDATE SET "
+                "observed_at=excluded.observed_at, source_rowid=excluded.source_rowid "
+                f"WHERE excluded.source_rowid > {_STATE_TABLE}.source_rowid; "
+                "END"
+            )
+        setattr(store, _STORE_READY_ATTR, True)
 
 
 def _meta(store: ObservationEventStore) -> dict[str, Any]:
@@ -309,6 +316,7 @@ def status(store: ObservationEventStore | None = None) -> dict[str, Any]:
         "steady_state_query": "indexed-recent-mint-state",
         "startup_full_history_index_build": False,
         "history_scaled_per_tick_query_removed": True,
+        "schema_init_per_store_once": True,
         "bootstrap_fail_closed_until_exact": True,
         "state_prune_batch_rows": STATE_PRUNE_BATCH_ROWS,
         "state_prune_interval_seconds": STATE_PRUNE_INTERVAL_SECONDS,
