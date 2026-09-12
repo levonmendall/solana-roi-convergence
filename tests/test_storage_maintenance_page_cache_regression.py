@@ -13,6 +13,7 @@ from solana_roi.continuity_storage_capacity_repair import MAINTENANCE_BATCH_ROWS
 from solana_roi.direct_solana import DirectSolanaJournal
 from solana_roi.storage_maintenance_lock_isolation_repair import (
     _bounded_storage_maintenance_worker,
+    _ensure_state,
     _prune_operational_rows_once_isolated,
 )
 
@@ -355,6 +356,44 @@ def test_storage_maintenance_backlog_cannot_spin_at_startup(monkeypatch) -> None
         )
     )
     assert observed_timeouts == [storage_capacity.MAINTENANCE_IDLE_SECONDS]
+
+
+def test_cursor_state_migrates_v2_schema_without_resetting_metric_progress(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cursor-migration.sqlite3"
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE direct_solana_storage_maintenance_cursor ("
+        "id INTEGER PRIMARY KEY CHECK(id=1), "
+        "metric_scan_rowid INTEGER NOT NULL DEFAULT 0, "
+        "last_scan_rows INTEGER NOT NULL DEFAULT 0, "
+        "last_scan_at TEXT)"
+    )
+    db.execute(
+        "INSERT INTO direct_solana_storage_maintenance_cursor("
+        "id, metric_scan_rowid, last_scan_rows, last_scan_at"
+        ") VALUES (1, 12345, 5000, '2026-09-12T00:00:00+00:00')"
+    )
+    db.commit()
+
+    _ensure_state(db)
+
+    columns = {
+        str(row[1])
+        for row in db.execute(
+            "PRAGMA table_info(direct_solana_storage_maintenance_cursor)"
+        ).fetchall()
+    }
+    row = db.execute(
+        "SELECT queue_scan_rowid, metric_scan_rowid, "
+        "last_queue_scan_rows, last_scan_rows "
+        "FROM direct_solana_storage_maintenance_cursor WHERE id=1"
+    ).fetchone()
+    db.close()
+
+    assert {"queue_scan_rowid", "last_queue_scan_rows"} <= columns
+    assert row == (0, 12345, 0, 5000)
 
 
 def test_phase_snapshot_separates_cache_writeback_wal_io_and_process_bounds(
