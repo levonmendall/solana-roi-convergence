@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,7 @@ from . import direct_solana as direct_solana_module
 
 
 REPAIR_VERSION = "storage-maintenance-lock-isolation-v2-bounded-rowid-cursor"
-BOUNDED_IO_VERSION = "storage-maintenance-bounded-rowid-cursor-v1"
+BOUNDED_IO_VERSION = "storage-maintenance-bounded-rowid-cursor-v2-time-budget"
 MAINTENANCE_BUSY_TIMEOUT_MS = 250
 DELETE_CHUNK_ROWS = 400
 PAPER_ONLY = True
@@ -215,6 +217,54 @@ def _checkpoint_wal_isolated(self: Any) -> tuple[int, int, int] | None:
         connection.close()
 
 
+async def _bounded_storage_maintenance_worker(self: Any, stop: asyncio.Event) -> None:
+    """Run at most one bounded maintenance batch per normal 60-second interval.
+
+    The former drain mode retried every 100 ms while any old rows remained, turning
+    startup backlog size into sustained database I/O and dirty/writeback pressure.
+    Retention semantics are unchanged: each pass still applies the same predicates
+    and the durable metric cursor guarantees later batches remain reachable. Only
+    the housekeeping I/O rate is bounded so backlog cannot monopolize the cgroup.
+    """
+
+    next_checkpoint = 0.0
+    drained_since_checkpoint = False
+    while not stop.is_set():
+        queue_rows = 0
+        metric_rows = 0
+        try:
+            queue_rows, metric_rows = await asyncio.to_thread(
+                storage_capacity._prune_operational_rows_once, self
+            )
+            if queue_rows or metric_rows:
+                drained_since_checkpoint = True
+            now_mono = time.monotonic()
+            drain_complete = not queue_rows and not metric_rows and drained_since_checkpoint
+            if now_mono >= next_checkpoint or drain_complete:
+                await asyncio.to_thread(storage_capacity._checkpoint_wal, self)
+                next_checkpoint = now_mono + storage_capacity.WAL_CHECKPOINT_INTERVAL_SECONDS
+                drained_since_checkpoint = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                await asyncio.to_thread(storage_capacity._ensure_maintenance_state, self)
+                with self.store._lock, self.store.db:
+                    self.store.db.execute(
+                        "UPDATE direct_solana_storage_maintenance SET last_error=? WHERE id=1",
+                        (f"{type(exc).__name__}: storage maintenance failed",),
+                    )
+            except Exception:
+                pass
+
+        try:
+            await asyncio.wait_for(
+                stop.wait(), timeout=storage_capacity.MAINTENANCE_IDLE_SECONDS
+            )
+        except asyncio.TimeoutError:
+            continue
+
+
 setattr(
     _prune_operational_rows_once_isolated,
     "_roi_storage_maintenance_lock_isolation",
@@ -230,21 +280,37 @@ setattr(
     "_roi_storage_maintenance_lock_isolation",
     True,
 )
+setattr(
+    _bounded_storage_maintenance_worker,
+    "_roi_storage_maintenance_bounded_cadence",
+    True,
+)
 
 
 def install_storage_maintenance_lock_isolation() -> None:
-    """Compose isolated, bounded housekeeping plus read-only phase attribution."""
+    """Compose isolated, time-bounded housekeeping plus phase attribution."""
 
     current_prune = storage_capacity._prune_operational_rows_once
     current_checkpoint = storage_capacity._checkpoint_wal
-    already_installed = bool(
-        getattr(current_prune, "_roi_storage_maintenance_lock_isolation", False)
-        and getattr(current_prune, "_roi_storage_maintenance_bounded_io", False)
-        and getattr(current_checkpoint, "_roi_storage_maintenance_lock_isolation", False)
+    current_worker = storage_capacity._storage_maintenance_worker
+    prune_ok = bool(
+        (
+            getattr(current_prune, "_roi_storage_maintenance_lock_isolation", False)
+            and getattr(current_prune, "_roi_storage_maintenance_bounded_io", False)
+        )
+        or getattr(current_prune, "_roi_sqlite_phase_observed", False)
     )
-    if not already_installed:
+    checkpoint_ok = bool(
+        getattr(current_checkpoint, "_roi_storage_maintenance_lock_isolation", False)
+        or getattr(current_checkpoint, "_roi_sqlite_phase_observed", False)
+    )
+    worker_ok = bool(
+        getattr(current_worker, "_roi_storage_maintenance_bounded_cadence", False)
+    )
+    if not (prune_ok and checkpoint_ok and worker_ok):
         storage_capacity._prune_operational_rows_once = _prune_operational_rows_once_isolated
         storage_capacity._checkpoint_wal = _checkpoint_wal_isolated
+        storage_capacity._storage_maintenance_worker = _bounded_storage_maintenance_worker
     with _STATE_LOCK:
         _STATE["installed"] = True
 
@@ -267,6 +333,8 @@ def status() -> dict[str, Any]:
         "maintenance_busy_timeout_ms": MAINTENANCE_BUSY_TIMEOUT_MS,
         "metric_scan_mode": "durable_rowid_keyset",
         "metric_scan_max_rows_per_pass": storage_capacity.MAINTENANCE_BATCH_ROWS,
+        "backlog_drain_interval_seconds": storage_capacity.MAINTENANCE_IDLE_SECONDS,
+        "aggressive_100ms_backlog_drain_disabled": True,
         "metric_deletion_predicate_changed": False,
         "canonical_store_python_lock_acquired_by_retention_prune": False,
         "canonical_store_python_lock_acquired_by_wal_checkpoint": False,
@@ -284,6 +352,7 @@ __all__ = [
     "DELETE_CHUNK_ROWS",
     "MAINTENANCE_BUSY_TIMEOUT_MS",
     "REPAIR_VERSION",
+    "_bounded_storage_maintenance_worker",
     "_checkpoint_wal_isolated",
     "_prune_operational_rows_once_isolated",
     "install_storage_maintenance_lock_isolation",
