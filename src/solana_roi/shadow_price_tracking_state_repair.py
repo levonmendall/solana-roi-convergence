@@ -287,7 +287,9 @@ def _bounded_tracked_mints(
 setattr(_bounded_tracked_mints, "_roi_shadow_tracked_mints_bounded", True)
 
 
-def install_shadow_price_tracking_state_repair() -> None:
+def configure_shadow_price_tracking_state_repair() -> None:
+    """Configure the bounded shadow-price hot path before production composition."""
+
     global _INSTALLED
     with _INSTALL_LOCK:
         current = ObservationEventStore.tracked_mints
@@ -329,6 +331,6 @@ __all__ = [
     "STATE_PRUNE_BATCH_ROWS",
     "_advance_bootstrap",
     "_bounded_tracked_mints",
-    "install_shadow_price_tracking_state_repair",
+    "configure_shadow_price_tracking_state_repair",
     "status",
 ]
