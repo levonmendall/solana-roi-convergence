@@ -33,6 +33,8 @@ FORWARD_EVIDENCE_RULES_CHANGED = False
 _ORIGINAL_RUN = discovery.ContinuousWalletDiscovery.run
 _ORIGINAL_PROPOSAL_EXISTS = discovery.ContinuousWalletDiscovery._proposal_exists
 _INSTALLED = False
+_EXPLICIT_RUN_ONCE_PRESERVED = False
+_PUBLIC_STATUS_PRESERVED = False
 
 
 def _row_value(row: Any, key: str, index: int = 0) -> Any:
@@ -101,13 +103,24 @@ setattr(_background_run, "_roi_wallet_status_off_background_hotpath", True)
 
 
 def configure_wallet_discovery_background_status_repair() -> None:
-    global _INSTALLED
+    global _INSTALLED, _EXPLICIT_RUN_ONCE_PRESERVED, _PUBLIC_STATUS_PRESERVED
+    run_once_before = discovery.ContinuousWalletDiscovery.run_once
+    status_before = discovery.ContinuousWalletDiscovery.status
+
     current_proposal = discovery.ContinuousWalletDiscovery._proposal_exists
     if not bool(getattr(current_proposal, "_roi_bounded_wallet_status_tail", False)):
         discovery.ContinuousWalletDiscovery._proposal_exists = _proposal_exists_tail  # type: ignore[assignment]
     current_run = discovery.ContinuousWalletDiscovery.run
     if not bool(getattr(current_run, "_roi_wallet_status_off_background_hotpath", False)):
         discovery.ContinuousWalletDiscovery.run = _background_run  # type: ignore[assignment]
+
+    # Record what this configurator itself changed. Later production composition may
+    # legitimately wrap run_once/status for independent forward-evidence behavior;
+    # those wrappers must not make this repair falsely claim it changed them.
+    _EXPLICIT_RUN_ONCE_PRESERVED = discovery.ContinuousWalletDiscovery.run_once is run_once_before
+    _PUBLIC_STATUS_PRESERVED = discovery.ContinuousWalletDiscovery.status is status_before
+    if not _EXPLICIT_RUN_ONCE_PRESERVED or not _PUBLIC_STATUS_PRESERVED:
+        raise RuntimeError("wallet background status repair mutated explicit wallet interfaces")
     _INSTALLED = True
 
 
@@ -115,8 +128,8 @@ def status() -> dict[str, Any]:
     return {
         "repair_version": REPAIR_VERSION,
         "installed": _INSTALLED,
-        "explicit_run_once_unchanged": discovery.ContinuousWalletDiscovery.run_once is not None,
-        "public_status_unchanged": discovery.ContinuousWalletDiscovery.status is not None,
+        "explicit_run_once_unchanged": _EXPLICIT_RUN_ONCE_PRESERVED,
+        "public_status_unchanged": _PUBLIC_STATUS_PRESERVED,
         "background_status_materialization": False,
         "proposal_exists_read": "adaptive_wallet_cohorts_latest_id_tail",
         "proposal_selection_logic_unchanged": True,
