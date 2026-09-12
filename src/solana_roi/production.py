@@ -52,8 +52,15 @@ from .production_system import (
     ingestion_runtime,
     production_system,
 )
+from .sqlite_phase_observability import install_sqlite_phase_observability
 from .startup_retention_cleanup import run_safe_retention_cleanup
 from . import legacy_production_composition as _legacy_production
+
+# Attribute startup cgroup file cache, dirty/writeback, WAL growth and process I/O to
+# the exact long-lived worker/SQLite phase before ASGI lifespan starts those workers.
+# This is read-only observability: no worker, retention, strategy, guard, or authority
+# behavior is changed.
+install_sqlite_phase_observability()
 
 # The production system has now composed the complete logical-bootstrap route stack.
 # When service splitting is enabled, configure one lifecycle gate around that final
