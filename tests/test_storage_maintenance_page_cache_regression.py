@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from solana_roi import sqlite_phase_observability as phase_observability
 from solana_roi.continuity_storage_capacity_repair import MAINTENANCE_BATCH_ROWS
 from solana_roi.direct_solana import DirectSolanaJournal
 from solana_roi.storage_maintenance_bounded_io_repair import _bounded_prune_operational_rows_once
@@ -124,3 +125,37 @@ def test_bounded_prune_preserves_historical_and_recent_rows(tmp_path: Path) -> N
     assert historical == 37
     assert recent == 41
     store.db.close()
+
+
+def test_phase_snapshot_separates_cache_writeback_wal_io_and_process_bounds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "memory.stat").write_text(
+        "anon 200\nfile 1000\nfile_dirty 100\nfile_writeback 50\n",
+        encoding="utf-8",
+    )
+    (cgroup / "memory.current").write_text("1400\n", encoding="utf-8")
+    (cgroup / "memory.max").write_text("2000\n", encoding="utf-8")
+    (cgroup / "pids.current").write_text("39\n", encoding="utf-8")
+    monkeypatch.setattr(phase_observability, "_CGROUP_ROOT", cgroup)
+
+    db_path = tmp_path / "production.sqlite3"
+    db_path.write_bytes(b"db-bytes")
+    Path(f"{db_path}-wal").write_bytes(b"w" * 123)
+    Path(f"{db_path}-shm").write_bytes(b"s" * 31)
+
+    snapshot = phase_observability.resource_snapshot(SimpleNamespace(path=db_path))
+
+    assert snapshot["anon_bytes"] == 200
+    assert snapshot["file_cache_bytes"] == 1000
+    assert snapshot["clean_file_cache_bytes_estimate"] == 850
+    assert snapshot["file_dirty_bytes"] == 100
+    assert snapshot["file_writeback_bytes"] == 50
+    assert snapshot["sqlite_wal_bytes"] == 123
+    assert snapshot["sqlite_shm_bytes"] == 31
+    assert snapshot["pids_current"] == 39
+    assert isinstance(snapshot["threads"], int) and snapshot["threads"] > 0
+    assert isinstance(snapshot["proc_read_bytes"], int)
+    assert isinstance(snapshot["proc_write_bytes"], int)
