@@ -1,30 +1,31 @@
 from __future__ import annotations
 
-"""Quiesce logical-bootstrap SQLite cache before the next page can begin.
+"""Serialize logical-bootstrap page lifecycles through post-send cache cleanup.
 
-Production telemetry proved that bounded logical-bootstrap pages can each succeed while
-clean SQLite-backed page cache accumulates faster than post-response background cleanup
-can evict it.  On a 2 GiB cgroup, that clean cache can combine with a large but
-reclaimable anonymous-heap baseline and push the unchanged 94% raw-memory guard back
-into fail-closed 503s after only a handful of pages.
+Production telemetry proved that successful bounded pages can refault hundreds of MiB
+of clean SQLite file cache while a large reclaimable anonymous-heap baseline remains.
+The response reaches the certifier before Starlette runs the existing post-response
+cache cleanup, so the next request can enter the unchanged 94% raw-cgroup guard while
+the prior page's cache is still resident and fail closed again.
 
-This repair changes no pagination, historical identity, certification threshold, or
-trading authority.  It keeps the post-response cleanup, but also performs one best-
-effort DB/WAL/SHM cache quiesce synchronously inside the already-offloop page worker
-after the SQLite reader has closed and before the materialized payload is returned to
-the ASGI route.  The next certifier request therefore cannot race ahead of the prior
-page's read-cache eviction.  Failed manifest/page opens receive the same cleanup.
+The repair deliberately does *not* move cleanup before response serialization/send.
+Instead, one page owns an asyncio gate from route entry until the already-registered
+post-send cleanup has completed. A following page can arrive immediately, but it may
+not start SQLite/guard work until that cleanup releases the gate. This preserves the
+ASGI memory-lifecycle contract, pagination, historical identity, the 94% guard, and all
+paper-only/certification authority.
 """
 
-import sqlite3
-from pathlib import Path
+import asyncio
+from functools import wraps
 from typing import Any, Callable
 
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
+from starlette.background import BackgroundTask
 
-from . import certification_logical_bootstrap as logical
-
-REPAIR_VERSION = "logical-bootstrap-page-cache-quiesce-v1"
+REPAIR_VERSION = "logical-bootstrap-page-lifecycle-gate-v2"
+PAGE_PATH = "/v1/operations/certification-db-logical-bootstrap-page"
+PAGE_GATE_WAIT_SECONDS = 30.0
 
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
@@ -36,132 +37,168 @@ CONTINUITY_SEMANTICS_CHANGED = False
 RAW_CRITICAL_FRACTION_CHANGED = False
 
 _INSTALLED = False
-_ORIGINAL_PINNED_READER: Callable[..., sqlite3.Connection] | None = None
-_ORIGINAL_MANIFEST: Callable[..., dict[str, Any]] | None = None
-_ORIGINAL_PAGE: Callable[..., dict[str, Any]] | None = None
+_LAST_STATE: dict[str, Any] | None = None
 
 
-def _source_path(store: Any) -> Path:
-    return Path(getattr(store, "path", ""))
-
-
-def _lease_aware_pinned_reader(store: Any) -> sqlite3.Connection:
-    """Open the canonical bounded reader while preserving bootstrap WAL ownership."""
-
-    source_path = _source_path(store)
-    if not source_path.is_file():
-        raise HTTPException(status_code=503, detail="canonical certification source unavailable")
-
-    from . import durable_bootstrap_memory_repair as durable_memory
-
-    lease_state = getattr(store, "_roi_certification_bootstrap_autocheckpoint_lease", None)
-    lease_active = isinstance(lease_state, dict) and bool(lease_state.get("active"))
-    try:
-        durable_memory._guard_raw_cgroup(
-            source_path,
-            allow_wal_checkpoint=not lease_active,
-        )
-    except MemoryError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="certification logical bootstrap deferred: raw cgroup memory pressure",
-        ) from exc
-
-    reader = sqlite3.connect(
-        f"file:{source_path.resolve()}?mode=ro&cache=private",
-        uri=True,
-        timeout=5.0,
+def _route(app: Any) -> Any:
+    route = next(
+        (candidate for candidate in app.routes if getattr(candidate, "path", None) == PAGE_PATH),
+        None,
     )
-    reader.execute("PRAGMA query_only=ON")
-    reader.execute("PRAGMA busy_timeout=5000")
-    reader.execute(f"PRAGMA cache_size=-{logical.READER_CACHE_KIB}")
-    reader.execute("PRAGMA mmap_size=0")
-    reader.execute("PRAGMA temp_store=FILE")
-    return reader
+    dependant = getattr(route, "dependant", None) if route is not None else None
+    if route is None or dependant is None or not callable(getattr(dependant, "call", None)):
+        raise RuntimeError(f"certification bootstrap page route unavailable: {PAGE_PATH}")
+    return route
 
 
-setattr(_lease_aware_pinned_reader, "_roi_durable_bootstrap_memory_bounded", True)
-setattr(_lease_aware_pinned_reader, "_roi_bootstrap_lease_wal_aware", True)
+def _release_gate(gate: asyncio.Lock, state: dict[str, Any], generation: int) -> None:
+    if gate.locked():
+        gate.release()
+    if int(state.get("generation", 0)) == generation:
+        state["active"] = False
+    state["releases"] = int(state.get("releases", 0)) + 1
 
 
-def _cleanup_source(store: Any) -> bool:
-    """Use the runtime's current sidecar-aware cleanup hook, if available."""
+async def _complete_page_lifecycle(
+    tasks: tuple[BackgroundTask, ...],
+    gate: asyncio.Lock,
+    state: dict[str, Any],
+    generation: int,
+) -> None:
+    """Run the original post-send tasks in order and always unblock the next page."""
 
-    path = _source_path(store)
     try:
-        return bool(logical.split._drop_file_cache(path))
-    except (OSError, RuntimeError):
-        # Cache eviction is best-effort only.  The unchanged raw-cgroup guard remains
-        # authoritative and will fail closed before the next read if pressure persists.
-        return False
-
-
-def _manifest_with_failure_cleanup(store: Any) -> dict[str, Any]:
-    if _ORIGINAL_MANIFEST is None:
-        raise RuntimeError("logical bootstrap cache repair manifest wrapper is unbound")
-    try:
-        return _ORIGINAL_MANIFEST(store)
+        for task in tasks:
+            await task()
     finally:
-        # The original manifest already releases cache after a successful open.  This
-        # second idempotent release is what also covers a guard/open failure before its
-        # local reader-finally block is entered.
-        _cleanup_source(store)
+        # A cleanup failure is still allowed to propagate after the response, but it
+        # must not strand the lifecycle gate forever. The unchanged next-page raw
+        # cgroup guard remains the fail-closed authority if cache pressure persists.
+        _release_gate(gate, state, generation)
 
 
-def _page_with_pre_response_cache_quiesce(store: Any, **kwargs: Any) -> dict[str, Any]:
-    if _ORIGINAL_PAGE is None:
-        raise RuntimeError("logical bootstrap cache repair page wrapper is unbound")
-    try:
-        return _ORIGINAL_PAGE(store, **kwargs)
-    finally:
-        # _ORIGINAL_PAGE closes its SQLite reader before control returns here.  The
-        # response rows are already materialized Python values, so evicting DB/WAL/SHM
-        # read cache cannot alter the response or its historical identity.  Because the
-        # whole page callable already runs in Starlette's bounded worker pool, this
-        # cleanup cannot block the ASGI event loop.
-        _cleanup_source(store)
+def install_logical_bootstrap_page_cache_repair(app: Any) -> None:
+    """Install one app-scoped lifecycle gate around the fully composed page route."""
 
-
-setattr(_manifest_with_failure_cleanup, "_roi_bootstrap_failure_cache_cleanup", True)
-setattr(_page_with_pre_response_cache_quiesce, "_roi_pre_response_cache_quiesce", True)
-
-
-def configure_logical_bootstrap_page_cache_repair() -> None:
-    """Install one idempotent production-only logical-bootstrap cache repair."""
-
-    global _INSTALLED, _ORIGINAL_PINNED_READER, _ORIGINAL_MANIFEST, _ORIGINAL_PAGE
-    if _INSTALLED:
+    global _INSTALLED, _LAST_STATE
+    marker = "roi_logical_bootstrap_page_lifecycle_gate"
+    if bool(getattr(app.state, marker, False)):
         return
 
-    if not bool(getattr(logical._pinned_reader, "_roi_bootstrap_lease_wal_aware", False)):
-        _ORIGINAL_PINNED_READER = logical._pinned_reader
-        logical._pinned_reader = _lease_aware_pinned_reader  # type: ignore[assignment]
+    route = _route(app)
+    original_page: Callable[..., Any] = route.dependant.call
+    if bool(getattr(original_page, "_roi_logical_bootstrap_page_lifecycle_gate", False)):
+        setattr(app.state, marker, True)
+        return
 
-    if not bool(getattr(logical._manifest, "_roi_bootstrap_failure_cache_cleanup", False)):
-        _ORIGINAL_MANIFEST = logical._manifest
-        logical._manifest = _manifest_with_failure_cleanup  # type: ignore[assignment]
+    gate = asyncio.Lock()
+    state: dict[str, Any] = {
+        "gate": gate,
+        "active": False,
+        "generation": 0,
+        "acquisitions": 0,
+        "releases": 0,
+        "timeouts": 0,
+        "cancelled_waiters": 0,
+    }
 
-    if not bool(getattr(logical._page, "_roi_pre_response_cache_quiesce", False)):
-        _ORIGINAL_PAGE = logical._page
-        logical._page = _page_with_pre_response_cache_quiesce  # type: ignore[assignment]
+    @wraps(original_page)
+    async def page_with_lifecycle_gate(
+        background_tasks: BackgroundTasks,
+        table: str,
+        epoch: str,
+        schema_fingerprint: str,
+        cursor: str | None = None,
+        limit: int = 250,
+        x_certification_token: str | None = None,
+    ) -> Any:
+        try:
+            await asyncio.wait_for(gate.acquire(), timeout=PAGE_GATE_WAIT_SECONDS)
+        except TimeoutError as exc:
+            state["timeouts"] = int(state.get("timeouts", 0)) + 1
+            raise HTTPException(
+                status_code=503,
+                detail="certification logical bootstrap deferred: previous page cleanup still active",
+            ) from exc
+        except asyncio.CancelledError:
+            state["cancelled_waiters"] = int(state.get("cancelled_waiters", 0)) + 1
+            raise
 
+        state["generation"] = int(state.get("generation", 0)) + 1
+        generation = int(state["generation"])
+        state["active"] = True
+        state["acquisitions"] = int(state.get("acquisitions", 0)) + 1
+        tasks_before = len(background_tasks.tasks)
+
+        try:
+            payload = await original_page(
+                background_tasks=background_tasks,
+                table=table,
+                epoch=epoch,
+                schema_fingerprint=schema_fingerprint,
+                cursor=cursor,
+                limit=limit,
+                x_certification_token=x_certification_token,
+            )
+        except BaseException:
+            # The existing logical route performs immediate off-loop cache cleanup on
+            # failed page construction because no successful response will be sent.
+            # Once that call unwinds it is safe to let a retry enter the gate.
+            _release_gate(gate, state, generation)
+            raise
+
+        appended = tuple(background_tasks.tasks[tasks_before:])
+        if not appended:
+            _release_gate(gate, state, generation)
+            raise HTTPException(
+                status_code=503,
+                detail="certification logical bootstrap deferred: post-response cleanup unavailable",
+            )
+
+        # Preserve exact post-send timing and task order. Starlette runs BackgroundTasks
+        # only after the final response body is sent. Replacing just the tasks appended
+        # by this page with one composite makes gate release a finally-action *after*
+        # those original tasks, even when cleanup itself raises.
+        background_tasks.tasks[tasks_before:] = [
+            BackgroundTask(_complete_page_lifecycle, appended, gate, state, generation)
+        ]
+        return payload
+
+    setattr(page_with_lifecycle_gate, "_roi_logical_bootstrap_page_lifecycle_gate", True)
+    setattr(page_with_lifecycle_gate, "_roi_original_endpoint", original_page)
+    route.endpoint = page_with_lifecycle_gate
+    route.dependant.call = page_with_lifecycle_gate
+
+    app.state.roi_logical_bootstrap_page_lifecycle_gate = True
+    app.state.roi_logical_bootstrap_page_lifecycle_gate_version = REPAIR_VERSION
+    app.state.roi_logical_bootstrap_page_lifecycle_gate_state = state
+    _LAST_STATE = state
     _INSTALLED = True
 
 
-def status() -> dict[str, Any]:
+def status(app: Any | None = None) -> dict[str, Any]:
+    state = None
+    if app is not None:
+        state = getattr(app.state, "roi_logical_bootstrap_page_lifecycle_gate_state", None)
+    if state is None:
+        state = _LAST_STATE
     return {
         "repair_version": REPAIR_VERSION,
-        "installed": _INSTALLED,
-        "pre_response_sqlite_cache_quiesce": bool(
-            getattr(logical._page, "_roi_pre_response_cache_quiesce", False)
+        "installed": bool(
+            _INSTALLED
+            if app is None
+            else getattr(app.state, "roi_logical_bootstrap_page_lifecycle_gate", False)
         ),
-        "failed_open_cache_cleanup": bool(
-            getattr(logical._manifest, "_roi_bootstrap_failure_cache_cleanup", False)
-        ),
-        "bootstrap_lease_wal_aware": bool(
-            getattr(logical._pinned_reader, "_roi_bootstrap_lease_wal_aware", False)
-        ),
+        "scope": "logical_bootstrap_page_through_post_send_cleanup",
         "post_response_cleanup_preserved": True,
+        "pre_response_cleanup_added": False,
+        "next_page_waits_for_prior_cleanup": True,
+        "bounded_wait_seconds": PAGE_GATE_WAIT_SECONDS,
+        "active": bool(state.get("active", False)) if isinstance(state, dict) else False,
+        "acquisitions": int(state.get("acquisitions", 0)) if isinstance(state, dict) else 0,
+        "releases": int(state.get("releases", 0)) if isinstance(state, dict) else 0,
+        "timeouts": int(state.get("timeouts", 0)) if isinstance(state, dict) else 0,
+        "cancelled_waiters": int(state.get("cancelled_waiters", 0)) if isinstance(state, dict) else 0,
         "raw_critical_fraction_changed": RAW_CRITICAL_FRACTION_CHANGED,
         "strategy_thresholds_changed": STRATEGY_THRESHOLDS_CHANGED,
         "certification_thresholds_changed": CERTIFICATION_THRESHOLDS_CHANGED,
@@ -175,6 +212,6 @@ def status() -> dict[str, Any]:
 
 __all__ = [
     "REPAIR_VERSION",
-    "configure_logical_bootstrap_page_cache_repair",
+    "install_logical_bootstrap_page_cache_repair",
     "status",
 ]
