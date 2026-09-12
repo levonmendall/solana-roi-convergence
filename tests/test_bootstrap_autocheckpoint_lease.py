@@ -284,7 +284,7 @@ def test_lease_safety_contract_and_retry_window():
     assert state["module_global_logical_functions_mutated"] is False
     assert state["route_wrappers_async"] is True
     assert state["background_tasks_forwarded"] is True
-    assert state["anyio_sync_worker_route_wrapper"] is False
+    assert state["anyio_sync_worker_route_wrapper"] is True
     assert state["preworker_lease_priming"] is True
     assert state["preworker_checkpoint_enabled"] is False
     assert state["preworker_sync_and_file_cache_release"] is True
