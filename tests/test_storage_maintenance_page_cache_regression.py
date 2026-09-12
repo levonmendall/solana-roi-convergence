@@ -12,6 +12,7 @@ from solana_roi import sqlite_phase_observability as phase_observability
 from solana_roi.continuity_storage_capacity_repair import MAINTENANCE_BATCH_ROWS
 from solana_roi.direct_solana import DirectSolanaJournal
 from solana_roi.storage_maintenance_lock_isolation_repair import (
+    _bounded_storage_maintenance_worker,
     _prune_operational_rows_once_isolated,
 )
 
@@ -153,8 +154,11 @@ def test_storage_maintenance_backlog_cannot_spin_at_startup(monkeypatch) -> None
         raise asyncio.TimeoutError
 
     monkeypatch.setattr(storage_capacity.asyncio, "wait_for", fake_wait_for)
-    asyncio.run(storage_capacity._storage_maintenance_worker(plane, stop))
+    asyncio.run(_bounded_storage_maintenance_worker(plane, stop))
 
+    assert bool(
+        getattr(_bounded_storage_maintenance_worker, "_roi_storage_maintenance_bounded_cadence", False)
+    )
     assert observed_timeouts == [storage_capacity.MAINTENANCE_IDLE_SECONDS]
 
 
