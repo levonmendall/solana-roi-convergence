@@ -1,0 +1,22 @@
+{
+  "canonical_sha": "92c0c1620f78116e7ecbeade039e9aedaf3a51a9",
+  "network_mode": "replay-only",
+  "production_entrypoint": "uvicorn solana_roi.production:app --host 0.0.0.0 --port $PORT",
+  "state_families": {
+    "wallet_history": {"fixture_path": "/fixtures/wallet.sqlite", "provenance": "UNKNOWN"},
+    "direct_solana": {"fixture_path": "/fixtures/direct-solana.sqlite", "provenance": "UNKNOWN"},
+    "hydration": {"fixture_path": "/fixtures/hydration.sqlite", "provenance": "UNKNOWN"},
+    "forward_evidence": {"fixture_path": "/fixtures/forward-evidence.sqlite", "provenance": "UNKNOWN"},
+    "events_checkpoints": {"fixture_path": "/fixtures/events.sqlite", "provenance": "UNKNOWN"},
+    "lifecycle_portfolio_control": {"fixture_path": "/fixtures/control.sqlite", "provenance": "UNKNOWN"},
+    "certification_replication": {"fixture_path": "/fixtures/certification.sqlite", "provenance": "UNKNOWN"},
+    "shadow_price_tokens": {"fixture_path": "/fixtures/shadow.sqlite", "provenance": "UNKNOWN"}
+  },
+  "provider_paths": {
+    "solana_http": {"classification": "NOT REPRESENTED", "live_network_allowed": false},
+    "solana_websocket": {"classification": "NOT REPRESENTED", "live_network_allowed": false},
+    "jupiter": {"classification": "NOT REPRESENTED", "live_network_allowed": false},
+    "robinhood_rpc": {"classification": "NOT REPRESENTED", "live_network_allowed": false},
+    "blockscout": {"classification": "NOT REPRESENTED", "live_network_allowed": false}
+  }
+}
