@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 from solana_roi import certification_incremental_replication as replication
 from solana_roi import certification_logical_bootstrap as logical
 from solana_roi import durable_bootstrap_memory_repair as durable_memory
+from solana_roi import logical_bootstrap_page_cache_repair as lifecycle
 
 
 PAGE_PATH = "/v1/operations/certification-db-logical-bootstrap-page"
@@ -45,10 +46,10 @@ def test_heap_trim_runs_after_json_response_call_returns(
     still owned by that response object.  Trimming at that point can therefore occur
     before those bytes are eligible for allocator release.
 
-    This regression observes the real FastAPI/Starlette response lifecycle.  It fails
-    on the current implementation if the heap trim runs while JSONResponse.__call__ is
-    still active and passes only when cleanup is deferred until the response call has
-    fully unwound.
+    This regression exercises the exact production composition: the logical-bootstrap
+    route plus the page lifecycle gate.  It fails on the current implementation if the
+    heap trim runs while JSONResponse.__call__ is still active and passes only when
+    cleanup is deferred until the response call has fully unwound.
     """
 
     store = _store(tmp_path)
@@ -94,6 +95,7 @@ def test_heap_trim_runs_after_json_response_call_returns(
         app,
         lambda: SimpleNamespace(store=store),
     )
+    lifecycle.install_logical_bootstrap_page_cache_repair(app)
 
     async def scenario() -> None:
         transport = httpx.ASGITransport(app=app)
