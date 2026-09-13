@@ -15,6 +15,7 @@ the explicit composition root (not called from this facade):
 import asyncio
 
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
+from .direct_solana_hydration_status_repair import configure_direct_solana_hydration_status_repair
 from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
 from .logical_bootstrap_page_cache_repair import configure_logical_bootstrap_page_cache_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
@@ -43,6 +44,12 @@ configure_robinhood_drpc_backup()
 # hot path while preserving explicit status endpoints, proposal selection, forward
 # evidence, strategy thresholds, and all paper-only authority boundaries.
 configure_wallet_discovery_background_status_repair()
+
+# Reconstruct the direct-Solana hydration status sample through bounded physical-row
+# keyset batches and then serve the latest 500 samples from a small indexed helper.
+# The canonical hydration history remains append/update authoritative and untouched;
+# this only replaces the old full-history scan/temp-sort used for operational status.
+configure_direct_solana_hydration_status_repair()
 
 # The shadow price clock previously scanned and sorted token_first_touches every
 # second. Configure its durable recent-mint state before production composition so
