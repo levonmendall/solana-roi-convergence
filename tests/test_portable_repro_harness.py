@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PRE = ROOT / "diagnostics" / "portable_repro" / "preflight.py"
 FID = ROOT / "diagnostics" / "portable_repro" / "fidelity.py"
+HOST = ROOT / "diagnostics" / "portable_repro" / "host_collect.py"
+OBS = ROOT / "diagnostics" / "portable_repro" / "observer.py"
 
 
 def load(path: Path, name: str):
@@ -24,6 +26,8 @@ def load(path: Path, name: str):
 
 preflight = load(PRE, "portable_preflight")
 fidelity = load(FID, "portable_fidelity")
+host_collect = load(HOST, "portable_host_collect")
+observer = load(OBS, "portable_observer")
 
 
 class PreflightTests(unittest.TestCase):
@@ -127,6 +131,39 @@ class NetworkGuardTests(unittest.TestCase):
 
     def test_blocks_external_hostname(self):
         self.assertEqual(self._check("('api.mainnet.solana.com', 443)"), "False")
+
+
+class HostCollectorTests(unittest.TestCase):
+    def test_resolves_unified_cgroup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            proc = root / "proc"
+            syscg = root / "cgroup"
+            (proc / "44").mkdir(parents=True)
+            syscg.mkdir()
+            (proc / "44" / "cgroup").write_text("0::/docker/example\n")
+            self.assertEqual(
+                host_collect.resolve_cgroup_root(44, proc_root=proc, sys_cgroup_root=syscg),
+                syscg / "docker/example",
+            )
+
+    def test_rejects_non_v2_membership(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            proc = root / "proc"
+            (proc / "44").mkdir(parents=True)
+            (proc / "44" / "cgroup").write_text("5:memory:/legacy\n")
+            with self.assertRaises(host_collect.HostCollectError):
+                host_collect.resolve_cgroup_root(44, proc_root=proc, sys_cgroup_root=root / "cgroup")
+
+
+class ObserverTests(unittest.TestCase):
+    def test_accepts_loopback(self):
+        observer._validate_base_url("http://127.0.0.1:10000")
+
+    def test_rejects_external_host(self):
+        with self.assertRaises(ValueError):
+            observer._validate_base_url("https://example.com")
 
 
 if __name__ == "__main__":
