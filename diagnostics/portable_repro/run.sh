@@ -37,15 +37,29 @@ python "$ROOT/diagnostics/portable_repro/collector.py" \
   --samples "${PORTABLE_REPRO_MAX_SAMPLES:-240}" &
 COLLECTOR_PID=$!
 
+python "$ROOT/diagnostics/portable_repro/observer.py" \
+  --base-url "http://127.0.0.1:$PORT" \
+  --output "$OUT/http-observations.jsonl" \
+  --interval "${PORTABLE_REPRO_OBSERVER_SECONDS:-10}" \
+  --samples "${PORTABLE_REPRO_OBSERVER_SAMPLES:-120}" &
+OBSERVER_PID=$!
+
 cleanup() {
   status=$?
-  kill "$COLLECTOR_PID" 2>/dev/null || true
+  trap - EXIT INT TERM
+  kill "$COLLECTOR_PID" "$OBSERVER_PID" 2>/dev/null || true
   wait "$COLLECTOR_PID" 2>/dev/null || true
+  wait "$OBSERVER_PID" 2>/dev/null || true
+  cp /sys/fs/cgroup/memory.events "$OUT/memory.events.final" 2>/dev/null || true
+  cp /sys/fs/cgroup/memory.stat "$OUT/memory.stat.final" 2>/dev/null || true
+  cp /sys/fs/cgroup/memory.current "$OUT/memory.current.final" 2>/dev/null || true
   printf '{"exit_status":%s,"finished_at":%(%s)T}\n' "$status" -1 > "$OUT/termination.json"
   exit "$status"
 }
 trap cleanup EXIT INT TERM
 
+# GNU coreutils timeout returns 124 on wall-clock expiry. A whole-container OOM may
+# bypass this trap, so run_docker.sh also preserves Docker state and host samples.
 timeout --signal=TERM --kill-after=15s "${MAX_SECONDS}s" \
   uvicorn solana_roi.production:app --host 0.0.0.0 --port "$PORT" \
   2>&1 | tee "$OUT/application.log"
