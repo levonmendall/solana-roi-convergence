@@ -1,0 +1,20 @@
+{
+  "1x": {
+    "physical": 8396800.0,
+    "anon": 8591360.0,
+    "cache": 16785408.0,
+    "resanon": 4231168.0,
+    "rescache": 8388608.0,
+    "trimanon": 20480.0,
+    "trimcache": 8388608.0
+  },
+  "10x": {
+    "physical": 8396800.0,
+    "anon": 8589312.0,
+    "cache": 16490496.0,
+    "resanon": 4227072.0,
+    "rescache": -4161536.0,
+    "trimanon": 18432.0,
+    "trimcache": -7286784.0
+  }
+}
