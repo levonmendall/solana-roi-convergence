@@ -45,7 +45,7 @@ def test_validation_cloud_is_preferred_for_getlogs_without_moving_primary_provid
         addresses=None,
         topics=None,
     ) -> list[dict[str, Any]]:
-        raise AssertionError("canonical provider should not run while Validation Cloud is healthy")
+        raise AssertionError("governed fallback should not run while Validation Cloud is healthy")
 
     async def validation_rpc(self: _Rpc, method: str, params: list[Any]) -> Any:
         methods.append((method, params))
@@ -62,7 +62,11 @@ def test_validation_cloud_is_preferred_for_getlogs_without_moving_primary_provid
             return [{"blockNumber": hex(block)} for block in range(start, end + 1)]
         raise AssertionError(method)
 
+    # _ORIGINAL_GET_LOGS keeps the provider guard structurally installed for this
+    # focused test. _request_range represents the later production capability
+    # wrapper. Neither may run while the dedicated Validation Cloud path is healthy.
     monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", canonical_should_not_run)
+    monkeypatch.setattr(guard, "_request_range", canonical_should_not_run)
     monkeypatch.setattr(guard, "_validation_cloud_rpc", validation_rpc)
 
     first = _run(rpc, 100, 104)
@@ -80,7 +84,7 @@ def test_validation_cloud_is_preferred_for_getlogs_without_moving_primary_provid
     assert rpc._roi_getlogs_guard_validation_cloud_successes == 2
 
 
-def test_validation_cloud_failure_falls_back_to_exact_canonical_range(monkeypatch) -> None:
+def test_validation_cloud_failure_falls_back_to_exact_governed_range(monkeypatch) -> None:
     monkeypatch.setenv(
         guard.ENV_VALIDATION_CLOUD_RPC_URL,
         "https://mainnet.robinhood.validationcloud.example/key",
@@ -94,7 +98,7 @@ def test_validation_cloud_failure_falls_back_to_exact_canonical_range(monkeypatc
     async def validation_failure(self: _Rpc, method: str, params: list[Any]) -> Any:
         raise RuntimeError("simulated Validation Cloud outage")
 
-    async def canonical(
+    async def governed_fallback(
         self: _Rpc,
         *,
         from_block: int,
@@ -108,7 +112,8 @@ def test_validation_cloud_failure_falls_back_to_exact_canonical_range(monkeypatc
         return [{"blockNumber": hex(block)} for block in range(from_block, to_block + 1)]
 
     monkeypatch.setattr(guard, "_validation_cloud_rpc", validation_failure)
-    monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", canonical)
+    monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", governed_fallback)
+    monkeypatch.setattr(guard, "_request_range", governed_fallback)
 
     rows = _run(rpc, 200, 204)
 
@@ -138,7 +143,7 @@ def test_wrong_validation_cloud_chain_never_admits_wrong_chain_logs(monkeypatch)
             raise AssertionError("wrong-chain endpoint must never be queried for logs")
         raise AssertionError(method)
 
-    async def canonical(
+    async def governed_fallback(
         self: _Rpc,
         *,
         from_block: int,
@@ -150,7 +155,8 @@ def test_wrong_validation_cloud_chain_never_admits_wrong_chain_logs(monkeypatch)
         return [{"blockNumber": hex(block)} for block in range(from_block, to_block + 1)]
 
     monkeypatch.setattr(guard, "_validation_cloud_rpc", wrong_chain)
-    monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", canonical)
+    monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", governed_fallback)
+    monkeypatch.setattr(guard, "_request_range", governed_fallback)
 
     rows = _run(rpc, 300, 302)
 
@@ -182,7 +188,7 @@ def test_validation_cloud_specific_block_limit_chunks_without_changing_filters(
         addresses=None,
         topics=None,
     ) -> list[dict[str, Any]]:
-        raise AssertionError("canonical provider should not run")
+        raise AssertionError("governed fallback should not run")
 
     async def validation_rpc(self: _Rpc, method: str, params: list[Any]) -> Any:
         if method == "eth_chainId":
@@ -198,6 +204,7 @@ def test_validation_cloud_specific_block_limit_chunks_without_changing_filters(
         raise AssertionError(method)
 
     monkeypatch.setattr(guard, "_ORIGINAL_GET_LOGS", canonical_should_not_run)
+    monkeypatch.setattr(guard, "_request_range", canonical_should_not_run)
     monkeypatch.setattr(guard, "_validation_cloud_rpc", validation_rpc)
 
     rows = _run(rpc, 400, 411)
@@ -226,6 +233,7 @@ def test_validation_cloud_status_preserves_paper_only_authority(monkeypatch) -> 
     assert proof["validation_cloud_configured"] is True
     assert proof["validation_cloud_getlogs_only"] is True
     assert proof["validation_cloud_preserves_primary_ws"] is True
+    assert proof["validation_cloud_dispatch_above_capability_repair"] is True
     assert proof["changes_strategy_thresholds"] is False
     assert proof["paper_only"] is True
     assert proof["live_money_authority"] is False
