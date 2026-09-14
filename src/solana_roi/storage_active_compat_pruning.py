@@ -13,11 +13,12 @@ def prune_active_compatibility_database(
 ) -> dict[str, int]:
     """Prune only evidence/transport whose runtime dependency is explicitly bounded.
 
-    This is active-store maintenance, not a legacy purge.  It never deletes
+    This is active-store maintenance, not a legacy purge. It never deletes
     pending/processing transport, paper/cohort authority, certification epochs,
     current provider/gap state, wallet-forward runtime epochs, or event lineage.
-    Wallet-forward source observations are removed before their de-dup markers so
-    a retained source row can never be reprocessed because its marker disappeared.
+    It also preserves the exact latest-sample surfaces consumed by certification
+    gates and any old normalized swap still required to prove first-touch
+    chronology conflicts.
     """
     instant = now or datetime.now(timezone.utc)
     cutoff31 = (instant - timedelta(days=31)).isoformat()
@@ -41,10 +42,11 @@ def prune_active_compatibility_database(
             cursor = connection.execute(sql, args)
             deleted[table] = deleted.get(table, 0) + max(0, int(cursor.rowcount))
 
-        # Durable transport: unresolved work always survives.
+        # Durable transport: unresolved work always survives. Helius has no
+        # completed_at column; updated_at is its terminal-time materialization.
         run(
             "helius_webhook_inbox",
-            "DELETE FROM helius_webhook_inbox WHERE state='complete' AND completed_at IS NOT NULL AND completed_at<?",
+            "DELETE FROM helius_webhook_inbox WHERE state='complete' AND updated_at<?",
             (cutoff7,),
         )
         run(
@@ -75,9 +77,9 @@ def prune_active_compatibility_database(
             (cutoff31,),
         )
 
-        # Wallet discovery and forward-alpha source evidence.  Source observations
+        # Wallet discovery and forward-alpha source evidence. Source observations
         # go first; only then may stale de-dup markers with no retained source row
-        # disappear.  This prevents historical observations from being replayed.
+        # disappear. This prevents historical observations from being replayed.
         run(
             "wallet_discovery_forward_observations",
             "DELETE FROM wallet_discovery_forward_observations WHERE received_at<?",
@@ -109,35 +111,73 @@ def prune_active_compatibility_database(
             (cutoff31,),
         )
 
-        # Prospective certification/research windows.
+        # Semantic-candidate persistence is watch-state only and explicitly has
+        # entry_authority=0. Its immediate deadline is seconds, so a 31-day hot
+        # window is deliberately conservative while still bounding unique-token
+        # accumulation.
+        run(
+            "semantic_candidate_events",
+            "DELETE FROM semantic_candidate_events WHERE received_at<?",
+            (cutoff31,),
+        )
+        run(
+            "semantic_candidate_opportunities",
+            "DELETE FROM semantic_candidate_opportunities WHERE last_seen<?",
+            (cutoff31,),
+        )
+        run(
+            "semantic_candidate_risk_state",
+            "DELETE FROM semantic_candidate_risk_state WHERE assessed_at<?",
+            (cutoff31,),
+        )
+
+        # Prospective certification/research windows. Keep the exact latest-500
+        # surface used by the gates even if activity has been sparse for >31d.
         run(
             "execution_quote_observations",
-            "DELETE FROM execution_quote_observations WHERE received_at<?",
+            "DELETE FROM execution_quote_observations WHERE received_at<? AND id NOT IN ("
+            "SELECT id FROM execution_quote_observations ORDER BY id DESC LIMIT 500)",
             (cutoff31,),
         )
         run(
             "shadow_execution_observations",
-            "DELETE FROM shadow_execution_observations WHERE completed_at<?",
+            "DELETE FROM shadow_execution_observations WHERE completed_at<? AND id NOT IN ("
+            "SELECT id FROM shadow_execution_observations ORDER BY id DESC LIMIT 500)",
             (cutoff31,),
         )
         run(
             "risk_refresh_measurements",
-            "DELETE FROM risk_refresh_measurements WHERE completed_at<?",
+            "DELETE FROM risk_refresh_measurements WHERE completed_at<? AND id NOT IN ("
+            "SELECT id FROM risk_refresh_measurements ORDER BY id DESC LIMIT 500)",
             (cutoff7,),
         )
         run(
             "program_coverage_observations",
-            "DELETE FROM program_coverage_observations WHERE assessed_at<?",
+            "DELETE FROM program_coverage_observations WHERE assessed_at<? AND id NOT IN ("
+            "SELECT id FROM program_coverage_observations ORDER BY assessed_at DESC,id DESC LIMIT 500)",
             (cutoff31,),
         )
-        run(
-            "normalized_swaps",
-            "DELETE FROM normalized_swaps WHERE received_at<?",
-            (cutoff31,),
-        )
+
+        # First-touch certification queries the historical existence of an earlier
+        # eligible S/A buy. Preserve every row that proves such a conflict even
+        # outside the hot window; all unrelated old swaps are bounded away.
+        if {"normalized_swaps", "token_first_touches", "wallet_profiles"}.issubset(tables):
+            run(
+                "normalized_swaps",
+                "DELETE FROM normalized_swaps WHERE received_at<? AND NOT EXISTS ("
+                "SELECT 1 FROM token_first_touches t JOIN wallet_profiles w ON w.wallet=normalized_swaps.wallet "
+                "WHERE t.token_mint=normalized_swaps.token_mint AND normalized_swaps.side='buy' "
+                "AND w.historically_eligible=1 AND w.tier IN ('S','A') "
+                "AND julianday(normalized_swaps.observed_at)<julianday(t.observed_at))",
+                (cutoff31,),
+            )
+
+        # Keep current stale-vs-missing risk semantics by retaining the newest
+        # evidence per token/dimension even if older than the hot window.
         run(
             "risk_evidence",
-            "DELETE FROM risk_evidence WHERE received_at<?",
+            "DELETE FROM risk_evidence WHERE received_at<? AND id NOT IN ("
+            "SELECT MAX(id) FROM risk_evidence GROUP BY token_mint,dimension)",
             (cutoff31,),
         )
 
