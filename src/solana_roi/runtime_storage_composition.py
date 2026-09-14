@@ -9,6 +9,7 @@ from .active_runtime import ActiveDurablePaperTradingEngine, ActiveObservationEv
 from .certification_active_manifest import install_active_certification_manifest
 from .durable_engine import DurablePaperTradingEngine
 from .observation_store import ObservationEventStore
+from .storage_current_v52_shadow import reconcile_current_v52_shadow
 from .storage_shadow_migration import build_shadow_database
 from .storage_transition import (
     ACTIVE_PATH_ENV,
@@ -25,6 +26,7 @@ SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
 FINALIZE_ENV = "SOLANA_ROI_ACTIVE_STORAGE_FINALIZE_FROM_LEGACY"
 HIDE_LEGACY_ENV = "SOLANA_ROI_ACTIVE_STORAGE_HIDE_LEGACY"
+RESTORE_LEGACY_ENV = "SOLANA_ROI_ACTIVE_STORAGE_RESTORE_LEGACY"
 LEGACY_QUARANTINE_ENV = "SOLANA_ROI_LEGACY_QUARANTINE_DIR"
 
 
@@ -47,6 +49,11 @@ def _active_path() -> Path:
     return Path(raw)
 
 
+def _quarantine_root(legacy: Path) -> Path:
+    root_raw = (os.getenv(LEGACY_QUARANTINE_ENV) or "").strip()
+    return Path(root_raw) if root_raw else legacy.parent / "legacy-quarantine"
+
+
 def _report(prefix: str, payload: dict[str, Any]) -> None:
     print(prefix + " " + json.dumps(payload, sort_keys=True, default=str), flush=True)
 
@@ -60,8 +67,12 @@ def _build_exact_snapshot(*, release: str, mode: str) -> dict[str, Any]:
         release_sha=release,
         replace_existing=True,
     )
+    current_v52 = reconcile_current_v52_shadow(legacy, active)
     payload = {
         **report.__dict__,
+        "active_size_bytes": int(current_v52["active_size_bytes"]),
+        "active_wal_bytes": int(current_v52["active_wal_bytes"]),
+        "current_v52_reconciliation": current_v52,
         "mode": mode,
         "authoritative_runtime_changed": False,
         "paper_only": True,
@@ -84,10 +95,10 @@ def _quarantine_legacy_for_independence_proof(legacy: Path) -> dict[str, Any]:
     """Make the legacy SQLite family physically unavailable without deleting it.
 
     Sidecars are moved first and the main DB last, all on the same persistent
-    disk.  The operation is reversible; no historical bytes are deleted.
+    disk. The original main path remains absent unless the whole family has been
+    moved. No historical bytes are deleted.
     """
-    root_raw = (os.getenv(LEGACY_QUARANTINE_ENV) or "").strip()
-    root = Path(root_raw) if root_raw else legacy.parent / "legacy-quarantine"
+    root = _quarantine_root(legacy)
     root.mkdir(parents=True, exist_ok=True)
     moved: list[dict[str, str]] = []
     for suffix in ("-wal", "-shm", ""):
@@ -124,8 +135,69 @@ def _quarantine_legacy_for_independence_proof(legacy: Path) -> dict[str, Any]:
     return payload
 
 
+def _restore_legacy_from_quarantine(legacy: Path) -> dict[str, Any]:
+    """Restore a quarantined legacy SQLite family before any store is opened.
+
+    Sidecars are restored before the main file, mirroring the quarantine safety
+    boundary: the original main path does not reappear until all available
+    matching sidecars are in place. This is an explicit rollback mechanism, not
+    a hidden fallback from active mode.
+    """
+    root = _quarantine_root(legacy)
+    quarantined_main = root / legacy.name
+    if legacy.exists() and quarantined_main.exists():
+        raise RuntimeError("legacy restore blocked: main database exists at both original and quarantine paths")
+    if legacy.exists() and not quarantined_main.exists():
+        return {
+            "status": "legacy_already_available",
+            "original_path": str(legacy),
+            "restored": [],
+            "deleted": False,
+        }
+    if not quarantined_main.exists():
+        raise RuntimeError("legacy restore blocked: quarantined main database missing")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    restored: list[dict[str, str]] = []
+    for suffix in ("-wal", "-shm", ""):
+        source = root / (legacy.name + suffix)
+        target = Path(str(legacy) + suffix)
+        if source.exists() and target.exists():
+            raise RuntimeError(f"legacy restore blocked: both source and destination exist: {target}")
+        if source.exists():
+            os.replace(source, target)
+            restored.append({"source": str(source), "target": str(target)})
+    if not legacy.exists():
+        raise RuntimeError("legacy restore blocked: restored main database missing")
+    try:
+        fd = os.open(legacy.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    payload = {
+        "status": "legacy_restored_to_original_path",
+        "original_path": str(legacy),
+        "quarantine_path": str(quarantined_main),
+        "restored": restored,
+        "deleted": False,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+    _report("ROI_ACTIVE_STORAGE_LEGACY_RESTORE", payload)
+    return payload
+
+
 def compose_runtime_storage() -> tuple[ObservationEventStore, DurablePaperTradingEngine, dict[str, Any]]:
     """Compose exactly one runtime store/engine without hidden package installers."""
+    if _truthy(HIDE_LEGACY_ENV) and _truthy(RESTORE_LEGACY_ENV):
+        raise RuntimeError("storage composition blocked: hide-legacy and restore-legacy cannot both be enabled")
+
+    restored: dict[str, Any] | None = None
+    if _truthy(RESTORE_LEGACY_ENV):
+        restored = _restore_legacy_from_quarantine(_legacy_path())
+
     shadow = _shadow_once()
     if _truthy(ACTIVATE_ENV):
         release = _release_sha()
@@ -154,6 +226,7 @@ def compose_runtime_storage() -> tuple[ObservationEventStore, DurablePaperTradin
             "legacy_fallback": False,
             "finalization": finalization,
             "legacy_quarantine": quarantine,
+            "legacy_restore": restored,
             "paper_only": True,
             "live_money_authority": False,
         }
@@ -164,6 +237,7 @@ def compose_runtime_storage() -> tuple[ObservationEventStore, DurablePaperTradin
         "mode": "legacy_authoritative",
         "path": str(store.path),
         "shadow": shadow,
+        "legacy_restore": restored,
         "paper_only": True,
         "live_money_authority": False,
     }
