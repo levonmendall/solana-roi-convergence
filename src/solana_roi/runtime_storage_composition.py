@@ -8,6 +8,7 @@ from typing import Any
 from .active_runtime import ActiveDurablePaperTradingEngine, ActiveObservationEventStore
 from .certification_active_manifest import install_active_certification_manifest
 from .durable_engine import DurablePaperTradingEngine
+from .legacy_storage_containment import LegacyContainedObservationEventStore
 from .observation_store import ObservationEventStore
 from .storage_shadow_migration import build_shadow_database
 from .storage_transition import (
@@ -227,13 +228,18 @@ def compose_runtime_storage() -> tuple[ObservationEventStore, DurablePaperTradin
             "live_money_authority": False,
         }
 
-    store = ObservationEventStore(_legacy_path())
-    engine = DurablePaperTradingEngine(store=store)
-    return store, engine, {
+    # Until the active-store cutover is proven, legacy remains authoritative but
+    # no longer accumulates every positively classified low-value row forever.
+    # Containment is bounded, best-effort maintenance only and cannot authorize
+    # or block strategy/portfolio writes.
+    contained_store = LegacyContainedObservationEventStore(_legacy_path())
+    engine = DurablePaperTradingEngine(store=contained_store)
+    return contained_store, engine, {
         "mode": "legacy_authoritative",
-        "path": str(store.path),
+        "path": str(contained_store.path),
         "shadow": shadow,
         "legacy_restore": restored,
+        "legacy_containment": contained_store.containment_status(),
         "paper_only": True,
         "live_money_authority": False,
     }
