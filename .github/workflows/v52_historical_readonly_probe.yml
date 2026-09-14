@@ -1,4 +1,4 @@
-name: v5.2 historical provider probe
+name: v5.2 historical evidence path probe
 
 on:
   push:
@@ -14,44 +14,57 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    env:
-      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-      SOLANA_ROI_ALCHEMY_API_KEY: ${{ secrets.SOLANA_ROI_ALCHEMY_API_KEY }}
-      SOLANA_ROI_DRPC_API_KEY: ${{ secrets.SOLANA_ROI_DRPC_API_KEY }}
-      ROBINHOOD_RPC_URL: ${{ secrets.ROBINHOOD_RPC_URL }}
-      ROBINHOOD_BACKUP_RPC_URL: ${{ secrets.ROBINHOOD_BACKUP_RPC_URL }}
-      ROBINHOOD_VALIDATION_CLOUD_RPC_URL: ${{ secrets.ROBINHOOD_VALIDATION_CLOUD_RPC_URL }}
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
-      - name: Check provider availability without exposing credentials
+      - name: Trace certification bootstrap and replica read paths
+        shell: bash
+        run: |
+          set -u
+          mkdir -p diagnostics/v52_historical_replay/output
+          grep -RniE 'certification-db-logical-bootstrap|logical.bootstrap|BOOTSTRAP.*TABLE|bootstrap.*allow|replica.*table|replica.*read|certifier.*replica|normalized_swaps|v51_candidates|candidate_stage_events' src operations tests 2>/dev/null | head -n 6000 > diagnostics/v52_historical_replay/output/bootstrap_trace.txt || true
+          cat diagnostics/v52_historical_replay/output/bootstrap_trace.txt
+      - name: Inspect public authoritative and certifier schemas
         shell: python
         run: |
-          import json, os, urllib.request
+          import json, urllib.request
           from pathlib import Path
-          out=Path('diagnostics/v52_historical_replay/output'); out.mkdir(parents=True,exist_ok=True)
-          names=['HELIUS_API_KEY','SOLANA_ROI_ALCHEMY_API_KEY','SOLANA_ROI_DRPC_API_KEY','ROBINHOOD_RPC_URL','ROBINHOOD_BACKUP_RPC_URL','ROBINHOOD_VALIDATION_CLOUD_RPC_URL']
-          result={'configured':{n:bool(os.getenv(n)) for n in names}}
-          def rpc(url,method,params):
-            body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
-            req=urllib.request.Request(url,data=body,headers={'content-type':'application/json','user-agent':'v52-readonly-historical-probe'})
+          out=Path('diagnostics/v52_historical_replay/output')
+          result={}
+          for name,base in [('authoritative','https://solana-roi-convergence.onrender.com'),('certifier','https://solana-roi-certifier.onrender.com')]:
             try:
-              with urllib.request.urlopen(req,timeout=15) as r:
-                data=json.loads(r.read())
-              return {'ok': 'result' in data, 'error': data.get('error'), 'result_type': type(data.get('result')).__name__}
+              req=urllib.request.Request(base+'/openapi.json',headers={'user-agent':'v52-readonly-historical-probe'})
+              with urllib.request.urlopen(req,timeout=30) as r: spec=json.loads(r.read())
+              paths=sorted(spec.get('paths',{}))
+              result[name]={'ok':True,'paths':[p for p in paths if any(k in p.lower() for k in ('cert','bootstrap','replica','evidence','candidate','swap','trial','paper','wallet','strategy'))]}
+              (out/f'{name}_openapi.json').write_text(json.dumps(spec,indent=2))
             except Exception as e:
-              return {'ok':False,'error_type':type(e).__name__,'error_text':str(e)[:160]}
-          hk=os.getenv('HELIUS_API_KEY','')
-          if hk:
-            result['helius_rpc']=rpc(f'https://mainnet.helius-rpc.com/?api-key={hk}','getSlot',[{'commitment':'finalized'}])
-          for key in ['ROBINHOOD_RPC_URL','ROBINHOOD_BACKUP_RPC_URL','ROBINHOOD_VALIDATION_CLOUD_RPC_URL']:
-            url=os.getenv(key,'').strip()
-            if url:
-              result[key+'_probe']=rpc(url,'eth_chainId',[])
-          (out/'provider_probe.json').write_text(json.dumps(result,indent=2,sort_keys=True))
-          print(json.dumps(result,indent=2,sort_keys=True))
+              result[name]={'ok':False,'error':repr(e)}
+          (out/'openapi_summary.json').write_text(json.dumps(result,indent=2))
+          print(json.dumps(result,indent=2))
+      - name: Probe candidate read surfaces without credentials
+        shell: python
+        run: |
+          import json, urllib.parse, urllib.request
+          from pathlib import Path
+          out=Path('diagnostics/v52_historical_replay/output')
+          probes=[]
+          bases=['https://solana-roi-convergence.onrender.com','https://solana-roi-certifier.onrender.com']
+          paths=['/v1/validation/evidence','/v1/shadow/trials','/v1/paper','/v1/strategy/candidate-coverage','/v1/operations/certification-db-logical-bootstrap-manifest']
+          for base in bases:
+            for path in paths:
+              url=base+path
+              try:
+                req=urllib.request.Request(url,headers={'user-agent':'v52-readonly-historical-probe'})
+                with urllib.request.urlopen(req,timeout=30) as r:
+                  body=r.read(200000).decode('utf-8','replace')
+                  probes.append({'url':url,'status':r.status,'body_prefix':body[:5000]})
+              except Exception as e:
+                probes.append({'url':url,'error':repr(e)})
+          (out/'surface_probe.json').write_text(json.dumps(probes,indent=2))
+          print(json.dumps(probes,indent=2)[:30000])
       - uses: actions/upload-artifact@v4
         with:
-          name: v52-historical-provider-probe
-          path: diagnostics/v52_historical_replay/output/provider_probe.json
+          name: v52-historical-evidence-path-probe
+          path: diagnostics/v52_historical_replay/output
           retention-days: 7
