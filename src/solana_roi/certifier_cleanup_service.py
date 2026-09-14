@@ -31,8 +31,9 @@ from . import production_data_cleanup_v4 as cleanup
 from . import production_disk_ownership as disk_ownership
 from .certification_active_manifest import install_active_certification_manifest
 from .certification_replica_client import _replica_path
+from .storage_transition_quiesce import transition_certifier_quiesce_requested
 
-SERVICE_VERSION = "isolated-certifier-cleanup-entrypoint-v4-active-manifest-alignment"
+SERVICE_VERSION = "isolated-certifier-cleanup-entrypoint-v5-storage-transition-quiesce"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -76,6 +77,8 @@ _STATE: dict[str, Any] = {
     "runtime_disk_ownership_required": True,
     "same_release_lease_establishment_required": True,
     "worker_quiesced_until_cleanup_complete": True,
+    "storage_transition_certifier_quiesced": False,
+    "certification_available_during_storage_transition": True,
     "active_storage_child_bridge": True,
     "active_storage_replication_manifest": _ACTIVE_MANIFEST_INSTALLED,
     "replication_version": _ACTIVE_REPLICATION_VERSION,
@@ -241,16 +244,42 @@ async def lifespan(app: Any) -> AsyncIterator[None]:
     lease: disk_ownership.RuntimeDiskLease | None = None
     marker_task: asyncio.Task[None] | None = None
     enabled = _env_true(cleanup.ENABLED_ENV)
+    transition_quiesced = transition_certifier_quiesce_requested()
     waiting = _set_state(
         enabled=enabled,
         status="waiting_for_runtime_disk_ownership",
         database_path=str(database_path),
+        storage_transition_certifier_quiesced=transition_quiesced,
+        certification_available_during_storage_transition=not transition_quiesced,
     )
     _emit("ROI_CERTIFIER_CLEANUP_RUNTIME", waiting)
     try:
         lease = await disk_ownership.acquire_runtime_disk_lease(database_path, stop=stop)
         owned = _set_state(disk_ownership=lease.status())
         _emit("ROI_CERTIFIER_CLEANUP_RUNTIME", owned)
+
+        if transition_quiesced:
+            quiesced = _set_state(
+                enabled=enabled,
+                status="storage_transition_quiesced",
+                storage_transition_certifier_quiesced=True,
+                certification_available_during_storage_transition=False,
+                worker_started_after_cleanup=False,
+                storage_activation_authorized=False,
+            )
+            with certifier._LOCK:
+                certifier._STATE["storage_transition_quiesced"] = True
+                certifier._STATE["last_error_type"] = "StorageTransitionQuiesced"
+            _emit("ROI_CERTIFIER_STORAGE_TRANSITION_QUIESCED", quiesced)
+            # Liveness remains available, but the original certifier lifespan is
+            # deliberately not entered. Deep certification surfaces therefore stay
+            # fail-closed and no legacy logical-bootstrap page can be requested.
+            yield
+            return
+
+        with certifier._LOCK:
+            certifier._STATE["storage_transition_quiesced"] = False
+
         if enabled:
             _set_state(status="cleanup_preflight_or_execution")
             try:
@@ -278,7 +307,11 @@ async def lifespan(app: Any) -> AsyncIterator[None]:
 
         with certifier._LOCK:
             baseline_successes = int(certifier._STATE.get("successes", 0) or 0)
-        _set_state(status="disabled_running_normally")
+        _set_state(
+            status="disabled_running_normally",
+            storage_transition_certifier_quiesced=False,
+            certification_available_during_storage_transition=True,
+        )
         async with _ORIGINAL_LIFESPAN(app):
             marker_task = asyncio.create_task(
                 _mark_established_after_success(
