@@ -6,6 +6,7 @@ on:
       - analysis/historical-chain-backtest-20260914
     paths:
       - diagnostics/historical_chain_backtest_probe.py
+      - diagnostics/historical_candidate_route_probe.py
       - .github/workflows/historical-chain-backtest-probe.yml
   workflow_dispatch:
 
@@ -21,5 +22,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Probe production and public chains
-        run: python diagnostics/historical_chain_backtest_probe.py
+      - name: Probe candidate routes and production source
+        run: python diagnostics/historical_candidate_route_probe.py
