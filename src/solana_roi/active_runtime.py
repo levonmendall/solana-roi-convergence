@@ -12,6 +12,7 @@ from . import storage_manifest as _storage_manifest  # noqa: F401
 from .active_storage import ActiveStorage
 from .durable_engine import DurablePaperTradingEngine, _ENGINE_EVENT_TYPES
 from .observation_store import ObservationEventStore
+from .storage_current_v52_reconciliation import prune_current_v52_database
 from .storage_transition import load_verified_checkpoint
 
 
@@ -66,6 +67,7 @@ class ActiveObservationEventStore(ObservationEventStore):
         storage = ActiveStorage(self.path)
         storage.prune_v52_market_validation()
         storage.prune_v52_wallet_forward_alpha()
+        prune_current_v52_database(self.path)
         storage.prune_expired_diagnostics()
         storage.prune_acknowledged_transport()
         storage.checkpoint_wal()
