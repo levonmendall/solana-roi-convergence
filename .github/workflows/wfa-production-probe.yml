@@ -1,0 +1,34 @@
+name: WFA Production Probe
+
+on:
+  push:
+    branches:
+      - diagnostic/wfa-production-probe-fd0ef
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read authoritative Wallet Forward Alpha production state
+        shell: bash
+        run: |
+          set +e
+          base="https://solana-roi-convergence.onrender.com"
+          for path in \
+            "/health" \
+            "/v1/operations/production-composition" \
+            "/v1/strategy/authority" \
+            "/v1/strategy/v52/wallet-forward-alpha"
+          do
+            echo "===== ${path} ====="
+            curl --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 2 -sS \
+              -H 'Accept: application/json' \
+              -w '\nHTTP_STATUS:%{http_code}\n' \
+              "${base}${path}"
+            echo
+          done
