@@ -23,6 +23,8 @@ _STORAGE_INVENTORY_ROOT = "/var/data"
 _STORAGE_INVENTORY_TOP_N = 20
 _STORAGE_INVENTORY_START_DELAY_SECONDS = 5.0
 _STORAGE_INVENTORY_LOG_EMITTED = False
+_SHADOW_START_DELAY_SECONDS = 15.0
+_SHADOW_RETRY_SECONDS = 15.0
 _LOGGER = logging.getLogger(__name__)
 _BOOTSTRAP_STATE: dict[str, Any] = {
     "state": "not_started",
@@ -33,6 +35,15 @@ _BOOTSTRAP_STATE: dict[str, Any] = {
     "last_error_type": None,
     "last_error_message": None,
     "lifespan_active": False,
+}
+_SHADOW_STATE: dict[str, Any] = {
+    "state": "not_started",
+    "requested": False,
+    "attempts": 0,
+    "last_memory_fraction": None,
+    "last_memory_headroom_bytes": None,
+    "last_error_type": None,
+    "equivalent": None,
 }
 _RUNTIME: Any | None = None
 _API: Any | None = None
@@ -110,9 +121,13 @@ def _public_status() -> dict[str, Any]:
         "ready_at": _BOOTSTRAP_STATE["ready_at"],
         "last_error_type": _BOOTSTRAP_STATE["last_error_type"],
         "last_error_message": _BOOTSTRAP_STATE["last_error_message"],
+        "deferred_storage_shadow": dict(_SHADOW_STATE),
         "liveness_decoupled_from_sqlite_bootstrap": True,
         "deep_runtime_fail_closed_until_ready": True,
         "sqlite_lock_retries_are_background_only": True,
+        "storage_shadow_decoupled_from_startup": True,
+        "storage_shadow_memory_gated": True,
+        "storage_shadow_has_activation_authority": False,
         "certification_research_architecture_installed_before_api_capture": True,
         "wallet_research_operationally_isolated": True,
         "process_wide_rpc_workload_governor": True,
@@ -152,6 +167,120 @@ async def _wait_or_stop(stop: asyncio.Event, delay: float) -> None:
     try:
         await asyncio.wait_for(stop.wait(), timeout=max(0.01, float(delay)))
     except asyncio.TimeoutError:
+        return
+
+
+def _shadow_memory_has_headroom() -> tuple[bool, dict[str, Any]]:
+    """Reuse the existing production cgroup boundary; unavailable proof fails closed."""
+    from .runtime_memory_capacity_repair import (
+        MEMORY_PRESSURE_DEFER_FRACTION,
+        MEMORY_PRESSURE_MIN_HEADROOM_BYTES,
+        cgroup_memory_status,
+    )
+
+    memory = cgroup_memory_status()
+    current = memory.get("memory_current_bytes")
+    limit = memory.get("memory_max_bytes")
+    fraction = memory.get("memory_fraction")
+    headroom = memory.get("memory_headroom_bytes")
+    safe = (
+        isinstance(current, int)
+        and isinstance(limit, int)
+        and limit > 0
+        and isinstance(fraction, (int, float))
+        and float(fraction) < float(MEMORY_PRESSURE_DEFER_FRACTION)
+        and isinstance(headroom, int)
+        and headroom > int(MEMORY_PRESSURE_MIN_HEADROOM_BYTES)
+    )
+    return safe, memory
+
+
+async def _run_deferred_storage_shadow(stop: asyncio.Event) -> None:
+    """Prepare non-authoritative active storage only after liveness is established.
+
+    This worker has no activation, quarantine, deletion, signing, submission, or
+    live-money authority.  Under memory pressure it does nothing except re-check
+    the same read-only cgroup signal already used by production admission control.
+    """
+    from .runtime_storage_composition import (
+        run_requested_shadow_snapshot,
+        shadow_snapshot_requested,
+    )
+
+    requested = shadow_snapshot_requested()
+    _SHADOW_STATE.update(
+        {
+            "state": "waiting_for_post_startup" if requested else "not_requested",
+            "requested": requested,
+            "attempts": 0,
+            "last_memory_fraction": None,
+            "last_memory_headroom_bytes": None,
+            "last_error_type": None,
+            "equivalent": None,
+        }
+    )
+    if not requested:
+        return
+
+    await _wait_or_stop(stop, _SHADOW_START_DELAY_SECONDS)
+    if stop.is_set():
+        _SHADOW_STATE["state"] = "stopped_before_start"
+        return
+
+    while not stop.is_set():
+        safe, memory = _shadow_memory_has_headroom()
+        _SHADOW_STATE["last_memory_fraction"] = memory.get("memory_fraction")
+        _SHADOW_STATE["last_memory_headroom_bytes"] = memory.get("memory_headroom_bytes")
+        if not safe:
+            _SHADOW_STATE["state"] = "waiting_for_memory_headroom"
+            await _wait_or_stop(stop, _SHADOW_RETRY_SECONDS)
+            continue
+
+        _SHADOW_STATE["state"] = "building"
+        _SHADOW_STATE["attempts"] = int(_SHADOW_STATE["attempts"]) + 1
+        try:
+            report = await asyncio.to_thread(run_requested_shadow_snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _SHADOW_STATE["state"] = "failed_closed"
+            _SHADOW_STATE["last_error_type"] = type(exc).__name__
+            _LOGGER.warning(
+                "SOLANA_ROI_DEFERRED_STORAGE_SHADOW_FAILED %s",
+                json.dumps(
+                    {
+                        "error_type": type(exc).__name__,
+                        "authoritative_runtime_changed": False,
+                        "legacy_deleted": False,
+                        "legacy_quarantined": False,
+                        "paper_only": True,
+                        "live_money_authority": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            return
+
+        equivalent = bool(report and report.get("equivalent"))
+        _SHADOW_STATE["state"] = "completed" if equivalent else "failed_closed"
+        _SHADOW_STATE["equivalent"] = equivalent
+        _SHADOW_STATE["last_error_type"] = None if equivalent else "ShadowEquivalenceUnavailable"
+        _LOGGER.warning(
+            "SOLANA_ROI_DEFERRED_STORAGE_SHADOW_COMPLETE %s",
+            json.dumps(
+                {
+                    "equivalent": equivalent,
+                    "authoritative_runtime_changed": False,
+                    "legacy_deleted": False,
+                    "legacy_quarantined": False,
+                    "paper_only": True,
+                    "live_money_authority": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
         return
 
 
@@ -237,7 +366,17 @@ async def _bootstrap_and_run(stop: asyncio.Event) -> None:
     runtime = await _build_runtime_until_ready(stop)
     if runtime is None or stop.is_set():
         return
-    await _run_runtime_workers(runtime, stop)
+    shadow_task = asyncio.create_task(
+        _run_deferred_storage_shadow(stop),
+        name="deferred-storage-shadow",
+    )
+    try:
+        await _run_runtime_workers(runtime, stop)
+    finally:
+        if not shadow_task.done():
+            shadow_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await shadow_task
 
 
 def _guarded_ingestion_runtime() -> Any:
@@ -283,6 +422,17 @@ async def _render_handoff_lifespan(_app: Any):
             "lifespan_active": True,
         }
     )
+    _SHADOW_STATE.update(
+        {
+            "state": "not_started",
+            "requested": False,
+            "attempts": 0,
+            "last_memory_fraction": None,
+            "last_memory_headroom_bytes": None,
+            "last_error_type": None,
+            "equivalent": None,
+        }
+    )
     stop = asyncio.Event()
     inventory_task = asyncio.create_task(
         _emit_storage_inventory_once_if_enabled(),
@@ -302,6 +452,8 @@ async def _render_handoff_lifespan(_app: Any):
         _BOOTSTRAP_STATE["lifespan_active"] = False
         if _BOOTSTRAP_STATE["state"] == "ready":
             _BOOTSTRAP_STATE["state"] = "stopped"
+        if _SHADOW_STATE["state"] in {"waiting_for_post_startup", "waiting_for_memory_headroom"}:
+            _SHADOW_STATE["state"] = "stopped_before_start"
 
 
 def install_render_runtime_bootstrap_handoff() -> None:
@@ -370,6 +522,8 @@ __all__ = [
     "_profitability_route",
     "_public_status",
     "_render_handoff_lifespan",
+    "_run_deferred_storage_shadow",
     "_run_runtime_workers",
+    "_shadow_memory_has_headroom",
     "install_render_runtime_bootstrap_handoff",
 ]
