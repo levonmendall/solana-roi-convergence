@@ -21,6 +21,11 @@ def test_legacy_containment_deletes_only_positive_old_rows_and_never_events(tmp_
     future = _iso(now + timedelta(hours=1))
     recent = _iso(now - timedelta(hours=1))
     try:
+        # Establish event lineage before creating any stale containment fixtures;
+        # the first append may legitimately run an empty maintenance pass.
+        lineage = store.append("containment_test", recent, {"paper_only": True})
+        assert lineage
+        before_event_count = int(store.db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
         with store._lock, store.db:
             store.db.execute(
                 "CREATE TABLE direct_solana_recent_receipts("
@@ -52,13 +57,10 @@ def test_legacy_containment_deletes_only_positive_old_rows_and_never_events(tmp_
             store.db.execute("INSERT INTO semantic_candidate_opportunities VALUES('new','PUMP_FUN',?)", (recent,))
             store.db.execute("INSERT INTO semantic_candidate_risk_state VALUES('old','PUMP_FUN',?)", (old32,))
             store.db.execute("INSERT INTO semantic_candidate_risk_state VALUES('new','PUMP_FUN',?)", (recent,))
-        lineage = store.append("containment_test", recent, {"paper_only": True})
-        assert lineage
-        before_event_count = int(store.db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
 
         report = store.contain_once(now=now)
 
-        assert report["deleted_rows"] == 4
+        assert report["deleted_rows"] == 5
         assert int(store.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]) == before_event_count
         assert store.db.execute("SELECT COUNT(*) FROM direct_solana_recent_receipts").fetchone()[0] == 1
         assert store.db.execute("SELECT state FROM helius_webhook_inbox").fetchone()[0] == "pending"
