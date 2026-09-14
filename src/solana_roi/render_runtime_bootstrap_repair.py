@@ -127,6 +127,7 @@ def _public_status() -> dict[str, Any]:
         "sqlite_lock_retries_are_background_only": True,
         "storage_shadow_decoupled_from_startup": True,
         "storage_shadow_memory_gated": True,
+        "storage_shadow_serialized_after_certification_bootstrap": True,
         "storage_shadow_has_activation_authority": False,
         "certification_research_architecture_installed_before_api_capture": True,
         "wallet_research_operationally_isolated": True,
@@ -195,12 +196,38 @@ def _shadow_memory_has_headroom() -> tuple[bool, dict[str, Any]]:
     return safe, memory
 
 
+def _certification_bootstrap_complete_for_shadow() -> bool:
+    """Require explicit same-process logical-bootstrap completion before shadow I/O.
+
+    The certification bootstrap lease is primed before runtime workers and records
+    ``restore_reason=bootstrap_complete`` only after the last manifest table has
+    reached ``done``.  Missing runtime/store/lease state therefore fails closed.
+    An idle timeout is deliberately insufficient: it can occur mid-bootstrap and
+    must not allow a large shadow copy to race a later certifier retry.
+    """
+    runtime = _RUNTIME
+    store = getattr(runtime, "store", None) if runtime is not None else None
+    if store is None:
+        return False
+    try:
+        from .certification_bootstrap_autocheckpoint_lease import STATE_ATTR
+    except Exception:
+        return False
+    state = getattr(store, STATE_ATTR, None)
+    return bool(
+        isinstance(state, dict)
+        and not bool(state.get("active"))
+        and str(state.get("restore_reason") or "") == "bootstrap_complete"
+    )
+
+
 async def _run_deferred_storage_shadow(stop: asyncio.Event) -> None:
     """Prepare non-authoritative active storage only after liveness is established.
 
     This worker has no activation, quarantine, deletion, signing, submission, or
-    live-money authority.  Under memory pressure it does nothing except re-check
-    the same read-only cgroup signal already used by production admission control.
+    live-money authority. It waits for the exact-release certification bootstrap to
+    complete, then requires the same read-only cgroup headroom signal already used
+    by production admission control before performing any shadow I/O.
     """
     from .runtime_storage_composition import (
         run_requested_shadow_snapshot,
@@ -228,6 +255,11 @@ async def _run_deferred_storage_shadow(stop: asyncio.Event) -> None:
         return
 
     while not stop.is_set():
+        if not _certification_bootstrap_complete_for_shadow():
+            _SHADOW_STATE["state"] = "waiting_for_certification_bootstrap"
+            await _wait_or_stop(stop, _SHADOW_RETRY_SECONDS)
+            continue
+
         safe, memory = _shadow_memory_has_headroom()
         _SHADOW_STATE["last_memory_fraction"] = memory.get("memory_fraction")
         _SHADOW_STATE["last_memory_headroom_bytes"] = memory.get("memory_headroom_bytes")
@@ -452,7 +484,11 @@ async def _render_handoff_lifespan(_app: Any):
         _BOOTSTRAP_STATE["lifespan_active"] = False
         if _BOOTSTRAP_STATE["state"] == "ready":
             _BOOTSTRAP_STATE["state"] = "stopped"
-        if _SHADOW_STATE["state"] in {"waiting_for_post_startup", "waiting_for_memory_headroom"}:
+        if _SHADOW_STATE["state"] in {
+            "waiting_for_post_startup",
+            "waiting_for_certification_bootstrap",
+            "waiting_for_memory_headroom",
+        }:
             _SHADOW_STATE["state"] = "stopped_before_start"
 
 
@@ -516,6 +552,7 @@ __all__ = [
     "BOOTSTRAP_RETRY_SECONDS",
     "_architecture_route",
     "_build_runtime_until_ready",
+    "_certification_bootstrap_complete_for_shadow",
     "_emit_storage_inventory_once_if_enabled",
     "_guarded_ingestion_runtime",
     "_is_sqlite_lock_error",
