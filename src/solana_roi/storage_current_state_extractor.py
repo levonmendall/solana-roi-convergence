@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from .active_storage import payload_hash
+from .config import BASELINE
 from .storage_current_v52_reconciliation import augment_current_state_truth
 from .storage_runtime_persistence_reconciliation import augment_runtime_current_state_truth
 
@@ -15,6 +17,7 @@ from .storage_runtime_persistence_reconciliation import augment_runtime_current_
 TERMINAL_CANDIDATE_STATES = {
     "closed","expired","rejected","settled","failed","complete","completed","cancelled","canceled","terminal"
 }
+_ENGINE_EVENT_TYPES = ("first_touch", "confirmation", "price", "trade_intent", "trade_outcome")
 
 # Current-state tables are read in a bounded way.  If a table that is expected
 # to be current state has grown beyond its contract, extraction fails closed
@@ -82,6 +85,25 @@ def _connect_ro(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _release_source_file_cache(path: Path) -> None:
+    """Best-effort release of legacy pages touched by one-shot migration reads."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    advice = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or advice is None:
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            fadvise(fd, 0, 0, advice)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+
+
 def _tables(conn: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
 
@@ -145,12 +167,55 @@ def _active_rows(conn: sqlite3.Connection, table: str, max_rows: int) -> list[di
     return [_row_dict(row) for row in rows]
 
 
+def _genesis_paper_state() -> dict[str, Any]:
+    """Exact state DurablePaperTradingEngine uses before its first engine event."""
+    return {
+        "schema": "roi-convergence-paper-engine-checkpoint.v1",
+        "strategy_version": BASELINE.version,
+        "initial_capital_usd": BASELINE.initial_capital_usd,
+        "cash_usd": BASELINE.initial_capital_usd,
+        "marks": {},
+        "trade_start_nav": {},
+        "candidates": {},
+        "positions": {},
+        "closed": [],
+    }
+
+
+def _latest_engine_event(conn: sqlite3.Connection, tables: set[str]) -> sqlite3.Row | None:
+    if "events" not in tables:
+        raise RuntimeError("migration blocked: events ledger missing")
+    placeholders = ",".join("?" for _ in _ENGINE_EVENT_TYPES)
+    # This is the same authority boundary used by DurablePaperTradingEngine.  It
+    # selects only the event PK/type columns and never materializes history.
+    return conn.execute(
+        f"SELECT id,event_type FROM events WHERE event_type IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        _ENGINE_EVENT_TYPES,
+    ).fetchone()
+
+
 def _extract_paper_checkpoint(conn: sqlite3.Connection, tables: set[str]) -> dict[str,Any]:
     if "paper_engine_checkpoint" not in tables:
         raise RuntimeError("migration blocked: paper_engine_checkpoint missing")
     row = conn.execute("SELECT saved_at,last_engine_event_id,state_json,state_sha256 FROM paper_engine_checkpoint WHERE id=1").fetchone()
     if row is None:
-        raise RuntimeError("migration blocked: paper_engine_checkpoint row missing")
+        engine_event = _latest_engine_event(conn, tables)
+        if engine_event is not None:
+            raise RuntimeError(
+                "migration blocked: engine history exists without a durable checkpoint:"
+                f"{int(engine_event['id'])}:{str(engine_event['event_type'])}"
+            )
+        state = _genesis_paper_state()
+        raw = json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        return {
+            "saved_at": None,
+            "last_engine_event_id": 0,
+            "state_sha256": digest,
+            "state": state,
+            "source_checkpoint_present": False,
+            "genesis_materialized": True,
+        }
     raw = str(row["state_json"])
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     if digest != str(row["state_sha256"]):
@@ -210,8 +275,10 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> str:
 class LegacyCurrentStateExtractor:
     """Read-only, fail-closed extractor for the state needed to resume production.
 
-    It intentionally never selects historical event/swap/risk bodies wholesale.
-    The only portfolio source is the existing hash-checked paper checkpoint.
+    Historical event/swap/risk bodies are never copied wholesale.  Portfolio
+    truth comes from the durable checkpoint, except for the one exact state the
+    durable engine itself permits without a checkpoint: genesis with no engine
+    event history.
     """
 
     def __init__(self, path: Path | str) -> None:
@@ -268,6 +335,7 @@ class LegacyCurrentStateExtractor:
             )
         finally:
             conn.close()
+            _release_source_file_cache(self.path)
 
 
 def exact_truth_hash(truth: Mapping[str,Any]) -> str:
