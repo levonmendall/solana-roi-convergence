@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
 from . import storage_retention as base
+from .certification_epoch import release_commit_from_env
 
 R = base.RetentionClass
 C = base.RetentionContract
@@ -163,6 +164,44 @@ def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
+_CERTIFICATION_PRIOR_EPOCH_LIMIT = 1
+
+
+def _certification_release_epoch_current_state(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Return the exact release frontier plus one bounded predecessor."""
+    release_commit = release_commit_from_env()
+    if release_commit is None:
+        raise RuntimeError(
+            "runtime current-state extraction blocked: certification release commit unavailable"
+        )
+
+    current = connection.execute(
+        "SELECT * FROM certification_release_epochs WHERE release_commit=? LIMIT 2",
+        (release_commit,),
+    ).fetchall()
+    if len(current) != 1:
+        raise RuntimeError(
+            "runtime current-state extraction blocked: exact current certification release epoch missing"
+        )
+
+    started_at = current[0]["started_at"]
+    if not started_at:
+        raise RuntimeError(
+            "runtime current-state extraction blocked: current certification release epoch has no started_at"
+        )
+
+    prior = connection.execute(
+        "SELECT * FROM certification_release_epochs "
+        "WHERE release_commit<>? AND started_at<=? "
+        "ORDER BY started_at DESC,release_commit DESC LIMIT ?",
+        (release_commit, started_at, _CERTIFICATION_PRIOR_EPOCH_LIMIT),
+    ).fetchall()
+    rows = list(reversed(prior)) + current
+    return [_row_dict(row) for row in rows]
+
+
 def augment_runtime_current_state_truth(
     connection: sqlite3.Connection,
     tables: set[str],
@@ -183,7 +222,13 @@ def augment_runtime_current_state_truth(
 
     put("strategy", "forward_cohort_manifest", "SELECT * FROM forward_cohort_manifest ORDER BY id", limit=1)
     put("strategy", "forward_cohort_arm_state", "SELECT * FROM forward_cohort_arm_state ORDER BY id", limit=1)
-    put("certification", "certification_release_epochs", "SELECT * FROM certification_release_epochs ORDER BY started_at", limit=256)
+    if "certification_release_epochs" in tables:
+        payload = truth.setdefault("certification", {})
+        if not isinstance(payload, MutableMapping):
+            raise RuntimeError("runtime-state extraction blocked: section not mapping:certification")
+        rows = _certification_release_epoch_current_state(connection)
+        payload["certification_release_epochs"] = rows
+        counts["certification_release_epochs"] = len(rows)
 
     put("provider_source", "direct_solana_provider_state", "SELECT * FROM direct_solana_provider_state ORDER BY provider", limit=64)
     put("continuity", "direct_solana_global_state", "SELECT * FROM direct_solana_global_state ORDER BY id", limit=1)
