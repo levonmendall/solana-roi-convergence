@@ -144,7 +144,7 @@ def test_semantic_candidate_tables_are_positive_bounded_contracts():
         "semantic_candidate_risk_state",
     ):
         contract = contracts[name]
-        assert contract.retention_class.value == "bounded_window"
-        assert contract.max_age == "31d"
-        assert contract.startup_required is True
-        assert contract.certification_required is True
+        assert contract.retention_class.value == "BOUNDED_WINDOW"
+        assert contract.max_hot_age == "31d"
+        assert contract.startup_access is True
+        assert contract.certification_access is True
