@@ -15,62 +15,24 @@ from .strategy_v52_authority import (
     strategy_evolution_snapshot,
 )
 from .v52_authoritative_strategy import install_v52_authoritative_strategy, status as strategy_status
-from .v52_robinhood_storage_compatibility import (
-    install_v52_robinhood_storage_compatibility,
-    status as robinhood_storage_status,
-)
-from .v52_robinhood_exit_authority import (
-    install_v52_robinhood_exit_authority,
-    status as robinhood_exit_status,
-)
-from .v52_robinhood_position_lifecycle import (
-    install_v52_robinhood_position_lifecycle,
-    lifecycle_status as robinhood_lifecycle_status,
-)
-from .v52_robinhood_candidate_reconciliation import (
-    install_v52_robinhood_candidate_reconciliation,
-    status as robinhood_candidate_reconciliation_status,
-)
+from .v52_robinhood_storage_compatibility import install_v52_robinhood_storage_compatibility, status as robinhood_storage_status
+from .v52_robinhood_exit_authority import install_v52_robinhood_exit_authority, status as robinhood_exit_status
+from .v52_robinhood_position_lifecycle import install_v52_robinhood_position_lifecycle, lifecycle_status as robinhood_lifecycle_status
+from .v52_robinhood_candidate_reconciliation import install_v52_robinhood_candidate_reconciliation, status as robinhood_candidate_reconciliation_status
 from .v52_strategy_api import install_v52_strategy_api, status as api_status
 from .v52_wallet_alpha_refinement import WalletAlphaRefinementLedger
-from .v52_wallet_intelligence_alignment import (
-    install_v52_wallet_intelligence_alignment,
-    status as wallet_alignment_status,
-)
-from .v52_adaptive_continuation_refinement import (
-    install_v52_adaptive_continuation_refinement,
-    status as adaptive_continuation_status,
-)
-from .v52_profit_confidence_completion import (
-    install_v52_profit_confidence_completion,
-    status as profit_confidence_status,
-)
-from .v52_profit_confidence_finalization import (
-    install_v52_profit_confidence_finalization,
-    status as profit_confidence_finalization_status,
-)
-from .v52_market_validation_controls import (
-    install_v52_market_validation_controls,
-    status as market_validation_status,
-)
-from .v52_market_validation_governance import (
-    install_v52_market_validation_governance,
-    status as market_validation_governance_status,
-)
-from .v52_market_validation_completion import (
-    install_v52_market_validation_completion,
-    status as market_validation_completion_status,
-)
-from .v52_learning_governance import (
-    install_v52_learning_governance,
-    status as learning_governance_status,
-)
-from .v52_learning_governance_hardening import (
-    install_v52_learning_governance_hardening,
-    status as learning_governance_hardening_status,
-)
+from .v52_wallet_intelligence_alignment import install_v52_wallet_intelligence_alignment, status as wallet_alignment_status
+from .v52_adaptive_continuation_refinement import install_v52_adaptive_continuation_refinement, status as adaptive_continuation_status
+from .v52_profit_confidence_completion import install_v52_profit_confidence_completion, status as profit_confidence_status
+from .v52_profit_confidence_finalization import install_v52_profit_confidence_finalization, status as profit_confidence_finalization_status
+from .v52_market_validation_controls import install_v52_market_validation_controls, status as market_validation_status
+from .v52_market_validation_governance import install_v52_market_validation_governance, status as market_validation_governance_status
+from .v52_market_validation_completion import install_v52_market_validation_completion, status as market_validation_completion_status
+from .v52_market_validation_completion_runtime import install_v52_market_validation_completion_runtime, status as market_validation_completion_runtime_status
+from .v52_learning_governance import install_v52_learning_governance, status as learning_governance_status
+from .v52_learning_governance_hardening import install_v52_learning_governance_hardening, status as learning_governance_hardening_status
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v14-market-validation-completion"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v15-market-validation-complete"
 _INSTALLED = False
 _RUNTIME: Any | None = None
 _WALLET_ALPHA: WalletAlphaRefinementLedger | None = None
@@ -139,12 +101,10 @@ def install_v52_production_authority(app: Any, runtime_provider: Callable[[], An
     install_v52_learning_governance(runtime)
     install_v52_learning_governance_hardening()
     install_v52_profit_confidence_finalization()
-    # Final additive validation/control layers. They may preserve or reduce an
-    # already-authorized paper fraction but cannot originate entries, increase
-    # sizing, weaken v5.2 guards, sign, submit, or grant live-money authority.
     market_validation_controller = install_v52_market_validation_controls(runtime.store)
     market_validation_governance = install_v52_market_validation_governance(market_validation_controller)
-    install_v52_market_validation_completion(market_validation_controller, market_validation_governance)
+    market_validation_completion = install_v52_market_validation_completion(market_validation_controller, market_validation_governance)
+    install_v52_market_validation_completion_runtime(market_validation_completion)
     install_v52_strategy_api(app)
 
     strategy_epoch = strategy_evolution_snapshot()
@@ -168,6 +128,7 @@ def install_v52_production_authority(app: Any, runtime_provider: Callable[[], An
     app.state.roi_v52_market_validation_controls = True
     app.state.roi_v52_market_validation_governance = True
     app.state.roi_v52_market_validation_completion = True
+    app.state.roi_v52_market_validation_completion_runtime = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
     app.state.roi_authority_fingerprint = authority_fingerprint()
@@ -192,24 +153,15 @@ def status() -> dict[str, Any]:
     market_validation = market_validation_status()
     market_validation_governance = market_validation_governance_status()
     market_validation_completion = market_validation_completion_status()
+    market_validation_completion_runtime = market_validation_completion_runtime_status()
     strategy_epoch = strategy_evolution_snapshot()
 
     if _RUNTIME is None:
-        wallet_alignment = {
-            "installed": False,
-            "reason": "runtime_not_installed",
-            "paper_only": True,
-            "live_money_authority": False,
-        }
+        wallet_alignment = {"installed": False, "reason": "runtime_not_installed", "paper_only": True, "live_money_authority": False}
     else:
         wallet_alignment = wallet_alignment_status(_RUNTIME)
     if _WALLET_ALPHA is None:
-        wallet_alpha = {
-            "version": "v52-wallet-alpha-refinement-v1",
-            "installed": False,
-            "paper_only": True,
-            "live_money_authority": False,
-        }
+        wallet_alpha = {"version": "v52-wallet-alpha-refinement-v1", "installed": False, "paper_only": True, "live_money_authority": False}
     else:
         wallet_alpha = dict(_WALLET_ALPHA.status())
         wallet_alpha["installed"] = True
@@ -218,17 +170,13 @@ def status() -> dict[str, Any]:
     runtime["robinhood_v52_authority_from_release_epoch"] = True
     runtime["continuous_strategy_evolution_enabled"] = True
     runtime["active_strategy_epoch"] = strategy_epoch
-    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_robinhood_profit_confidence_plus_market_validation_completion"
+    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_robinhood_profit_confidence_plus_market_validation_complete"
     runtime["robinhood_scale_in_authority"] = bool(
-        lifecycle.get("installed")
-        and lifecycle.get("aggregate_exact_exitability_before_add")
-        and lifecycle.get("stressed_exit_capacity_before_entry_or_add")
-        and lifecycle.get("scale_requires_new_forward_strength")
+        lifecycle.get("installed") and lifecycle.get("aggregate_exact_exitability_before_add")
+        and lifecycle.get("stressed_exit_capacity_before_entry_or_add") and lifecycle.get("scale_requires_new_forward_strength")
         and not lifecycle.get("averaging_down_allowed")
     )
-    runtime["staged_derisk_runner_authority"] = bool(
-        lifecycle.get("installed") and lifecycle.get("staged_derisk_runner_authority")
-    )
+    runtime["staged_derisk_runner_authority"] = bool(lifecycle.get("installed") and lifecycle.get("staged_derisk_runner_authority"))
     runtime["adaptive_continuation_refinement"] = bool(adaptive.get("installed"))
     runtime["profit_confidence_completion"] = bool(profit_completion.get("installed"))
     runtime["learning_governance"] = bool(learning.get("installed"))
@@ -237,60 +185,44 @@ def status() -> dict[str, Any]:
     runtime["market_validation_controls"] = bool(market_validation.get("installed"))
     runtime["market_validation_governance"] = bool(market_validation_governance.get("installed"))
     runtime["market_validation_completion"] = bool(market_validation_completion.get("installed"))
+    runtime["market_validation_completion_runtime"] = bool(market_validation_completion_runtime.get("installed"))
 
     all_owned = bool(
-        runtime.get("solana_final_owner")
-        and runtime.get("fomo_final_owner")
-        and runtime.get("robinhood_final_owner")
-        and runtime.get("robinhood_forward_profile_owner")
-        and runtime.get("robinhood_scale_in_authority")
-        and runtime.get("staged_derisk_runner_authority")
-        and adaptive.get("installed")
-        and profit_completion.get("installed")
-        and profit_completion.get("parallel_exact_quote_acquisition")
+        runtime.get("solana_final_owner") and runtime.get("fomo_final_owner") and runtime.get("robinhood_final_owner")
+        and runtime.get("robinhood_forward_profile_owner") and runtime.get("robinhood_scale_in_authority")
+        and runtime.get("staged_derisk_runner_authority") and adaptive.get("installed")
+        and profit_completion.get("installed") and profit_completion.get("parallel_exact_quote_acquisition")
         and float(profit_completion.get("minimum_exit_depth_coverage_ratio") or 0.0) >= 2.0
-        and learning.get("installed")
-        and learning.get("bayesian_posterior_confidence")
-        and learning.get("wallet_distribution_reversal_primary_exit_signal")
-        and learning.get("lane_specific_learned_decay")
-        and learning.get("automatic_challenger_generation")
-        and learning.get("concurrent_named_same_stream_tournament")
-        and learning.get("automatic_forward_promotion")
-        and learning.get("automatic_forward_demotion")
-        and hardening.get("installed")
-        and hardening.get("stable_auto_challenger_ids")
-        and hardening.get("fresh_same_stream_epoch_after_promotion")
-        and not hardening.get("old_forward_evidence_reuse_for_next_promotion")
-        and finalization.get("installed")
-        and finalization.get("numeric_lane_cap_guard")
-        and finalization.get("absolute_signal_age_guard")
-        and float(finalization.get("absolute_chase_max_fraction") or 1.0) <= 0.80
+        and learning.get("installed") and learning.get("bayesian_posterior_confidence")
+        and learning.get("wallet_distribution_reversal_primary_exit_signal") and learning.get("lane_specific_learned_decay")
+        and learning.get("automatic_challenger_generation") and learning.get("concurrent_named_same_stream_tournament")
+        and learning.get("automatic_forward_promotion") and learning.get("automatic_forward_demotion")
+        and hardening.get("installed") and hardening.get("stable_auto_challenger_ids")
+        and hardening.get("fresh_same_stream_epoch_after_promotion") and not hardening.get("old_forward_evidence_reuse_for_next_promotion")
+        and finalization.get("installed") and finalization.get("numeric_lane_cap_guard")
+        and finalization.get("absolute_signal_age_guard") and float(finalization.get("absolute_chase_max_fraction") or 1.0) <= 0.80
         and float(finalization.get("latency_hard_max_seconds") or 99.0) <= 20.0
-        and market_validation.get("installed")
-        and market_validation.get("graduation_quality_score")
-        and market_validation.get("post_graduation_decay_clock")
-        and market_validation.get("lane_relative_percentile_calibration")
-        and market_validation.get("lane_level_alpha_gating")
-        and market_validation.get("shadow_strategies_control_trading") is False
+        and market_validation.get("installed") and market_validation.get("graduation_quality_score")
+        and market_validation.get("post_graduation_decay_clock") and market_validation.get("lane_relative_percentile_calibration")
+        and market_validation.get("lane_level_alpha_gating") and market_validation.get("shadow_strategies_control_trading") is False
         and market_validation.get("fomo_state_separate_from_discovery_route")
-        and market_validation_governance.get("installed")
-        and market_validation_governance.get("point_in_time_history_cutoff")
+        and market_validation_governance.get("installed") and market_validation_governance.get("point_in_time_history_cutoff")
         and market_validation_governance.get("independent_economic_actor_counting")
-        and market_validation_governance.get("activation_deactivation_hysteresis")
-        and market_validation_governance.get("automatic_reactivation")
+        and market_validation_governance.get("activation_deactivation_hysteresis") and market_validation_governance.get("automatic_reactivation")
         and market_validation_governance.get("future_leakage_allowed") is False
-        and market_validation_completion.get("installed")
-        and market_validation_completion.get("all_shadow_variants_non_authoritative")
-        and market_validation_completion.get("automatic_point_in_time_recording")
-        and market_validation_completion.get("automatic_independent_actor_enrichment")
-        and market_validation_completion.get("lane_accounting_continuous")
-        and "reduced" in set(market_validation_completion.get("lane_states") or ())
+        and market_validation_completion.get("installed") and market_validation_completion.get("all_shadow_variants_non_authoritative")
+        and market_validation_completion.get("automatic_point_in_time_recording") and market_validation_completion.get("automatic_independent_actor_enrichment")
+        and market_validation_completion.get("lane_accounting_continuous") and "reduced" in set(market_validation_completion.get("lane_states") or ())
         and market_validation_completion.get("live_money_authority") is False
-        and wallet_alignment.get("installed")
-        and storage.get("v52_authority_from_release_epoch")
-        and robinhood_exit.get("final_exit_policy_owner") == "v52"
-        and lifecycle.get("installed")
-        and reconciliation.get("installed")
+        and market_validation_completion_runtime.get("installed")
+        and market_validation_completion_runtime.get("duplicate_candidate_observation_protection")
+        and market_validation_completion_runtime.get("fomo_archetype_specific_calibration")
+        and market_validation_completion_runtime.get("evidence_derived_reduced_multiplier")
+        and market_validation_completion_runtime.get("graduation_only_real_executable_entry")
+        and market_validation_completion_runtime.get("sequential_a_to_g_ablation")
+        and market_validation_completion_runtime.get("live_money_authority") is False
+        and wallet_alignment.get("installed") and storage.get("v52_authority_from_release_epoch")
+        and robinhood_exit.get("final_exit_policy_owner") == "v52" and lifecycle.get("installed") and reconciliation.get("installed")
     )
 
     return {
@@ -318,6 +250,7 @@ def status() -> dict[str, Any]:
         "market_validation_controls": market_validation,
         "market_validation_governance": market_validation_governance,
         "market_validation_completion": market_validation_completion,
+        "market_validation_completion_runtime": market_validation_completion_runtime,
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
         "robinhood_position_lifecycle": lifecycle,
@@ -331,9 +264,4 @@ def status() -> dict[str, Any]:
     }
 
 
-__all__ = [
-    "COMPOSITION_VERSION",
-    "install_v52_production_authority",
-    "status",
-    "wallet_alpha_refinement",
-]
+__all__ = ["COMPOSITION_VERSION", "install_v52_production_authority", "status", "wallet_alpha_refinement"]
