@@ -4,7 +4,6 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from .activation import CandidateActivationGate, ForwardCohortController
@@ -25,6 +24,7 @@ from .observation_store import ObservationEventStore
 from .prospective_shadow import ProspectiveShadowExecutionCertificationGate
 from .quote import JupiterQuoteOnlyClient, QuoteCertificationGate
 from .risk import EntityResolver, RiskPolicy, TokenRiskIntelligence
+from .runtime_storage_composition import compose_runtime_storage
 from .shadow_execution import (
     JupiterShadowTransactionSimulator,
     ShadowAwareQuoteCertificationGate,
@@ -71,12 +71,6 @@ class RuntimeForwardCohortController(ForwardCohortController):
         return self._direct_stream_status_ok(self._direct_stream_status())
 
     def runtime_continuity_ok(self) -> bool:
-        """Require both durable paper state and live full-scope data-plane continuity.
-
-        CandidateActivationGate calls this method immediately before every paper
-        authorization. A direct-stream loss therefore fails closed even after the
-        cohort has already been frozen and armed.
-        """
         return bool(super().runtime_continuity_ok() and self._direct_stream_continuity_ok())
 
     def _base_readiness(self) -> dict[str, Any]:
@@ -120,6 +114,7 @@ class IngestionRuntime:
     webhook_queue: DurableHeliusWebhookQueue
     webhook_worker: HeliusWebhookWorker
     certification_epoch: datetime
+    storage_status: dict[str, Any]
 
     @property
     def paper_signal_promotion_enabled(self) -> bool:
@@ -148,14 +143,16 @@ def _wallet_profiles_from_env() -> list[WalletProfile]:
     for item in payload:
         if not isinstance(item, dict):
             raise ValueError("wallet profile entries must be JSON objects")
-        profiles.append(WalletProfile(
-            wallet=str(item["wallet"]),
-            entity_id=str(item["entity_id"]),
-            tier=WalletTier(str(item["tier"]).upper()),
-            first_touch_sample_size=int(item.get("first_touch_sample_size", 0)),
-            historically_eligible=bool(item.get("historically_eligible", True)),
-            updated_at=now,
-        ))
+        profiles.append(
+            WalletProfile(
+                wallet=str(item["wallet"]),
+                entity_id=str(item["entity_id"]),
+                tier=WalletTier(str(item["tier"]).upper()),
+                first_touch_sample_size=int(item.get("first_touch_sample_size", 0)),
+                historically_eligible=bool(item.get("historically_eligible", True)),
+                updated_at=now,
+            )
+        )
     return profiles
 
 
@@ -206,10 +203,9 @@ def _wallet_discovery_policy() -> WalletDiscoveryPolicy:
 
 
 def build_runtime() -> IngestionRuntime:
-    store = ObservationEventStore(Path(os.getenv("SOLANA_ROI_DB_PATH", "data/solana-roi.sqlite3")))
+    store, engine, storage_status = compose_runtime_storage()
     certification_epoch = ensure_release_certification_epoch(store)
     webhook_queue = DurableHeliusWebhookQueue(store)
-    engine = DurablePaperTradingEngine(store=store)
     registry = WalletProfileRegistry(store)
     profiles = _wallet_profiles_from_env()
     for profile in profiles:
@@ -247,10 +243,7 @@ def build_runtime() -> IngestionRuntime:
         full_position_notional_fn=lambda: engine.portfolio.full_position_notional(engine.marks),
         max_chase_fraction=engine.config.max_chase_fraction,
     )
-    base_quote_gate = QuoteCertificationGate(
-        quote_handoff.ledger,
-        prospective_start_at=certification_epoch,
-    )
+    base_quote_gate = QuoteCertificationGate(quote_handoff.ledger, prospective_start_at=certification_epoch)
     shadow_gate = ProspectiveShadowExecutionCertificationGate(
         quote_handoff.shadow_ledger,
         shadow_wallet_public_key=shadow_wallet,
@@ -277,11 +270,7 @@ def build_runtime() -> IngestionRuntime:
         coverage_gate=coverage_gate,
     )
     cohort_controller.webhook_queue = webhook_queue
-    activation_gate = CandidateActivationGate(
-        controller=cohort_controller,
-        engine=engine,
-        store=store,
-    )
+    activation_gate = CandidateActivationGate(controller=cohort_controller, engine=engine, store=store)
     price_clock = ShadowPriceClock(
         store=store,
         engine=engine,
@@ -353,4 +342,5 @@ def build_runtime() -> IngestionRuntime:
         webhook_queue=webhook_queue,
         webhook_worker=webhook_worker,
         certification_epoch=certification_epoch,
+        storage_status=storage_status,
     )
