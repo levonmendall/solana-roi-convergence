@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -133,6 +134,49 @@ def _copy_current_sections(source: sqlite3.Connection, dest: sqlite3.Connection,
                 counts[str(table)] = counts.get(str(table), 0) + _copy_dict_rows(source, dest, str(table), rows)
     if _exists(source, "paper_engine_checkpoint"):
         counts["paper_engine_checkpoint"] = _copy_query(source, dest, "paper_engine_checkpoint", "SELECT * FROM paper_engine_checkpoint WHERE id=1")
+
+
+def _ensure_paper_checkpoint(
+    source: sqlite3.Connection,
+    dest: sqlite3.Connection,
+    truth: Mapping[str, Any],
+    counts: dict[str, int],
+) -> None:
+    """Materialize only a genesis checkpoint already proven valid by extraction.
+
+    The legacy durable engine legitimately has no checkpoint row before its
+    first engine event. Active storage needs a physical checkpoint so that its
+    sealed transition anchor remains restartable after legacy is unavailable.
+    No non-genesis state is ever synthesized here.
+    """
+    table = "paper_engine_checkpoint"
+    if not _exists(source, table):
+        raise RuntimeError("migration blocked: paper_engine_checkpoint missing")
+    if not _exists(dest, table):
+        dest.execute(_table_ddl(source, table))
+    existing = dest.execute("SELECT id FROM paper_engine_checkpoint WHERE id=1").fetchone()
+    if existing is not None:
+        counts[table] = max(1, int(counts.get(table, 0)))
+        return
+    portfolio = truth.get("portfolio")
+    if not isinstance(portfolio, Mapping):
+        raise RuntimeError("migration blocked: portfolio truth missing")
+    if not bool(portfolio.get("genesis_materialized")) or bool(portfolio.get("source_checkpoint_present", True)):
+        raise RuntimeError("migration blocked: source paper checkpoint row unavailable outside proven genesis")
+    if int(portfolio.get("last_engine_event_id", -1)) != 0:
+        raise RuntimeError("migration blocked: synthesized genesis has nonzero engine event id")
+    state = portfolio.get("state")
+    if not isinstance(state, Mapping):
+        raise RuntimeError("migration blocked: synthesized genesis state missing")
+    raw = json.dumps(dict(state), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if digest != str(portfolio.get("state_sha256") or ""):
+        raise RuntimeError("migration blocked: synthesized genesis digest mismatch")
+    dest.execute(
+        "INSERT INTO paper_engine_checkpoint(id,saved_at,last_engine_event_id,state_json,state_sha256) VALUES(1,?,?,?,?)",
+        (datetime.now(timezone.utc).isoformat(), 0, raw, digest),
+    )
+    counts[table] = 1
 
 
 def _copy_latest_250_features(source: sqlite3.Connection, dest: sqlite3.Connection) -> int:
@@ -276,6 +320,7 @@ def build_shadow_database(*, legacy_path: Path | str, active_path: Path | str, r
         source.execute("BEGIN")
         dest.execute("BEGIN IMMEDIATE")
         _copy_current_sections(source, dest, extraction.truth, copied)
+        _ensure_paper_checkpoint(source, dest, extraction.truth, copied)
         _copy_bounded_v52(source, dest, copied)
         _copy_wallet_materializations(source, dest, copied)
         _copy_active_subject_evidence(source, dest, extraction.truth, copied)
