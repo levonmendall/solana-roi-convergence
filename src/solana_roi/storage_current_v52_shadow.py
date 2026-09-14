@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 from . import storage_current_v52_reconciliation as current_v52
 from . import storage_manifest
 from .active_storage import ActiveStorage
+from .storage_current_v52_pruning import prune_current_v52_database
 
 
 def _connect_ro(path: Path) -> sqlite3.Connection:
@@ -112,7 +113,7 @@ def reconcile_current_v52_shadow(
         source.close()
 
     # The active database, not the legacy source, owns ongoing pruning.
-    pruned = current_v52.prune_current_v52_database(active)
+    pruned = prune_current_v52_database(active)
     storage = ActiveStorage(active)
     storage.assert_positive_schema()
     storage.checkpoint_wal()
