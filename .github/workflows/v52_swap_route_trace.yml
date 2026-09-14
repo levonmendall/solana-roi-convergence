@@ -1,0 +1,29 @@
+name: v5.2 persisted swap route trace
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_swap_route_trace.yml
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find read paths for persisted historical swaps
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== normalized_swaps references with route/query context ==='
+          grep -R -n -B5 -A12 'normalized_swaps' src operations 2>/dev/null | head -n 4000
+          echo '=== route decorators in files mentioning normalized_swaps / robinhood_swaps / fomo_token_flows ==='
+          files=$(grep -R -l -E 'normalized_swaps|robinhood_swaps|fomo_token_flows' src operations 2>/dev/null || true)
+          for f in $files; do
+            grep -n -E '@(app|router)\.(get|post)|add_api_route|normalized_swaps|robinhood_swaps|fomo_token_flows' "$f" 2>/dev/null || true
+          done
