@@ -107,12 +107,24 @@ RUNTIME_CONTRACTS = (
        rows=1, bytes_=1_048_576, startup=True, certification=True),
     _c("execution_quote_observations", "execution-observation", R.BOUNDED_WINDOW,
        "Recent amount-specific quote evidence for prospective certification", "QuoteCertificationGate",
-       age="31d", rows=250_000, bytes_=134_217_728,
-       prune="older than 31d", certification=True),
+       age="31d plus latest 500", rows=250_000, bytes_=134_217_728,
+       prune="older than 31d except latest 500", certification=True),
     _c("shadow_execution_observations", "execution-observation", R.BOUNDED_WINDOW,
        "Recent unsigned simulation evidence for prospective execution certification", "ProspectiveShadowExecutionCertificationGate",
+       age="31d plus latest 500", rows=250_000, bytes_=134_217_728,
+       prune="older than 31d except latest 500", certification=True),
+    _c("semantic_candidate_events", "candidate-attribution", R.BOUNDED_WINDOW,
+       "Recent venue-native semantic scout attribution facts; never entry authority", "Semantic candidate attribution/status",
+       age="31d", rows=500_000, bytes_=201_326_592,
+       prune="received_at older than 31d", startup=True, certification=True),
+    _c("semantic_candidate_opportunities", "candidate-attribution", R.BOUNDED_WINDOW,
+       "Recent venue-native watch-state materialization; entry_authority is always zero", "Semantic candidate attribution/status",
        age="31d", rows=250_000, bytes_=134_217_728,
-       prune="older than 31d", certification=True),
+       prune="last_seen older than 31d", startup=True, certification=True),
+    _c("semantic_candidate_risk_state", "candidate-attribution", R.BOUNDED_WINDOW,
+       "Recent risk-readthrough materialization; entry_authority is always zero", "Semantic candidate attribution/status",
+       age="31d", rows=250_000, bytes_=134_217_728,
+       prune="assessed_at older than 31d", startup=True, certification=True),
 )
 
 for contract in RUNTIME_CONTRACTS:
@@ -207,15 +219,14 @@ def copy_bounded_runtime_evidence(
     instant = now or datetime.now(timezone.utc)
     cutoff31 = (instant - timedelta(days=31)).isoformat()
     cutoff7 = (instant - timedelta(days=7)).isoformat()
-    cutoff24h = (instant - timedelta(hours=24)).replace(second=0, microsecond=0).isoformat()
     existing = {
         str(row[0])
         for row in source.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
     }
     specs: Sequence[tuple[str, str, tuple[Any, ...]]] = (
-        ("helius_webhook_inbox", "SELECT * FROM helius_webhook_inbox WHERE state<>'complete' OR completed_at>=?", (cutoff7,)),
+        ("helius_webhook_inbox", "SELECT * FROM helius_webhook_inbox WHERE state<>'complete' OR updated_at>=?", (cutoff7,)),
         ("direct_solana_recent_receipts", "SELECT * FROM direct_solana_recent_receipts WHERE expires_at>=?", (instant.isoformat(),)),
-        ("direct_solana_minute_receipts", "SELECT * FROM direct_solana_minute_receipts WHERE bucket>=?", (cutoff24h,)),
+        ("direct_solana_minute_receipts", "SELECT * FROM direct_solana_minute_receipts WHERE bucket>=?", (cutoff31,)),
         ("direct_solana_hydration_queue", "SELECT * FROM direct_solana_hydration_queue WHERE status<>'complete' OR updated_at>=?", (cutoff7,)),
         ("direct_solana_hydration_metrics", "SELECT * FROM direct_solana_hydration_metrics WHERE hydrated_at>=?", (cutoff31,)),
         (
@@ -226,14 +237,27 @@ def copy_bounded_runtime_evidence(
         ),
         ("wallet_discovery_forward_observations", "SELECT * FROM wallet_discovery_forward_observations WHERE received_at>=?", (cutoff31,)),
         ("wallet_realtime_receipts", "SELECT * FROM wallet_realtime_receipts WHERE status<>'complete' OR updated_at>=?", (cutoff7,)),
-        ("execution_quote_observations", "SELECT * FROM execution_quote_observations WHERE received_at>=?", (cutoff31,)),
-        ("shadow_execution_observations", "SELECT * FROM shadow_execution_observations WHERE completed_at>=?", (cutoff31,)),
-        # Source-aware certification counts recent normalized live delivery and
-        # excludes historical recovery by joining hydration metrics. Preserve a
-        # bounded matching window across all sources, not only portfolio mints.
-        ("normalized_swaps", "SELECT * FROM normalized_swaps WHERE received_at>=?", (cutoff31,)),
-        ("program_coverage_observations", "SELECT * FROM program_coverage_observations WHERE pair_created_at>=?", (cutoff31,)),
-        ("risk_refresh_measurements", "SELECT * FROM risk_refresh_measurements WHERE completed_at>=?", (cutoff7,)),
+        ("execution_quote_observations", "SELECT * FROM execution_quote_observations WHERE received_at>=? OR id IN (SELECT id FROM execution_quote_observations ORDER BY id DESC LIMIT 500)", (cutoff31,)),
+        ("shadow_execution_observations", "SELECT * FROM shadow_execution_observations WHERE completed_at>=? OR id IN (SELECT id FROM shadow_execution_observations ORDER BY id DESC LIMIT 500)", (cutoff31,)),
+        ("semantic_candidate_events", "SELECT * FROM semantic_candidate_events WHERE received_at>=?", (cutoff31,)),
+        ("semantic_candidate_opportunities", "SELECT * FROM semantic_candidate_opportunities WHERE last_seen>=?", (cutoff31,)),
+        ("semantic_candidate_risk_state", "SELECT * FROM semantic_candidate_risk_state WHERE assessed_at>=?", (cutoff31,)),
+        # Preserve the 31-day hot normalized-swap window plus every older row that
+        # is still necessary to prove a token-first-touch chronology conflict.
+        (
+            "normalized_swaps",
+            "SELECT s.* FROM normalized_swaps s WHERE s.received_at>=? OR EXISTS ("
+            "SELECT 1 FROM token_first_touches t JOIN wallet_profiles w ON w.wallet=s.wallet "
+            "WHERE t.token_mint=s.token_mint AND s.side='buy' AND w.historically_eligible=1 "
+            "AND w.tier IN ('S','A') AND julianday(s.observed_at)<julianday(t.observed_at))",
+            (cutoff31,),
+        ),
+        # Program coverage and risk-refresh gates consume the latest 500 rows, so
+        # retain that exact decision surface even if activity is older than the
+        # nominal hot window.
+        ("program_coverage_observations", "SELECT * FROM program_coverage_observations WHERE assessed_at>=? OR id IN (SELECT id FROM program_coverage_observations ORDER BY assessed_at DESC,id DESC LIMIT 500)", (cutoff31,)),
+        ("risk_refresh_measurements", "SELECT * FROM risk_refresh_measurements WHERE completed_at>=? OR id IN (SELECT id FROM risk_refresh_measurements ORDER BY id DESC LIMIT 500)", (cutoff7,)),
+        ("risk_evidence", "SELECT * FROM risk_evidence WHERE received_at>=? OR id IN (SELECT MAX(id) FROM risk_evidence GROUP BY token_mint,dimension)", (cutoff31,)),
     )
     for table, sql, args in specs:
         if table not in existing:
