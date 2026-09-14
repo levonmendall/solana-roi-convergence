@@ -31,6 +31,9 @@ def _status_with_forward_pipeline(self: ContinuousWalletDiscovery) -> dict[str, 
         "v4_research_is_release_bound": True,
         "old_release_forward_rows_replayed_into_new_release": False,
         "active_v3_1_cohort_mutation_allowed": False,
+        "wallet_forward_alpha_point_in_time_runtime": bool(
+            getattr(realtime_record, "_roi_v52_wallet_forward_alpha_runtime", False)
+        ),
         "paper_only": True,
         "live_money_authority": False,
         "signing_or_submission_available": False,
@@ -88,6 +91,13 @@ def install_wallet_forward_pipeline_architecture() -> None:
 
     install_forward_evidence_runtime_repair()
     install_forward_evidence_compatibility()
+
+    # Start the first-class Wallet Forward Alpha capture/replay runtime inside the
+    # existing realtime wallet worker tree. It is prospective-only and never grants
+    # strategy authority by itself.
+    from .v52_wallet_forward_alpha_bootstrap import install_v52_wallet_forward_alpha_bootstrap
+
+    install_v52_wallet_forward_alpha_bootstrap()
 
     # Wallet Forward Alpha is a bounded modifier of an already-eligible v5.2 target.
     # It remains neutral until a genuine point-in-time 24h/7d/30d replay has been
