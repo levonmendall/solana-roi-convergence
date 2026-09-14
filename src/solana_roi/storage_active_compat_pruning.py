@@ -36,19 +36,37 @@ def prune_active_compatibility_database(
         }
         deleted: dict[str, int] = {}
 
+        def columns(table: str) -> set[str]:
+            if table not in tables:
+                return set()
+            return {
+                str(row[1])
+                for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+            }
+
         def run(table: str, sql: str, args: tuple[Any, ...]) -> None:
             if table not in tables:
                 return
             cursor = connection.execute(sql, args)
             deleted[table] = deleted.get(table, 0) + max(0, int(cursor.rowcount))
 
-        # Durable transport: unresolved work always survives. Helius has no
-        # completed_at column; updated_at is its terminal-time materialization.
-        run(
-            "helius_webhook_inbox",
-            "DELETE FROM helius_webhook_inbox WHERE state='complete' AND updated_at<?",
-            (cutoff7,),
-        )
+        # Durable transport: unresolved work always survives. Current Helius
+        # materializes terminal time in updated_at; older supported databases
+        # used completed_at. Detect the source schema rather than assuming one
+        # generation, and never delete a row unless it is explicitly complete.
+        webhook_columns = columns("helius_webhook_inbox")
+        if "updated_at" in webhook_columns:
+            run(
+                "helius_webhook_inbox",
+                "DELETE FROM helius_webhook_inbox WHERE state='complete' AND updated_at IS NOT NULL AND updated_at<?",
+                (cutoff7,),
+            )
+        elif "completed_at" in webhook_columns:
+            run(
+                "helius_webhook_inbox",
+                "DELETE FROM helius_webhook_inbox WHERE state='complete' AND completed_at IS NOT NULL AND completed_at<?",
+                (cutoff7,),
+            )
         run(
             "direct_solana_hydration_queue",
             "DELETE FROM direct_solana_hydration_queue WHERE status NOT IN ('pending','processing') AND updated_at<?",
