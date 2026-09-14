@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from .active_storage import payload_hash
 from .storage_current_v52_reconciliation import augment_current_state_truth
+from .storage_runtime_persistence_reconciliation import augment_runtime_current_state_truth
 
 
 TERMINAL_CANDIDATE_STATES = {
@@ -239,6 +240,7 @@ class LegacyCurrentStateExtractor:
                     counts[table] = len(rows)
                 truth[section] = section_payload
             augment_current_state_truth(conn, tables, truth, counts)
+            augment_runtime_current_state_truth(conn, tables, truth, counts)
             truth["portfolio"] = paper
             truth["latest_event_ids"] = _extract_event_heads(conn,tables,paper)
             truth["freshness"] = _extract_freshness(conn,tables)
