@@ -62,8 +62,6 @@ def install_wallet_forward_pipeline_architecture() -> None:
     from .wallet_entity_universe_v4 import install_v4_wallet_entity_universe
     from .wallet_evidence_rpc_repair import install_wallet_evidence_rpc_repair
 
-    # Evidence semantics first, final v4 sampler second, dynamic entity universe
-    # third. All three installers are idempotent and retain paper-only authority.
     install_wallet_evidence_rpc_repair()
     install_final_profit_first_entity_research()
     install_v4_wallet_entity_universe()
@@ -85,17 +83,18 @@ def install_wallet_forward_pipeline_architecture() -> None:
         setattr(_status_with_forward_pipeline, "_roi_wallet_forward_pipeline_architecture", True)
         ContinuousWalletDiscovery.status = _status_with_forward_pipeline  # type: ignore[method-assign]
 
-    # Final production composition: remove mutable-global wallet status/run-once
-    # recursion, align candidate claims with actual RPC capacity, prewarm point-in-
-    # time risk evidence, and schedule funding provenance directly from launch
-    # attestation. This is intentionally installed after the v4 handoff so its safe
-    # wallet status becomes the final outer composition without touching record
-    # adapters or promotion authority.
     from .forward_evidence_runtime_repair import install_forward_evidence_runtime_repair
     from .forward_evidence_compatibility import install_forward_evidence_compatibility
 
     install_forward_evidence_runtime_repair()
     install_forward_evidence_compatibility()
+
+    # Wallet Forward Alpha is a bounded modifier of an already-eligible v5.2 target.
+    # It remains neutral until a genuine point-in-time 24h/7d/30d replay has been
+    # persisted as materially positive and cannot create trade authority.
+    from .v52_wallet_forward_alpha_integration import install_v52_wallet_forward_alpha_integration
+
+    install_v52_wallet_forward_alpha_integration()
 
 
 __all__ = ["install_wallet_forward_pipeline_architecture"]
