@@ -65,6 +65,20 @@ def _make_legacy(path: Path) -> None:
         conn.commit()
 
 
+def _make_genesis_legacy(path: Path) -> None:
+    _make_legacy(path)
+    observed_at = "2026-09-13T00:00:00+00:00"
+    raw = "{}"
+    lineage = hashlib.sha256(f"|storage_probe|{observed_at}|{raw}".encode()).hexdigest()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE events SET event_type='storage_probe',previous_hash=NULL,lineage_hash=? WHERE id=?",
+            (lineage, ANCHOR_ID),
+        )
+        conn.execute("DELETE FROM paper_engine_checkpoint WHERE id=1")
+        conn.commit()
+
+
 def _truth() -> dict[str, object]:
     raw, digest = _paper_raw()
     return {
@@ -130,6 +144,41 @@ def test_extractor_rejects_corrupt_paper_checkpoint(tmp_path: Path) -> None:
     legacy=tmp_path/"l.sqlite3"; _make_legacy(legacy)
     with sqlite3.connect(legacy) as conn: conn.execute("UPDATE paper_engine_checkpoint SET state_sha256='bad'"); conn.commit()
     with pytest.raises(RuntimeError,match="digest mismatch"): LegacyCurrentStateExtractor(legacy).extract()
+
+
+def test_extractor_accepts_missing_checkpoint_only_at_proven_genesis(tmp_path: Path) -> None:
+    legacy=tmp_path/"genesis.sqlite3"; _make_genesis_legacy(legacy)
+    portfolio=LegacyCurrentStateExtractor(legacy).extract().truth["portfolio"]
+    assert portfolio["last_engine_event_id"] == 0
+    assert portfolio["state"] == _paper_state()
+    assert portfolio["source_checkpoint_present"] is False
+    assert portfolio["genesis_materialized"] is True
+
+
+def test_extractor_rejects_missing_checkpoint_when_engine_history_exists(tmp_path: Path) -> None:
+    legacy=tmp_path/"history.sqlite3"; _make_legacy(legacy)
+    with sqlite3.connect(legacy) as conn:
+        conn.execute("DELETE FROM paper_engine_checkpoint WHERE id=1")
+        conn.commit()
+    with pytest.raises(RuntimeError,match="engine history exists without a durable checkpoint"):
+        LegacyCurrentStateExtractor(legacy).extract()
+
+
+def test_shadow_materializes_proven_genesis_checkpoint_for_active_restart(tmp_path: Path) -> None:
+    legacy=tmp_path/"genesis.sqlite3"; active=tmp_path/"active.sqlite3"; _make_genesis_legacy(legacy)
+    report=build_shadow_database(legacy_path=legacy,active_path=active,release_sha=RELEASE)
+    assert report.equivalent and report.copied_rows["paper_engine_checkpoint"] == 1
+    with sqlite3.connect(active) as conn:
+        row=conn.execute("SELECT last_engine_event_id,state_json,state_sha256 FROM paper_engine_checkpoint WHERE id=1").fetchone()
+    assert row is not None and int(row[0]) == 0
+    assert json.loads(str(row[1])) == _paper_state()
+    assert hashlib.sha256(str(row[1]).encode()).hexdigest() == str(row[2])
+    legacy.unlink()
+    store=ActiveObservationEventStore(active,expected_release_sha=RELEASE)
+    engine=ActiveDurablePaperTradingEngine(store=store)
+    assert engine.portfolio.cash_usd == BASELINE.initial_capital_usd
+    assert engine._last_engine_event_id == 0
+    store.close()
 
 
 def test_shadow_build_is_exact_and_bounded(tmp_path: Path) -> None:
