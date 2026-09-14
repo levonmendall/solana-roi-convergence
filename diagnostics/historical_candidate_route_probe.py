@@ -6,8 +6,9 @@ import urllib.request
 BASE = "https://solana-roi-convergence.onrender.com"
 
 
-def get_json(url: str, timeout: float = 10.0):
-    req = urllib.request.Request(url, headers={"User-Agent": "historical-candidate-route-probe/2"})
+def get_json(path: str, timeout: float = 15.0):
+    url = BASE + path
+    req = urllib.request.Request(url, headers={"User-Agent": "historical-candidate-route-probe/3"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
@@ -16,18 +17,14 @@ def get_json(url: str, timeout: float = 10.0):
 
 
 def main() -> int:
-    spec = get_json(BASE + "/openapi.json")
-    paths = (spec.get("paths") or {}) if isinstance(spec, dict) else {}
-    wanted = []
-    for path, definition in sorted(paths.items()):
-        low = path.lower()
-        if any(k in low for k in ("candidate", "opportun", "semantic", "robinhood", "performance", "wallet-forward")):
-            wanted.append((path, definition))
-    print("CANDIDATE_OPENAPI_BEGIN")
-    for path, definition in wanted:
-        print("PATH", path)
-        print(json.dumps(definition, sort_keys=True, separators=(",", ":")))
-    print("CANDIDATE_OPENAPI_END")
+    for path in (
+        "/v1/strategy/candidate-coverage",
+        "/v1/robinhood-chain/status",
+    ):
+        result = get_json(path)
+        print("RESULT_BEGIN", path)
+        print(json.dumps(result, sort_keys=True, indent=2, default=str))
+        print("RESULT_END", path)
     return 0
 
 
