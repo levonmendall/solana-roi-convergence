@@ -84,8 +84,68 @@ class FidelityTests(unittest.TestCase):
             },
         }
 
+    def production_scale(self):
+        data = self.valid()
+        rows = {name: index + 1 for index, name in enumerate(sorted(fidelity.REQUIRED_STATE_FAMILIES))}
+        data.update(
+            {
+                "production_scale_claimed": True,
+                "production_shape": {
+                    "sqlite_db_bytes": 40960,
+                    "sqlite_page_size": 4096,
+                    "sqlite_page_count": 10,
+                    "provenance": "EXISTING PRODUCTION LOG/DIAGNOSTIC",
+                },
+                "state_cardinality_targets": {
+                    name: {
+                        "known": True,
+                        "rows": count,
+                        "provenance": "EXISTING PRODUCTION LOG/DIAGNOSTIC",
+                        "evidence": f"test-evidence:{name}",
+                    }
+                    for name, count in rows.items()
+                },
+                "fixture_inventory": {
+                    "sqlite_db_bytes": 40960,
+                    "sqlite_page_size": 4096,
+                    "sqlite_page_count": 10,
+                    "state_families": rows,
+                },
+            }
+        )
+        return data
+
     def test_accepts_complete_manifest(self):
         fidelity.validate_manifest(self.valid())
+
+    def test_accepts_fully_proven_exact_production_scale_manifest(self):
+        fidelity.validate_manifest(self.production_scale())
+
+    def test_rejects_production_scale_claim_without_shape_evidence(self):
+        data = self.valid()
+        data["production_scale_claimed"] = True
+        with self.assertRaisesRegex(fidelity.FidelityError, "production_shape"):
+            fidelity.validate_manifest(data)
+
+    def test_rejects_unknown_production_state_cardinality(self):
+        data = self.production_scale()
+        first = next(iter(fidelity.REQUIRED_STATE_FAMILIES))
+        data["state_cardinality_targets"].pop(first)
+        with self.assertRaisesRegex(fidelity.FidelityError, "unknown state cardinalities"):
+            fidelity.validate_manifest(data)
+
+    def test_rejects_fixture_state_cardinality_mismatch(self):
+        data = self.production_scale()
+        first = next(iter(fidelity.REQUIRED_STATE_FAMILIES))
+        data["fixture_inventory"]["state_families"][first] += 1
+        with self.assertRaisesRegex(fidelity.FidelityError, "cardinality mismatch"):
+            fidelity.validate_manifest(data)
+
+    def test_rejects_fixture_sqlite_geometry_mismatch(self):
+        data = self.production_scale()
+        data["fixture_inventory"]["sqlite_page_count"] = 11
+        with self.assertRaisesRegex(fidelity.FidelityError, "SQLite geometry"):
+            fidelity.validate_manifest(data)
 
     def test_rejects_missing_state(self):
         data = self.valid()
