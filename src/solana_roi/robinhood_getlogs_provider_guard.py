@@ -80,9 +80,11 @@ def _provider_max_blocks(self: Any) -> int | None:
     if explicit is not None:
         return explicit
     if str(os.getenv(ENV_VALIDATION_CLOUD_RPC_URL) or "").strip():
-        validation_limit = _validation_cloud_max_blocks()
-        if validation_limit is not None:
-            return validation_limit
+        # Validation Cloud is the first-choice log plane when configured. Do not
+        # inherit a block-span ceiling from whichever fallback provider happens to
+        # be active (notably Alchemy's ten-block free-tier limit). Operators can set
+        # a Validation Cloud-specific cap after observing its real production limits.
+        return _validation_cloud_max_blocks()
     if _is_alchemy_endpoint(str(getattr(self, "rpc_url", "") or "")):
         # The connected Robinhood production app is on the Alchemy Free tier, whose
         # eth_getLogs range is capped at ten inclusive blocks. Keep ten as the safe
@@ -232,7 +234,6 @@ async def _failover_from_getlogs_403(self: Any) -> bool:
 
         original_rpc = failover._ORIGINAL_RPC
         if original_rpc is None:
-            # A replacement may not remain active without a canonical chain verifier.
             failover._switch_from(
                 replacement.name,
                 failure_type="MissingRobinhoodChainVerifier",
@@ -245,7 +246,6 @@ async def _failover_from_getlogs_403(self: Any) -> bool:
             return False
         return True
     except Exception:
-        # Recovery itself must never convert a provider denial into apparent success.
         return False
 
 
@@ -283,10 +283,6 @@ async def _request_range(
             _inc(self, "http_403_fail_closed")
             raise
 
-        # Retry the exact same contiguous range. Re-entering the provider guard is
-        # intentional: the verified replacement can have a stricter range limit
-        # (Alchemy is ten blocks), so that limit is applied before any retry is sent.
-        # No caller cursor/watermark can observe success until the full range succeeds.
         _inc(self, "http_403_failovers")
         return await _provider_bounded_get_logs(
             self,
@@ -326,9 +322,6 @@ async def _dispatch_range(
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Do not advance the caller frontier. The exact same interval is handed
-            # to the composed governed provider path below; if that path cannot serve
-            # it, the request remains fail-closed.
             _inc(self, "validation_cloud_failures")
 
     return await _request_range(
@@ -392,9 +385,6 @@ async def _provider_bounded_get_logs(
                 topics=topics,
             )
         )
-        # Advance only after the entire current chunk returned successfully. Any
-        # refusal by every verified provider raises above and leaves this frontier
-        # unadvanced, preserving fail-closed contiguous event coverage.
         cursor = chunk_end + 1
     return rows
 
