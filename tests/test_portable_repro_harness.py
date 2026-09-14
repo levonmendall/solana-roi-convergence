@@ -132,6 +132,44 @@ class NetworkGuardTests(unittest.TestCase):
     def test_blocks_external_hostname(self):
         self.assertEqual(self._check("('api.mainnet.solana.com', 443)"), "False")
 
+    def test_blocks_external_dns_before_resolution(self):
+        guard = ROOT / "diagnostics" / "portable_repro" / "network_guard" / "sitecustomize.py"
+        code = (
+            "import importlib.util, socket; "
+            f"p={str(guard)!r}; "
+            "s=importlib.util.spec_from_file_location('portable_network_guard_dns', p); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+            "\ntry:\n socket.getaddrinfo('example.com', 443)\nexcept OSError as e:\n print(str(e))\nelse:\n raise SystemExit(9)"
+        )
+        out = subprocess.check_output([sys.executable, "-S", "-c", code], text=True)
+        self.assertIn("blocked live DNS resolution", out)
+
+    def test_allows_loopback_dns(self):
+        guard = ROOT / "diagnostics" / "portable_repro" / "network_guard" / "sitecustomize.py"
+        code = (
+            "import importlib.util, socket; "
+            f"p={str(guard)!r}; "
+            "s=importlib.util.spec_from_file_location('portable_network_guard_loopback', p); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+            "print(bool(socket.getaddrinfo('localhost', 80)))"
+        )
+        self.assertEqual(subprocess.check_output([sys.executable, "-S", "-c", code], text=True).strip(), "True")
+
+
+class SourceIntegrityTests(unittest.TestCase):
+    def test_runner_constructs_canonical_tree_and_only_overlays_harness(self):
+        runner = (ROOT / "diagnostics" / "portable_repro" / "run_docker.sh").read_text()
+        self.assertIn('git -C "$ROOT" archive "$CANONICAL_SHA"', runner)
+        self.assertIn('cp -a "$ROOT/diagnostics/portable_repro"', runner)
+        self.assertIn('.canonical_source_tree_sha256', runner)
+        self.assertNotIn('docker build \\\n  --build-arg "SOURCE_SHA=$CANONICAL_SHA" \\\n  -f "$ROOT/diagnostics/portable_repro/Dockerfile"', runner)
+
+    def test_runtime_rehashes_production_tree(self):
+        runner = (ROOT / "diagnostics" / "portable_repro" / "run.sh").read_text()
+        self.assertIn("production source-tree hash mismatch", runner)
+        self.assertIn("source-provenance-runtime.json", runner)
+        self.assertNotIn("git -C \"$ROOT\" rev-parse HEAD", runner)
+
 
 class HostCollectorTests(unittest.TestCase):
     def test_resolves_unified_cgroup(self):
