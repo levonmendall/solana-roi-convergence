@@ -1,0 +1,36 @@
+name: v5.2 Solscan historical index probe
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_solscan_index_probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Test indexed historical endpoints without private credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          FROM=1788480000
+          TO=1789429500
+          ADDR=pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+          urls=(
+            "https://pro-api.solscan.io/playground/account/transactions/enhanced?address=${ADDR}&from_time=${FROM}&to_time=${TO}&status=true&limit=10&encoding=jsonParsed"
+            "https://public-api.solscan.io/account/transactions?account=${ADDR}&limit=10"
+            "https://public-api.solscan.io/account/transactions?address=${ADDR}&limit=10"
+          )
+          for url in "${urls[@]}"; do
+            echo "=== ${url%%\?*} ==="
+            code=$(curl -sS -L --max-time 45 -A 'v52-readonly-replay/1' -o body.json -w '%{http_code}' "$url" || true)
+            echo "HTTP ${code}"
+            head -c 5000 body.json || true
+            echo
+          done
