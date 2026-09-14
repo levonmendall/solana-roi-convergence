@@ -1,0 +1,48 @@
+name: v5.2 historical manifest probe
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_historical_manifest_probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASE_URL: https://solana-roi-convergence.onrender.com
+      CERT_TOKEN: ${{ secrets.SOLANA_ROI_CERTIFICATION_SHARED_TOKEN }}
+    steps:
+      - name: Probe authenticated read-only manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_TOKEN:-}" ]; then
+            echo 'credential_present=false'
+            exit 0
+          fi
+          echo 'credential_present=true'
+          status=$(curl -sS --retry 3 --retry-all-errors --max-time 90 -o manifest.json -w '%{http_code}' \
+            -H "X-Certification-Token: ${CERT_TOKEN}" \
+            "${BASE_URL}/v1/operations/certification-db-logical-bootstrap" || true)
+          echo "manifest_http_status=${status}"
+          if [ "$status" = 200 ]; then
+            python - <<'PY'
+          import json
+          m=json.load(open('manifest.json'))
+          wanted={'normalized_swaps','wallet_intelligence_snapshots','v52_wallet_snapshot_assignments','robinhood_swaps','robinhood_launches','fomo_token_flows','price_marks','token_first_touches','risk_evidence','entity_links'}
+          print('release_commit='+str(m.get('release_commit','')))
+          print('epoch='+str(m.get('epoch','')))
+          print('schema_fingerprint='+str(m.get('schema_fingerprint','')))
+          names={t.get('name') for t in m.get('tables',[])}
+          print('target_tables_present='+','.join(sorted(wanted & names)))
+          print('target_tables_missing='+','.join(sorted(wanted - names)))
+          PY
+          else
+            cat manifest.json || true
+          fi
