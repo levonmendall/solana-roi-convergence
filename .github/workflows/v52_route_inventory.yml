@@ -1,0 +1,42 @@
+name: v5.2 route inventory
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_route_inventory.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inventory API routes relevant to replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast, pathlib, re
+          out=[]
+          for p in pathlib.Path('src').rglob('*.py'):
+              try: text=p.read_text(errors='ignore'); tree=ast.parse(text)
+              except Exception: continue
+              for node in ast.walk(tree):
+                  if not isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)): continue
+                  for dec in node.decorator_list:
+                      call=dec if isinstance(dec,ast.Call) else None
+                      if not call or not isinstance(call.func,ast.Attribute): continue
+                      if call.func.attr not in {'get','post'} or not call.args: continue
+                      arg=call.args[0]
+                      if isinstance(arg,ast.Constant) and isinstance(arg.value,str):
+                          path=arg.value
+                          if any(k in path.lower() for k in ('strategy','wallet','swap','candidate','fomo','robinhood','history','replay','backtest','observation','event','price','diagnostic','proof')):
+                              out.append((path,call.func.attr,str(p),node.lineno,node.name))
+          for row in sorted(set(out)):
+              print('\t'.join(map(str,row)))
+          PY
