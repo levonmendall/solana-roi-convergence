@@ -1,37 +1,33 @@
 from __future__ import annotations
 
-import pathlib
+import json
+import urllib.request
 
-ROOT = pathlib.Path("src")
-NEEDLES = (
-    "CERTIFICATION_TOKEN",
-    "certification_token",
-    "_require_shared_token",
-    "semantic_candidate_opportunities",
-    "semantic_candidate_events",
-    "normalized_swaps",
-    "LOGICAL_BOOTSTRAP",
-)
+BASE = "https://solana-roi-convergence.onrender.com"
+
+
+def get_json(url: str, timeout: float = 10.0):
+    req = urllib.request.Request(url, headers={"User-Agent": "historical-candidate-route-probe/2"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as exc:
+        return {"_error": f"{type(exc).__name__}:{exc}", "_url": url}
 
 
 def main() -> int:
-    for path in sorted(ROOT.rglob("*.py")):
-        try:
-            lines = path.read_text(errors="replace").splitlines()
-        except Exception:
-            continue
-        hit_indexes = [i for i, line in enumerate(lines) if any(n in line for n in NEEDLES)]
-        if not hit_indexes:
-            continue
-        emitted = []
-        for i in hit_indexes:
-            lo, hi = max(0, i - 8), min(len(lines), i + 18)
-            if any(a <= lo and hi <= b for a, b in emitted):
-                continue
-            emitted.append((lo, hi))
-            print(f"--- {path}:{i+1} ---")
-            for j in range(lo, hi):
-                print(f"{j+1:05d}: {lines[j]}")
+    spec = get_json(BASE + "/openapi.json")
+    paths = (spec.get("paths") or {}) if isinstance(spec, dict) else {}
+    wanted = []
+    for path, definition in sorted(paths.items()):
+        low = path.lower()
+        if any(k in low for k in ("candidate", "opportun", "semantic", "robinhood", "performance", "wallet-forward")):
+            wanted.append((path, definition))
+    print("CANDIDATE_OPENAPI_BEGIN")
+    for path, definition in wanted:
+        print("PATH", path)
+        print(json.dumps(definition, sort_keys=True, separators=(",", ":")))
+    print("CANDIDATE_OPENAPI_END")
     return 0
 
 
