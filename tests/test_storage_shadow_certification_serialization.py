@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -115,3 +116,90 @@ def test_deferred_shadow_stays_fail_closed_during_incomplete_bootstrap(
     assert snapshots == []
     assert handoff._SHADOW_STATE["attempts"] == 0
     assert handoff._SHADOW_STATE["state"] == "waiting_for_certification_bootstrap"
+
+
+def _gate_store(*, active: bool, reason: str | None) -> SimpleNamespace:
+    store = SimpleNamespace(_lock=threading.RLock())
+    setattr(store, lease.STATE_ATTR, {"active": active, "restore_reason": reason})
+    return store
+
+
+def _enable_transition_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SOLANA_ROI_ACTIVE_STORAGE_SHADOW", "1")
+    monkeypatch.setenv("SOLANA_ROI_ACTIVE_STORAGE_ENABLED", "0")
+    monkeypatch.setattr(lease, "WORKER_GATE_POLL_SECONDS", 0.005)
+
+
+def test_worker_gate_rejects_idle_timeout_until_explicit_completion_and_shadow_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_transition_gate(monkeypatch)
+    monkeypatch.setattr(lease, "_worker_gate_seconds", lambda: 0.25)
+    store = _gate_store(active=False, reason="idle_timeout")
+    shadow = SimpleNamespace(_SHADOW_STATE={"state": "waiting_for_certification_bootstrap"})
+
+    async def scenario() -> str:
+        stop = asyncio.Event()
+        task = asyncio.create_task(lease._wait_for_transition_worker_gate(store, stop, shadow))
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        setattr(store, lease.STATE_ATTR, {"active": False, "restore_reason": "bootstrap_complete"})
+        shadow._SHADOW_STATE["state"] = "building"
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        shadow._SHADOW_STATE["state"] = "completed"
+        return await task
+
+    assert asyncio.run(scenario()) == "released"
+
+
+def test_worker_gate_timeout_restores_paper_availability_without_authorizing_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_transition_gate(monkeypatch)
+    monkeypatch.setattr(lease, "_worker_gate_seconds", lambda: 0.03)
+    store = _gate_store(active=False, reason="idle_timeout")
+    original_state = getattr(store, lease.STATE_ATTR)
+    shadow = SimpleNamespace(_SHADOW_STATE={"state": "waiting_for_certification_bootstrap"})
+
+    result = asyncio.run(
+        lease._wait_for_transition_worker_gate(store, asyncio.Event(), shadow)
+    )
+
+    assert result == "timeout"
+    assert getattr(store, lease.STATE_ATTR) is original_state
+    assert original_state == {"active": False, "restore_reason": "idle_timeout"}
+    assert shadow._SHADOW_STATE["state"] == "waiting_for_certification_bootstrap"
+
+
+def test_worker_gate_stops_promptly_without_starting_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_transition_gate(monkeypatch)
+    monkeypatch.setattr(lease, "_worker_gate_seconds", lambda: 1.0)
+    store = _gate_store(active=True, reason=None)
+    shadow = SimpleNamespace(_SHADOW_STATE={"state": "waiting_for_certification_bootstrap"})
+
+    async def scenario() -> str:
+        stop = asyncio.Event()
+        task = asyncio.create_task(lease._wait_for_transition_worker_gate(store, stop, shadow))
+        await asyncio.sleep(0.01)
+        stop.set()
+        return await task
+
+    assert asyncio.run(scenario()) == "stopped"
+
+
+def test_worker_gate_is_transition_only_and_skips_active_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOLANA_ROI_ACTIVE_STORAGE_SHADOW", "1")
+    monkeypatch.setenv("SOLANA_ROI_ACTIVE_STORAGE_ENABLED", "1")
+    store = _gate_store(active=True, reason=None)
+    shadow = SimpleNamespace(_SHADOW_STATE={"state": "building"})
+
+    result = asyncio.run(
+        lease._wait_for_transition_worker_gate(store, asyncio.Event(), shadow)
+    )
+
+    assert result == "not_requested"
