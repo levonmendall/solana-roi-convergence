@@ -10,13 +10,18 @@ writer uses SQLite WAL. Production proved two distinct failure modes:
 * after that cadence was suppressed, an already-large physical WAL could cross the
   bounded maintenance ceiling before the certifier's first request.
 
-This module changes only physical checkpoint cadence. It primes a temporary lease after
-the canonical runtime is restored but before live workers start, refreshes that lease on
-bootstrap requests, restores the exact original setting on completion/inactivity, and
-uses a zero-wait TRUNCATE checkpoint only when the configured WAL ceiling is reached.
-A busy, failed, or non-shrinking maintenance attempt remains fail-closed with HTTP 503.
-No strategy, certification, evidence, signing, submission, or live-money authority is
-changed.
+This module changes only physical checkpoint cadence and transition startup ordering.
+It primes a temporary lease after the canonical runtime is restored but before live
+workers start, refreshes that lease on bootstrap requests, restores the exact original
+setting on completion/inactivity, and uses a zero-wait TRUNCATE checkpoint only when
+the configured WAL ceiling is reached. During an ordinary storage-shadow transition,
+the history-heavy runtime worker chain is held behind explicit bootstrap completion
+and the deferred shadow attempt so those readers cannot refill the cgroup file cache
+while certification is scanning the same database. A bounded timeout restores
+paper-runtime availability without marking bootstrap complete or authorizing storage
+activation. A busy, failed, or non-shrinking maintenance attempt remains fail-closed
+with HTTP 503. No strategy, certification, evidence, signing, submission, or live-money
+authority is changed.
 """
 
 import asyncio
@@ -32,13 +37,18 @@ from typing import Any, Callable
 from fastapi import BackgroundTasks, HTTPException
 from starlette.concurrency import run_in_threadpool
 
-LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v7-route-lifecycle-offload"
+LEASE_VERSION = "certification-bootstrap-autocheckpoint-lease-v8-transition-worker-gate"
 DEFAULT_IDLE_SECONDS = 45.0
 MIN_IDLE_SECONDS = 35.0
 MAX_IDLE_SECONDS = 120.0
 DEFAULT_MAX_WAL_BYTES = 64 * 1024 * 1024
 MIN_MAX_WAL_BYTES = 32 * 1024 * 1024
 MAX_MAX_WAL_BYTES = 256 * 1024 * 1024
+DEFAULT_WORKER_GATE_SECONDS = 1800.0
+MIN_WORKER_GATE_SECONDS = 60.0
+MAX_WORKER_GATE_SECONDS = 3600.0
+WORKER_GATE_POLL_SECONDS = 0.25
+WORKER_GATE_ENV = "SOLANA_ROI_CERTIFICATION_BOOTSTRAP_WORKER_GATE_SECONDS"
 STATE_ATTR = "_roi_certification_bootstrap_autocheckpoint_lease"
 MANIFEST_PATH = "/v1/operations/certification-db-logical-bootstrap"
 PAGE_PATH = "/v1/operations/certification-db-logical-bootstrap-page"
@@ -88,6 +98,31 @@ def _max_wal_bytes() -> int:
         )
     except ValueError:
         return DEFAULT_MAX_WAL_BYTES
+
+
+def _worker_gate_seconds() -> float:
+    try:
+        return max(
+            MIN_WORKER_GATE_SECONDS,
+            min(
+                MAX_WORKER_GATE_SECONDS,
+                float(os.getenv(WORKER_GATE_ENV, str(DEFAULT_WORKER_GATE_SECONDS))),
+            ),
+        )
+    except ValueError:
+        return DEFAULT_WORKER_GATE_SECONDS
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _transition_worker_gate_requested() -> bool:
+    """Gate workers only for legacy-authoritative ordinary shadow preparation."""
+
+    return _truthy_env("SOLANA_ROI_ACTIVE_STORAGE_SHADOW") and not _truthy_env(
+        "SOLANA_ROI_ACTIVE_STORAGE_ENABLED"
+    )
 
 
 def _wal_path(store: Any) -> Path:
@@ -412,6 +447,91 @@ def finish(store: Any, *, reason: str = "explicit") -> bool:
         return _restore_locked(store, state, reason=reason, cancel_timer=True)
 
 
+def _bootstrap_completed(store: Any) -> bool:
+    lock = getattr(store, "_lock", None)
+    if lock is None:
+        return False
+    with lock:
+        state = _state(store)
+        return bool(
+            isinstance(state, dict)
+            and not bool(state.get("active"))
+            and str(state.get("restore_reason") or "") == "bootstrap_complete"
+        )
+
+
+def _shadow_state(render_bootstrap: Any) -> str:
+    state = getattr(render_bootstrap, "_SHADOW_STATE", None)
+    if not isinstance(state, dict):
+        return "unavailable"
+    return str(state.get("state") or "idle")
+
+
+def _shadow_settled_for_worker_release(render_bootstrap: Any) -> bool:
+    return _shadow_state(render_bootstrap) in {
+        "not_requested",
+        "completed",
+        "failed_closed",
+        "stopped_before_start",
+    }
+
+
+async def _wait_for_transition_worker_gate(store: Any, stop: Any, render_bootstrap: Any) -> str:
+    """Give certification + shadow an exclusive bounded startup window.
+
+    Only the ordinary legacy-authoritative shadow transition uses this gate. An idle
+    lease timeout never satisfies it. The timeout is an availability escape hatch for
+    the paper runtime only: it does not mutate lease state, shadow state, storage
+    activation, certification truth, or authority.
+    """
+
+    if not _transition_worker_gate_requested():
+        return "not_requested"
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _worker_gate_seconds()
+    print(
+        "ROI_BOOTSTRAP_WORKER_GATE "
+        f"event=waiting timeout_seconds={_worker_gate_seconds():.3f} "
+        "requires_bootstrap_complete=true requires_shadow_settled=true "
+        "paper_only=true live_money_authority=false",
+        flush=True,
+    )
+    while True:
+        if bool(stop.is_set()):
+            print("ROI_BOOTSTRAP_WORKER_GATE event=stopped", flush=True)
+            return "stopped"
+
+        complete = _bootstrap_completed(store)
+        shadow_state = _shadow_state(render_bootstrap)
+        if complete and _shadow_settled_for_worker_release(render_bootstrap):
+            print(
+                "ROI_BOOTSTRAP_WORKER_GATE "
+                f"event=release reason=bootstrap_complete_shadow_settled shadow_state={shadow_state} "
+                "paper_only=true live_money_authority=false",
+                flush=True,
+            )
+            return "released"
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            print(
+                "ROI_BOOTSTRAP_WORKER_GATE "
+                f"event=timeout bootstrap_complete={str(complete).lower()} shadow_state={shadow_state} "
+                "storage_activation_authorized=false paper_only=true live_money_authority=false",
+                flush=True,
+            )
+            return "timeout"
+
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=min(WORKER_GATE_POLL_SECONDS, remaining),
+            )
+        except asyncio.TimeoutError:
+            continue
+
+
 def _runtime_store(runtime_provider: Callable[[], Any]) -> Any:
     try:
         runtime = runtime_provider()
@@ -471,7 +591,7 @@ def _runtime_provider_from_endpoint(endpoint: Any) -> Callable[[], Any] | None:
 
 
 def _install_preworker_quiesce() -> None:
-    """Wrap the already-composed worker chain without changing authority markers."""
+    """Wrap the composed worker chain with transition-only startup serialization."""
 
     from . import render_runtime_bootstrap_repair as render_bootstrap
 
@@ -485,6 +605,9 @@ def _install_preworker_quiesce() -> None:
         if store is None:
             raise RuntimeError("canonical runtime store unavailable before worker start")
         await asyncio.to_thread(prime_before_workers, store)
+        gate_result = await _wait_for_transition_worker_gate(store, stop, render_bootstrap)
+        if gate_result == "stopped":
+            return None
         return await current_workers(runtime, stop)
 
     setattr(workers_with_bootstrap_quiesce, "_roi_bootstrap_preworker_quiesce", True)
@@ -600,6 +723,12 @@ def status() -> dict[str, Any]:
         "preworker_unconditional_checkpoint_enabled": False,
         "preworker_ceiling_maintenance_enabled": True,
         "preworker_sync_and_file_cache_release": True,
+        "transition_worker_gate_requested": _transition_worker_gate_requested(),
+        "transition_worker_gate_seconds": _worker_gate_seconds(),
+        "transition_worker_gate_requires_bootstrap_complete": True,
+        "transition_worker_gate_requires_shadow_settled": True,
+        "transition_worker_gate_timeout_authorizes_storage": False,
+        "idle_timeout_satisfies_worker_gate": False,
         "idle_seconds": _idle_seconds(),
         "max_wal_bytes": _max_wal_bytes(),
         "maintenance_checkpoint_mode": "truncate_zero_wait_at_ceiling_only",
