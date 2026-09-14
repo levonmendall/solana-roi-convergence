@@ -1,0 +1,32 @@
+name: v5.2 deployed route snapshot
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_openapi_route_snapshot.yml
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch OpenAPI and list candidate read routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 90 https://solana-roi-convergence.onrender.com/openapi.json -o openapi.json
+          python - <<'PY'
+          import json
+          obj=json.load(open('openapi.json'))
+          paths=obj.get('paths',{})
+          for p,v in sorted(paths.items()):
+              key=p.lower()
+              if any(x in key for x in ('swap','wallet','candidate','fomo','robinhood','history','observation','event','price','strategy','certification-db')):
+                  methods=','.join(sorted(v))
+                  print(f'{methods:20} {p}')
+          PY
