@@ -1,0 +1,67 @@
+name: v5.2 historical read-only probe
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_historical_readonly_probe.yml
+      - diagnostics/v52_historical_replay/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch canonical public evidence surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/v52_historical_replay/output
+          base='https://solana-roi-convergence.onrender.com'
+          for path in \
+            '/health' \
+            '/v1/liveness' \
+            '/v1/strategy/v52' \
+            '/v1/strategy/v52/performance/24h' \
+            '/v1/strategy/v52/performance/7d' \
+            '/v1/strategy/v52/wallet-forward-alpha' \
+            '/v1/system-proof' \
+            '/openapi.json'
+          do
+            name=$(printf '%s' "$path" | sed 's#^/##;s#[/?=&]#_#g')
+            code=$(curl -L -sS --connect-timeout 10 --max-time 120 -w '%{http_code}' -o "diagnostics/v52_historical_replay/output/${name}.json" "$base$path" || true)
+            printf '%s %s\n' "$code" "$path" | tee -a diagnostics/v52_historical_replay/output/http_status.txt
+          done
+      - name: Summarize opportunity evidence
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+          root=Path('diagnostics/v52_historical_replay/output')
+          def load(name):
+              p=root/name
+              try: return json.loads(p.read_text())
+              except Exception as e: return {'_error':type(e).__name__,'_text':p.read_text(errors='replace')[:2000] if p.exists() else ''}
+          p24=load('v1_strategy_v52_performance_24h.json')
+          p7=load('v1_strategy_v52_performance_7d.json')
+          w=load('v1_strategy_v52_wallet-forward-alpha.json')
+          v=load('v1_strategy_v52.json')
+          summary={
+              'strategy': {k:v.get(k) for k in ('authoritative_strategy','strategy_version','authority_id','economic_freeze_epoch','canonical_lanes','paper_only','live_money_authority')},
+              'performance_24h': p24,
+              'performance_7d': p7,
+              'wallet_forward_alpha': w,
+          }
+          (root/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True,default=str))
+          print(json.dumps(summary,indent=2,sort_keys=True,default=str)[:30000])
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v52-historical-readonly-probe
+          path: diagnostics/v52_historical_replay/output
+          retention-days: 7
