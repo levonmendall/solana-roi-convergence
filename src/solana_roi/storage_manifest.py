@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from . import storage_retention as base
+# These two modules extend the same positive registry with persistence that was
+# added after the original storage branch: current v5.2 validation state and
+# constructor-reachable runtime continuity/transport state.  Importing them here
+# makes the central manifest the single registration boundary used by active
+# schema validation and certification scope.
+from . import storage_current_v52_reconciliation as _current_v52_reconciliation  # noqa: F401
+from . import storage_runtime_persistence_reconciliation as _runtime_persistence_reconciliation  # noqa: F401
 
 R = base.RetentionClass
 C = base.RetentionContract
