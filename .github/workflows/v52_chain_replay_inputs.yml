@@ -1,0 +1,28 @@
+name: v5.2 chain replay inputs
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_chain_replay_inputs.yml
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve frozen program IDs, replay code, and provider secret names
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== FROZEN PROGRAM IDS ==='
+          grep -R -n -E 'FROZEN_SUPPORTED_PROGRAM_IDS_BY_SOURCE|PUMP.*PROGRAM|PROGRAM.*PUMP|ROBINHOOD.*PROGRAM|FOMO.*PROGRAM|PUMP_FUN|PUMP_AMM|PUMPSWAP' src operations | head -n 1200 || true
+          echo '=== HISTORICAL / REPLAY IMPLEMENTATIONS ==='
+          grep -R -n -E 'historical.*replay|replay.*historical|counterfactual|backtest|simulate.*portfolio|sequential.*portfolio' src operations | head -n 1200 || true
+          echo '=== PROVIDER SECRET REFERENCES ==='
+          grep -R -n -E 'secrets\.[A-Za-z0-9_]*(HELIUS|ALCHEMY|CHAINSTACK|VALIDATION|SOLANA|RPC)|\$\{\{ *secrets\.[A-Za-z0-9_]+ *\}\}' .github/workflows | sed -E 's/(secrets\.[A-Za-z0-9_]+).*/\1/' | sort -u || true
