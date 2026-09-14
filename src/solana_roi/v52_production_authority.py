@@ -57,6 +57,10 @@ from .v52_market_validation_governance import (
     install_v52_market_validation_governance,
     status as market_validation_governance_status,
 )
+from .v52_market_validation_completion import (
+    install_v52_market_validation_completion,
+    status as market_validation_completion_status,
+)
 from .v52_learning_governance import (
     install_v52_learning_governance,
     status as learning_governance_status,
@@ -66,7 +70,7 @@ from .v52_learning_governance_hardening import (
     status as learning_governance_hardening_status,
 )
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v13-market-validation-governance"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v14-market-validation-completion"
 _INSTALLED = False
 _RUNTIME: Any | None = None
 _WALLET_ALPHA: WalletAlphaRefinementLedger | None = None
@@ -135,11 +139,12 @@ def install_v52_production_authority(app: Any, runtime_provider: Callable[[], An
     install_v52_learning_governance(runtime)
     install_v52_learning_governance_hardening()
     install_v52_profit_confidence_finalization()
-    # These are the final additive control layers. They can only preserve or
-    # reduce an already-authorized paper fraction; they cannot originate entries,
-    # increase sizing, weaken a v5.2 guard, sign, submit, or grant live-money authority.
+    # Final additive validation/control layers. They may preserve or reduce an
+    # already-authorized paper fraction but cannot originate entries, increase
+    # sizing, weaken v5.2 guards, sign, submit, or grant live-money authority.
     market_validation_controller = install_v52_market_validation_controls(runtime.store)
-    install_v52_market_validation_governance(market_validation_controller)
+    market_validation_governance = install_v52_market_validation_governance(market_validation_controller)
+    install_v52_market_validation_completion(market_validation_controller, market_validation_governance)
     install_v52_strategy_api(app)
 
     strategy_epoch = strategy_evolution_snapshot()
@@ -162,6 +167,7 @@ def install_v52_production_authority(app: Any, runtime_provider: Callable[[], An
     app.state.roi_v52_profit_confidence_finalization = True
     app.state.roi_v52_market_validation_controls = True
     app.state.roi_v52_market_validation_governance = True
+    app.state.roi_v52_market_validation_completion = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
     app.state.roi_authority_fingerprint = authority_fingerprint()
@@ -179,12 +185,13 @@ def status() -> dict[str, Any]:
     lifecycle = robinhood_lifecycle_status()
     reconciliation = robinhood_candidate_reconciliation_status()
     adaptive = adaptive_continuation_status()
-    completion = profit_confidence_status()
+    profit_completion = profit_confidence_status()
     learning = learning_governance_status()
     hardening = learning_governance_hardening_status()
     finalization = profit_confidence_finalization_status()
     market_validation = market_validation_status()
     market_validation_governance = market_validation_governance_status()
+    market_validation_completion = market_validation_completion_status()
     strategy_epoch = strategy_evolution_snapshot()
 
     if _RUNTIME is None:
@@ -211,7 +218,7 @@ def status() -> dict[str, Any]:
     runtime["robinhood_v52_authority_from_release_epoch"] = True
     runtime["continuous_strategy_evolution_enabled"] = True
     runtime["active_strategy_epoch"] = strategy_epoch
-    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_robinhood_profit_confidence_plus_market_validation_governance"
+    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_robinhood_profit_confidence_plus_market_validation_completion"
     runtime["robinhood_scale_in_authority"] = bool(
         lifecycle.get("installed")
         and lifecycle.get("aggregate_exact_exitability_before_add")
@@ -223,12 +230,13 @@ def status() -> dict[str, Any]:
         lifecycle.get("installed") and lifecycle.get("staged_derisk_runner_authority")
     )
     runtime["adaptive_continuation_refinement"] = bool(adaptive.get("installed"))
-    runtime["profit_confidence_completion"] = bool(completion.get("installed"))
+    runtime["profit_confidence_completion"] = bool(profit_completion.get("installed"))
     runtime["learning_governance"] = bool(learning.get("installed"))
     runtime["learning_governance_hardening"] = bool(hardening.get("installed"))
     runtime["profit_confidence_finalization"] = bool(finalization.get("installed"))
     runtime["market_validation_controls"] = bool(market_validation.get("installed"))
     runtime["market_validation_governance"] = bool(market_validation_governance.get("installed"))
+    runtime["market_validation_completion"] = bool(market_validation_completion.get("installed"))
 
     all_owned = bool(
         runtime.get("solana_final_owner")
@@ -238,9 +246,9 @@ def status() -> dict[str, Any]:
         and runtime.get("robinhood_scale_in_authority")
         and runtime.get("staged_derisk_runner_authority")
         and adaptive.get("installed")
-        and completion.get("installed")
-        and completion.get("parallel_exact_quote_acquisition")
-        and float(completion.get("minimum_exit_depth_coverage_ratio") or 0.0) >= 2.0
+        and profit_completion.get("installed")
+        and profit_completion.get("parallel_exact_quote_acquisition")
+        and float(profit_completion.get("minimum_exit_depth_coverage_ratio") or 0.0) >= 2.0
         and learning.get("installed")
         and learning.get("bayesian_posterior_confidence")
         and learning.get("wallet_distribution_reversal_primary_exit_signal")
@@ -271,6 +279,13 @@ def status() -> dict[str, Any]:
         and market_validation_governance.get("activation_deactivation_hysteresis")
         and market_validation_governance.get("automatic_reactivation")
         and market_validation_governance.get("future_leakage_allowed") is False
+        and market_validation_completion.get("installed")
+        and market_validation_completion.get("all_shadow_variants_non_authoritative")
+        and market_validation_completion.get("automatic_point_in_time_recording")
+        and market_validation_completion.get("automatic_independent_actor_enrichment")
+        and market_validation_completion.get("lane_accounting_continuous")
+        and "reduced" in set(market_validation_completion.get("lane_states") or ())
+        and market_validation_completion.get("live_money_authority") is False
         and wallet_alignment.get("installed")
         and storage.get("v52_authority_from_release_epoch")
         and robinhood_exit.get("final_exit_policy_owner") == "v52"
@@ -296,12 +311,13 @@ def status() -> dict[str, Any]:
         "wallet_intelligence_alignment": wallet_alignment,
         "wallet_alpha_refinement": wallet_alpha,
         "adaptive_continuation_refinement": adaptive,
-        "profit_confidence_completion": completion,
+        "profit_confidence_completion": profit_completion,
         "learning_governance": learning,
         "learning_governance_hardening": hardening,
         "profit_confidence_finalization": finalization,
         "market_validation_controls": market_validation,
         "market_validation_governance": market_validation_governance,
+        "market_validation_completion": market_validation_completion,
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
         "robinhood_position_lifecycle": lifecycle,
