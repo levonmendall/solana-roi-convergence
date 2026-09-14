@@ -13,103 +13,56 @@ jobs:
   inspect-readonly-evidence:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      SOLANA_ROI_PRODUCTION_URL: https://solana-roi-convergence.onrender.com
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Fetch read-only production evidence surfaces
+      - name: Page current read-only evidence tables
         shell: bash
         run: |
           python - <<'PY'
           import json, urllib.request, urllib.error, urllib.parse
-          from collections import defaultdict
-
           base = "https://solana-roi-convergence.onrender.com"
-          paths = [
-              "/health",
-              "/v1/strategy/e2e-status",
-              "/v1/strategy/forward-certification",
-              "/v1/strategy/production-proof",
-          ]
-          payloads = {}
-          def get(path, timeout=60):
-              url = base + path
-              try:
-                  with urllib.request.urlopen(url, timeout=timeout) as r:
-                      raw = r.read().decode("utf-8", "replace")
-                      print(f"=== GET {path} status={r.status} bytes={len(raw)} ===")
-                      print(raw[:200000])
-                      try: return r.status, json.loads(raw)
-                      except Exception: return r.status, raw
-              except urllib.error.HTTPError as e:
-                  raw = e.read().decode("utf-8", "replace")
-                  print(f"=== GET {path} status={e.code} bytes={len(raw)} ===")
-                  print(raw[:200000])
-                  try: return e.code, json.loads(raw)
-                  except Exception: return e.code, raw
-              except Exception as exc:
-                  print(f"=== GET {path} ERROR {type(exc).__name__}: {exc} ===")
-                  return None, None
-
-          for p in paths:
-              payloads[p] = get(p)[1]
-
-          # First ask the logical-bootstrap surface what it requires.
-          get("/v1/operations/certification-db-logical-bootstrap-page?table=profit_first_final_outcomes&limit=5")
-
-          found = defaultdict(list)
-          def walk(obj, trail="root"):
-              if isinstance(obj, dict):
-                  for k,v in obj.items():
-                      lk = k.lower()
-                      if any(token in lk for token in ("epoch", "fingerprint", "schema", "release_commit", "release_sha")):
-                          if isinstance(v, (str,int,float,bool)) or v is None:
-                              found[k].append((trail+"."+k, v))
-                      walk(v, trail+"."+k)
-              elif isinstance(obj, list):
-                  for i,v in enumerate(obj[:2000]): walk(v, f"{trail}[{i}]")
-          for p, body in payloads.items(): walk(body, p)
-          print("=== DISCOVERED EPOCH/FINGERPRINT/RELEASE FIELDS ===")
-          print(json.dumps(found, indent=2, default=str)[:200000])
-
-          # Try plausible current epoch/fingerprint pairs discovered in the payloads.
-          epochs=[]; fps=[]
-          for key, vals in found.items():
-              lk=key.lower()
-              for _,v in vals:
-                  if not isinstance(v,str) or not v: continue
-                  if "epoch" in lk and v not in epochs: epochs.append(v)
-                  if ("fingerprint" in lk or "schema" in lk) and len(v)>=16 and v not in fps: fps.append(v)
+          epoch = "aujNKhdJlQURx1AtMXciTvUwmXTMsz_m"
+          fp = "a5ade0f3e2d2fbeaea49bcd531add8509b7f27acb71d04f1b73d7d31ccb3c648"
           tables = [
-              "profit_first_final_trials",
-              "profit_first_final_outcomes",
-              "profit_first_final_exit_signals",
-              "profit_first_final_exit_liquidations",
+              "profit_first_entity_forward_outcomes",
+              "profit_first_entity_shadow_trials",
+              "profit_first_final_epochs",
               "profit_first_final_exit_execution_attempts",
+              "profit_first_final_exit_liquidations",
+              "profit_first_final_exit_signals",
+              "profit_first_final_outcome_execution_models",
+              "profit_first_final_outcomes",
+              "profit_first_final_trials",
+              "candidate_compute_admission_decisions",
               "candidate_execution_plane_snapshots",
               "ephemeral_candidate_state",
+              "release_bound_candidate_failures",
+              "anonymous_candidate_latency_failures",
               "v52_market_validation_point_in_time",
               "v52_market_validation_shadow_outcomes",
               "v52_wallet_forward_outcomes",
               "v52_wallet_forward_validation",
+              "normalized_swaps",
+              "market_quotes",
+              "events",
           ]
-          print("=== DISCOVERED CANDIDATE EPOCHS ===", epochs[:20])
-          print("=== DISCOVERED CANDIDATE FINGERPRINTS ===", fps[:20])
-          for epoch in epochs[:5]:
-              for fp in fps[:5]:
-                  for table in tables:
-                      qs=urllib.parse.urlencode({"table":table,"epoch":epoch,"schema_fingerprint":fp,"limit":5})
-                      status, body = get("/v1/operations/certification-db-logical-bootstrap-page?"+qs, timeout=60)
-                      if status == 200:
-                          print(f"BOOTSTRAP_SUCCESS table={table} epoch={epoch} fingerprint={fp}")
-                          break
-                  else:
-                      continue
-                  break
-              else:
-                  continue
-              break
+          def get(table):
+              qs = urllib.parse.urlencode({"table":table,"epoch":epoch,"schema_fingerprint":fp,"limit":20})
+              url = base + "/v1/operations/certification-db-logical-bootstrap-page?" + qs
+              try:
+                  with urllib.request.urlopen(url, timeout=60) as r:
+                      raw=r.read().decode("utf-8","replace")
+                      print(f"=== TABLE {table} status={r.status} bytes={len(raw)} ===")
+                      print(raw[:120000])
+              except urllib.error.HTTPError as e:
+                  raw=e.read().decode("utf-8","replace")
+                  print(f"=== TABLE {table} status={e.code} bytes={len(raw)} ===")
+                  print(raw[:20000])
+              except Exception as exc:
+                  print(f"=== TABLE {table} ERROR {type(exc).__name__}: {exc} ===")
+          for table in tables:
+              get(table)
           PY
