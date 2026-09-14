@@ -1,5 +1,5 @@
 {
-  "policy_version": "v51-module-reachability-131-v6-cleanup-capable-certifier-root",
+  "policy_version": "v51-module-reachability-131-v7-storage-transition",
   "production_root": "solana_roi.production",
   "non_authoritative_service_roots": [
     "solana_roi.certifier_service",
@@ -20,8 +20,11 @@
     "solana_roi.v52_final_refinement"
   ],
   "migration_only": [
+    "solana_roi.active_storage",
     "solana_roi.cli",
     "solana_roi.split_webhooks",
+    "solana_roi.storage_retention",
+    "solana_roi.storage_transition",
     "solana_roi.v51_architecture_retirement"
   ],
   "archived_fixture_roots": [
