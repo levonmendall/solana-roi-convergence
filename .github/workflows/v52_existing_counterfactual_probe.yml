@@ -1,0 +1,35 @@
+name: v5.2 existing counterfactual probe
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_existing_counterfactual_probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe existing analytical evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://solana-roi-convergence.onrender.com
+          for path in \
+            /v1/strategy/v52/learning-governance \
+            /v1/strategy/rejected-counterfactuals \
+            /v1/strategy/economic-dashboard \
+            /v1/strategy/candidate-coverage \
+            /v1/program-coverage/status \
+            /v1/wallet-intelligence/status \
+            /v1/wallet-discovery/status; do
+            code=$(curl -sS --max-time 90 -o body.json -w '%{http_code}' "$base$path" || true)
+            echo "=== $path HTTP $code ==="
+            head -c 30000 body.json || true
+            echo
+          done
