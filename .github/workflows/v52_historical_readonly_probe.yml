@@ -1,4 +1,4 @@
-name: v5.2 ten-day economic evidence probe
+name: v5.2 ten-day exact read-only page probe
 
 on:
   push:
@@ -14,65 +14,50 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch public economic evidence surfaces
+      - name: Fetch already-established certification pages read-only
         shell: python
         run: |
-          import json, urllib.request, urllib.error
+          import json, urllib.parse, urllib.request, urllib.error
           from pathlib import Path
           out=Path('diagnostics/v52_historical_replay/output'); out.mkdir(parents=True,exist_ok=True)
           base='https://solana-roi-convergence.onrender.com'
-          paths=[
-            '/v1/strategy/rejected-counterfactuals',
-            '/v1/strategy/execution-cost-ledger',
-            '/v1/strategy/forward-certification',
-            '/v1/strategy/research-allocation',
-            '/v1/certification/profitability',
-            '/v1/strategy/e2e-status',
-            '/v1/strategy/economic-certification',
-            '/v1/strategy/final-certification',
-            '/v1/strategy/portfolio-reconciliation',
-            '/v1/strategy/promotion-certification',
-            '/v1/strategy/incremental-alpha',
-            '/v1/strategy/hazard-calibration',
-            '/v1/strategy/execution-stress',
-            '/v1/strategy/allocation-maturity',
-            '/v1/strategy/alpha-certificate',
-            '/v1/strategy/v52',
-            '/v1/strategy/v52/performance/24h',
-            '/v1/strategy/v52/performance/7d',
-            '/v1/strategy/v52/wallet-forward-alpha',
-            '/v1/strategy/candidate-coverage',
-            '/v1/robinhood-chain/status',
-          ]
-          summary=[]
-          for path in paths:
-            name=path.strip('/').replace('/','_')+'.json'
+          epoch='vUM5ejaI1mAIH94juZph0RWI46rhq3Os'
+          fp='8b9ae1ec6674944004333f439ae4ef25129a062e046ec8cc8019e1a997f265da'
+          tables=['robinhood_launches','robinhood_swaps','robinhood_paper_trials','robinhood_paper_outcomes','normalized_swaps','v51_candidates','v51_candidate_stage_events','profit_first_final_trials','profit_first_final_outcomes','fomo_paper_trials','fomo_paper_outcomes']
+          result={}
+          for table in tables:
+            q=urllib.parse.urlencode({'table':table,'epoch':epoch,'schema_fingerprint':fp,'limit':10})
+            url=base+'/v1/operations/certification-db-logical-bootstrap-page?'+q
+            try:
+              req=urllib.request.Request(url,headers={'user-agent':'v52-ten-day-readonly-replay'})
+              with urllib.request.urlopen(req,timeout=30) as r:
+                body=r.read(2_000_000)
+              data=json.loads(body)
+              result[table]={'status':r.status,'data':data}
+            except urllib.error.HTTPError as e:
+              body=e.read().decode('utf-8','replace')[:2000]
+              result[table]={'status':e.code,'error_body':body}
+            except Exception as e:
+              result[table]={'error':repr(e)}
+          for path in ['/v1/operations/certification-db-replication','/v1/operations/certification-db-logical-bootstrap']:
             try:
               req=urllib.request.Request(base+path,headers={'user-agent':'v52-ten-day-readonly-replay'})
-              with urllib.request.urlopen(req,timeout=90) as r:
-                body=r.read(10_000_000)
-                status=r.status
-              (out/name).write_bytes(body)
-              try:
-                data=json.loads(body)
-                info={'path':path,'status':status,'bytes':len(body),'keys':list(data)[:100] if isinstance(data,dict) else None,'type':type(data).__name__}
-              except Exception as e:
-                info={'path':path,'status':status,'bytes':len(body),'parse_error':type(e).__name__}
-              summary.append(info)
-              print(json.dumps(info,sort_keys=True))
-            except Exception as e:
-              info={'path':path,'error':repr(e)}; summary.append(info); print(json.dumps(info,sort_keys=True))
-          (out/'surface_summary.json').write_text(json.dumps(summary,indent=2))
-      - name: Trace source implementations of useful surfaces
-        shell: bash
-        run: |
-          set -u
-          grep -RniE 'rejected.counterfactual|execution.cost.ledger|def .*forward.*cert|def .*profitability|incremental.alpha|hazard.calibration|allocation.maturity|alpha.certificate|portfolio.reconciliation' src/solana_roi 2>/dev/null | head -n 8000 > diagnostics/v52_historical_replay/output/economic_surface_source_trace.txt || true
+              with urllib.request.urlopen(req,timeout=30) as r: body=r.read(2_000_000)
+              result[path]={'status':r.status,'data':json.loads(body)}
+            except urllib.error.HTTPError as e:
+              result[path]={'status':e.code,'error_body':e.read().decode('utf-8','replace')[:2000]}
+            except Exception as e: result[path]={'error':repr(e)}
+          (out/'exact_page_probe.json').write_text(json.dumps(result,indent=2,sort_keys=True,default=str))
+          for k,v in result.items():
+            short={'status':v.get('status'),'error':v.get('error'),'error_body':v.get('error_body')}
+            if 'data' in v:
+              d=v['data']; short['data_keys']=list(d)[:50] if isinstance(d,dict) else None; short['data_type']=type(d).__name__; short['data_preview']=str(d)[:1000]
+            print(k, json.dumps(short,sort_keys=True))
       - uses: actions/upload-artifact@v4
         with:
-          name: v52-ten-day-economic-evidence
-          path: diagnostics/v52_historical_replay/output
+          name: v52-ten-day-exact-page-probe
+          path: diagnostics/v52_historical_replay/output/exact_page_probe.json
           retention-days: 7
