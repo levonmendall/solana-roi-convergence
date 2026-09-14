@@ -20,6 +20,7 @@ from .incremental_event_integrity_repair import configure_incremental_event_inte
 from .logical_bootstrap_page_cache_repair import configure_logical_bootstrap_page_cache_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 from .shadow_price_tracking_state_repair import configure_shadow_price_tracking_state_repair
+from .storage_transition_quiesce import configure_storage_transition_quiesce
 from .wallet_discovery_background_status_repair import configure_wallet_discovery_background_status_repair
 
 # Keep authoritative certification-replica requests below the certifier's bounded
@@ -58,6 +59,13 @@ configure_direct_solana_hydration_status_repair()
 # configurator pattern used by other startup hot-path repairs; production authority
 # remains exclusively in production_system.
 configure_shadow_price_tracking_state_repair()
+
+# During the explicit one-time legacy-to-active storage transition, the isolated
+# certifier can be intentionally quiesced so the compact shadow migration does not
+# race another O(total-history) legacy scan. This only changes startup serialization;
+# certification remains fail-closed and storage activation still requires the normal
+# verified active-store gates.
+configure_storage_transition_quiesce()
 
 from .production_system import (
     COMPOSITION_STATUS_PATH,
