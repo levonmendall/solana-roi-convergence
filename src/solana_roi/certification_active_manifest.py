@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+# Register persistence added by the current v5.2 market-validation and
+# wallet-forward runtimes before the positive certification allowlist is read.
+from . import storage_current_v52_reconciliation as _current_v52_reconciliation  # noqa: F401
 from .storage_manifest import certification_table_allowlist
 
 _INSTALLED = False
@@ -10,10 +13,10 @@ _INSTALLED = False
 def install_active_certification_manifest() -> None:
     """Replace discovery-based certification scope with the positive manifest.
 
-    This is installed only by active-storage runtime composition.  Legacy mode
-    is left byte-for-byte behaviorally unchanged until cutover.  Logical
-    bootstrap calls the same replication helpers, so one scope controls both
-    trigger installation/deltas and bootstrap tables/schema objects.
+    This is installed only by active-storage runtime composition. Legacy mode
+    is left behaviorally unchanged until cutover. Logical bootstrap calls the
+    same replication helpers, so one scope controls both trigger installation,
+    bounded deltas, and bootstrap tables/schema objects.
     """
     global _INSTALLED
     if _INSTALLED:
