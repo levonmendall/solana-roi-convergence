@@ -1,0 +1,59 @@
+name: v5.2 public RPC density
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_public_rpc_density.yml
+
+permissions:
+  contents: read
+
+jobs:
+  density:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Measure public Solana signature density
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, time, urllib.request, urllib.error
+          RPCS=['https://api.mainnet-beta.solana.com','https://solana-rpc.publicnode.com']
+          programs={
+            'PUMP_FUN':'6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+            'PUMP_AMM':'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+          }
+          cutoff=1788480000  # 2026-09-04T00:00:00Z
+          def rpc(url,method,params):
+              body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req=urllib.request.Request(url,data=body,headers={'Content-Type':'application/json','User-Agent':'v52-readonly-replay/1'})
+              with urllib.request.urlopen(req,timeout=30) as r: return json.load(r)
+          chosen=None
+          for u in RPCS:
+              try:
+                  x=rpc(u,'getSlot',[{'commitment':'finalized'}])
+                  if 'result' in x: chosen=u; break
+              except Exception as e: print('rpc_probe_failed',u,type(e).__name__)
+          if not chosen:
+              raise SystemExit('no_public_rpc_available')
+          print('rpc_selected',chosen)
+          for name,address in programs.items():
+              before=None; total=0; pages=0; oldest=None
+              while pages<20:
+                  cfg={'limit':1000,'commitment':'finalized'}
+                  if before: cfg['before']=before
+                  try: out=rpc(chosen,'getSignaturesForAddress',[address,cfg])
+                  except Exception as e:
+                      print(name,'page_error',pages+1,type(e).__name__,str(e)[:200]); break
+                  rows=out.get('result') or []
+                  if not rows: break
+                  pages+=1; total+=len(rows); oldest=rows[-1].get('blockTime'); before=rows[-1]['signature']
+                  newest=rows[0].get('blockTime')
+                  print(name,'page',pages,'rows',len(rows),'newest',newest,'oldest',oldest)
+                  if oldest is not None and oldest <= cutoff: break
+                  time.sleep(.25)
+              print(name,'pages',pages,'signatures',total,'oldest_block_time',oldest,'reached_sep4',bool(oldest is not None and oldest<=cutoff))
+          PY
