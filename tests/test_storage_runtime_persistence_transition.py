@@ -10,6 +10,7 @@ from solana_roi.storage_active_compat_pruning import prune_active_compatibility_
 from solana_roi.storage_runtime_persistence_reconciliation import (
     advance_registered_sequences,
     augment_runtime_current_state_truth,
+    copy_bounded_runtime_evidence,
 )
 
 
@@ -93,6 +94,50 @@ def test_registered_autoincrement_sequence_advances_without_copying_old_rows(tmp
     finally:
         source.close()
         destination.close()
+
+
+def test_shadow_copy_supports_legacy_helius_completed_at_schema() -> None:
+    source = sqlite3.connect(":memory:")
+    destination = sqlite3.connect(":memory:")
+    now = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    old = _iso(now - timedelta(days=40))
+    recent = _iso(now - timedelta(days=1))
+    source.execute(
+        "CREATE TABLE helius_webhook_inbox(id INTEGER PRIMARY KEY,state TEXT,completed_at TEXT)"
+    )
+    source.executemany(
+        "INSERT INTO helius_webhook_inbox VALUES(?,?,?)",
+        [(1, "pending", None), (2, "complete", old), (3, "complete", recent)],
+    )
+    selected: list[tuple[int, ...]] = []
+    selected_sql: list[str] = []
+
+    def copy_query(
+        src: sqlite3.Connection,
+        _dst: sqlite3.Connection,
+        table: str,
+        sql: str,
+        args: tuple[object, ...],
+    ) -> int:
+        assert table == "helius_webhook_inbox"
+        selected_sql.append(sql)
+        rows = src.execute(sql, args).fetchall()
+        selected.append(tuple(int(row[0]) for row in rows))
+        return len(rows)
+
+    counts: dict[str, int] = {}
+    copy_bounded_runtime_evidence(
+        source,
+        destination,
+        copy_query=copy_query,
+        counts=counts,
+        now=now,
+    )
+    assert selected == [(1, 3)]
+    assert "completed_at" in selected_sql[0]
+    assert counts["helius_webhook_inbox"] == 2
+    source.close()
+    destination.close()
 
 
 def test_active_pruning_keeps_pending_transport_and_pairs_wallet_source_with_dedup(tmp_path: Path) -> None:
