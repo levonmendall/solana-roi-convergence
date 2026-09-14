@@ -53,6 +53,10 @@ from .v52_market_validation_controls import (
     install_v52_market_validation_controls,
     status as market_validation_status,
 )
+from .v52_market_validation_governance import (
+    install_v52_market_validation_governance,
+    status as market_validation_governance_status,
+)
 from .v52_learning_governance import (
     install_v52_learning_governance,
     status as learning_governance_status,
@@ -62,7 +66,7 @@ from .v52_learning_governance_hardening import (
     status as learning_governance_hardening_status,
 )
 
-COMPOSITION_VERSION = "v52-explicit-production-authority-v12-market-validation-controls"
+COMPOSITION_VERSION = "v52-explicit-production-authority-v13-market-validation-governance"
 _INSTALLED = False
 _RUNTIME: Any | None = None
 _WALLET_ALPHA: WalletAlphaRefinementLedger | None = None
@@ -131,10 +135,11 @@ def install_v52_production_authority(app: Any, runtime_provider: Callable[[], An
     install_v52_learning_governance(runtime)
     install_v52_learning_governance_hardening()
     install_v52_profit_confidence_finalization()
-    # This is the final additive control layer. It can only preserve or reduce
-    # an already-authorized paper fraction; it cannot originate entries, increase
-    # sizing, weaken a v5.2 guard, sign, submit, or grant live-money authority.
-    install_v52_market_validation_controls(runtime.store)
+    # These are the final additive control layers. They can only preserve or
+    # reduce an already-authorized paper fraction; they cannot originate entries,
+    # increase sizing, weaken a v5.2 guard, sign, submit, or grant live-money authority.
+    market_validation_controller = install_v52_market_validation_controls(runtime.store)
+    install_v52_market_validation_governance(market_validation_controller)
     install_v52_strategy_api(app)
 
     strategy_epoch = strategy_evolution_snapshot()
@@ -156,6 +161,7 @@ def install_v52_production_authority(app: Any, runtime_provider: Callable[[], An
     app.state.roi_v52_learning_governance_hardening = True
     app.state.roi_v52_profit_confidence_finalization = True
     app.state.roi_v52_market_validation_controls = True
+    app.state.roi_v52_market_validation_governance = True
     app.state.roi_authoritative_strategy_version = STRATEGY_VERSION
     app.state.roi_authority_id = AUTHORITY_ID
     app.state.roi_authority_fingerprint = authority_fingerprint()
@@ -178,6 +184,7 @@ def status() -> dict[str, Any]:
     hardening = learning_governance_hardening_status()
     finalization = profit_confidence_finalization_status()
     market_validation = market_validation_status()
+    market_validation_governance = market_validation_governance_status()
     strategy_epoch = strategy_evolution_snapshot()
 
     if _RUNTIME is None:
@@ -204,7 +211,7 @@ def status() -> dict[str, Any]:
     runtime["robinhood_v52_authority_from_release_epoch"] = True
     runtime["continuous_strategy_evolution_enabled"] = True
     runtime["active_strategy_epoch"] = strategy_epoch
-    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_robinhood_profit_confidence_plus_market_validation"
+    runtime["new_rows_carry_v52_strategy_version"] = "solana_fomo_robinhood_profit_confidence_plus_market_validation_governance"
     runtime["robinhood_scale_in_authority"] = bool(
         lifecycle.get("installed")
         and lifecycle.get("aggregate_exact_exitability_before_add")
@@ -221,6 +228,7 @@ def status() -> dict[str, Any]:
     runtime["learning_governance_hardening"] = bool(hardening.get("installed"))
     runtime["profit_confidence_finalization"] = bool(finalization.get("installed"))
     runtime["market_validation_controls"] = bool(market_validation.get("installed"))
+    runtime["market_validation_governance"] = bool(market_validation_governance.get("installed"))
 
     all_owned = bool(
         runtime.get("solana_final_owner")
@@ -257,6 +265,12 @@ def status() -> dict[str, Any]:
         and market_validation.get("lane_level_alpha_gating")
         and market_validation.get("shadow_strategies_control_trading") is False
         and market_validation.get("fomo_state_separate_from_discovery_route")
+        and market_validation_governance.get("installed")
+        and market_validation_governance.get("point_in_time_history_cutoff")
+        and market_validation_governance.get("independent_economic_actor_counting")
+        and market_validation_governance.get("activation_deactivation_hysteresis")
+        and market_validation_governance.get("automatic_reactivation")
+        and market_validation_governance.get("future_leakage_allowed") is False
         and wallet_alignment.get("installed")
         and storage.get("v52_authority_from_release_epoch")
         and robinhood_exit.get("final_exit_policy_owner") == "v52"
@@ -287,6 +301,7 @@ def status() -> dict[str, Any]:
         "learning_governance_hardening": hardening,
         "profit_confidence_finalization": finalization,
         "market_validation_controls": market_validation,
+        "market_validation_governance": market_validation_governance,
         "robinhood_storage_compatibility": storage,
         "robinhood_exit_authority": robinhood_exit,
         "robinhood_position_lifecycle": lifecycle,
