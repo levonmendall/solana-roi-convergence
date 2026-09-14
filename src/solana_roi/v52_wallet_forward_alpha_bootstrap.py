@@ -4,8 +4,9 @@ from types import SimpleNamespace
 from typing import Any
 
 from . import v52_wallet_forward_alpha_runtime as runtime_mod
+from .v52_wallet_forward_alpha_strict_validation import install_strict_wallet_forward_alpha_validation
 
-BOOTSTRAP_VERSION = "v52-wallet-forward-alpha-bootstrap-v1"
+BOOTSTRAP_VERSION = "v52-wallet-forward-alpha-bootstrap-v2-strict-validation"
 _INSTALLED = False
 _BASE_RECORD: Any = None
 _BASE_RUN: Any = None
@@ -14,7 +15,6 @@ _BASE_RUN: Any = None
 def _ensure_runtime(tracker: Any) -> runtime_mod.WalletForwardAlphaRuntime:
     current = runtime_mod._RUNTIME
     if current is not None and current.store is tracker.store:
-        # Upgrade a minimal/lazy owner with the live discovery object when possible.
         owner = getattr(current, "runtime", None)
         if owner is not None and getattr(owner, "wallet_discovery", None) is None:
             try:
@@ -65,6 +65,7 @@ def install_v52_wallet_forward_alpha_bootstrap() -> None:
         return
     from .wallet_realtime_tracking_repair import RealtimeWalletTracker
 
+    install_strict_wallet_forward_alpha_validation()
     record = RealtimeWalletTracker._record_quick_forward_swap
     run = RealtimeWalletTracker.run
     if not bool(getattr(record, "_roi_v52_wallet_forward_alpha_runtime", False)):
@@ -92,6 +93,7 @@ def status() -> dict[str, Any]:
         "version": BOOTSTRAP_VERSION,
         "single_realtime_tracker_worker_tree": True,
         "automatic_point_in_time_capture": True,
+        "strict_incremental_acceptance_gate": True,
         "paper_only": True,
         "live_money_authority": False,
         "signing_available": False,
