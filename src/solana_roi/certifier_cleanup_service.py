@@ -25,17 +25,46 @@ from typing import Any, AsyncIterator
 from fastapi import Header
 
 from . import certifier_service as certifier
+from . import certification_logical_bootstrap_client as logical_bootstrap_client
+from . import certification_replica_client as replica_client
 from . import production_data_cleanup_v4 as cleanup
 from . import production_disk_ownership as disk_ownership
+from .certification_active_manifest import install_active_certification_manifest
 from .certification_replica_client import _replica_path
 
-SERVICE_VERSION = "isolated-certifier-cleanup-entrypoint-v3-active-storage-child"
+SERVICE_VERSION = "isolated-certifier-cleanup-entrypoint-v4-active-manifest-alignment"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
 TRANSACTION_SUBMISSION_AVAILABLE = False
 STATUS_PATH = "/v1/operations/production-data-cleanup"
 _LOG = logging.getLogger("solana_roi.certifier_production_data_cleanup")
+
+
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _align_active_replication_manifest() -> tuple[bool, str]:
+    """Bind the certifier client to the same positive manifest as active production.
+
+    ``certifier_service`` imports the replica clients before it imports this wrapper.
+    Active authoritative composition changes the replication protocol version when it
+    installs the positive table manifest.  Mirror that exact install here and refresh
+    the two already-imported client module constants so bootstrap and delta requests
+    cannot enter a release-stable version-mismatch loop after cutover.
+    """
+    if not _env_true("SOLANA_ROI_ACTIVE_STORAGE_ENABLED"):
+        return False, str(replica_client.REPLICATION_VERSION)
+    install_active_certification_manifest()
+    from . import certification_incremental_replication as replication
+
+    replica_client.REPLICATION_VERSION = replication.REPLICATION_VERSION
+    logical_bootstrap_client.REPLICATION_VERSION = replication.REPLICATION_VERSION
+    return True, str(replication.REPLICATION_VERSION)
+
+
+_ACTIVE_MANIFEST_INSTALLED, _ACTIVE_REPLICATION_VERSION = _align_active_replication_manifest()
 
 _ORIGINAL_LIFESPAN = certifier.app.router.lifespan_context
 _ORIGINAL_CHILD_ENVIRONMENT = certifier._child_environment
@@ -48,6 +77,8 @@ _STATE: dict[str, Any] = {
     "same_release_lease_establishment_required": True,
     "worker_quiesced_until_cleanup_complete": True,
     "active_storage_child_bridge": True,
+    "active_storage_replication_manifest": _ACTIVE_MANIFEST_INSTALLED,
+    "replication_version": _ACTIVE_REPLICATION_VERSION,
     "paper_only": True,
     "live_money_authority": False,
     "signing_available": False,
@@ -89,10 +120,6 @@ def _active_storage_child_environment(snapshot: Path, release: str) -> dict[str,
 certifier._child_environment = _active_storage_child_environment
 
 
-def _env_true(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _emit(prefix: str, payload: dict[str, Any]) -> None:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     print(f"{prefix} {raw}", flush=True)
@@ -106,6 +133,8 @@ def _set_state(**updates: Any) -> dict[str, Any]:
             "service_version": SERVICE_VERSION,
             "cleanup_version": cleanup.CLEANUP_VERSION,
             "active_storage_child_bridge": True,
+            "active_storage_replication_manifest": _ACTIVE_MANIFEST_INSTALLED,
+            "replication_version": _ACTIVE_REPLICATION_VERSION,
             "paper_only": True,
             "live_money_authority": False,
             "signing_available": False,
