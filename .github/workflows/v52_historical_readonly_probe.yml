@@ -1,4 +1,4 @@
-name: v5.2 historical read-only probe
+name: v5.2 historical provider probe
 
 on:
   push:
@@ -6,7 +6,6 @@ on:
       - analysis/v52-historical-replay-20260914
     paths:
       - .github/workflows/v52_historical_readonly_probe.yml
-      - diagnostics/v52_historical_replay/**
   workflow_dispatch:
 
 permissions:
@@ -15,60 +14,44 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      SOLANA_ROI_ALCHEMY_API_KEY: ${{ secrets.SOLANA_ROI_ALCHEMY_API_KEY }}
+      SOLANA_ROI_DRPC_API_KEY: ${{ secrets.SOLANA_ROI_DRPC_API_KEY }}
+      ROBINHOOD_RPC_URL: ${{ secrets.ROBINHOOD_RPC_URL }}
+      ROBINHOOD_BACKUP_RPC_URL: ${{ secrets.ROBINHOOD_BACKUP_RPC_URL }}
+      ROBINHOOD_VALIDATION_CLOUD_RPC_URL: ${{ secrets.ROBINHOOD_VALIDATION_CLOUD_RPC_URL }}
     steps:
       - uses: actions/checkout@v4
-      - name: Trace exact lane, provider, wallet, and exit surfaces
-        shell: bash
-        run: |
-          set -u
-          mkdir -p diagnostics/v52_historical_replay/output
-          {
-            echo '=== PROGRAM / CONTRACT / PROVIDER CONSTANTS ==='
-            grep -RniE '6EF8rrect|pAMMBay|pump[_ -]?fun|pump[_ -]?amm|pump[_ -]?swap|fomo|robinhood|raydium|program.?id|factory|pool.?address|rpc_url|chainstack|helius|validation.cloud' src config operations 2>/dev/null | head -n 4000 || true
-            echo '=== V5.2 EXIT / POSITION MANAGEMENT ==='
-            grep -RniE 'take.?profit|stop.?loss|trailing|runner|de.?risk|exit|re.?entry|reentry|averag.*down|chase|deterior|profit.?lock|position.*fraction|target.*fraction' src/solana_roi 2>/dev/null | grep -E 'v52|strategy_v52|profit_confidence|continuation|lifecycle' | head -n 4000 || true
-            echo '=== ENV NAMES ONLY ==='
-            grep -RhoE '[A-Z][A-Z0-9_]{5,}(RPC_URL|API_KEY|ENDPOINT|BASE_URL)' src config operations .github 2>/dev/null | sort -u || true
-          } > diagnostics/v52_historical_replay/output/source_trace.txt
-          cat diagnostics/v52_historical_replay/output/source_trace.txt
-      - name: Fetch read-only live research surfaces
-        shell: bash
-        run: |
-          set -u
-          base='https://solana-roi-convergence.onrender.com'
-          for path in \
-            '/v1/strategy/candidate-coverage' \
-            '/v1/robinhood-chain/status' \
-            '/v1/wallet-intelligence/status' \
-            '/v1/wallet-discovery/status' \
-            '/v1/strategy/v52'
-          do
-            name=$(printf '%s' "$path" | sed 's#^/##;s#[/?=&]#_#g')
-            code=$(curl -L -sS --connect-timeout 5 --max-time 45 -w '%{http_code}' -o "diagnostics/v52_historical_replay/output/${name}.json" "$base$path" || true)
-            printf '%s %s\n' "$code" "$path" | tee -a diagnostics/v52_historical_replay/output/http_status.txt
-          done
-      - name: Probe public historical RPC availability
+      - name: Check provider availability without exposing credentials
         shell: python
         run: |
-          import json, urllib.request
+          import json, os, urllib.request
           from pathlib import Path
-          out=Path('diagnostics/v52_historical_replay/output')
-          def rpc(url, method, params):
-              body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
-              req=urllib.request.Request(url,data=body,headers={'content-type':'application/json'})
-              try:
-                  with urllib.request.urlopen(req,timeout=20) as r: return {'ok':True,'body':json.loads(r.read())}
-              except Exception as e: return {'ok':False,'error':repr(e)}
-          probes={
-            'solana_slot': rpc('https://api.mainnet-beta.solana.com','getSlot',[{'commitment':'finalized'}]),
-            'robinhood_chain_id': rpc('https://rpc.mainnet.chain.robinhood.com','eth_chainId',[]),
-            'robinhood_block': rpc('https://rpc.mainnet.chain.robinhood.com','eth_blockNumber',[]),
-          }
-          (out/'rpc_probe.json').write_text(json.dumps(probes,indent=2))
-          print(json.dumps(probes,indent=2))
+          out=Path('diagnostics/v52_historical_replay/output'); out.mkdir(parents=True,exist_ok=True)
+          names=['HELIUS_API_KEY','SOLANA_ROI_ALCHEMY_API_KEY','SOLANA_ROI_DRPC_API_KEY','ROBINHOOD_RPC_URL','ROBINHOOD_BACKUP_RPC_URL','ROBINHOOD_VALIDATION_CLOUD_RPC_URL']
+          result={'configured':{n:bool(os.getenv(n)) for n in names}}
+          def rpc(url,method,params):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+            req=urllib.request.Request(url,data=body,headers={'content-type':'application/json','user-agent':'v52-readonly-historical-probe'})
+            try:
+              with urllib.request.urlopen(req,timeout=15) as r:
+                data=json.loads(r.read())
+              return {'ok': 'result' in data, 'error': data.get('error'), 'result_type': type(data.get('result')).__name__}
+            except Exception as e:
+              return {'ok':False,'error_type':type(e).__name__,'error_text':str(e)[:160]}
+          hk=os.getenv('HELIUS_API_KEY','')
+          if hk:
+            result['helius_rpc']=rpc(f'https://mainnet.helius-rpc.com/?api-key={hk}','getSlot',[{'commitment':'finalized'}])
+          for key in ['ROBINHOOD_RPC_URL','ROBINHOOD_BACKUP_RPC_URL','ROBINHOOD_VALIDATION_CLOUD_RPC_URL']:
+            url=os.getenv(key,'').strip()
+            if url:
+              result[key+'_probe']=rpc(url,'eth_chainId',[])
+          (out/'provider_probe.json').write_text(json.dumps(result,indent=2,sort_keys=True))
+          print(json.dumps(result,indent=2,sort_keys=True))
       - uses: actions/upload-artifact@v4
         with:
-          name: v52-historical-readonly-probe-v2
-          path: diagnostics/v52_historical_replay/output
+          name: v52-historical-provider-probe
+          path: diagnostics/v52_historical_replay/output/provider_probe.json
           retention-days: 7
