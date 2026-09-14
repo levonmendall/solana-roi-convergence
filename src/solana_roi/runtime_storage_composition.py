@@ -9,7 +9,6 @@ from .active_runtime import ActiveDurablePaperTradingEngine, ActiveObservationEv
 from .certification_active_manifest import install_active_certification_manifest
 from .durable_engine import DurablePaperTradingEngine
 from .observation_store import ObservationEventStore
-from .storage_current_v52_shadow import reconcile_current_v52_shadow
 from .storage_shadow_migration import build_shadow_database
 from .storage_transition import (
     ACTIVE_PATH_ENV,
@@ -67,13 +66,10 @@ def _build_exact_snapshot(*, release: str, mode: str) -> dict[str, Any]:
         release_sha=release,
         replace_existing=True,
     )
-    current_v52 = reconcile_current_v52_shadow(legacy, active)
     payload = {
         **report.__dict__,
-        "active_size_bytes": int(current_v52["active_size_bytes"]),
-        "active_wal_bytes": int(current_v52["active_wal_bytes"]),
-        "current_v52_reconciliation": current_v52,
         "mode": mode,
+        "single_pinned_source_transaction": True,
         "authoritative_runtime_changed": False,
         "paper_only": True,
         "live_money_authority": False,
