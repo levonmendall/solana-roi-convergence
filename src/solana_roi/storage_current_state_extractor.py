@@ -5,9 +5,10 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping
 
-from .active_storage import canonical_json, payload_hash
+from .active_storage import payload_hash
+from .storage_current_v52_reconciliation import augment_current_state_truth
 
 
 TERMINAL_CANDIDATE_STATES = {
@@ -237,6 +238,7 @@ class LegacyCurrentStateExtractor:
                     section_payload[table] = rows
                     counts[table] = len(rows)
                 truth[section] = section_payload
+            augment_current_state_truth(conn, tables, truth, counts)
             truth["portfolio"] = paper
             truth["latest_event_ids"] = _extract_event_heads(conn,tables,paper)
             truth["freshness"] = _extract_freshness(conn,tables)
