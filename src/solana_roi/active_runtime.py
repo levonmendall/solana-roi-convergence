@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+# Importing the manifest extends the base retention registry before active
+# runtime schemas are validated.
+from . import storage_manifest as _storage_manifest  # noqa: F401
+from .durable_engine import DurablePaperTradingEngine, _ENGINE_EVENT_TYPES
+from .observation_store import ObservationEventStore
+from .storage_transition import load_verified_checkpoint
+
+
+class ActiveObservationEventStore(ObservationEventStore):
+    """Bounded compatibility adapter over the compact active database.
+
+    The pre-transition event body is deliberately absent.  The verified
+    transition checkpoint seals its exact high-water ID and lineage hash.  New
+    events continue from that hash and from high-water+1, preserving lineage and
+    monotonically increasing IDs without opening the legacy database.
+    """
+
+    active_storage_mode = True
+
+    def __init__(self, path: str | Path, *, expected_release_sha: str | None = None):
+        self.transition_checkpoint = load_verified_checkpoint(path, expected_release_sha=expected_release_sha)
+        event_head = dict(self.transition_checkpoint.get("latest_event_ids",{}).get("events") or {})
+        if not event_head:
+            raise RuntimeError("active runtime blocked: transition event head missing")
+        try:
+            self.transition_event_head_id = int(event_head["id"])
+            self.transition_event_head_hash = str(event_head["lineage_hash"])
+            self.transition_engine_event_id = int(self.transition_checkpoint["portfolio"]["last_engine_event_id"])
+        except (KeyError,TypeError,ValueError) as exc:
+            raise RuntimeError("active runtime blocked: transition event anchor invalid") from exc
+        if self.transition_event_head_id < self.transition_engine_event_id:
+            raise RuntimeError("active runtime blocked: event head precedes paper checkpoint")
+        if len(self.transition_event_head_hash) != 64:
+            raise RuntimeError("active runtime blocked: transition lineage hash invalid")
+        super().__init__(path)
+        with self._lock, self.db:
+            local = self.db.execute("SELECT id FROM events ORDER BY id LIMIT 1").fetchone()
+            if local is not None and int(local["id"]) <= self.transition_event_head_id:
+                raise RuntimeError("active runtime blocked: historical event body present in active database")
+            # AUTOINCREMENT uses sqlite_sequence.  Advancing the empty tail to
+            # the sealed source head makes the first new event head+1.
+            if local is None:
+                self.db.execute(
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES('events',?) "
+                    "ON CONFLICT(name) DO UPDATE SET seq=MAX(seq,excluded.seq)",
+                    (self.transition_event_head_id,),
+                )
+
+    def append(self, event_type: str, observed_at: str, payload: dict[str,Any]) -> str:
+        raw = json.dumps(payload, sort_keys=True, separators=(",",":"), default=str)
+        with self._lock, self.db:
+            row = self.db.execute("SELECT id,lineage_hash FROM events ORDER BY id DESC LIMIT 1").fetchone()
+            previous = str(row["lineage_hash"]) if row is not None else self.transition_event_head_hash
+            lineage = hashlib.sha256(f"{previous}|{event_type}|{observed_at}|{raw}".encode()).hexdigest()
+            self.db.execute(
+                "INSERT INTO events(event_type,observed_at,payload_json,previous_hash,lineage_hash) VALUES(?,?,?,?,?)",
+                (event_type,observed_at,raw,previous,lineage),
+            )
+            new_row = self.db.execute("SELECT id FROM events WHERE lineage_hash=?", (lineage,)).fetchone()
+            if new_row is None or int(new_row["id"]) <= self.transition_event_head_id:
+                raise RuntimeError("active event id did not advance beyond transition frontier")
+        return lineage
+
+    def verify(self) -> bool:
+        previous = self.transition_event_head_hash
+        expected_id_floor = self.transition_event_head_id
+        with self._verify_lock:
+            reader: sqlite3.Connection | None = None
+            try:
+                uri = f"{self.path.resolve().as_uri()}?mode=ro&cache=private"
+                reader = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                reader.execute("PRAGMA query_only=ON")
+                reader.execute("BEGIN")
+                rows = reader.execute(
+                    "SELECT id,event_type,observed_at,payload_json,previous_hash,lineage_hash FROM events ORDER BY id"
+                )
+                last_id = expected_id_floor
+                for event_id,event_type,observed_at,raw,recorded_previous,lineage in rows:
+                    if int(event_id) <= expected_id_floor or int(event_id) <= last_id:
+                        return False
+                    if str(recorded_previous) != previous:
+                        return False
+                    expected = hashlib.sha256(f"{previous}|{event_type}|{observed_at}|{raw}".encode()).hexdigest()
+                    if expected != str(lineage):
+                        return False
+                    previous = str(lineage)
+                    last_id = int(event_id)
+                return True
+            finally:
+                if reader is not None:
+                    reader.close()
+                self._release_verification_file_cache()
+
+
+class ActiveDurablePaperTradingEngine(DurablePaperTradingEngine):
+    """Paper engine restore that trusts only the sealed transition anchor + active tail."""
+
+    def _verify_engine_snapshot(self) -> tuple[bool,int,int|None]:
+        store = self.store
+        if not isinstance(store, ActiveObservationEventStore):
+            return super()._verify_engine_snapshot()
+        if not store.verify():
+            return False,0,None
+        with store._lock:
+            head = store.db.execute("SELECT id FROM events ORDER BY id DESC LIMIT 1").fetchone()
+            placeholders = ",".join("?" for _ in _ENGINE_EVENT_TYPES)
+            latest = store.db.execute(
+                f"SELECT id FROM events WHERE event_type IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+                _ENGINE_EVENT_TYPES,
+            ).fetchone()
+        verified_through = int(head["id"]) if head is not None else store.transition_event_head_id
+        latest_engine = int(latest["id"]) if latest is not None else store.transition_engine_event_id
+        return True,verified_through,latest_engine
+
+    def _checkpoint_event_marker_valid(self, event_id: int) -> bool:
+        store = self.store
+        if isinstance(store, ActiveObservationEventStore) and int(event_id) == store.transition_engine_event_id:
+            return True
+        return super()._checkpoint_event_marker_valid(event_id)
