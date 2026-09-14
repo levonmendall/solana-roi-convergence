@@ -58,11 +58,20 @@ def _copy_dict_rows(source: sqlite3.Connection, dest: sqlite3.Connection, table:
     if not rows:
         return 0
     storage_manifest.contract_for(table)
-    dest.execute(_table_ddl(source, table))
+    source_columns = _columns(source, table)
+    if _exists(dest, table):
+        destination_columns = _columns(dest, table)
+        if destination_columns != source_columns:
+            raise RuntimeError(
+                f"migration blocked: compatibility schema mismatch:{table}:"
+                f"source={source_columns}:destination={destination_columns}"
+            )
+    else:
+        dest.execute(_table_ddl(source, table))
     columns = list(rows[0].keys())
     if any(list(row.keys()) != columns for row in rows):
         raise RuntimeError(f"migration blocked: inconsistent row shape:{table}")
-    real = set(_columns(source, table))
+    real = set(source_columns)
     if set(columns) - real:
         raise RuntimeError(f"migration blocked: synthetic columns selected for {table}:{sorted(set(columns)-real)}")
     qcols = ",".join('"' + c.replace('"', '""') + '"' for c in columns)
