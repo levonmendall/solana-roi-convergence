@@ -1,55 +1,55 @@
 from __future__ import annotations
 
 import pathlib
+import re
 
 ROOTS = [pathlib.Path("src"), pathlib.Path("tests")]
 NEEDLES = (
+    "CERTIFICATION_LOGICAL_BOOTSTRAP_ALLOWLIST",
     "semantic_candidate_opportunities",
     "semantic_candidate_events",
     "normalized_swaps",
-    "paper_trials",
-    "paper_outcomes",
-    "logical_bootstrap",
-    "certification-db-logical-bootstrap",
+    "paper_trial",
+    "paper_outcome",
     "replica.sqlite3",
-    "adaptive_wallet_cohorts",
-    "anonymous_candidate_latency_failures",
-    "REPLICATED",
-    "replication_manifest",
-    "bootstrap_tables",
-    "table_manifest",
+    "certification-db-logical-bootstrap-page",
 )
+ROUTE_MARKERS = ("@router.get", "@app.get", "add_api_route")
 
 
-def emit(path: pathlib.Path) -> None:
-    try:
-        lines = path.read_text(errors="replace").splitlines()
-    except Exception:
-        return
+def blocks(path: pathlib.Path, lines: list[str]) -> list[tuple[int, int]]:
     hits = [i for i, line in enumerate(lines) if any(n.lower() in line.lower() for n in NEEDLES)]
-    if not hits:
-        return
-    merged: list[tuple[int, int]] = []
+    spans: list[tuple[int, int]] = []
     for i in hits:
-        lo, hi = max(0, i - 14), min(len(lines), i + 32)
-        if merged and lo <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        lo, hi = max(0, i - 8), min(len(lines), i + 20)
+        # If this looks like a constant/container declaration, continue until closing delimiter.
+        if "ALLOWLIST" in lines[i] or re.search(r"\b(semantic_candidate|normalized_swaps|paper_(trial|outcome))", lines[i], re.I):
+            hi = min(len(lines), i + 60)
+        if spans and lo <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], hi))
         else:
-            merged.append((lo, hi))
-    for lo, hi in merged:
-        print(f"--- {path}:{lo+1}-{hi} ---")
-        for j in range(lo, hi):
-            print(f"{j+1:05d}: {lines[j]}")
+            spans.append((lo, hi))
+    return spans
 
 
 def main() -> int:
-    print("MANIFEST_TRACE_BEGIN")
+    print("TARGETED_REPLAY_TRACE_BEGIN")
     for root in ROOTS:
         if not root.exists():
             continue
         for path in sorted(root.rglob("*.py")):
-            emit(path)
-    print("MANIFEST_TRACE_END")
+            try:
+                lines = path.read_text(errors="replace").splitlines()
+            except Exception:
+                continue
+            spans = blocks(path, lines)
+            if not spans:
+                continue
+            for lo, hi in spans:
+                print(f"--- {path}:{lo+1}-{hi} ---")
+                for j in range(lo, hi):
+                    print(f"{j+1:05d}: {lines[j]}")
+    print("TARGETED_REPLAY_TRACE_END")
     return 0
 
 
