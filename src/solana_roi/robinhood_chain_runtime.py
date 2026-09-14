@@ -3,6 +3,19 @@ from __future__ import annotations
 from .robinhood_chain_core import *
 
 
+DEFAULT_COMBINED_LOG_ADDRESS_BATCH_SIZE = 64
+MAX_COMBINED_LOG_ADDRESS_BATCH_SIZE = 64
+
+
+def _combined_log_address_batch_size() -> int:
+    raw = os.getenv("ROBINHOOD_COMBINED_LOG_ADDRESS_BATCH_SIZE")
+    try:
+        value = int(raw) if raw is not None else DEFAULT_COMBINED_LOG_ADDRESS_BATCH_SIZE
+    except (TypeError, ValueError):
+        value = DEFAULT_COMBINED_LOG_ADDRESS_BATCH_SIZE
+    return max(32, min(MAX_COMBINED_LOG_ADDRESS_BATCH_SIZE, value))
+
+
 class RobinhoodRuntimeMixin:
     async def _poll_once(self) -> None:
         self._last_poll_at = _utcnow()
@@ -19,11 +32,12 @@ class RobinhoodRuntimeMixin:
             await self._settle_open_positions()
             self._last_success_at = _utcnow()
             return
+        from_block = self._cursor + 1
         to_block = min(latest, self._cursor + MAX_BLOCKS_PER_POLL)
         live = latest - to_block <= LIVE_LAG_BLOCKS
         observed_at = _utcnow()
         factory_logs = await self.rpc.get_logs(
-            from_block=self._cursor + 1,
+            from_block=from_block,
             to_block=to_block,
             addresses=[
                 UNISWAP_V3_FACTORY,
@@ -35,35 +49,60 @@ class RobinhoodRuntimeMixin:
         for log in factory_logs:
             await self._process_factory_log(log)
 
+        # V3 and Pons V2 previously scanned the exact same block window in separate
+        # 32-address requests. EVM eth_getLogs supports an address array plus OR
+        # semantics in topic[0], so query both venue families together and then
+        # demultiplex locally. The cursor, address set, topics and downstream order
+        # remain exact; this only reduces physical provider requests.
         pools = list(self.v3_pools.values())
-        for index in range(0, len(pools), 32):
-            batch = pools[index : index + 32]
-            logs = await self.rpc.get_logs(
-                from_block=self._cursor + 1,
-                to_block=to_block,
-                addresses=[pool.pool for pool in batch],
-                topics=[V3_SWAP_TOPIC],
-            )
-            by_market = {pool.pool: pool for pool in batch}
-            for log in logs:
-                pool = by_market.get(_clean_address(log.get("address")))
-                if pool is not None:
-                    await self._process_v3_swap(pool, log, live=live, observed_at=observed_at)
-
         curves = list(self.v2_curves.values())
-        for index in range(0, len(curves), 32):
-            batch2 = curves[index : index + 32]
+        v3_by_market = {pool.pool: pool for pool in pools}
+        v2_by_market = {curve.curve: curve for curve in curves}
+        overlapping = set(v3_by_market).intersection(v2_by_market)
+        if overlapping:
+            raise RuntimeError("robinhood_market_address_classification_collision")
+
+        ordered_addresses = [pool.pool for pool in pools] + [curve.curve for curve in curves]
+        batch_size = _combined_log_address_batch_size()
+        v3_logs: list[dict[str, Any]] = []
+        v2_logs: list[dict[str, Any]] = []
+        actual_market_requests = 0
+        for index in range(0, len(ordered_addresses), batch_size):
+            addresses = ordered_addresses[index : index + batch_size]
             logs = await self.rpc.get_logs(
-                from_block=self._cursor + 1,
+                from_block=from_block,
                 to_block=to_block,
-                addresses=[curve.curve for curve in batch2],
-                topics=[[PONS_V2_CURVE_BUY_TOPIC, PONS_V2_CURVE_SELL_TOPIC]],
+                addresses=addresses,
+                topics=[[V3_SWAP_TOPIC, PONS_V2_CURVE_BUY_TOPIC, PONS_V2_CURVE_SELL_TOPIC]],
             )
-            by_curve = {curve.curve: curve for curve in batch2}
+            actual_market_requests += 1
             for log in logs:
-                curve = by_curve.get(_clean_address(log.get("address")))
-                if curve is not None:
-                    await self._process_v2_curve_log(curve, log, live=live, observed_at=observed_at)
+                address = _clean_address(log.get("address"))
+                if address in v3_by_market:
+                    v3_logs.append(log)
+                elif address in v2_by_market:
+                    v2_logs.append(log)
+
+        # Preserve the historical downstream ordering exactly: all V3 observations
+        # are processed before all V2 observations even though provider acquisition
+        # is now shared. Strategy inputs therefore do not gain a new cross-venue
+        # ordering signal from this transport optimization.
+        for log in v3_logs:
+            pool = v3_by_market.get(_clean_address(log.get("address")))
+            if pool is not None:
+                await self._process_v3_swap(pool, log, live=live, observed_at=observed_at)
+        for log in v2_logs:
+            curve = v2_by_market.get(_clean_address(log.get("address")))
+            if curve is not None:
+                await self._process_v2_curve_log(curve, log, live=live, observed_at=observed_at)
+
+        legacy_equivalent = (len(pools) + 31) // 32 + (len(curves) + 31) // 32
+        self._roi_market_log_legacy_equivalent_requests = int(
+            getattr(self, "_roi_market_log_legacy_equivalent_requests", 0) or 0
+        ) + legacy_equivalent
+        self._roi_market_log_actual_requests = int(
+            getattr(self, "_roi_market_log_actual_requests", 0) or 0
+        ) + actual_market_requests
 
         self._set_cursor(to_block)
         self._caught_up = latest - to_block <= LIVE_LAG_BLOCKS
@@ -166,6 +205,9 @@ class RobinhoodRuntimeMixin:
                 "SELECT COUNT(*) AS n FROM robinhood_swaps WHERE release_commit=?",
                 (self.release_commit,),
             ).fetchone()
+        legacy_equivalent = int(getattr(self, "_roi_market_log_legacy_equivalent_requests", 0) or 0)
+        actual_market_requests = int(getattr(self, "_roi_market_log_actual_requests", 0) or 0)
+        saved = max(0, legacy_equivalent - actual_market_requests)
         return {
             "enabled": self.enabled,
             "chain": "ROBINHOOD_CHAIN",
@@ -191,6 +233,21 @@ class RobinhoodRuntimeMixin:
             "last_success_at": self._last_success_at,
             "last_error": self._last_error,
             "rpc_failures": self._rpc_failures,
+            "getlogs_efficiency": {
+                "combined_cross_venue_market_log_batching": True,
+                "combined_address_batch_size": _combined_log_address_batch_size(),
+                "legacy_equivalent_market_log_requests": legacy_equivalent,
+                "actual_market_log_requests": actual_market_requests,
+                "market_log_requests_saved": saved,
+                "market_log_request_savings_pct": (
+                    round(saved / legacy_equivalent * 100.0, 3) if legacy_equivalent > 0 else 0.0
+                ),
+                "factory_discovery_requests_unchanged": True,
+                "block_coverage_reduced": False,
+                "market_coverage_reduced": False,
+                "topics_preserved": True,
+                "downstream_v3_before_v2_order_preserved": True,
+            },
             "rwa_filter": {
                 "required": os.getenv("ROBINHOOD_RWA_FILTER_REQUIRED", "true").strip().lower() not in {"0", "false", "no"},
                 "official_registry_available": self._rwa_registry_available,
