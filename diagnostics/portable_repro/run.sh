@@ -14,18 +14,46 @@ if [[ "${PORTABLE_REPRO_SOURCE_SHA:-}" != "$CANONICAL_SHA" ]]; then
   echo "refusing run: PORTABLE_REPRO_SOURCE_SHA does not match canonical SHA" >&2
   exit 2
 fi
+if [[ "${EXPECTED_SOURCE_SHA:-$CANONICAL_SHA}" != "$CANONICAL_SHA" ]]; then
+  echo "refusing run: EXPECTED_SOURCE_SHA does not match canonical SHA" >&2
+  exit 2
+fi
+if [[ ! -s "$ROOT/.canonical_source_sha" || ! -s "$ROOT/.harness_source_sha" || ! -s "$ROOT/.canonical_source_tree_sha256" ]]; then
+  echo "refusing run: source provenance markers are missing" >&2
+  exit 2
+fi
+ACTUAL_MARKER_SHA="$(tr -d '\r\n' < "$ROOT/.canonical_source_sha")"
+HARNESS_SHA="$(tr -d '\r\n' < "$ROOT/.harness_source_sha")"
+EXPECTED_TREE_HASH="$(tr -d '\r\n' < "$ROOT/.canonical_source_tree_sha256")"
+if [[ "$ACTUAL_MARKER_SHA" != "$CANONICAL_SHA" ]]; then
+  echo "refusing run: canonical source marker mismatch: $ACTUAL_MARKER_SHA" >&2
+  exit 2
+fi
+ACTUAL_TREE_HASH="$(python - "$ROOT" <<'PY'
+from __future__ import annotations
+import hashlib
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+paths = [root / "pyproject.toml"]
+paths.extend(sorted(p for p in (root / "src").rglob("*") if p.is_file()))
+h = hashlib.sha256()
+for path in paths:
+    rel = path.relative_to(root).as_posix().encode()
+    h.update(rel); h.update(b"\0"); h.update(path.read_bytes()); h.update(b"\0")
+print(h.hexdigest())
+PY
+)"
+if [[ "$ACTUAL_TREE_HASH" != "$EXPECTED_TREE_HASH" ]]; then
+  echo "refusing run: production source-tree hash mismatch" >&2
+  exit 2
+fi
+printf '{"canonical_source_sha":"%s","harness_source_sha":"%s","canonical_source_tree_sha256":"%s","verified":true}\n' \
+  "$CANONICAL_SHA" "$HARNESS_SHA" "$ACTUAL_TREE_HASH" > "$OUT/source-provenance-runtime.json"
 
 # Everything below occurs before importing solana_roi.production.
 python "$ROOT/diagnostics/portable_repro/preflight.py" --output "$OUT/preflight.json"
 python "$ROOT/diagnostics/portable_repro/fidelity.py" "$MANIFEST" | tee "$OUT/fidelity-validation.json"
-
-if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse HEAD >/dev/null 2>&1; then
-  ACTUAL_SHA="$(git -C "$ROOT" rev-parse HEAD)"
-  if [[ "$ACTUAL_SHA" != "$CANONICAL_SHA" ]]; then
-    echo "refusing run: checkout $ACTUAL_SHA != canonical $CANONICAL_SHA" >&2
-    exit 2
-  fi
-fi
 
 export PAPER_ONLY=true
 export PORT
