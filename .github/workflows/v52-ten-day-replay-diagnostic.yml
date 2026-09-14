@@ -13,20 +13,31 @@ jobs:
   inspect-readonly-evidence:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      CERT_TOKEN: ${{ secrets.SOLANA_ROI_CERTIFICATION_SHARED_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Page current read-only evidence tables
+      - name: Page current authenticated read-only evidence tables
         shell: bash
         run: |
           python - <<'PY'
-          import json, urllib.request, urllib.error, urllib.parse
+          import json, os, urllib.request, urllib.error, urllib.parse
           base = "https://solana-roi-convergence.onrender.com"
           epoch = "aujNKhdJlQURx1AtMXciTvUwmXTMsz_m"
           fp = "a5ade0f3e2d2fbeaea49bcd531add8509b7f27acb71d04f1b73d7d31ccb3c648"
+          token = os.getenv("CERT_TOKEN", "")
+          print("CERT_TOKEN_PRESENT=" + ("yes" if token else "no"))
           tables = [
+              "risk_conditioned_alpha_v5_trials",
+              "risk_conditioned_alpha_v5_outcomes",
+              "robinhood_paper_trials",
+              "v51_candidates",
+              "v51_candidate_stage_events",
+              "v51_candidate_current_state",
+              "v51_candidate_pipeline_audit",
               "profit_first_entity_forward_outcomes",
               "profit_first_entity_shadow_trials",
               "profit_first_final_epochs",
@@ -39,8 +50,6 @@ jobs:
               "candidate_compute_admission_decisions",
               "candidate_execution_plane_snapshots",
               "ephemeral_candidate_state",
-              "release_bound_candidate_failures",
-              "anonymous_candidate_latency_failures",
               "v52_market_validation_point_in_time",
               "v52_market_validation_shadow_outcomes",
               "v52_wallet_forward_outcomes",
@@ -52,8 +61,11 @@ jobs:
           def get(table):
               qs = urllib.parse.urlencode({"table":table,"epoch":epoch,"schema_fingerprint":fp,"limit":20})
               url = base + "/v1/operations/certification-db-logical-bootstrap-page?" + qs
+              req = urllib.request.Request(url)
+              if token:
+                  req.add_header("X-Certification-Token", token)
               try:
-                  with urllib.request.urlopen(url, timeout=60) as r:
+                  with urllib.request.urlopen(req, timeout=60) as r:
                       raw=r.read().decode("utf-8","replace")
                       print(f"=== TABLE {table} status={r.status} bytes={len(raw)} ===")
                       print(raw[:120000])
