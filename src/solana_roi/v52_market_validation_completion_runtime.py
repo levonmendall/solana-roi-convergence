@@ -103,23 +103,25 @@ class HardenedRuntime(hardening_module.MarketValidationCompletionHardening):
         return payload
 
 
+def _patch_engine(engine: completion_module.MarketValidationCompletion, runtime_layer: HardenedRuntime) -> None:
+    engine.lane_capital_state = lambda lane, decision_at: runtime_layer.lane_capital_state(engine, lane, decision_at)  # type: ignore[method-assign]
+    engine.evaluate_candidate = lambda **kwargs: runtime_layer.evaluate_candidate(engine, **kwargs)  # type: ignore[method-assign]
+    engine.record_market_mark = lambda **kwargs: runtime_layer.record_market_mark(engine, **kwargs)  # type: ignore[method-assign]
+    engine.resolve_outcome = lambda **kwargs: runtime_layer.resolve_outcome(engine, **kwargs)  # type: ignore[method-assign]
+
+
 def install_v52_market_validation_completion_runtime(
     engine: completion_module.MarketValidationCompletion,
 ) -> HardenedRuntime:
     global _RUNTIME, _INSTALLED
     if _RUNTIME is None or _RUNTIME.engine is not engine:
         _RUNTIME = HardenedRuntime(engine)
-    if not _INSTALLED:
-        # Assign closures directly to the instance. The completion wrappers call
-        # the global completion instance, so this changes only the additive
-        # validation layer and cannot replace the v5.2 strategy authority.
-        engine.lane_capital_state = lambda lane, decision_at: _RUNTIME.lane_capital_state(engine, lane, decision_at)  # type: ignore[method-assign]
-        engine.evaluate_candidate = lambda **kwargs: _RUNTIME.evaluate_candidate(engine, **kwargs)  # type: ignore[method-assign]
-        engine.record_market_mark = lambda **kwargs: _RUNTIME.record_market_mark(engine, **kwargs)  # type: ignore[method-assign]
-        engine.resolve_outcome = lambda **kwargs: _RUNTIME.resolve_outcome(engine, **kwargs)  # type: ignore[method-assign]
-        hardening_module._HARDENING = _RUNTIME
-        hardening_module._INSTALLED = True
-        _INSTALLED = True
+        _patch_engine(engine, _RUNTIME)
+    elif not _INSTALLED:
+        _patch_engine(engine, _RUNTIME)
+    hardening_module._HARDENING = _RUNTIME
+    hardening_module._INSTALLED = True
+    _INSTALLED = True
     return _RUNTIME
 
 
