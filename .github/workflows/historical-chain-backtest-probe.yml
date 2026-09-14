@@ -1,0 +1,25 @@
+name: Historical Chain Backtest Probe
+
+on:
+  push:
+    branches:
+      - analysis/historical-chain-backtest-20260914
+    paths:
+      - diagnostics/historical_chain_backtest_probe.py
+      - .github/workflows/historical-chain-backtest-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe production and public chains
+        run: python diagnostics/historical_chain_backtest_probe.py
