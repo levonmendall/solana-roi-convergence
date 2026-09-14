@@ -1,4 +1,4 @@
-name: v5.2 ten-day exact read-only page probe
+name: v5.2 historical event emitter trace
 
 on:
   push:
@@ -17,47 +17,22 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch already-established certification pages read-only
-        shell: python
+      - name: Locate event log emitters and historical table schemas
+        shell: bash
         run: |
-          import json, urllib.parse, urllib.request, urllib.error
-          from pathlib import Path
-          out=Path('diagnostics/v52_historical_replay/output'); out.mkdir(parents=True,exist_ok=True)
-          base='https://solana-roi-convergence.onrender.com'
-          epoch='vUM5ejaI1mAIH94juZph0RWI46rhq3Os'
-          fp='8b9ae1ec6674944004333f439ae4ef25129a062e046ec8cc8019e1a997f265da'
-          tables=['robinhood_launches','robinhood_swaps','robinhood_paper_trials','robinhood_paper_outcomes','normalized_swaps','v51_candidates','v51_candidate_stage_events','profit_first_final_trials','profit_first_final_outcomes','fomo_paper_trials','fomo_paper_outcomes']
-          result={}
-          for table in tables:
-            q=urllib.parse.urlencode({'table':table,'epoch':epoch,'schema_fingerprint':fp,'limit':10})
-            url=base+'/v1/operations/certification-db-logical-bootstrap-page?'+q
-            try:
-              req=urllib.request.Request(url,headers={'user-agent':'v52-ten-day-readonly-replay'})
-              with urllib.request.urlopen(req,timeout=30) as r:
-                body=r.read(2_000_000)
-              data=json.loads(body)
-              result[table]={'status':r.status,'data':data}
-            except urllib.error.HTTPError as e:
-              body=e.read().decode('utf-8','replace')[:2000]
-              result[table]={'status':e.code,'error_body':body}
-            except Exception as e:
-              result[table]={'error':repr(e)}
-          for path in ['/v1/operations/certification-db-replication','/v1/operations/certification-db-logical-bootstrap']:
-            try:
-              req=urllib.request.Request(base+path,headers={'user-agent':'v52-ten-day-readonly-replay'})
-              with urllib.request.urlopen(req,timeout=30) as r: body=r.read(2_000_000)
-              result[path]={'status':r.status,'data':json.loads(body)}
-            except urllib.error.HTTPError as e:
-              result[path]={'status':e.code,'error_body':e.read().decode('utf-8','replace')[:2000]}
-            except Exception as e: result[path]={'error':repr(e)}
-          (out/'exact_page_probe.json').write_text(json.dumps(result,indent=2,sort_keys=True,default=str))
-          for k,v in result.items():
-            short={'status':v.get('status'),'error':v.get('error'),'error_body':v.get('error_body')}
-            if 'data' in v:
-              d=v['data']; short['data_keys']=list(d)[:50] if isinstance(d,dict) else None; short['data_type']=type(d).__name__; short['data_preview']=str(d)[:1000]
-            print(k, json.dumps(short,sort_keys=True))
+          set -u
+          mkdir -p diagnostics/v52_historical_replay/output
+          {
+            echo '=== LOG EMITTERS ==='
+            grep -RniE '(print|logger\.|logging\.).*(SOLANA_ROI|candidate|trial|outcome|fomo|robinhood|wallet|swap|qualification|entry|exit)' src operations 2>/dev/null | head -n 12000 || true
+            echo '=== TABLE DDL / INSERT / SELECT ==='
+            grep -RniE '(CREATE TABLE|INSERT INTO|SELECT .* FROM|UPDATE ).*(normalized_swaps|v51_candidates|candidate_stage_events|fomo_paper|robinhood_(launches|swaps|paper_trials|paper_outcomes)|wallet)' src operations 2>/dev/null | head -n 12000 || true
+            echo '=== EVENT TYPES ==='
+            grep -RhoE "['\"][A-Za-z0-9_.:-]*(candidate|trial|outcome|entry|exit|fomo|robinhood|wallet|swap)[A-Za-z0-9_.:-]*['\"]" src/solana_roi 2>/dev/null | sort -u | head -n 5000 || true
+          } > diagnostics/v52_historical_replay/output/emitter_trace.txt
+          cat diagnostics/v52_historical_replay/output/emitter_trace.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: v52-ten-day-exact-page-probe
-          path: diagnostics/v52_historical_replay/output/exact_page_probe.json
+          name: v52-historical-event-emitter-trace
+          path: diagnostics/v52_historical_replay/output/emitter_trace.txt
           retention-days: 7
