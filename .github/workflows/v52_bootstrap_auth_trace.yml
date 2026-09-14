@@ -1,0 +1,37 @@
+name: v5.2 bootstrap auth trace
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_bootstrap_auth_trace.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trace logical bootstrap route and auth references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          {
+            echo '=== ROUTE / LOGICAL BOOTSTRAP REFERENCES ==='
+            grep -R -n -E 'certification-db-logical-bootstrap|logical[_-]bootstrap|bootstrap[_-]page' src operations .github/workflows 2>/dev/null || true
+            echo
+            echo '=== AUTH / TOKEN REFERENCES NEAR CERTIFICATION ==='
+            grep -R -n -E 'CERTIFICATION.*(TOKEN|SECRET|AUTH)|AUTH.*CERTIFICATION|Bearer|Authorization|X-[A-Za-z-]*Cert|secrets\.' src operations .github/workflows 2>/dev/null || true
+          } > output/auth_trace.txt
+          cat output/auth_trace.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v52-bootstrap-auth-trace
+          path: output/auth_trace.txt
+          retention-days: 7
