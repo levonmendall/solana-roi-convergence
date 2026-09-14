@@ -1,4 +1,4 @@
-name: v5.2 historical event emitter trace
+name: v5.2 historical replay implementation trace
 
 on:
   push:
@@ -17,22 +17,22 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Locate event log emitters and historical table schemas
+      - name: Trace replay implementations and entry points
         shell: bash
         run: |
           set -u
           mkdir -p diagnostics/v52_historical_replay/output
           {
-            echo '=== LOG EMITTERS ==='
-            grep -RniE '(print|logger\.|logging\.).*(SOLANA_ROI|candidate|trial|outcome|fomo|robinhood|wallet|swap|qualification|entry|exit)' src operations 2>/dev/null | head -n 12000 || true
-            echo '=== TABLE DDL / INSERT / SELECT ==='
-            grep -RniE '(CREATE TABLE|INSERT INTO|SELECT .* FROM|UPDATE ).*(normalized_swaps|v51_candidates|candidate_stage_events|fomo_paper|robinhood_(launches|swaps|paper_trials|paper_outcomes)|wallet)' src operations 2>/dev/null | head -n 12000 || true
-            echo '=== EVENT TYPES ==='
-            grep -RhoE "['\"][A-Za-z0-9_.:-]*(candidate|trial|outcome|entry|exit|fomo|robinhood|wallet|swap)[A-Za-z0-9_.:-]*['\"]" src/solana_roi 2>/dev/null | sort -u | head -n 5000 || true
-          } > diagnostics/v52_historical_replay/output/emitter_trace.txt
-          cat diagnostics/v52_historical_replay/output/emitter_trace.txt
+            echo '=== HISTORICAL REPLAY REFERENCES ==='
+            grep -Rni -B12 -A35 -E 'historical_swap_replay|historical swap replay|historical_replay|replay_historical|backtest|retrospective' src operations tests 2>/dev/null | head -n 12000 || true
+            echo '=== ROBINHOOD RETURN RESOLUTION ==='
+            grep -Rni -B15 -A70 -E '_resolve_robinhood_forward_market_returns|forward_market_returns|price_eth,observed_at.*robinhood_swaps' src/solana_roi 2>/dev/null | head -n 8000 || true
+            echo '=== SOLANA PRICE PATH / COUNTERFACTUAL ==='
+            grep -Rni -B15 -A70 -E 'normalized_swaps.*reference_price_sol|reference_price_sol.*normalized_swaps|counterfactual.*normalized_swaps|MFE|MAE' src/solana_roi 2>/dev/null | head -n 10000 || true
+          } > diagnostics/v52_historical_replay/output/replay_trace.txt
+          cat diagnostics/v52_historical_replay/output/replay_trace.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: v52-historical-event-emitter-trace
-          path: diagnostics/v52_historical_replay/output/emitter_trace.txt
+          name: v52-historical-replay-implementation-trace
+          path: diagnostics/v52_historical_replay/output/replay_trace.txt
           retention-days: 7
