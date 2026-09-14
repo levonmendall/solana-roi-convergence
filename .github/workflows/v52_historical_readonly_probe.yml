@@ -15,29 +15,36 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: Fetch canonical public evidence surfaces
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           mkdir -p diagnostics/v52_historical_replay/output
           base='https://solana-roi-convergence.onrender.com'
-          for path in \
-            '/health' \
-            '/v1/liveness' \
-            '/v1/strategy/v52' \
-            '/v1/strategy/v52/performance/24h' \
-            '/v1/strategy/v52/performance/7d' \
-            '/v1/strategy/v52/wallet-forward-alpha' \
-            '/v1/system-proof' \
+          paths=(
+            '/health'
+            '/v1/liveness'
+            '/v1/strategy/v52'
+            '/v1/strategy/v52/performance/24h'
+            '/v1/strategy/v52/performance/7d'
+            '/v1/strategy/v52/wallet-forward-alpha'
+            '/v1/system-proof'
             '/openapi.json'
-          do
+          )
+          fetch_one() {
+            path="$1"
             name=$(printf '%s' "$path" | sed 's#^/##;s#[/?=&]#_#g')
-            code=$(curl -L -sS --connect-timeout 10 --max-time 120 -w '%{http_code}' -o "diagnostics/v52_historical_replay/output/${name}.json" "$base$path" || true)
-            printf '%s %s\n' "$code" "$path" | tee -a diagnostics/v52_historical_replay/output/http_status.txt
-          done
+            code=$(curl -L -sS --connect-timeout 5 --max-time 20 -w '%{http_code}' -o "diagnostics/v52_historical_replay/output/${name}.json" "$base$path" || true)
+            printf '%s %s\n' "$code" "$path" > "diagnostics/v52_historical_replay/output/status_${name}.txt"
+          }
+          export base
+          export -f fetch_one
+          for path in "${paths[@]}"; do fetch_one "$path" & done
+          wait
+          cat diagnostics/v52_historical_replay/output/status_*.txt | sort | tee diagnostics/v52_historical_replay/output/http_status.txt
       - name: Summarize opportunity evidence
         shell: python
         run: |
