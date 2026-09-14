@@ -139,6 +139,10 @@ def test_deferred_shadow_does_not_execute_while_memory_pressure_is_high(
     calls: list[str] = []
     monkeypatch.setattr(handoff, "_SHADOW_START_DELAY_SECONDS", 0.01)
     monkeypatch.setattr(handoff, "_SHADOW_RETRY_SECONDS", 0.01)
+    # This test exercises the post-certification memory gate specifically. The
+    # certification-serialization behavior itself is covered in the dedicated
+    # shadow serialization regression suite.
+    monkeypatch.setattr(handoff, "_certification_bootstrap_complete_for_shadow", lambda: True)
     monkeypatch.setattr(
         handoff,
         "_shadow_memory_has_headroom",
@@ -178,6 +182,8 @@ def test_deferred_shadow_runs_once_after_runtime_headroom_exists(
     storage._reset_shadow_snapshot_state_for_tests()
     calls: list[str] = []
     monkeypatch.setattr(handoff, "_SHADOW_START_DELAY_SECONDS", 0.01)
+    # This test exercises post-certification execution once headroom exists.
+    monkeypatch.setattr(handoff, "_certification_bootstrap_complete_for_shadow", lambda: True)
     monkeypatch.setattr(
         handoff,
         "_shadow_memory_has_headroom",
