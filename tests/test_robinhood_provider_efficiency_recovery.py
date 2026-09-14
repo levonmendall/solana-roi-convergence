@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from solana_roi import robinhood_catchup_capacity_repair as catchup
 from solana_roi import robinhood_chain_runtime as runtime
+from solana_roi import robinhood_provider_efficiency_repair as efficiency
 from solana_roi import robinhood_provider_failover as failover
 from solana_roi import robinhood_provider_runtime_proof as proof
 
@@ -41,8 +43,20 @@ class _FakeRpc:
         if topics is None:
             return []
         return [
-            {"address": self.v3_address, "topics": [runtime.V3_SWAP_TOPIC]},
-            {"address": self.v2_address, "topics": [runtime.PONS_V2_CURVE_BUY_TOPIC]},
+            {
+                "address": self.v3_address,
+                "topics": [runtime.V3_SWAP_TOPIC],
+                "blockNumber": "0x3e8",
+                "transactionIndex": "0x0",
+                "logIndex": "0x0",
+            },
+            {
+                "address": self.v2_address,
+                "topics": [runtime.PONS_V2_CURVE_BUY_TOPIC],
+                "blockNumber": "0x3e8",
+                "transactionIndex": "0x0",
+                "logIndex": "0x1",
+            },
         ]
 
 
@@ -87,9 +101,11 @@ class _FakePlane:
 
 def test_cross_venue_market_logs_share_one_64_address_request_without_scope_loss(monkeypatch) -> None:
     monkeypatch.delenv("ROBINHOOD_COMBINED_LOG_ADDRESS_BATCH_SIZE", raising=False)
+    efficiency.install_robinhood_provider_efficiency_repair()
+    assert catchup._fetch_market_logs is efficiency._combined_fetch_market_logs
     plane = _FakePlane()
 
-    asyncio.run(runtime.RobinhoodRuntimeMixin._poll_once(plane))
+    asyncio.run(catchup._capacity_poll_once(plane))
 
     assert len(plane.rpc.calls) == 2
     factory_call, market_call = plane.rpc.calls
@@ -111,9 +127,10 @@ def test_cross_venue_market_logs_share_one_64_address_request_without_scope_loss
 
 
 def test_cross_venue_batching_fails_closed_on_address_classification_collision() -> None:
+    efficiency.install_robinhood_provider_efficiency_repair()
     plane = _FakePlane(duplicate_address=True)
     with pytest.raises(RuntimeError, match="robinhood_market_address_classification_collision"):
-        asyncio.run(runtime.RobinhoodRuntimeMixin._poll_once(plane))
+        asyncio.run(catchup._capacity_poll_once(plane))
     assert plane._cursor == 900
     assert len(plane.rpc.calls) == 1
 
