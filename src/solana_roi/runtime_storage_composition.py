@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,20 @@ FINALIZE_ENV = "SOLANA_ROI_ACTIVE_STORAGE_FINALIZE_FROM_LEGACY"
 HIDE_LEGACY_ENV = "SOLANA_ROI_ACTIVE_STORAGE_HIDE_LEGACY"
 RESTORE_LEGACY_ENV = "SOLANA_ROI_ACTIVE_STORAGE_RESTORE_LEGACY"
 LEGACY_QUARANTINE_ENV = "SOLANA_ROI_LEGACY_QUARANTINE_DIR"
+
+# Shadow preparation is non-authoritative migration work.  It must never make
+# runtime import/startup wait on a large SQLite read/copy.  The FastAPI lifespan
+# schedules this exact operation after startup and only when cgroup headroom is
+# available.  Activation/finalization remains a separate explicit fail-closed
+# boundary below.
+_SHADOW_LOCK = threading.Lock()
+_SHADOW_STATE: dict[str, Any] = {
+    "state": "idle",
+    "attempts": 0,
+    "release_sha": None,
+    "report": None,
+    "last_error_type": None,
+}
 
 
 def _truthy(name: str) -> bool:
@@ -178,13 +193,80 @@ def _build_exact_snapshot(*, release: str, mode: str) -> dict[str, Any]:
     return payload
 
 
-def _shadow_once() -> dict[str, Any] | None:
-    if not _truthy(SHADOW_ENV) or _truthy(ACTIVATE_ENV):
+def shadow_snapshot_requested() -> bool:
+    """Return whether non-authoritative shadow preparation is requested."""
+    return _truthy(SHADOW_ENV) and not _truthy(ACTIVATE_ENV)
+
+
+def shadow_snapshot_status() -> dict[str, Any]:
+    """Expose bounded in-process truth without performing migration work."""
+    with _SHADOW_LOCK:
+        state = dict(_SHADOW_STATE)
+    report = state.get("report")
+    return {
+        "requested": shadow_snapshot_requested(),
+        "execution": "post_startup_memory_gated_single_flight",
+        "state": state.get("state"),
+        "attempts": int(state.get("attempts", 0) or 0),
+        "release_sha": state.get("release_sha"),
+        "equivalent": report.get("equivalent") if isinstance(report, dict) else None,
+        "last_error_type": state.get("last_error_type"),
+        "authoritative_runtime_changed": False,
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+
+
+def run_requested_shadow_snapshot() -> dict[str, Any] | None:
+    """Build one exact shadow snapshot outside the startup-critical path.
+
+    This function never activates the new store, moves/quarantines legacy files,
+    changes runtime authority, or deletes legacy history.  It is intentionally
+    synchronous so callers can place it in an existing bounded worker thread.
+    """
+    if not shadow_snapshot_requested():
+        with _SHADOW_LOCK:
+            _SHADOW_STATE["state"] = "not_requested"
+            _SHADOW_STATE["last_error_type"] = None
         return None
     release = _release_sha()
     if not release:
         raise RuntimeError("shadow storage requires exact release SHA")
-    return _build_exact_snapshot(release=release, mode="shadow")
+    if not _SHADOW_LOCK.acquire(blocking=False):
+        return None
+    try:
+        if _SHADOW_STATE.get("state") == "completed" and _SHADOW_STATE.get("release_sha") == release:
+            report = _SHADOW_STATE.get("report")
+            return dict(report) if isinstance(report, dict) else None
+        _SHADOW_STATE["state"] = "running"
+        _SHADOW_STATE["attempts"] = int(_SHADOW_STATE.get("attempts", 0) or 0) + 1
+        _SHADOW_STATE["release_sha"] = release
+        _SHADOW_STATE["report"] = None
+        _SHADOW_STATE["last_error_type"] = None
+        try:
+            report = _build_exact_snapshot(release=release, mode="shadow")
+        except Exception as exc:
+            _SHADOW_STATE["state"] = "failed"
+            _SHADOW_STATE["last_error_type"] = type(exc).__name__
+            raise
+        _SHADOW_STATE["state"] = "completed"
+        _SHADOW_STATE["report"] = dict(report)
+        return dict(report)
+    finally:
+        _SHADOW_LOCK.release()
+
+
+def _reset_shadow_snapshot_state_for_tests() -> None:
+    with _SHADOW_LOCK:
+        _SHADOW_STATE.update(
+            {
+                "state": "idle",
+                "attempts": 0,
+                "release_sha": None,
+                "report": None,
+                "last_error_type": None,
+            }
+        )
 
 
 def _quarantine_legacy_for_independence_proof(legacy: Path) -> dict[str, Any]:
@@ -294,7 +376,6 @@ def compose_runtime_storage() -> tuple[ObservationEventStore, DurablePaperTradin
     if _truthy(RESTORE_LEGACY_ENV):
         restored = _restore_legacy_from_quarantine(_legacy_path())
 
-    shadow = _shadow_once()
     if _truthy(ACTIVATE_ENV):
         release = _release_sha()
         if not release:
@@ -330,14 +411,15 @@ def compose_runtime_storage() -> tuple[ObservationEventStore, DurablePaperTradin
     # Until the active-store cutover is proven, legacy remains authoritative but
     # no longer accumulates every positively classified low-value row forever.
     # Containment is bounded, best-effort maintenance only and cannot authorize
-    # or block strategy/portfolio writes.
+    # or block strategy/portfolio writes.  Shadow preparation is intentionally
+    # deferred until after the web process is live and cgroup memory has headroom.
     contained_store = LegacyContainedObservationEventStore(_legacy_path())
     engine = DurablePaperTradingEngine(store=contained_store)
     genesis_checkpoint = _materialize_verified_genesis_checkpoint_if_needed(contained_store, engine)
     return contained_store, engine, {
         "mode": "legacy_authoritative",
         "path": str(contained_store.path),
-        "shadow": shadow,
+        "shadow": shadow_snapshot_status(),
         "legacy_restore": restored,
         "legacy_containment": contained_store.containment_status(),
         "legacy_genesis_checkpoint": genesis_checkpoint,
