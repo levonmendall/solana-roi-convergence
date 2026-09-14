@@ -8,6 +8,7 @@ from .v52_authoritative_strategy import status as strategy_status
 from .v52_profit_confidence_completion import report as profit_confidence_report, status as profit_confidence_status
 from .v52_profit_confidence_finalization import status as profit_confidence_finalization_status
 from .v52_learning_governance import status as learning_governance_status
+from .v52_wallet_forward_alpha_runtime import report as wallet_forward_alpha_report, status as wallet_forward_alpha_status
 
 STATUS_PATH = "/v1/strategy/authority"
 V52_STATUS_PATH = "/v1/strategy/v52"
@@ -15,6 +16,7 @@ V51_CONTROL_PATH = "/v1/strategy/control/v51-authority"
 PERFORMANCE_24H_PATH = "/v1/strategy/v52/performance/24h"
 PERFORMANCE_7D_PATH = "/v1/strategy/v52/performance/7d"
 LEARNING_GOVERNANCE_PATH = "/v1/strategy/v52/learning-governance"
+WALLET_FORWARD_ALPHA_PATH = "/v1/strategy/v52/wallet-forward-alpha"
 _INSTALLED = False
 
 
@@ -41,9 +43,11 @@ def _payload() -> dict[str, Any]:
         "profit_confidence_completion": profit_confidence_status(),
         "learning_governance": learning_governance_status(),
         "profit_confidence_finalization": profit_confidence_finalization_status(),
+        "wallet_forward_alpha": wallet_forward_alpha_status(),
         "performance_reports": {
             "24h": PERFORMANCE_24H_PATH,
             "7d": PERFORMANCE_7D_PATH,
+            "wallet_forward_alpha": WALLET_FORWARD_ALPHA_PATH,
             "read_only": True,
         },
         "learning_governance_status_path": LEARNING_GOVERNANCE_PATH,
@@ -109,12 +113,17 @@ def install_v52_strategy_api(app: Any) -> None:
         @app.get(LEARNING_GOVERNANCE_PATH)
         def v52_learning_governance_status() -> dict[str, Any]:
             return learning_governance_status()
+    if WALLET_FORWARD_ALPHA_PATH not in existing:
+        @app.get(WALLET_FORWARD_ALPHA_PATH)
+        def v52_wallet_forward_alpha_status() -> dict[str, Any]:
+            return wallet_forward_alpha_report()
 
     app.state.roi_strategy_authority_status = _payload
     app.state.roi_v51_control_authority_status = _v51_control_payload
     app.state.roi_v52_performance_24h = lambda: profit_confidence_report(24)
     app.state.roi_v52_performance_7d = lambda: profit_confidence_report(24 * 7)
     app.state.roi_v52_learning_governance_status = learning_governance_status
+    app.state.roi_v52_wallet_forward_alpha_status = wallet_forward_alpha_report
     _INSTALLED = True
 
 
@@ -127,8 +136,10 @@ def status() -> dict[str, Any]:
         "performance_24h_path": PERFORMANCE_24H_PATH,
         "performance_7d_path": PERFORMANCE_7D_PATH,
         "learning_governance_path": LEARNING_GOVERNANCE_PATH,
+        "wallet_forward_alpha_path": WALLET_FORWARD_ALPHA_PATH,
         "performance_reports_read_only": True,
         "learning_governance_status_read_only": True,
+        "wallet_forward_alpha_status_read_only": True,
         "authoritative_strategy": "v5.2",
         "v51_control_final_decision_authority": False,
         "paper_only": True,
@@ -145,6 +156,7 @@ __all__ = [
     "STATUS_PATH",
     "V51_CONTROL_PATH",
     "V52_STATUS_PATH",
+    "WALLET_FORWARD_ALPHA_PATH",
     "install_v52_strategy_api",
     "status",
 ]
