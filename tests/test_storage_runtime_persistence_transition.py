@@ -18,7 +18,7 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def test_runtime_resume_state_is_sealed_into_existing_truth_sections() -> None:
+def test_runtime_resume_state_is_sealed_into_existing_truth_sections(monkeypatch) -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     connection.executescript(
@@ -35,8 +35,13 @@ def test_runtime_resume_state_is_sealed_into_existing_truth_sections() -> None:
         "CREATE TABLE direct_solana_hydration_queue(signature TEXT PRIMARY KEY,status TEXT,updated_at TEXT);"
         "CREATE TABLE wallet_realtime_receipts(id INTEGER PRIMARY KEY,status TEXT,updated_at TEXT);"
     )
-    connection.execute("INSERT INTO certification_release_epochs VALUES('a','2026-09-14T00:00:00+00:00')")
-    connection.execute("INSERT INTO forward_cohort_manifest VALUES(1,'t','a','{}','h')")
+    release = "a" * 40
+    monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", release)
+    connection.execute(
+        "INSERT INTO certification_release_epochs VALUES(?,?)",
+        (release, "2026-09-14T00:00:00+00:00"),
+    )
+    connection.execute("INSERT INTO forward_cohort_manifest VALUES(1,'t',?,'{}','h')", (release,))
     connection.execute("INSERT INTO forward_cohort_arm_state VALUES(1,'t','h')")
     connection.execute("INSERT INTO direct_solana_provider_state VALUES('alchemy',1,'t','t',2,NULL)")
     connection.execute("INSERT INTO direct_solana_global_state VALUES(1,'t',1,NULL,'gap')")
@@ -64,13 +69,54 @@ def test_runtime_resume_state_is_sealed_into_existing_truth_sections() -> None:
 
     assert truth["strategy"]["forward_cohort_manifest"][0]["manifest_sha256"] == "h"
     assert truth["strategy"]["forward_cohort_arm_state"][0]["manifest_sha256"] == "h"
-    assert truth["certification"]["certification_release_epochs"][0]["release_commit"] == "a"
+    assert truth["certification"]["certification_release_epochs"][0]["release_commit"] == release
     assert truth["provider_source"]["direct_solana_provider_state"][0]["provider"] == "alchemy"
     assert truth["continuity"]["direct_solana_global_state"][0]["unresolved_gap"] == 1
     assert truth["wallet"]["wallet_discovery_candidates"][0]["state"] == "tracking"
     assert truth["continuity"]["helius_webhook_inbox"][0]["state"] == "pending"
     assert truth["continuity"]["direct_solana_hydration_queue"][0]["status"] == "pending"
     assert truth["continuity"]["wallet_realtime_receipts"][0]["status"] == "processing"
+
+
+def test_certification_release_epoch_selector_binds_exact_frontier_in_large_history(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE certification_release_epochs(release_commit TEXT PRIMARY KEY,started_at TEXT NOT NULL)"
+    )
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    history = [
+        (f"{index:040x}", _iso(base + timedelta(minutes=index)))
+        for index in range(300)
+    ]
+    current_release = "f" * 40
+    current = (current_release, _iso(base + timedelta(minutes=300)))
+    later_nonfrontier = ("e" * 40, _iso(base + timedelta(minutes=301)))
+    connection.executemany(
+        "INSERT INTO certification_release_epochs(release_commit,started_at) VALUES(?,?)",
+        [*history, current, later_nonfrontier],
+    )
+    source_count = connection.execute("SELECT COUNT(*) FROM certification_release_epochs").fetchone()[0]
+    assert source_count > 256
+    monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", current_release)
+
+    truth = {"certification": {}}
+    counts: dict[str, int] = {}
+    augment_runtime_current_state_truth(
+        connection,
+        {"certification_release_epochs"},
+        truth,
+        counts,
+    )
+
+    selected = truth["certification"]["certification_release_epochs"]
+    assert [row["release_commit"] for row in selected] == [history[-1][0], current_release]
+    assert counts["certification_release_epochs"] == 2
+    assert connection.execute("SELECT COUNT(*) FROM certification_release_epochs").fetchone()[0] == source_count
+    assert connection.execute(
+        "SELECT COUNT(*) FROM certification_release_epochs WHERE release_commit=?",
+        (later_nonfrontier[0],),
+    ).fetchone()[0] == 1
 
 
 def test_registered_autoincrement_sequence_advances_without_copying_old_rows(tmp_path: Path) -> None:
