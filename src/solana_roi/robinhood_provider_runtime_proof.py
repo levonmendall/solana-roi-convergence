@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
@@ -13,7 +14,7 @@ from . import robinhood_chain_runtime as runtime
 from . import robinhood_provider_failover as failover
 
 
-RUNTIME_PROOF_VERSION = "robinhood-provider-runtime-proof-v3-drpc-method-quarantine"
+RUNTIME_PROOF_VERSION = "robinhood-provider-runtime-proof-v4-alchemy-monthly-quota-recovery"
 DEFAULT_DRPC_METHOD_UNAVAILABLE_COOLDOWN_SECONDS = 900.0
 _INSTALLED = False
 _PROBE_LOCK = threading.Lock()
@@ -75,6 +76,63 @@ def _jsonrpc_error_code(exc: BaseException) -> int | None:
 
 def _drpc_method_unavailable(provider: failover.ProviderEndpoint, exc: BaseException) -> bool:
     return _provider_kind(provider) == "drpc" and _jsonrpc_error_code(exc) == -32601
+
+
+def _next_utc_month_epoch(now_epoch: float | None = None) -> float:
+    current = datetime.fromtimestamp(float(now_epoch if now_epoch is not None else time.time()), tz=timezone.utc)
+    if current.month == 12:
+        nxt = datetime(current.year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        nxt = datetime(current.year, current.month + 1, 1, tzinfo=timezone.utc)
+    return nxt.timestamp()
+
+
+def _iso_utc(epoch: Any) -> str | None:
+    try:
+        value = float(epoch)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _alchemy_monthly_quota_exhausted(
+    provider: failover.ProviderEndpoint,
+    exc: BaseException,
+) -> bool:
+    """Classify only durable/monthly Alchemy exhaustion, not ordinary burst 429s."""
+    if _provider_kind(provider) != "alchemy":
+        return False
+    if type(exc).__name__ == "RobinhoodProviderMonthlyBudgetExceeded":
+        return True
+    message = str(exc).lower()
+    strong_markers = (
+        "monthly quota",
+        "monthly request",
+        "monthly capacity",
+        "billing limit",
+        "billing capacity",
+        "compute unit limit",
+        "compute units limit",
+        "credit limit",
+        "usage limit",
+        "plan limit",
+    )
+    if any(marker in message for marker in strong_markers):
+        return True
+    if not isinstance(exc, httpx.HTTPStatusError) or int(exc.response.status_code) != 429:
+        return False
+    try:
+        body = str(exc.response.text or "").lower()
+    except Exception:
+        body = ""
+    try:
+        payload = exc.response.json()
+        body = f"{body} {payload!r}".lower()
+    except Exception:
+        pass
+    return any(marker in body for marker in strong_markers)
 
 
 def _mark_success_with_telemetry(name: str, *, transport_kind: str) -> None:
@@ -140,13 +198,18 @@ def _switch_from_with_verification_reset(
 def _record_probe_failure(provider: failover.ProviderEndpoint, exc: BaseException) -> None:
     jsonrpc_code = _jsonrpc_error_code(exc)
     method_unavailable = _drpc_method_unavailable(provider, exc)
-    cooldown_seconds = (
-        _drpc_method_unavailable_cooldown_seconds()
-        if method_unavailable
-        else failover._cooldown_seconds()
-    )
-    reason = "jsonrpc_method_not_found" if method_unavailable else None
+    monthly_quota = _alchemy_monthly_quota_exhausted(provider, exc)
     now_wall = time.time()
+    quota_until = _next_utc_month_epoch(now_wall) if monthly_quota else None
+    if monthly_quota:
+        cooldown_seconds = max(60.0, float(quota_until or now_wall) - now_wall)
+        reason = "alchemy_monthly_quota_exhausted"
+    elif method_unavailable:
+        cooldown_seconds = _drpc_method_unavailable_cooldown_seconds()
+        reason = "jsonrpc_method_not_found"
+    else:
+        cooldown_seconds = failover._cooldown_seconds()
+        reason = None
     with failover._LOCK:
         state = failover._state_for_locked(provider.name)
         state["http_failures"] = int(state.get("http_failures", 0) or 0) + 1
@@ -158,12 +221,24 @@ def _record_probe_failure(provider: failover.ProviderEndpoint, exc: BaseExceptio
         state["capability_quarantine_until"] = now_wall + cooldown_seconds if reason is not None else None
         state["chain_verified"] = False
         state["read_capability_verified"] = False
+        if monthly_quota:
+            state["quota_exhausted_until"] = quota_until
+            state["quota_recovery_probe_required"] = True
+            state["last_quota_exhausted_at"] = now_wall
     if method_unavailable:
         print(
             "ROBINHOOD_PROVIDER_CAPABILITY_QUARANTINED "
             f"provider={provider.name} provider_kind=drpc "
             f"reason={reason} jsonrpc_code=-32601 "
             f"cooldown_seconds={cooldown_seconds:.0f}",
+            flush=True,
+        )
+    if monthly_quota:
+        print(
+            "ROBINHOOD_PROVIDER_QUOTA_QUARANTINED "
+            f"provider={provider.name} provider_kind=alchemy "
+            f"reason={reason} reenable_after_utc={_iso_utc(quota_until)} "
+            "recovery_requires_chain_id_and_block_head=true",
             flush=True,
         )
 
@@ -188,6 +263,10 @@ def _record_provider_verified(
         state["last_capability_jsonrpc_code"] = None
         state["capability_quarantine_reason"] = None
         state["capability_quarantine_until"] = None
+        if _provider_kind(provider) == "alchemy":
+            state["quota_exhausted_until"] = None
+            state["quota_recovery_probe_required"] = False
+            state["last_quota_recovery_at"] = time.time()
         if changed:
             failover._ACTIVE_NAME = provider.name
             failover._GENERATION += 1
@@ -202,6 +281,91 @@ def _record_provider_verified(
     )
 
 
+async def _probe_provider(
+    rpc_self: Any,
+    provider: failover.ProviderEndpoint,
+) -> int:
+    original = failover._ORIGINAL_RPC
+    if original is None:
+        raise RuntimeError("provider_inner_rpc_unavailable")
+    rpc_self.rpc_url = provider.http
+    raw = await original(rpc_self, "eth_chainId", [])
+    text = str(raw).strip().lower()
+    chain_id = int(text, 16) if text.startswith("0x") else int(text)
+    if chain_id != runtime.ROBINHOOD_CHAIN_ID:
+        raise RuntimeError("WrongRobinhoodChainId")
+    head_raw = await original(rpc_self, "eth_blockNumber", [])
+    head_text = str(head_raw).strip().lower()
+    latest_block = int(head_text, 16) if head_text.startswith("0x") else int(head_text)
+    if latest_block < 0:
+        raise RuntimeError("InvalidRobinhoodBlockNumber")
+    return latest_block
+
+
+async def _verify_quota_recovery_if_needed(rpc_self: Any) -> bool:
+    """Re-admit an exhausted Alchemy endpoint only after its month boundary and live proof."""
+    active = failover.active_provider()
+    now_monotonic = time.monotonic()
+    candidate: failover.ProviderEndpoint | None = None
+    with failover._LOCK:
+        for item in failover.providers():
+            state = failover._state_for_locked(item.name)
+            if not bool(state.get("quota_recovery_probe_required", False)):
+                continue
+            if float(state.get("cooldown_until", 0.0) or 0.0) > now_monotonic:
+                continue
+            candidate = item
+            break
+    if candidate is None:
+        return False
+    if not _PROBE_LOCK.acquire(blocking=False):
+        return False
+    try:
+        active = failover.active_provider()
+        if active is None:
+            return False
+        with failover._LOCK:
+            state = failover._state_for_locked(candidate.name)
+            if not bool(state.get("quota_recovery_probe_required", False)):
+                return False
+            if float(state.get("cooldown_until", 0.0) or 0.0) > time.monotonic():
+                return False
+        old_url = str(getattr(rpc_self, "rpc_url", "") or "")
+        try:
+            latest_block = await _probe_provider(rpc_self, candidate)
+        except Exception as exc:
+            _record_probe_failure(candidate, exc)
+            rpc_self.rpc_url = active.http if active is not None else old_url
+            print(
+                "ROBINHOOD_PROVIDER_QUOTA_RECOVERY_FAILED "
+                f"provider={candidate.name} provider_kind={_provider_kind(candidate)} "
+                f"error_type={type(exc).__name__}",
+                flush=True,
+            )
+            return False
+        preferred = _preferred_provider()
+        previous_name = (
+            active.name
+            if preferred is not None
+            and preferred.name == candidate.name
+            and active.name != candidate.name
+            else None
+        )
+        _record_provider_verified(candidate, previous_name=previous_name, latest_block=latest_block)
+        restored = failover.active_provider()
+        rpc_self.rpc_url = restored.http if restored is not None else old_url
+        print(
+            "ROBINHOOD_PROVIDER_QUOTA_RECOVERED "
+            f"provider={candidate.name} provider_kind={_provider_kind(candidate)} "
+            f"chain_id={runtime.ROBINHOOD_CHAIN_ID} latest_block={latest_block} "
+            f"returned_to_pool=true",
+            flush=True,
+        )
+        return True
+    finally:
+        _PROBE_LOCK.release()
+
+
 async def _verify_preferred_if_needed(rpc_self: Any) -> bool:
     preferred = _preferred_provider()
     active = failover.active_provider()
@@ -213,7 +377,8 @@ async def _verify_preferred_if_needed(rpc_self: Any) -> bool:
         already_verified = bool(state.get("chain_verified", False)) and bool(
             state.get("read_capability_verified", False)
         )
-    if not eligible:
+        quota_probe_required = bool(state.get("quota_recovery_probe_required", False))
+    if not eligible or quota_probe_required:
         return False
     if active.name == preferred.name and already_verified:
         return True
@@ -228,29 +393,15 @@ async def _verify_preferred_if_needed(rpc_self: Any) -> bool:
             state = failover._state_for_locked(preferred.name)
             if float(state.get("cooldown_until", 0.0) or 0.0) > time.monotonic():
                 return False
+            if bool(state.get("quota_recovery_probe_required", False)):
+                return False
             if active.name == preferred.name and bool(state.get("chain_verified", False)) and bool(
                 state.get("read_capability_verified", False)
             ):
                 return True
-        original = failover._ORIGINAL_RPC
-        if original is None:
-            return False
         old_url = str(getattr(rpc_self, "rpc_url", "") or "")
-        rpc_self.rpc_url = preferred.http
         try:
-            raw = await original(rpc_self, "eth_chainId", [])
-            text = str(raw).strip().lower()
-            chain_id = int(text, 16) if text.startswith("0x") else int(text)
-            if chain_id != runtime.ROBINHOOD_CHAIN_ID:
-                raise RuntimeError("WrongRobinhoodChainId")
-
-            # Chain identity alone is not enough. The provider must also execute a
-            # normal Robinhood read before it can be considered healthy/preferred.
-            head_raw = await original(rpc_self, "eth_blockNumber", [])
-            head_text = str(head_raw).strip().lower()
-            latest_block = int(head_text, 16) if head_text.startswith("0x") else int(head_text)
-            if latest_block < 0:
-                raise RuntimeError("InvalidRobinhoodBlockNumber")
+            latest_block = await _probe_provider(rpc_self, preferred)
         except Exception as exc:
             _record_probe_failure(preferred, exc)
             rpc_self.rpc_url = active.http if active is not None else old_url
@@ -275,6 +426,7 @@ def _runtime_rpc_with_preferred_verification(
     async def wrapped(rpc_self: Any, method: str, params: list[Any]) -> Any:
         current = str(getattr(rpc_self, "rpc_url", "") or "")
         if current and failover._is_pool_http(current):
+            await _verify_quota_recovery_if_needed(rpc_self)
             await _verify_preferred_if_needed(rpc_self)
         try:
             return await original(rpc_self, method, params)
@@ -300,6 +452,7 @@ def _status_with_runtime_proof() -> dict[str, Any]:
             quarantine_reason = state.get("capability_quarantine_reason")
             cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
             quarantined = bool(quarantine_reason) and cooldown_until > now_monotonic
+            quota_recovery_required = bool(state.get("quota_recovery_probe_required", False))
             traffic[item.name] = {
                 "provider_kind": _provider_kind(item),
                 "http_successes": int(state.get("http_successes", 0) or 0),
@@ -320,6 +473,11 @@ def _status_with_runtime_proof() -> dict[str, Any]:
                     max(0.0, round(cooldown_until - now_monotonic, 3)) if quarantined else 0.0
                 ),
                 "last_capability_jsonrpc_code": state.get("last_capability_jsonrpc_code"),
+                "quota_recovery_probe_required": quota_recovery_required,
+                "quota_exhausted_until_utc": _iso_utc(state.get("quota_exhausted_until")),
+                "quota_recovery_due": quota_recovery_required and cooldown_until <= now_monotonic,
+                "last_quota_exhausted_at": state.get("last_quota_exhausted_at"),
+                "last_quota_recovery_at": state.get("last_quota_recovery_at"),
             }
     with _FAILURE_LOCK:
         request_failures = {
@@ -336,6 +494,14 @@ def _status_with_runtime_proof() -> dict[str, Any]:
             ),
             "provider_request_failures": request_failures,
             "drpc_method_unavailable_cooldown_seconds": _drpc_method_unavailable_cooldown_seconds(),
+            "alchemy_monthly_quota_recovery": {
+                "automatic": True,
+                "reenable_boundary": "next_utc_month",
+                "generic_transient_429_uses_monthly_quarantine": False,
+                "requires_chain_id_4663_probe": True,
+                "requires_block_head_probe": True,
+                "backup_provider_can_rejoin_without_becoming_primary": True,
+            },
         }
     )
     return result

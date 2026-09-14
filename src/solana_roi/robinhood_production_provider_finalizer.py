@@ -45,6 +45,10 @@ from .robinhood_provider_capacity_budget import (
     install_robinhood_provider_capacity_budget,
     status as provider_capacity_budget_status,
 )
+from .robinhood_provider_efficiency_repair import (
+    install_robinhood_provider_efficiency_repair,
+    status as provider_efficiency_status,
+)
 from .robinhood_provider_failover import (
     install_robinhood_provider_failover,
     status as provider_failover_status,
@@ -60,7 +64,7 @@ from .robinhood_usage_bounded_transport import (
 )
 
 
-FINALIZER_VERSION = "robinhood-production-provider-finalizer-v15-capability-specific-getlogs"
+FINALIZER_VERSION = "robinhood-production-provider-finalizer-v16-provider-efficiency-alchemy-recovery"
 _INSTALLED = False
 _LEGACY_FRESH_READY: Callable[[Any], Awaitable[bool]] | None = None
 
@@ -162,13 +166,16 @@ def install_robinhood_production_provider_finalizer(
     verification, fresh-event authority, paper-only operation, and the absence of
     signing/submission/live-money capability are unchanged. ``eth_getLogs`` is
     capability-specific: basic EVM reads cannot make a provider fully healthy when
-    mandatory log retrieval is unavailable.
+    mandatory log retrieval is unavailable. Market-log acquisition is composed above
+    the catch-up runtime so compatible V3/V2 filters share provider requests without
+    reducing market or block coverage.
     """
     global _INSTALLED, _LEGACY_FRESH_READY
     if _INSTALLED:
         return
 
     _LEGACY_FRESH_READY = legacy_fresh_ready
+    install_robinhood_provider_efficiency_repair()
     install_robinhood_provider_pool_throughput_repair()
     install_robinhood_getlogs_provider_guard()
     install_robinhood_provider_budget_transport()
@@ -218,6 +225,7 @@ def status() -> dict[str, Any]:
         "drpc_block_number_compat": drpc_block_number_compat_status(),
         "provider_pool_throughput": provider_pool_throughput_status(),
         "provider_capacity_budget": provider_capacity_budget_status(),
+        "provider_efficiency": provider_efficiency_status(),
         "getlogs_provider_guard": getlogs_provider_guard_status(),
         "getlogs_capability_repair": getlogs_capability_repair_status(),
         "provider_budget_transport": provider_budget_transport_status(),
