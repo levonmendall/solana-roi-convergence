@@ -1,0 +1,38 @@
+name: v5.2 data route inventory
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_data_route_inventory.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inventory bounded data/storage routes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast, pathlib
+          out=[]
+          for p in pathlib.Path('src').rglob('*.py'):
+              try: tree=ast.parse(p.read_text(errors='ignore'))
+              except Exception: continue
+              for node in ast.walk(tree):
+                  if not isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)): continue
+                  for dec in node.decorator_list:
+                      if not isinstance(dec,ast.Call) or not isinstance(dec.func,ast.Attribute) or dec.func.attr not in {'get','post'} or not dec.args: continue
+                      arg=dec.args[0]
+                      if not isinstance(arg,ast.Constant) or not isinstance(arg.value,str): continue
+                      path=arg.value
+                      if any(k in path.lower() for k in ('db','data','storage','export','snapshot','bootstrap','replica','table','ledger','telemetry','status')):
+                          out.append((path,dec.func.attr,str(p),node.lineno,node.name))
+          for r in sorted(set(out)): print('\t'.join(map(str,r)))
+          PY
