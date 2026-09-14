@@ -7,9 +7,11 @@ from solana_roi.observation_store import ObservationEventStore
 from solana_roi.v52_wallet_forward_alpha import STATUS_INCOMPLETE, STATUS_MATERIAL
 from solana_roi.v52_wallet_forward_alpha_integration import _no_wallet_pre
 from solana_roi.v52_wallet_forward_alpha_runtime import WalletForwardAlphaRuntime
+from solana_roi.v52_wallet_forward_alpha_strict_validation import install_strict_wallet_forward_alpha_validation
 
 
 def _runtime(tmp_path, *, started_at=None):
+    install_strict_wallet_forward_alpha_validation()
     store = ObservationEventStore(tmp_path / "wfa-runtime.sqlite3")
     owner = SimpleNamespace(store=store, wallet_discovery=None)
     return store, WalletForwardAlphaRuntime(store, owner, started_at=started_at)
@@ -97,10 +99,12 @@ def test_same_stream_shadow_outcome_uses_one_realized_outcome_for_all_variants(t
     assert rows["wallet_forward_alpha"]["trades"] == 30
     assert rows["baseline_v52_no_wallet"]["net_pnl_usd"] == 0.0
     assert rows["current_v52_wallet"]["net_pnl_usd"] > 0.0
-    # With no prior forward-alpha evidence, WFA is neutral to current v5.2.
+    # With no prior forward-alpha evidence, WFA is neutral to current v5.2 and
+    # therefore must NOT be promoted as incremental strategy value.
     assert abs(rows["wallet_forward_alpha"]["net_pnl_usd"] - rows["current_v52_wallet"]["net_pnl_usd"]) < 1e-9
     assert report["acceptance_decision"] != STATUS_MATERIAL
     assert report["strategy_influence_enabled"] is False
+    assert "no_statistically_positive_incremental_value_vs_current_wallet_intelligence" in report["validation"]["reasons"]
 
 
 def test_runtime_schema_is_paper_only_and_has_no_live_authority(tmp_path):
