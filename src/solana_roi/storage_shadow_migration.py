@@ -12,6 +12,11 @@ from . import storage_manifest
 from .active_storage import ActiveStorage, payload_hash
 from .observation_store import ObservationEventStore
 from .storage_current_state_extractor import LegacyCurrentStateExtractor
+from .storage_current_v52_reconciliation import copy_bounded_current_v52
+from .storage_runtime_persistence_reconciliation import (
+    advance_registered_sequences,
+    copy_bounded_runtime_evidence,
+)
 from .storage_transition import build_checkpoint_payload, persist_verified_checkpoint, verify_semantic_equivalence
 
 
@@ -261,15 +266,22 @@ def build_shadow_database(*, legacy_path: Path | str, active_path: Path | str, r
     schema_store = ObservationEventStore(active)
     schema_store.close()
     copied: dict[str, int] = {}
+    sequence_frontiers: dict[str, int] = {}
     source = _connect_ro(legacy)
     dest = storage.connect()
     try:
+        # One pinned source snapshot owns all exact state, bounded evidence and
+        # sequence frontiers.  No second migration pass is allowed to race ahead
+        # of the semantic checkpoint.
         source.execute("BEGIN")
         dest.execute("BEGIN IMMEDIATE")
         _copy_current_sections(source, dest, extraction.truth, copied)
         _copy_bounded_v52(source, dest, copied)
         _copy_wallet_materializations(source, dest, copied)
         _copy_active_subject_evidence(source, dest, extraction.truth, copied)
+        copy_bounded_current_v52(source, dest, copy_query=_copy_query, counts=copied)
+        copy_bounded_runtime_evidence(source, dest, copy_query=_copy_query, counts=copied)
+        sequence_frontiers = advance_registered_sequences(source, dest)
         dest.commit()
         source.execute("COMMIT")
     except Exception:
@@ -292,6 +304,8 @@ def build_shadow_database(*, legacy_path: Path | str, active_path: Path | str, r
             "legacy_schema_fingerprint": extraction.schema_fingerprint,
             "migration": "bounded-current-state-only",
             "history_copied_wholesale": False,
+            "single_pinned_source_transaction": True,
+            "registered_sequence_frontiers": sequence_frontiers,
         },
     )
     persist_verified_checkpoint(storage, checkpoint_payload=checkpoint, source_truth=extraction.truth)
