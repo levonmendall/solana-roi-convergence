@@ -29,7 +29,7 @@ from . import production_data_cleanup_v4 as cleanup
 from . import production_disk_ownership as disk_ownership
 from .certification_replica_client import _replica_path
 
-SERVICE_VERSION = "isolated-certifier-cleanup-entrypoint-v2-path-telemetry"
+SERVICE_VERSION = "isolated-certifier-cleanup-entrypoint-v3-active-storage-child"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -38,6 +38,7 @@ STATUS_PATH = "/v1/operations/production-data-cleanup"
 _LOG = logging.getLogger("solana_roi.certifier_production_data_cleanup")
 
 _ORIGINAL_LIFESPAN = certifier.app.router.lifespan_context
+_ORIGINAL_CHILD_ENVIRONMENT = certifier._child_environment
 _STATE: dict[str, Any] = {
     "service_version": SERVICE_VERSION,
     "cleanup_version": cleanup.CLEANUP_VERSION,
@@ -46,11 +47,46 @@ _STATE: dict[str, Any] = {
     "runtime_disk_ownership_required": True,
     "same_release_lease_establishment_required": True,
     "worker_quiesced_until_cleanup_complete": True,
+    "active_storage_child_bridge": True,
     "paper_only": True,
     "live_money_authority": False,
     "signing_available": False,
     "transaction_submission_available": False,
 }
+
+
+def _active_storage_child_environment(snapshot: Path, release: str) -> dict[str, str]:
+    """Point an isolated certification child at its active-store cycle clone.
+
+    The certifier service itself owns a durable replica.  Each certification job
+    receives a disposable clone of that replica.  Once production has cut over
+    to active storage, the child must compose the clone with active lineage and
+    checkpoint semantics rather than accidentally treating it as a legacy DB.
+    No migration, legacy quarantine/restore, or shadow build is permitted inside
+    the isolated child.
+    """
+    env = _ORIGINAL_CHILD_ENVIRONMENT(snapshot, release)
+    enabled = env.get("SOLANA_ROI_ACTIVE_STORAGE_ENABLED", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if not enabled:
+        return env
+    env["SOLANA_ROI_DB_PATH"] = str(snapshot)
+    env["SOLANA_ROI_ACTIVE_DB_PATH"] = str(snapshot)
+    env["SOLANA_ROI_ACTIVE_STORAGE_ENABLED"] = "1"
+    env["SOLANA_ROI_ACTIVE_STORAGE_SHADOW"] = "0"
+    env["SOLANA_ROI_ACTIVE_STORAGE_FINALIZE_FROM_LEGACY"] = "0"
+    env["SOLANA_ROI_ACTIVE_STORAGE_HIDE_LEGACY"] = "0"
+    env["SOLANA_ROI_ACTIVE_STORAGE_RESTORE_LEGACY"] = "0"
+    env["SOLANA_ROI_RELEASE_COMMIT"] = release
+    env["GIT_COMMIT"] = release
+    return env
+
+
+# The existing Render command imports certifier_service:app, which imports this
+# wrapper after defining _child_environment.  Patch only that child environment;
+# the service worker, transport and authority remain unchanged.
+certifier._child_environment = _active_storage_child_environment
 
 
 def _env_true(name: str) -> bool:
@@ -69,6 +105,7 @@ def _set_state(**updates: Any) -> dict[str, Any]:
         {
             "service_version": SERVICE_VERSION,
             "cleanup_version": cleanup.CLEANUP_VERSION,
+            "active_storage_child_bridge": True,
             "paper_only": True,
             "live_money_authority": False,
             "signing_available": False,
