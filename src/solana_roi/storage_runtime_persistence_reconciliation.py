@@ -156,6 +156,13 @@ def _bounded_query(
     return [_row_dict(row) for row in rows]
 
 
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+    }
+
+
 def augment_runtime_current_state_truth(
     connection: sqlite3.Connection,
     tables: set[str],
@@ -223,8 +230,25 @@ def copy_bounded_runtime_evidence(
         str(row[0])
         for row in source.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
     }
+
+    # Helius changed its terminal timestamp from completed_at to updated_at.
+    # A production shadow may be built from either supported schema generation,
+    # so select the bounded rows using the columns the source actually exposes.
+    if "helius_webhook_inbox" in existing:
+        webhook_columns = _table_columns(source, "helius_webhook_inbox")
+        if "updated_at" in webhook_columns:
+            webhook_sql = "SELECT * FROM helius_webhook_inbox WHERE state<>'complete' OR updated_at>=?"
+        elif "completed_at" in webhook_columns:
+            webhook_sql = "SELECT * FROM helius_webhook_inbox WHERE state<>'complete' OR completed_at>=?"
+        else:
+            raise RuntimeError(
+                "migration blocked: helius_webhook_inbox lacks supported terminal timestamp"
+            )
+        copied = int(copy_query(source, destination, "helius_webhook_inbox", webhook_sql, (cutoff7,)))
+        if copied:
+            counts["helius_webhook_inbox"] = max(counts.get("helius_webhook_inbox", 0), copied)
+
     specs: Sequence[tuple[str, str, tuple[Any, ...]]] = (
-        ("helius_webhook_inbox", "SELECT * FROM helius_webhook_inbox WHERE state<>'complete' OR updated_at>=?", (cutoff7,)),
         ("direct_solana_recent_receipts", "SELECT * FROM direct_solana_recent_receipts WHERE expires_at>=?", (instant.isoformat(),)),
         ("direct_solana_minute_receipts", "SELECT * FROM direct_solana_minute_receipts WHERE bucket>=?", (cutoff31,)),
         ("direct_solana_hydration_queue", "SELECT * FROM direct_solana_hydration_queue WHERE status<>'complete' OR updated_at>=?", (cutoff7,)),
