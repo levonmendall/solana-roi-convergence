@@ -12,7 +12,7 @@ import httpx
 from . import robinhood_chain_core as core
 
 
-REPAIR_VERSION = "robinhood-getlogs-provider-guard-v4-validation-cloud-log-provider"
+REPAIR_VERSION = "robinhood-getlogs-provider-guard-v5-validation-cloud-composed-dispatch"
 ALCHEMY_SAFE_MAX_BLOCKS = 10
 MAX_CONFIGURED_BLOCKS = 10_000
 ENV_MAX_BLOCKS = "ROBINHOOD_ETH_GET_LOGS_MAX_BLOCKS"
@@ -257,29 +257,15 @@ async def _request_range(
     addresses: list[str] | tuple[str, ...] | None,
     topics: list[Any] | None,
 ) -> list[dict[str, Any]]:
+    """Serve one exact range through the existing governed provider path.
+
+    Validation Cloud dispatch intentionally lives one level above this function in
+    `_dispatch_range`. Production installs the capability repair by replacing this
+    function, so keeping the dedicated archive provider above that replacement makes
+    the production composition deterministic instead of import-order dependent.
+    """
     if _ORIGINAL_GET_LOGS is None:
         raise RuntimeError("Robinhood eth_getLogs provider guard is not installed")
-
-    if str(os.getenv(ENV_VALIDATION_CLOUD_RPC_URL) or "").strip():
-        _inc(self, "validation_cloud_requests")
-        try:
-            rows = await _validation_cloud_get_logs(
-                self,
-                from_block=from_block,
-                to_block=to_block,
-                addresses=addresses,
-                topics=topics,
-            )
-            _inc(self, "validation_cloud_successes")
-            return rows
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # The dedicated archive path has no authority to advance the caller's
-            # frontier on failure. Fall back to the already-governed canonical pool;
-            # if that pool cannot serve the exact same range, the request still fails
-            # closed below and the caller cursor remains unadvanced.
-            _inc(self, "validation_cloud_failures")
 
     try:
         return await _ORIGINAL_GET_LOGS(
@@ -311,6 +297,49 @@ async def _request_range(
         )
 
 
+async def _dispatch_range(
+    self: Any,
+    *,
+    from_block: int,
+    to_block: int,
+    addresses: list[str] | tuple[str, ...] | None,
+    topics: list[Any] | None,
+) -> list[dict[str, Any]]:
+    """Prefer the dedicated Validation Cloud log plane, then exact-range fallback.
+
+    This function is never replaced by the later capability-repair installer. That
+    keeps Validation Cloud log routing active in the fully composed production path
+    while preserving the capability layer as the governed fallback authority.
+    """
+    if str(os.getenv(ENV_VALIDATION_CLOUD_RPC_URL) or "").strip():
+        _inc(self, "validation_cloud_requests")
+        try:
+            rows = await _validation_cloud_get_logs(
+                self,
+                from_block=from_block,
+                to_block=to_block,
+                addresses=addresses,
+                topics=topics,
+            )
+            _inc(self, "validation_cloud_successes")
+            return rows
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Do not advance the caller frontier. The exact same interval is handed
+            # to the composed governed provider path below; if that path cannot serve
+            # it, the request remains fail-closed.
+            _inc(self, "validation_cloud_failures")
+
+    return await _request_range(
+        self,
+        from_block=from_block,
+        to_block=to_block,
+        addresses=addresses,
+        topics=topics,
+    )
+
+
 async def _provider_bounded_get_logs(
     self: Any,
     *,
@@ -325,7 +354,7 @@ async def _provider_bounded_get_logs(
     start = int(from_block)
     end = int(to_block)
     if end < start:
-        return await _request_range(
+        return await _dispatch_range(
             self,
             from_block=start,
             to_block=end,
@@ -338,7 +367,7 @@ async def _provider_bounded_get_logs(
     limit = _provider_max_blocks(self)
     if limit is None or requested_blocks <= limit:
         _set_max(self, "max_sent_blocks", requested_blocks)
-        return await _request_range(
+        return await _dispatch_range(
             self,
             from_block=start,
             to_block=end,
@@ -355,7 +384,7 @@ async def _provider_bounded_get_logs(
         _inc(self, "provider_requests")
         _set_max(self, "max_sent_blocks", chunk_blocks)
         rows.extend(
-            await _request_range(
+            await _dispatch_range(
                 self,
                 from_block=cursor,
                 to_block=chunk_end,
@@ -400,6 +429,7 @@ def status() -> dict[str, Any]:
         "validation_cloud_chain_verified": _VALIDATION_CLOUD_VERIFIED_ENDPOINT is not None,
         "validation_cloud_getlogs_only": True,
         "validation_cloud_preserves_primary_ws": True,
+        "validation_cloud_dispatch_above_capability_repair": True,
         "prevents_oversized_provider_requests": True,
         "inclusive_block_range_accounting": True,
         "http_403_same_range_failover": True,
@@ -420,6 +450,7 @@ __all__ = [
     "ENV_VALIDATION_CLOUD_MAX_BLOCKS",
     "ENV_VALIDATION_CLOUD_RPC_URL",
     "REPAIR_VERSION",
+    "_dispatch_range",
     "_failover_from_getlogs_403",
     "_is_alchemy_endpoint",
     "_is_getlogs_http_403",
