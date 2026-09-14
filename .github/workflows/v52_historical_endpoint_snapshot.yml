@@ -1,0 +1,48 @@
+name: v5.2 historical endpoint snapshot
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_historical_endpoint_snapshot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch deployed read-only v5.2 surfaces
+        shell: bash
+        env:
+          BASE_URL: https://solana-roi-convergence.onrender.com
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          for item in \
+            'strategy:/v1/strategy/v52' \
+            'performance_24h:/v1/strategy/v52/performance/24h' \
+            'performance_7d:/v1/strategy/v52/performance/7d' \
+            'performance_10d:/v1/strategy/v52/performance/10d' \
+            'performance_30d:/v1/strategy/v52/performance/30d' \
+            'wallet_forward_alpha:/v1/strategy/v52/wallet-forward-alpha'; do
+            name="${item%%:*}"
+            path="${item#*:}"
+            status="$(curl -sS --max-time 90 -o "output/${name}.json" -w '%{http_code}' "${BASE_URL}${path}" || true)"
+            printf '%s %s %s\n' "$name" "$status" "$path" | tee -a output/status.txt
+            if [ "$status" = 200 ]; then
+              python -m json.tool "output/${name}.json" > "output/${name}.pretty.json"
+              cat "output/${name}.pretty.json"
+            else
+              cat "output/${name}.json" || true
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v52-historical-endpoint-snapshot
+          path: output
+          retention-days: 7
