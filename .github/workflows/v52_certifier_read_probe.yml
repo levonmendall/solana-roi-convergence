@@ -1,0 +1,28 @@
+name: v5.2 certifier read probe
+
+on:
+  push:
+    branches:
+      - analysis/v52-historical-replay-20260914
+    paths:
+      - .github/workflows/v52_certifier_read_probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe certifier read-only surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://solana-roi-certifier.onrender.com
+          for path in /health /v1/strategy/production-proof /v1/strategy/e2e-status /v1/strategy/forward-certification /v1/operations/certification-db-logical-bootstrap; do
+            code=$(curl -sS --max-time 60 -o body.json -w '%{http_code}' "$base$path" || true)
+            echo "=== $path HTTP $code ==="
+            head -c 12000 body.json || true
+            echo
+          done
