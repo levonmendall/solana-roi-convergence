@@ -8,10 +8,11 @@ from . import robinhood_chain_runtime as runtime
 from . import robinhood_live_frontier_verification_repair as frontier
 
 
-EFFICIENCY_REPAIR_VERSION = "robinhood-provider-efficiency-v2-live-frontier-composed-market-log-batching"
+EFFICIENCY_REPAIR_VERSION = "robinhood-provider-efficiency-v3-aligned-frontier-dedup"
 _INSTALLED = False
 _ORIGINAL_FETCH_MARKET_LOGS = catchup._fetch_market_logs
 _ORIGINAL_FRONTIER_FETCH_MARKET_LOGS = frontier._fetch_market_logs
+_ORIGINAL_ADVANCE_LIVE_EPOCH = frontier._advance_live_epoch
 
 
 def _topic_zero(log: dict[str, Any]) -> str | None:
@@ -67,16 +68,11 @@ async def _combined_fetch_market_logs(
         for log in rows:
             key = runtime._clean_address(log.get("address"))
             topic_zero = _topic_zero(log)
-            # The combined provider query ORs all three topic[0] signatures. Recheck
-            # the venue-specific signature locally so this remains observationally
-            # identical to the prior separate V3 and V2 provider filters even if a
-            # contract emits an unexpected cross-family signature.
             if key in v3_by_market and topic_zero == v3_topic:
                 flattened.append(("v3", v3_by_market[key], log))
             elif key in v2_by_market and topic_zero in v2_topics:
                 flattened.append(("v2", v2_by_market[key], log))
 
-    # Preserve the exact catch-up/runtime deterministic chain order.
     flattened.sort(
         key=lambda row: (
             int(str(row[2].get("blockNumber") or "0x0"), 16),
@@ -95,16 +91,84 @@ async def _combined_fetch_market_logs(
     return flattened
 
 
+async def _advance_live_epoch_with_aligned_history_reuse(self: Any) -> None:
+    """Reuse a fully acquired live range for the aligned lossless cursor.
+
+    The live-frontier wrapper runs before historical catch-up on every poll. Once the
+    historical cursor has caught up exactly to the live cursor, a normal live advance
+    acquires factory and market logs for the same next range that historical catch-up
+    would immediately request again. After (and only after) the live lane reports a
+    successfully completed contiguous range, that acquisition is semantically the
+    same lossless range needed by the historical cursor, so persist the historical
+    cursor to the completed live frontier and let the following catch-up poll observe
+    that it is already current.
+
+    Backlog, initial anchoring, large-gap re-anchors, chain-head regression and failed
+    live ranges never take this path and therefore cannot skip historical evidence.
+    """
+    historical_before = frontier._historical_cursor(self)
+    live_before = frontier._live_cursor(self)
+    completed_before = int(getattr(self, "_roi_live_frontier_ranges_completed", 0) or 0)
+
+    await _ORIGINAL_ADVANCE_LIVE_EPOCH(self)
+
+    live_after = frontier._live_cursor(self)
+    completed_after = int(getattr(self, "_roi_live_frontier_ranges_completed", 0) or 0)
+    last_range = getattr(self, "_roi_live_epoch_last_range", None)
+
+    reusable = bool(
+        historical_before is not None
+        and live_before is not None
+        and historical_before == live_before
+        and live_after is not None
+        and live_after > live_before
+        and completed_after == completed_before + 1
+        and bool(getattr(self, "_roi_live_epoch_ready", False))
+        and isinstance(last_range, dict)
+        and int(last_range.get("from_block", -1)) == int(live_before) + 1
+        and int(last_range.get("to_block", -1)) == int(live_after)
+    )
+    if not reusable:
+        return
+
+    self._set_cursor(int(live_after))
+    reused_blocks = int(live_after) - int(live_before)
+    self._roi_live_frontier_ranges_reused_for_historical = int(
+        getattr(self, "_roi_live_frontier_ranges_reused_for_historical", 0) or 0
+    ) + 1
+    self._roi_live_frontier_blocks_reused_for_historical = int(
+        getattr(self, "_roi_live_frontier_blocks_reused_for_historical", 0) or 0
+    ) + reused_blocks
+    self._roi_live_frontier_last_reused_range = {
+        "from_block": int(live_before) + 1,
+        "to_block": int(live_after),
+        "blocks": reused_blocks,
+        "reason": "aligned_live_range_already_fully_acquired",
+    }
+    print(
+        "ROBINHOOD_FRONTIER_RANGE_REUSED_FOR_HISTORY "
+        f"from_block={int(live_before) + 1} to_block={int(live_after)} "
+        f"blocks={reused_blocks}",
+        flush=True,
+    )
+
+
+setattr(
+    _advance_live_epoch_with_aligned_history_reuse,
+    "_roi_robinhood_aligned_frontier_dedup",
+    True,
+)
+
+
 def install_robinhood_provider_efficiency_repair() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    # Both seams matter. The verified live-frontier module imports the catch-up helper
-    # by value, so replacing only catchup._fetch_market_logs leaves the actual
-    # forward-only production lane on the legacy two-query path. Bind the composed
-    # helper to both aliases before the production worker starts.
     catchup._fetch_market_logs = _combined_fetch_market_logs
     frontier._fetch_market_logs = _combined_fetch_market_logs
+    current_advance = frontier._advance_live_epoch
+    if not bool(getattr(current_advance, "_roi_robinhood_aligned_frontier_dedup", False)):
+        frontier._advance_live_epoch = _advance_live_epoch_with_aligned_history_reuse
     _INSTALLED = True
 
 
@@ -114,6 +178,11 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "composed_catchup_market_log_batching": catchup._fetch_market_logs is _combined_fetch_market_logs,
         "composed_live_frontier_market_log_batching": frontier._fetch_market_logs is _combined_fetch_market_logs,
+        "aligned_live_range_reused_for_historical_cursor": bool(
+            getattr(frontier._advance_live_epoch, "_roi_robinhood_aligned_frontier_dedup", False)
+        ),
+        "historical_backlog_skipped": False,
+        "large_gap_reanchor_reused_as_history": False,
         "combined_address_batch_size": runtime._combined_log_address_batch_size(),
         "factory_discovery_unchanged": True,
         "block_coverage_reduced": False,
@@ -132,6 +201,7 @@ def status() -> dict[str, Any]:
 
 __all__ = [
     "EFFICIENCY_REPAIR_VERSION",
+    "_advance_live_epoch_with_aligned_history_reuse",
     "install_robinhood_provider_efficiency_repair",
     "status",
 ]
