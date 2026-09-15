@@ -1,0 +1,43 @@
+name: PR405 Composed Hang Isolation
+
+on:
+  push:
+    branches:
+      - repair/robinhood-page-cache-bounded-status
+
+permissions:
+  contents: read
+
+jobs:
+  isolate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install locked runtime
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Run composed suite verbosely with stack dumps
+        env:
+          PYTHONPATH: src
+        run: |
+          timeout --signal=TERM --kill-after=5s 720s python -u - <<'PY'
+          import faulthandler
+          import pytest
+          import solana_roi.production
+
+          faulthandler.enable()
+          faulthandler.dump_traceback_later(60, repeat=True)
+          raise SystemExit(pytest.main([
+              '-vv', '-s', '--durations=25',
+              '--ignore=tests/test_main_no_history_rewrite.py',
+              '--ignore=tests/test_api_wallet_endpoints.py',
+              '--ignore=tests/test_api_top_traders.py',
+          ]))
+          PY
