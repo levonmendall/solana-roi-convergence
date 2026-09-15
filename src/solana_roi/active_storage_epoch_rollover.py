@@ -9,11 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from .active_storage import ActiveStorage, ActiveStorageBudget
+from .storage_file_retention import assert_persistent_file_registered
 from .storage_shadow_migration import build_shadow_database
 from .storage_transition import load_verified_checkpoint
 
 ROLLOVER_MARKER_SUFFIX = ".rollover-requested"
 SEALED_EPOCH_DIR = "active-epochs"
+ROLLOVER_MARKER_DATASET = "active_rollover_request"
+SEALED_EPOCH_DATASET = "sealed_active_epoch"
 
 
 def _utc_stamp() -> str:
@@ -62,6 +65,7 @@ def rollover_marker(path: Path | str) -> Path:
 
 def request_rollover(path: Path | str, *, reason: str, sizes: dict[str, int] | None = None) -> Path:
     """Persist a tiny restart-safe request without touching SQLite contents."""
+    assert_persistent_file_registered(ROLLOVER_MARKER_DATASET)
     candidate = Path(path)
     marker = rollover_marker(candidate)
     payload = {
@@ -69,6 +73,7 @@ def request_rollover(path: Path | str, *, reason: str, sizes: dict[str, int] | N
         "reason": str(reason),
         "database_path": str(candidate),
         "sizes": dict(sizes or {}),
+        "retention_dataset": ROLLOVER_MARKER_DATASET,
         "paper_only": True,
         "live_money_authority": False,
     }
@@ -104,6 +109,8 @@ def rollover_active_epoch_if_needed(
     This is deliberately a startup-only operation: callers must invoke it before
     opening the long-lived runtime store or starting workers.
     """
+    assert_persistent_file_registered(ROLLOVER_MARKER_DATASET)
+    assert_persistent_file_registered(SEALED_EPOCH_DATASET)
     active = Path(path)
     configured = budget or ActiveStorageBudget()
     marker = rollover_marker(active)
@@ -210,6 +217,7 @@ def rollover_active_epoch_if_needed(
         "warning_bytes": configured.warning_bytes,
         "hard_bytes": configured.hard_bytes,
         "sealed_source_path": str(sealed_main),
+        "sealed_source_retention_dataset": SEALED_EPOCH_DATASET,
         "sealed_source_deleted": False,
         "checkpoint_id": checkpoint.get("checkpoint_id"),
         "semantic_hash": report.semantic_hash,
@@ -227,7 +235,9 @@ def rollover_active_epoch_if_needed(
 
 __all__ = [
     "ROLLOVER_MARKER_SUFFIX",
+    "ROLLOVER_MARKER_DATASET",
     "SEALED_EPOCH_DIR",
+    "SEALED_EPOCH_DATASET",
     "request_rollover",
     "rollover_active_epoch_if_needed",
     "rollover_marker",
