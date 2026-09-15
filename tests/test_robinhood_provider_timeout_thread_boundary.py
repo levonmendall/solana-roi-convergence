@@ -87,7 +87,16 @@ def test_repeated_alchemy_getlogs_timeouts_fail_over_to_drpc_without_thread_grow
             transport=httpx.MockTransport(handler),
             timeout=0.05,
         )
-        wrapped = failover._rpc_wrapper(core.RobinhoodRpc.rpc)
+
+        # In the composed production regression suite, RobinhoodRpc.rpc has already
+        # been wrapped by the complete provider finalizer. Re-wrapping that public
+        # method with another failover wrapper recursively nests provider authority
+        # and makes this stress regression test-order dependent. Exercise the same
+        # inner RPC seam captured by the installed failover layer instead; isolated
+        # execution falls back to the raw class method before installation.
+        inner_rpc = failover._ORIGINAL_RPC or core.RobinhoodRpc.rpc
+        assert not bool(getattr(inner_rpc, "_roi_robinhood_provider_failover_rpc", False))
+        wrapped = failover._rpc_wrapper(inner_rpc)
 
         async def forbidden_to_thread(*_args, **_kwargs):
             raise AssertionError("Robinhood provider failover must not enter asyncio.to_thread")
