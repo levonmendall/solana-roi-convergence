@@ -22,6 +22,9 @@ from .v51_evidence_analytics import (
 from .v51_execution_stress_diagnostics import build_execution_mechanism_stress
 from .v51_latency_challenger import build_latency_challenger_research
 from .v51_promotion_proof import refresh_release_attestation
+from .robinhood_proof_price_io_observability import install_robinhood_proof_price_io_observability
+
+install_robinhood_proof_price_io_observability()
 
 PROOF_CACHE_SECONDS = 30.0
 _CACHE_LOCK = threading.Lock()
