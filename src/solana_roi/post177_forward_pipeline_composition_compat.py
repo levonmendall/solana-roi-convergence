@@ -11,6 +11,7 @@ from . import post178_scout_terminal_classification_fix as post178_scout
 from . import unified_strategy_status as unified_status
 from .config import BASELINE
 from .direct_solana import DirectSolanaIngestionPlane
+from .robinhood_broad_observation import install_robinhood_broad_observation
 
 
 COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v3"
@@ -132,6 +133,12 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
 
     post178.install_post178_e2e_residual_repair(plane_cls)
     post178_scout.install_post178_scout_terminal_classification_fix()
+
+    # Install permanent V2/V4 observation only after the final Robinhood policy and
+    # scheduler composition. The observer is feature-gated off by default while the
+    # storage migration is active, reuses existing launch/swap tables, and cannot
+    # authorize entries, exits, signing, submission, or live money.
+    install_robinhood_broad_observation(plane_cls)
 
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_installed", True)
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_version", COMPAT_VERSION)
