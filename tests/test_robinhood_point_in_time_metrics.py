@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 
+import pytest
+
 from solana_roi.robinhood_chain_metrics import RobinhoodMetricsMixin
 
 
@@ -72,7 +74,7 @@ def test_out_of_order_and_late_arrival_use_event_time_not_ingestion_order() -> N
     shuffled = _MetricsHarness()._recent_metrics(late_arrival_order, now_ts=now)
 
     assert shuffled == ordered
-    assert shuffled["price_change_60s"] == 0.05
+    assert shuffled["price_change_60s"] == pytest.approx(0.05)
     assert shuffled["trigger_actor"] == "0x" + "3" * 40
 
 
