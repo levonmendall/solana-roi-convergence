@@ -6,7 +6,7 @@ from . import continuation_market_recalibration as continuation
 from . import fomo_paper_strategy as fomo_paper
 from . import risk_conditioned_alpha_v51 as v51
 
-REPAIR_VERSION = "v52-cross-lane-paper-certification-v3"
+REPAIR_VERSION = "v52-cross-lane-paper-certification-v4"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -33,12 +33,7 @@ def _qualified_fomo_open_fraction(adapter: Any) -> float:
 
 
 def _same_opportunity_solana_entry(adapter: Any, signature: str) -> bool:
-    """Detect only the exact same authoritative SOLANA opportunity identity.
-
-    Independent market-flow FOMO uses a distinct ``market-flow:`` signature and is
-    intentionally unaffected. This is a portfolio-construction dedupe, not a
-    strategy threshold or qualification change.
-    """
+    """Detect only the exact same authoritative SOLANA opportunity identity."""
     try:
         with adapter.store._lock:
             row = adapter.store.db.execute(
@@ -82,13 +77,7 @@ def _set_v5_rows_observe_preserving_terminal_rejections(adapter: Any, signature:
 
 
 def _build_pre_from_trials_preserving_terminal_rejections(adapter: Any, row: dict[str, Any]) -> Any:
-    """Stop v5.2 profit-confidence recomposition at an upstream terminal reject.
-
-    The completion wrapper calls this helper only after its base buy path has
-    persisted v5 trial decisions. Returning ``None`` here uses the wrapper's normal
-    early-return boundary, before any completion-layer requote, execution, or
-    decision rewrite can occur.
-    """
+    """Stop v5.2 profit-confidence recomposition at an upstream terminal reject."""
     if _ORIGINAL_V52_BUILD_PRE_FROM_TRIALS is None:
         raise RuntimeError("v52 profit-confidence terminal-decision precedence repair not installed")
     signature = str(row.get("signature") or "")
@@ -97,19 +86,15 @@ def _build_pre_from_trials_preserving_terminal_rejections(adapter: Any, row: dic
     return _ORIGINAL_V52_BUILD_PRE_FROM_TRIALS(adapter, row)
 
 
-def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any, signature: str) -> bool:
-    if _ORIGINAL_RECORD_PAPER_TRIAL is None:
-        raise RuntimeError("v52 cross-lane paper certification repair not installed")
-
-    inserted = bool(_ORIGINAL_RECORD_PAPER_TRIAL(adapter, signature))
-    if not _same_opportunity_solana_entry(adapter, signature):
-        return inserted
-
-    # The FOMO strategy layer may independently prefer the same source event after
-    # the authoritative SOLANA lane already accepted it. Preserve that analytical
-    # intent in the append-only event history, but make the durable paper-trial
-    # disposition explicit and non-reservable so one economic opportunity cannot
-    # consume portfolio capital twice.
+def _suppress_fomo_entry(
+    adapter: Any,
+    signature: str,
+    *,
+    decision: str,
+    reason: str,
+    event_type: str,
+) -> bool:
+    """Make a same-signature FOMO paper entry explicitly non-reservable."""
     with adapter.store._lock, adapter.store.db:
         row = adapter.store.db.execute(
             "SELECT id,token_mint,decision,decision_reason,position_fraction "
@@ -117,23 +102,19 @@ def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any,
             (adapter.release_commit, signature),
         ).fetchone()
         if row is None or not str(row["decision"] or "").startswith("paper_enter"):
-            return inserted
+            return False
         prior_decision = str(row["decision"] or "")
         prior_fraction = float(row["position_fraction"] or 0.0)
         adapter.store.db.execute(
             "UPDATE fomo_paper_trials SET decision=?,decision_reason=?,position_fraction=0.0 "
             "WHERE id=? AND decision LIKE 'paper_enter%'",
-            (
-                "no_entry_duplicate_authoritative_solana_opportunity",
-                "same_source_signature_already_has_authoritative_solana_paper_entry",
-                int(row["id"]),
-            ),
+            (decision, reason, int(row["id"])),
         )
         token_mint = str(row["token_mint"] or "")
 
     try:
         adapter.store.append(
-            "v52_cross_lane_paper_dedup",
+            event_type,
             continuation._utcnow(),
             {
                 "source_signature": signature,
@@ -142,8 +123,8 @@ def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any,
                 "authoritative_existing_surface": "SOLANA",
                 "prior_fomo_decision": prior_decision,
                 "prior_fomo_position_fraction": prior_fraction,
-                "final_fomo_decision": "no_entry_duplicate_authoritative_solana_opportunity",
-                "reason": "same_source_signature_already_has_authoritative_solana_paper_entry",
+                "final_fomo_decision": decision,
+                "reason": reason,
                 "strategy_thresholds_changed": False,
                 "qualification_changed": False,
                 "paper_only": True,
@@ -152,6 +133,43 @@ def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any,
         )
     except Exception:
         pass
+    return True
+
+
+def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any, signature: str) -> bool:
+    if _ORIGINAL_RECORD_PAPER_TRIAL is None:
+        raise RuntimeError("v52 cross-lane paper certification repair not installed")
+
+    inserted = bool(_ORIGINAL_RECORD_PAPER_TRIAL(adapter, signature))
+
+    # A terminal authoritative rejection is stronger than any same-event advisory
+    # FOMO preference. Keep independent market-flow FOMO untouched because those
+    # rows use distinct market-flow signatures and have no matching v5 reject.
+    if _terminal_v5_rejection_exists(adapter, signature):
+        _suppress_fomo_entry(
+            adapter,
+            signature,
+            decision="no_entry_terminal_authoritative_solana_rejection",
+            reason="same_source_signature_has_terminal_authoritative_solana_rejection",
+            event_type="v52_cross_lane_terminal_rejection",
+        )
+        return inserted
+
+    if not _same_opportunity_solana_entry(adapter, signature):
+        return inserted
+
+    # The FOMO strategy layer may independently prefer the same source event after
+    # the authoritative SOLANA lane already accepted it. Preserve that analytical
+    # intent in the append-only event history, but make the durable paper-trial
+    # disposition explicit and non-reservable so one economic opportunity cannot
+    # consume portfolio capital twice.
+    _suppress_fomo_entry(
+        adapter,
+        signature,
+        decision="no_entry_duplicate_authoritative_solana_opportunity",
+        reason="same_source_signature_already_has_authoritative_solana_paper_entry",
+        event_type="v52_cross_lane_paper_dedup",
+    )
     return inserted
 
 
@@ -181,6 +199,7 @@ def status() -> dict[str, Any]:
         "installed": _INSTALLED,
         "fomo_open_fraction_sql_qualified": True,
         "same_source_signature_cross_lane_double_allocation_blocked": True,
+        "same_source_signature_terminal_rejection_blocks_fomo_reservation": True,
         "independent_market_flow_fomo_preserved": True,
         "v51_downstream_sizing_preserves_terminal_v5_rejections": True,
         "v52_profit_confidence_preserves_terminal_v5_rejections_before_requote": True,
