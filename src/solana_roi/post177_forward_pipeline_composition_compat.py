@@ -8,12 +8,13 @@ from . import post104_production_architecture_repair as post104
 from . import post177_forward_pipeline_bottleneck_repair as repair
 from . import post178_e2e_residual_repair as post178
 from . import post178_scout_terminal_classification_fix as post178_scout
+from . import robinhood_provider_efficiency_repair as provider_efficiency
 from . import unified_strategy_status as unified_status
 from .config import BASELINE
 from .direct_solana import DirectSolanaIngestionPlane
 
 
-COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v3"
+COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v4-provider-efficiency-final-binding"
 _FINAL_DIRECT_STATUS: Callable[..., dict[str, Any]] | None = None
 
 
@@ -104,7 +105,9 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
     final standby-over-background RPC governor, preserve wrapper lineage markers,
     and leave unified-status composition to the repository's existing readiness
     installer before the post-178 residual repair applies its final current-frontier
-    semantics.
+    semantics. Bind provider-efficiency aliases only after those final Robinhood
+    wrappers are installed so the production live-frontier cannot retain an older
+    by-value market-log helper.
     """
 
     global _FINAL_DIRECT_STATUS
@@ -132,6 +135,13 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
 
     post178.install_post178_e2e_residual_repair(plane_cls)
     post178_scout.install_post178_scout_terminal_classification_fix()
+
+    # robinhood_live_frontier_verification_repair imports _fetch_market_logs by value.
+    # The efficiency helper therefore must be rebound at the final production
+    # composition boundary, not merely defined in its own module or exercised by
+    # unit tests. This changes provider request composition only: factory discovery,
+    # exact block coverage, market scope, ordering and paper authority are unchanged.
+    provider_efficiency.install_robinhood_provider_efficiency_repair()
 
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_installed", True)
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_version", COMPAT_VERSION)
