@@ -73,6 +73,23 @@ class ActiveStorage:
         self.path = Path(path)
         self.budget = budget or ActiveStorageBudget()
 
+    def _install_page_boundary(self, conn: sqlite3.Connection) -> None:
+        """Install the connection-local SQLite page ceiling on every writer.
+
+        SQLite's max_page_count is not durable across new connections.  Treating
+        initialization as a persistent physical quota therefore leaves later
+        connections uncapped.  ActiveStorage owns this connection factory, so
+        every connection must re-install and verify the ceiling before use.
+        """
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        hard_pages = max(1, int(self.budget.hard_bytes) // page_size)
+        effective_max = int(conn.execute(f"PRAGMA max_page_count={hard_pages}").fetchone()[0])
+        if effective_max > hard_pages:
+            conn.close()
+            raise RuntimeError(
+                f"active storage page boundary could not be installed: {effective_max} > {hard_pages}"
+            )
+
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30.0)
         conn.row_factory = sqlite3.Row
@@ -80,6 +97,7 @@ class ActiveStorage:
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
+        self._install_page_boundary(conn)
         return conn
 
     def initialize(self, *, epoch_id: str) -> None:
@@ -94,13 +112,7 @@ class ActiveStorage:
             conn.executescript(_SCHEMA_SQL)
             actual = self.ordinary_tables(conn)
             assert_registered(actual)
-            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
-            hard_pages = max(1, int(self.budget.hard_bytes) // page_size)
-            effective_max = int(conn.execute(f"PRAGMA max_page_count={hard_pages}").fetchone()[0])
-            if effective_max > hard_pages:
-                raise RuntimeError(
-                    f"active storage page boundary could not be installed: {effective_max} > {hard_pages}"
-                )
+            self._install_page_boundary(conn)
             now = _utc_now()
             conn.execute(
                 "INSERT INTO storage_epoch_state(singleton_key,epoch_id,opened_at,warning_bytes,hard_bytes,status,last_checkpoint_id,updated_at) "
