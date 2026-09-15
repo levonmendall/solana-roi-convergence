@@ -4,8 +4,9 @@ from typing import Any, Callable
 
 from . import continuation_market_recalibration as continuation
 from . import fomo_paper_strategy as fomo_paper
+from . import risk_conditioned_alpha_v51 as v51
 
-REPAIR_VERSION = "v52-cross-lane-paper-certification-v1"
+REPAIR_VERSION = "v52-cross-lane-paper-certification-v2"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -13,6 +14,7 @@ TRANSACTION_SUBMISSION_AVAILABLE = False
 
 _INSTALLED = False
 _ORIGINAL_RECORD_PAPER_TRIAL: Callable[[Any, str], bool] | None = None
+_ORIGINAL_SET_V5_ROWS_OBSERVE: Callable[[Any, str, str], None] | None = None
 
 
 def _qualified_fomo_open_fraction(adapter: Any) -> float:
@@ -47,6 +49,34 @@ def _same_opportunity_solana_entry(adapter: Any, signature: str) -> bool:
         return row is not None
     except Exception:
         return False
+
+
+def _terminal_v5_rejection_exists(adapter: Any, signature: str) -> bool:
+    """Return whether upstream strategy evaluation already issued a terminal reject.
+
+    v5.1 exact-sizing reconciliation is downstream of strategy safety evaluation.
+    It may convert a still-actionable candidate into an observe state when sizing
+    fails to converge, but it must never erase an established ``reject_*`` result.
+    """
+    try:
+        with adapter.store._lock:
+            row = adapter.store.db.execute(
+                "SELECT 1 FROM risk_conditioned_alpha_v5_trials "
+                "WHERE release_commit=? AND source_signature=? "
+                "AND decision LIKE 'reject_%' LIMIT 1",
+                (adapter.release_commit, signature),
+            ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _set_v5_rows_observe_preserving_terminal_rejections(adapter: Any, signature: str, reason: str) -> None:
+    if _ORIGINAL_SET_V5_ROWS_OBSERVE is None:
+        raise RuntimeError("v52 v5.1 terminal-decision precedence repair not installed")
+    if _terminal_v5_rejection_exists(adapter, signature):
+        return
+    _ORIGINAL_SET_V5_ROWS_OBSERVE(adapter, signature, reason)
 
 
 def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any, signature: str) -> bool:
@@ -108,12 +138,14 @@ def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any,
 
 
 def configure_v52_cross_lane_paper_certification_repair() -> None:
-    global _INSTALLED, _ORIGINAL_RECORD_PAPER_TRIAL
+    global _INSTALLED, _ORIGINAL_RECORD_PAPER_TRIAL, _ORIGINAL_SET_V5_ROWS_OBSERVE
     if _INSTALLED:
         return
     continuation._fomo_open_fraction = _qualified_fomo_open_fraction
     _ORIGINAL_RECORD_PAPER_TRIAL = fomo_paper._record_paper_trial
     fomo_paper._record_paper_trial = _record_paper_trial_without_same_opportunity_double_allocation
+    _ORIGINAL_SET_V5_ROWS_OBSERVE = v51._set_v5_rows_observe
+    v51._set_v5_rows_observe = _set_v5_rows_observe_preserving_terminal_rejections
     _INSTALLED = True
 
 
@@ -124,6 +156,8 @@ def status() -> dict[str, Any]:
         "fomo_open_fraction_sql_qualified": True,
         "same_source_signature_cross_lane_double_allocation_blocked": True,
         "independent_market_flow_fomo_preserved": True,
+        "v51_downstream_sizing_preserves_terminal_v5_rejections": True,
+        "mechanical_hard_stop_precedence_preserved": True,
         "strategy_thresholds_changed": False,
         "qualification_changed": False,
         "paper_only": PAPER_ONLY,
