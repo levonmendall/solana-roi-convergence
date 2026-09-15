@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 
-OBSERVABILITY_VERSION = "sqlite-startup-phase-attribution-v1"
+OBSERVABILITY_VERSION = "sqlite-phase-attribution-v2-thread-io-psi"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _INSTALLED = False
 
@@ -32,12 +32,40 @@ def _read_key_values(path: Path) -> dict[str, int]:
     return values
 
 
-def _proc_io() -> dict[str, int]:
+def _read_proc_io(path: Path) -> dict[str, int]:
     values: dict[str, int] = {}
     try:
-        for line in Path("/proc/self/io").read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             key, raw = line.split(":", 1)
             values[key.strip()] = int(raw.strip())
+    except (OSError, ValueError):
+        return values
+    return values
+
+
+def _proc_io() -> dict[str, int]:
+    return _read_proc_io(Path("/proc/self/io"))
+
+
+def _thread_io() -> dict[str, int]:
+    # /proc/thread-self resolves to the task currently executing this snapshot.
+    # This lets synchronous SQLite phase wrappers distinguish their own I/O from
+    # unrelated process-wide work happening concurrently in other workers.
+    return _read_proc_io(Path("/proc/thread-self/io"))
+
+
+def _read_pressure_totals(path: Path) -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            kind = parts[0]
+            for field in parts[1:]:
+                if field.startswith("total="):
+                    values[kind] = int(field.split("=", 1)[1])
+                    break
     except (OSError, ValueError):
         return values
     return values
@@ -70,11 +98,13 @@ def _size(path: Path) -> int | None:
 
 def resource_snapshot(store: Any | None = None) -> dict[str, Any]:
     stat = _read_key_values(_CGROUP_ROOT / "memory.stat")
+    pressure = _read_pressure_totals(_CGROUP_ROOT / "memory.pressure")
     file_bytes = int(stat.get("file", 0))
     dirty_bytes = int(stat.get("file_dirty", 0))
     writeback_bytes = int(stat.get("file_writeback", 0))
     db_path = _db_path(store)
     io = _proc_io()
+    thread_io = _thread_io()
     return {
         "memory_current_bytes": _read_int(_CGROUP_ROOT / "memory.current"),
         "memory_max_bytes": _read_int(_CGROUP_ROOT / "memory.max"),
@@ -83,9 +113,17 @@ def resource_snapshot(store: Any | None = None) -> dict[str, Any]:
         "clean_file_cache_bytes_estimate": max(0, file_bytes - dirty_bytes - writeback_bytes),
         "file_dirty_bytes": dirty_bytes,
         "file_writeback_bytes": writeback_bytes,
+        "cgroup_pgfault": int(stat.get("pgfault", 0)),
+        "cgroup_pgmajfault": int(stat.get("pgmajfault", 0)),
+        "cgroup_workingset_refault_file": int(stat.get("workingset_refault_file", 0)),
+        "cgroup_workingset_activate_file": int(stat.get("workingset_activate_file", 0)),
+        "memory_psi_some_total_us": pressure.get("some"),
+        "memory_psi_full_total_us": pressure.get("full"),
         "sqlite_db_bytes": _size(db_path),
         "sqlite_wal_bytes": _size(Path(f"{db_path}-wal")),
         "sqlite_shm_bytes": _size(Path(f"{db_path}-shm")),
+        # Process totals remain useful for service-level accounting, but must not be
+        # interpreted as phase ownership when other workers are running concurrently.
         "proc_read_bytes": io.get("read_bytes"),
         "proc_write_bytes": io.get("write_bytes"),
         "proc_rchar": io.get("rchar"),
@@ -93,6 +131,15 @@ def resource_snapshot(store: Any | None = None) -> dict[str, Any]:
         "proc_syscr": io.get("syscr"),
         "proc_syscw": io.get("syscw"),
         "proc_cancelled_write_bytes": io.get("cancelled_write_bytes"),
+        # Thread totals are the causal I/O signal for synchronous phase wrappers
+        # such as direct-Solana prune and WAL checkpoint.
+        "thread_read_bytes": thread_io.get("read_bytes"),
+        "thread_write_bytes": thread_io.get("write_bytes"),
+        "thread_rchar": thread_io.get("rchar"),
+        "thread_wchar": thread_io.get("wchar"),
+        "thread_syscr": thread_io.get("syscr"),
+        "thread_syscw": thread_io.get("syscw"),
+        "thread_cancelled_write_bytes": thread_io.get("cancelled_write_bytes"),
         "pids_current": _read_int(_CGROUP_ROOT / "pids.current"),
         "threads": _thread_count(),
     }
@@ -128,7 +175,11 @@ def emit_phase(
         "resource_control_changed": False,
         "retention_changed": False,
     }
-    print("ROI_SQLITE_PHASE " + json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str), flush=True)
+    print(
+        "ROI_SQLITE_PHASE "
+        + json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
+        flush=True,
+    )
 
 
 def _sync_phase(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
@@ -148,11 +199,21 @@ def _sync_phase(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
             error = exc
             raise
         finally:
-            detail: dict[str, Any] = {}
-            if isinstance(result, tuple) and len(result) == 2 and all(isinstance(v, int) for v in result):
+            detail: dict[str, Any] = {
+                "io_attribution": "thread_exact_for_sync_phase;process_concurrent_context_only"
+            }
+            if (
+                isinstance(result, tuple)
+                and len(result) == 2
+                and all(isinstance(v, int) for v in result)
+            ):
                 detail["queue_rows"] = int(result[0])
                 detail["metric_rows"] = int(result[1])
-            elif isinstance(result, tuple) and len(result) == 3 and all(isinstance(v, int) for v in result):
+            elif (
+                isinstance(result, tuple)
+                and len(result) == 3
+                and all(isinstance(v, int) for v in result)
+            ):
                 detail["checkpoint_busy"] = int(result[0])
                 detail["checkpoint_log_frames"] = int(result[1])
                 detail["checkpointed_frames"] = int(result[2])
@@ -170,7 +231,9 @@ def _sync_phase(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
     return wrapped
 
 
-def _async_worker_phase(name: str, original: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+def _async_worker_phase(
+    name: str, original: Callable[..., Awaitable[Any]]
+) -> Callable[..., Awaitable[Any]]:
     if bool(getattr(original, "_roi_sqlite_worker_observed", False)):
         return original
 
@@ -188,7 +251,9 @@ def _async_worker_phase(name: str, original: Callable[..., Awaitable[Any]]) -> C
                 duration_ms=(time.perf_counter() - started) * 1000.0,
             )
 
-        marker = asyncio.create_task(after_activation(), name=f"roi-observe-{name}-activation")
+        marker = asyncio.create_task(
+            after_activation(), name=f"roi-observe-{name}-activation"
+        )
         try:
             return await original(self, *args, **kwargs)
         finally:
@@ -204,7 +269,9 @@ def _async_worker_phase(name: str, original: Callable[..., Awaitable[Any]]) -> C
     return wrapped
 
 
-def _bootstrap_phase(original: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+def _bootstrap_phase(
+    original: Callable[..., Awaitable[Any]],
+) -> Callable[..., Awaitable[Any]]:
     if bool(getattr(original, "_roi_sqlite_bootstrap_observed", False)):
         return original
 
@@ -226,7 +293,9 @@ def _bootstrap_phase(original: Callable[..., Awaitable[Any]]) -> Callable[..., A
             emit_phase(
                 "runtime-bootstrap",
                 before=before,
-                after=resource_snapshot(getattr(result, "store", None) if result is not None else None),
+                after=resource_snapshot(
+                    getattr(result, "store", None) if result is not None else None
+                ),
                 duration_ms=(time.perf_counter() - started) * 1000.0,
                 detail=detail,
             )
@@ -248,12 +317,16 @@ def install_sqlite_phase_observability() -> None:
     from .webhook_queue import HeliusWebhookWorker
 
     storage._prune_operational_rows_once = _sync_phase(
-        "direct-solana-storage-maintenance:prune", storage._prune_operational_rows_once
+        "direct-solana-storage-maintenance:prune",
+        storage._prune_operational_rows_once,
     )
     storage._checkpoint_wal = _sync_phase(
-        "direct-solana-storage-maintenance:wal-checkpoint", storage._checkpoint_wal
+        "direct-solana-storage-maintenance:wal-checkpoint",
+        storage._checkpoint_wal,
     )
-    bootstrap._build_runtime_until_ready = _bootstrap_phase(bootstrap._build_runtime_until_ready)
+    bootstrap._build_runtime_until_ready = _bootstrap_phase(
+        bootstrap._build_runtime_until_ready
+    )
 
     DirectSolanaIngestionPlane.run = _async_worker_phase(
         "direct-solana-ingestion", DirectSolanaIngestionPlane.run
@@ -261,7 +334,9 @@ def install_sqlite_phase_observability() -> None:
     ContinuousWalletDiscovery.run = _async_worker_phase(
         "continuous-wallet-discovery", ContinuousWalletDiscovery.run
     )
-    ShadowPriceClock.run = _async_worker_phase("shadow-price-clock", ShadowPriceClock.run)
+    ShadowPriceClock.run = _async_worker_phase(
+        "shadow-price-clock", ShadowPriceClock.run
+    )
     HeliusWebhookWorker.run = _async_worker_phase(
         "legacy-helius-webhook-worker", HeliusWebhookWorker.run
     )
