@@ -6,7 +6,7 @@ from . import continuation_market_recalibration as continuation
 from . import fomo_paper_strategy as fomo_paper
 from . import risk_conditioned_alpha_v51 as v51
 
-REPAIR_VERSION = "v52-cross-lane-paper-certification-v2"
+REPAIR_VERSION = "v52-cross-lane-paper-certification-v3"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -15,6 +15,7 @@ TRANSACTION_SUBMISSION_AVAILABLE = False
 _INSTALLED = False
 _ORIGINAL_RECORD_PAPER_TRIAL: Callable[[Any, str], bool] | None = None
 _ORIGINAL_SET_V5_ROWS_OBSERVE: Callable[[Any, str, str], None] | None = None
+_ORIGINAL_V52_BUILD_PRE_FROM_TRIALS: Callable[..., Any] | None = None
 
 
 def _qualified_fomo_open_fraction(adapter: Any) -> float:
@@ -54,9 +55,10 @@ def _same_opportunity_solana_entry(adapter: Any, signature: str) -> bool:
 def _terminal_v5_rejection_exists(adapter: Any, signature: str) -> bool:
     """Return whether upstream strategy evaluation already issued a terminal reject.
 
-    v5.1 exact-sizing reconciliation is downstream of strategy safety evaluation.
-    It may convert a still-actionable candidate into an observe state when sizing
-    fails to converge, but it must never erase an established ``reject_*`` result.
+    v5.1 exact-sizing reconciliation and v5.2 profit-confidence completion are both
+    downstream of the strategy safety decision. They may refine sizing for an
+    actionable candidate, but they must never erase an established ``reject_*``
+    result or turn it back into a paper entry.
     """
     try:
         with adapter.store._lock:
@@ -77,6 +79,22 @@ def _set_v5_rows_observe_preserving_terminal_rejections(adapter: Any, signature:
     if _terminal_v5_rejection_exists(adapter, signature):
         return
     _ORIGINAL_SET_V5_ROWS_OBSERVE(adapter, signature, reason)
+
+
+def _build_pre_from_trials_preserving_terminal_rejections(adapter: Any, row: dict[str, Any]) -> Any:
+    """Stop v5.2 profit-confidence recomposition at an upstream terminal reject.
+
+    The completion wrapper calls this helper only after its base buy path has
+    persisted v5 trial decisions. Returning ``None`` here uses the wrapper's normal
+    early-return boundary, before any completion-layer requote, execution, or
+    decision rewrite can occur.
+    """
+    if _ORIGINAL_V52_BUILD_PRE_FROM_TRIALS is None:
+        raise RuntimeError("v52 profit-confidence terminal-decision precedence repair not installed")
+    signature = str(row.get("signature") or "")
+    if signature and _terminal_v5_rejection_exists(adapter, signature):
+        return None
+    return _ORIGINAL_V52_BUILD_PRE_FROM_TRIALS(adapter, row)
 
 
 def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any, signature: str) -> bool:
@@ -139,13 +157,21 @@ def _record_paper_trial_without_same_opportunity_double_allocation(adapter: Any,
 
 def configure_v52_cross_lane_paper_certification_repair() -> None:
     global _INSTALLED, _ORIGINAL_RECORD_PAPER_TRIAL, _ORIGINAL_SET_V5_ROWS_OBSERVE
+    global _ORIGINAL_V52_BUILD_PRE_FROM_TRIALS
     if _INSTALLED:
         return
+
+    # Import lazily so the certification repair can be configured before the full
+    # production composition without changing installer order.
+    from . import v52_profit_confidence_completion as profit_completion
+
     continuation._fomo_open_fraction = _qualified_fomo_open_fraction
     _ORIGINAL_RECORD_PAPER_TRIAL = fomo_paper._record_paper_trial
     fomo_paper._record_paper_trial = _record_paper_trial_without_same_opportunity_double_allocation
     _ORIGINAL_SET_V5_ROWS_OBSERVE = v51._set_v5_rows_observe
     v51._set_v5_rows_observe = _set_v5_rows_observe_preserving_terminal_rejections
+    _ORIGINAL_V52_BUILD_PRE_FROM_TRIALS = profit_completion._build_pre_from_trials
+    profit_completion._build_pre_from_trials = _build_pre_from_trials_preserving_terminal_rejections
     _INSTALLED = True
 
 
@@ -157,6 +183,7 @@ def status() -> dict[str, Any]:
         "same_source_signature_cross_lane_double_allocation_blocked": True,
         "independent_market_flow_fomo_preserved": True,
         "v51_downstream_sizing_preserves_terminal_v5_rejections": True,
+        "v52_profit_confidence_preserves_terminal_v5_rejections_before_requote": True,
         "mechanical_hard_stop_precedence_preserved": True,
         "strategy_thresholds_changed": False,
         "qualification_changed": False,
