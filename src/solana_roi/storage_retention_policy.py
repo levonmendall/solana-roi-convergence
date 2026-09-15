@@ -44,9 +44,9 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy(
         "v52_wallet_forward_validation",
         "semantic_milestones",
-        "semantic transition immediately; unchanged complete state every 1h",
+        3600,
         "writer",
-        "Preserve validation authority transitions without minute-by-minute duplicate durable snapshots.",
+        "Persist semantic authority transitions immediately and unchanged complete validation as an hourly milestone.",
     ),
     RetentionPolicy(
         "v52_wallet_forward_runtime_state",
