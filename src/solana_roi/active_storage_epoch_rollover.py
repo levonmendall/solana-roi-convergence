@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -93,6 +94,37 @@ def _remove_zero_sidecars(path: Path) -> None:
             sidecar.unlink()
 
 
+def _remove_successor_family(path: Path) -> None:
+    """Remove only an uninstalled temporary successor family after a failed build."""
+    for candidate in (Path(str(path) + "-wal"), Path(str(path) + "-shm"), path):
+        if candidate.exists():
+            candidate.unlink()
+
+
+def _rollover_headroom(path: Path, budget: ActiveStorageBudget) -> dict[str, int]:
+    """Fail closed unless a bounded shadow build has safe temporary disk headroom.
+
+    The migration uses WAL mode and can temporarily hold both the bounded database
+    body and a similarly sized WAL before checkpointing. The source epoch is never
+    deleted to make room. Requiring two hard-boundary bodies therefore prevents a
+    near-full disk from being consumed by a half-built successor.
+    """
+    usage = shutil.disk_usage(path.parent)
+    required = max(1, int(budget.hard_bytes)) * 2
+    free = int(usage.free)
+    if free < required:
+        raise RuntimeError(
+            "active epoch rollover blocked: insufficient temporary disk headroom:"
+            f"free={free}:required={required}:hard_bytes={int(budget.hard_bytes)}"
+        )
+    return {
+        "disk_total_bytes": int(usage.total),
+        "disk_used_bytes": int(usage.used),
+        "disk_free_bytes": free,
+        "required_rollover_free_bytes": required,
+    }
+
+
 def rollover_active_epoch_if_needed(
     path: Path | str,
     *,
@@ -130,6 +162,10 @@ def rollover_active_epoch_if_needed(
     if not active.is_file():
         raise RuntimeError(f"active epoch rollover blocked: requested database missing:{active}")
 
+    # Refuse the build before checkpointing or creating any temporary successor
+    # when the persistent filesystem cannot safely hold the bounded replacement.
+    headroom = _rollover_headroom(active, configured)
+
     # Fold the source WAL into the current main before any archival link is made.
     # With no runtime store/workers open, this is a bounded quiescent checkpoint.
     _truncate_wal(active)
@@ -137,62 +173,69 @@ def rollover_active_epoch_if_needed(
 
     token = uuid.uuid4().hex
     successor = active.with_name(f".{active.name}.epoch-next-{token}")
-    report = build_shadow_database(
-        legacy_path=active,
-        active_path=successor,
-        release_sha=release_sha,
-        replace_existing=True,
-    )
-    if not report.equivalent:
-        raise RuntimeError(
-            "active epoch rollover blocked: successor semantic equivalence failed:"
-            + ",".join(report.mismatched_sections)
-        )
-    if report.active_size_bytes >= configured.warning_bytes:
-        raise RuntimeError(
-            "active epoch rollover blocked: bounded successor lacks warning headroom:"
-            f"{report.active_size_bytes}>={configured.warning_bytes}"
-        )
-
-    successor_storage = ActiveStorage(successor, budget=configured)
-    successor_storage.assert_positive_schema()
-    successor_storage.enforce_hard_budget()
-    _truncate_wal(successor)
-    load_verified_checkpoint(successor, expected_release_sha=release_sha)
-
-    # Stamp a real active epoch identity after migration verification. This does
-    # not alter portfolio/strategy/certification truth or the checkpoint payload.
-    epoch_id = f"active-{_utc_stamp()}-{token[:12]}"
-    with successor_storage.connect() as connection:
-        connection.execute(
-            "UPDATE storage_epoch_state SET epoch_id=?,status='OPEN',updated_at=? WHERE singleton_key=1",
-            (epoch_id, datetime.now(timezone.utc).isoformat()),
-        )
-        connection.commit()
-    _truncate_wal(successor)
-
-    # The old source is retained without copying its multi-GB body: a hard link
-    # preserves the exact inode on the same persistent filesystem. It is outside
-    # normal runtime/certification paths and can be classified/purged later.
-    sealed_dir = active.parent / SEALED_EPOCH_DIR / f"sealed-{_utc_stamp()}-{token[:12]}"
-    sealed_dir.mkdir(parents=True, exist_ok=False)
-    sealed_main = sealed_dir / active.name
     try:
-        os.link(active, sealed_main)
-    except OSError as exc:
-        raise RuntimeError(
-            f"active epoch rollover blocked: unable to preserve sealed source by hard link:{exc.errno}"
-        ) from exc
-    _fsync_dir(sealed_dir)
+        report = build_shadow_database(
+            legacy_path=active,
+            active_path=successor,
+            release_sha=release_sha,
+            replace_existing=True,
+        )
+        if not report.equivalent:
+            raise RuntimeError(
+                "active epoch rollover blocked: successor semantic equivalence failed:"
+                + ",".join(report.mismatched_sections)
+            )
+        if report.active_size_bytes >= configured.warning_bytes:
+            raise RuntimeError(
+                "active epoch rollover blocked: bounded successor lacks warning headroom:"
+                f"{report.active_size_bytes}>={configured.warning_bytes}"
+            )
 
-    # Both source and successor are fully checkpointed. Sidecars can therefore be
-    # removed without discarding committed truth. The main-file replacement is a
-    # single same-filesystem rename; if it never occurs, the old active main still
-    # exists at the canonical path and remains restartable.
-    _remove_zero_sidecars(active)
-    _remove_zero_sidecars(successor)
-    os.replace(successor, active)
-    _fsync_dir(active.parent)
+        successor_storage = ActiveStorage(successor, budget=configured)
+        successor_storage.assert_positive_schema()
+        successor_storage.enforce_hard_budget()
+        _truncate_wal(successor)
+        load_verified_checkpoint(successor, expected_release_sha=release_sha)
+
+        # Stamp a real active epoch identity after migration verification. This does
+        # not alter portfolio/strategy/certification truth or the checkpoint payload.
+        epoch_id = f"active-{_utc_stamp()}-{token[:12]}"
+        with successor_storage.connect() as connection:
+            connection.execute(
+                "UPDATE storage_epoch_state SET epoch_id=?,status='OPEN',updated_at=? WHERE singleton_key=1",
+                (epoch_id, datetime.now(timezone.utc).isoformat()),
+            )
+            connection.commit()
+        _truncate_wal(successor)
+
+        # The old source is retained without copying its multi-GB body: a hard link
+        # preserves the exact inode on the same persistent filesystem. It is outside
+        # normal runtime/certification paths and can be classified/purged later.
+        sealed_dir = active.parent / SEALED_EPOCH_DIR / f"sealed-{_utc_stamp()}-{token[:12]}"
+        sealed_dir.mkdir(parents=True, exist_ok=False)
+        sealed_main = sealed_dir / active.name
+        try:
+            os.link(active, sealed_main)
+        except OSError as exc:
+            raise RuntimeError(
+                f"active epoch rollover blocked: unable to preserve sealed source by hard link:{exc.errno}"
+            ) from exc
+        _fsync_dir(sealed_dir)
+
+        # Both source and successor are fully checkpointed. Sidecars can therefore be
+        # removed without discarding committed truth. The main-file replacement is a
+        # single same-filesystem rename; if it never occurs, the old active main still
+        # exists at the canonical path and remains restartable.
+        _remove_zero_sidecars(active)
+        _remove_zero_sidecars(successor)
+        os.replace(successor, active)
+        _fsync_dir(active.parent)
+    except Exception:
+        # A failed build or pre-swap verification must not consume the remaining
+        # persistent disk with an orphaned temporary database/WAL. This never
+        # removes the canonical active source or the sealed rollback hard link.
+        _remove_successor_family(successor)
+        raise
 
     # Re-open only the compact canonical successor and prove its checkpoint after
     # the path swap. The sealed source remains physically present but unopened.
@@ -216,6 +259,7 @@ def rollover_active_epoch_if_needed(
         "successor_wal_bytes": after["wal"],
         "warning_bytes": configured.warning_bytes,
         "hard_bytes": configured.hard_bytes,
+        **headroom,
         "sealed_source_path": str(sealed_main),
         "sealed_source_retention_dataset": SEALED_EPOCH_DATASET,
         "sealed_source_deleted": False,
