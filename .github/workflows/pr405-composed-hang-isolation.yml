@@ -11,7 +11,7 @@ permissions:
 jobs:
   isolate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,21 +23,23 @@ jobs:
         run: |
           python -m pip install -r requirements.lock
           python -m pip install -e . --no-deps
-      - name: Run composed suite verbosely with stack dumps
+      - name: Reproduce provider-order and sequencer regressions under production composition
         env:
           PYTHONPATH: src
         run: |
-          timeout --signal=TERM --kill-after=5s 720s python -u - <<'PY'
-          import faulthandler
+          python -u - <<'PY'
           import pytest
           import solana_roi.production
 
-          faulthandler.enable()
-          faulthandler.dump_traceback_later(60, repeat=True)
           raise SystemExit(pytest.main([
-              '-vv', '-s', '--durations=25',
-              '--ignore=tests/test_main_no_history_rewrite.py',
-              '--ignore=tests/test_api_wallet_endpoints.py',
-              '--ignore=tests/test_api_top_traders.py',
+              '-vv', '-s', '--durations=20',
+              'tests/test_robinhood_provider_budget_transport.py',
+              'tests/test_robinhood_provider_capacity_budget.py',
+              'tests/test_robinhood_provider_efficiency_recovery.py',
+              'tests/test_robinhood_provider_failover.py',
+              'tests/test_robinhood_provider_pool_throughput_repair.py',
+              'tests/test_robinhood_provider_runtime_proof.py',
+              'tests/test_robinhood_provider_timeout_thread_boundary.py',
+              'tests/test_robinhood_sequencer_frontier.py',
           ]))
           PY
