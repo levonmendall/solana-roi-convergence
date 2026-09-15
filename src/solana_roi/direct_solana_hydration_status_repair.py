@@ -46,7 +46,7 @@ def _ensure_state(self: DirectSolanaJournal) -> None:
             "INSERT OR IGNORE INTO direct_solana_hydration_status_meta(id) VALUES (1)"
         )
         # New or updated hydration truth is captured immediately while the old source
-        # table is reconstructed incrementally.  The source table remains canonical.
+        # table is reconstructed incrementally. The source table remains canonical.
         self.store.db.execute(
             "CREATE TRIGGER IF NOT EXISTS trg_direct_hydration_status_insert "
             "AFTER INSERT ON direct_solana_hydration_metrics BEGIN "
@@ -257,7 +257,7 @@ def _recent_metrics(self: DirectSolanaJournal) -> tuple[list[dict[str, Any]], di
             state = _meta(self)
             if not complete:
                 # Exact latest-500 status is unknown until every pre-repair source row
-                # has been considered.  Fail closed rather than fall back to the old
+                # has been considered. Fail closed rather than fall back to the old
                 # history-scaled scan or publish a partial percentile as exact.
                 return [], state
         else:
@@ -313,6 +313,11 @@ def _bounded_status(self: DirectSolanaJournal) -> dict[str, Any]:
                 "reconnect_count, last_error_type FROM direct_solana_provider_state ORDER BY provider"
             ).fetchall()
         ]
+        live_provider_messages = getattr(self, "_provider_last_message_at", {})
+        for provider_state in providers:
+            latest_message_at = live_provider_messages.get(str(provider_state["provider"]))
+            if latest_message_at is not None:
+                provider_state["last_message_at"] = latest_message_at
         global_row = self.store.db.execute(
             "SELECT outage_started_at, unresolved_gap, last_backfill_complete_at, "
             "last_backfill_error FROM direct_solana_global_state WHERE id=1"
@@ -325,6 +330,12 @@ def _bounded_status(self: DirectSolanaJournal) -> dict[str, Any]:
             "WHERE bucket>=? GROUP BY source",
             ((now - timedelta(hours=1)).replace(second=0, microsecond=0).isoformat(),),
         ).fetchall()
+        heartbeat_received = int(getattr(self, "_provider_heartbeat_updates_received", 0) or 0)
+        heartbeat_persisted = int(getattr(self, "_provider_heartbeat_updates_persisted", 0) or 0)
+        heartbeat_coalesced = int(getattr(self, "_provider_heartbeat_updates_coalesced", 0) or 0)
+        heartbeat_interval = float(
+            getattr(self, "provider_heartbeat_persist_interval_seconds", 0.0) or 0.0
+        )
 
     metrics, hydration_state = _recent_metrics(self)
     values = sorted(float(row["total_hydration_ms"]) for row in metrics)
@@ -340,6 +351,10 @@ def _bounded_status(self: DirectSolanaJournal) -> dict[str, Any]:
         "durable": True,
         "connected_provider_count": connected,
         "provider_states": providers,
+        "provider_heartbeat_persist_interval_seconds": heartbeat_interval,
+        "provider_heartbeat_updates_received": heartbeat_received,
+        "provider_heartbeat_updates_persisted": heartbeat_persisted,
+        "provider_heartbeat_updates_coalesced": heartbeat_coalesced,
         "continuity_ok": connected >= 1 and not unresolved,
         "unresolved_gap": unresolved,
         "outage_started_at": outage_started or None,
