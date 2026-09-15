@@ -14,9 +14,10 @@ from .strategy_v52_authority import (
 from .v51_robinhood_candidate_coverage import _reconcile_durable_entry
 from .v51_robinhood_consolidation import _candidate_id
 from .v52_canonical_portfolio_restart_repair import install_v52_canonical_portfolio_restart_repair
+from .v52_robinhood_canonical_capital_bridge import install_v52_robinhood_canonical_capital_bridge
 from .v52_robinhood_shared_capital_repair import install_v52_robinhood_shared_capital_repair
 
-RECONCILIATION_VERSION = "v52-robinhood-post-validation-candidate-reconciliation-3-canonical-capital"
+RECONCILIATION_VERSION = "v52-robinhood-post-validation-candidate-reconciliation-4-canonical-bridge"
 _INSTALLED = False
 _BASE_VALIDATE: Callable[..., Awaitable[bool]] | None = None
 
@@ -81,6 +82,22 @@ async def _validate_and_reconcile(
     candidate = _candidate_id(token, market, recent)
     trial_id = _latest_committed_trial_id(owner, payload)
     if trial_id is None:
+        # A restart replay can resolve to the already durable prior-release lot.
+        # Candidate-ledger reconciliation was necessarily performed when that lot
+        # first committed, so do not create a second release-scoped trial merely to
+        # make the current release observable here.
+        with owner.store._lock:
+            prior = owner.store.db.execute(
+                "SELECT l.trial_id FROM v52_robinhood_position_lots l "
+                "JOIN robinhood_paper_trials t ON t.id=l.trial_id "
+                "WHERE t.token=? AND t.market=? AND l.remaining_fraction>0 "
+                "ORDER BY l.id DESC LIMIT 2",
+                (token, market),
+            ).fetchall()
+        if len(prior) == 1:
+            return True
+        if len(prior) > 1:
+            raise RuntimeError("validated Robinhood lifecycle has duplicate open cross-release lots")
         raise RuntimeError("validated Robinhood lifecycle trial not recoverable for candidate reconciliation")
     if _ledger_already_reconciled(owner, candidate, trial_id):
         return True
@@ -116,6 +133,7 @@ def status() -> dict[str, Any]:
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "reconciliation_trigger": "successful_v52_lifecycle_commit_only",
         "canonical_portfolio_restart_reconciliation_installed": True,
+        "robinhood_cross_release_capital_bridge_installed": True,
         "release_sha_is_capital_reset_boundary": False,
         "shared_capital_installed_before_reconciliation": True,
         "changes_economic_decision": False,
@@ -130,11 +148,9 @@ def install_v52_robinhood_candidate_reconciliation() -> None:
     global _INSTALLED, _BASE_VALIDATE
     if _INSTALLED:
         return
-    # v5.2 owns one durable $500 paper portfolio across deployment SHAs. Install
-    # cross-release settlement recovery before the Robinhood shared-capital adapter,
-    # then wrap the final repaired validator with candidate reconciliation.
     install_v52_canonical_portfolio_restart_repair()
     install_v52_robinhood_shared_capital_repair()
+    install_v52_robinhood_canonical_capital_bridge()
     _BASE_VALIDATE = lifecycle._validate_and_commit
     lifecycle._validate_and_commit = _validate_and_reconcile
     setattr(lifecycle._validate_and_commit, "_roi_v52_candidate_reconciliation", True)
