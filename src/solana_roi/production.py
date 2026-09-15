@@ -14,6 +14,7 @@ the explicit composition root (not called from this facade):
 
 import asyncio
 
+from .authoritative_event_verify_bounded_repair import configure_authoritative_event_verify_bounded_repair
 from .certification_delta_production_bounds import configure_production_certification_delta_bound
 from .direct_solana_hydration_status_repair import configure_direct_solana_hydration_status_repair
 from .incremental_event_integrity_repair import configure_incremental_event_integrity_repair
@@ -29,11 +30,16 @@ from .wallet_discovery_background_status_repair import configure_wallet_discover
 # every strategy/certification threshold remain unchanged.
 configure_production_certification_delta_bound()
 
-# Replace ordinary full-history event-ledger verification with a validated durable
-# integrity anchor plus append-only tail verification before production composition
-# installs the cgroup-bounded verifier. Missing/corrupt anchors still fall back to
-# complete hash-chain verification; no integrity or authority gate is weakened.
+# Preserve the existing append-time integrity checkpoint as a non-authoritative
+# acceleration/telemetry sidecar.  Authoritative durable restore is configured just
+# below to verify every retained event rather than trusting the sidecar to skip old
+# history.
 configure_incremental_event_integrity_repair()
+
+# Verify the complete retained event ledger at authoritative startup through bounded
+# keyset chunks.  Each SQLite reader closes before cache eviction/reclaim, so full
+# tamper detection is preserved without pinning one history-sized read snapshot.
+configure_authoritative_event_verify_bounded_repair()
 
 # Provider credentials must be materialized before importing the production
 # composition root because the legacy-compatible Robinhood ingestion substrate
