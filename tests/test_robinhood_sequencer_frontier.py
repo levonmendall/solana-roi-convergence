@@ -136,10 +136,13 @@ def test_skipped_blocks_have_no_retrospective_trade_authority(monkeypatch) -> No
 
 def test_fast_status_publisher_never_calls_proof_wrapped_status(monkeypatch) -> None:
     stop = asyncio.Event()
-    calls = {"base": 0, "wrapped": 0}
+    calls = {"fast": 0, "wrapped": 0}
+    plane = SimpleNamespace()
+    module = isolation._runtime_install_module()
 
-    def base_status():
-        calls["base"] += 1
+    def fast_status(actual_plane):
+        assert actual_plane is plane
+        calls["fast"] += 1
         return {"runtime_ready": True, "paper_only": True, "live_money_authority": False}
 
     def wrapped_status():
@@ -150,11 +153,12 @@ def test_fast_status_publisher_never_calls_proof_wrapped_status(monkeypatch) -> 
         assert store_path == "/tmp/rh.sqlite3"
         stop.set()
 
-    monkeypatch.setattr(isolation, "_BASE_STATUS", base_status)
+    monkeypatch.setattr(module, "_PLANE", plane)
+    monkeypatch.setattr(isolation, "_fast_live_status", fast_status)
     monkeypatch.setattr(isolation, "_ORIGINAL_STATUS", wrapped_status)
     monkeypatch.setattr(isolation, "_publish_snapshot", publish)
     asyncio.run(isolation._status_publisher(stop, store_path="/tmp/rh.sqlite3"))
-    assert calls == {"base": 1, "wrapped": 0}
+    assert calls == {"fast": 1, "wrapped": 0}
 
 
 def test_worker_metadata_declares_proof_offload() -> None:

@@ -14,12 +14,20 @@ from .observation_store import ObservationEventStore
 from .robinhood_chain_paper import RobinhoodChainPaperPlane
 
 
-REPAIR_VERSION = "robinhood-dedicated-worker-isolation-v2-proof-offload"
+REPAIR_VERSION = "robinhood-dedicated-worker-isolation-v3-page-cache-bounded"
 STATUS_PUBLISH_SECONDS = 1.0
 STATUS_STALE_SECONDS = 5.0
 PROOF_PUBLISH_SECONDS = 5.0
 THREAD_JOIN_TIMEOUT_SECONDS = 3.0
 THREAD_NAME = "robinhood-chain-paper-isolated"
+
+_PROOF_GENERATION_TABLE = "robinhood_proof_input_generation"
+_PROOF_INPUT_TABLES = (
+    "v51_robinhood_candidate_ledger",
+    "robinhood_paper_trials",
+    "robinhood_paper_outcomes",
+    "robinhood_v5_trial_context",
+)
 
 _STATUS_LOCK = threading.Lock()
 _STATUS_SNAPSHOT: dict[str, Any] | None = None
@@ -27,6 +35,7 @@ _STATUS_PUBLISHED_MONOTONIC: float | None = None
 _PROOF_LOCK = threading.Lock()
 _PROOF_SNAPSHOT: dict[str, Any] | None = None
 _PROOF_PUBLISHED_MONOTONIC: float | None = None
+_PROOF_INPUT_GENERATION: int | None = None
 _WORKER_THREAD: threading.Thread | None = None
 _WORKER_STOP: threading.Event | None = None
 _BASE_STATUS: Callable[[], dict[str, Any]] | None = None
@@ -61,6 +70,7 @@ def _worker_isolation_metadata(*, store_path: str | None = None) -> dict[str, An
     thread = _WORKER_THREAD
     with _PROOF_LOCK:
         proof_at = _PROOF_PUBLISHED_MONOTONIC
+        proof_generation = _PROOF_INPUT_GENERATION
     proof_age = max(0.0, time.monotonic() - proof_at) if proof_at is not None else None
     return {
         "repair_version": REPAIR_VERSION,
@@ -72,12 +82,18 @@ def _worker_isolation_metadata(*, store_path: str | None = None) -> dict[str, An
         "canonical_store_shared_for_robinhood_writes": False,
         "canonical_store_used_only_for_one_time_cursor_seed": True,
         "status_served_from_nonblocking_cache": True,
-        "fast_status_uses_base_status_only": True,
+        "fast_status_uses_in_memory_runtime_state_only": True,
+        "fast_status_history_scaled_sqlite_reads": False,
         "proof_refresh_uses_separate_sqlite_connection": True,
         "proof_refresh_runs_in_worker_threadpool": True,
+        "proof_refresh_input_generation_gated": True,
+        "raw_swap_writes_trigger_deep_proof": False,
+        "proof_input_generation": proof_generation,
         "proof_publish_seconds": PROOF_PUBLISH_SECONDS,
         "proof_cache_age_seconds": proof_age,
         "proof_blocks_live_frontier": False,
+        "source_history_deleted": False,
+        "retention_changed": False,
         "uvicorn_event_loop_runs_robinhood_chain_worker": False,
         "paper_decision_gate_changed": False,
         "strategy_thresholds_changed": False,
@@ -94,10 +110,13 @@ def _current_proof_snapshot() -> dict[str, Any] | None:
 
 
 def _publish_proof_snapshot(payload: dict[str, Any]) -> None:
-    global _PROOF_SNAPSHOT, _PROOF_PUBLISHED_MONOTONIC
+    global _PROOF_SNAPSHOT, _PROOF_PUBLISHED_MONOTONIC, _PROOF_INPUT_GENERATION
     with _PROOF_LOCK:
         _PROOF_SNAPSHOT = copy.deepcopy(payload)
         _PROOF_PUBLISHED_MONOTONIC = time.monotonic()
+        generation = payload.get("proof_input_generation")
+        if isinstance(generation, int):
+            _PROOF_INPUT_GENERATION = generation
 
 
 def _publish_snapshot(payload: dict[str, Any], *, store_path: str | None) -> None:
@@ -132,6 +151,108 @@ def _failed_closed_payload(error: str, *, store_path: str | None = None) -> dict
         "error": error,
         "production_install": dict(getattr(module, "_STATE", {})),
         "worker_isolation": _worker_isolation_metadata(store_path=store_path),
+    }
+
+
+def _fast_live_status(plane: Any) -> dict[str, Any]:
+    """Build the one-second status snapshot without touching SQLite.
+
+    Historical counts, NAV analytics and wallet-return summaries are proof/analytics
+    surfaces. They must not rescan a growing SQLite file merely to keep the live
+    heartbeat fresh. Decision readiness here is derived only from the same in-memory
+    cursor/frontier state maintained by the worker itself.
+    """
+    module = _runtime_install_module()
+    cursor = getattr(plane, "_cursor", None)
+    latest = getattr(plane, "_latest_block", None)
+    live_cursor = getattr(plane, "_roi_live_epoch_cursor", None)
+    if live_cursor is not None:
+        decision_cursor = int(live_cursor)
+        transport_error = getattr(plane, "_roi_live_epoch_last_error_type", None)
+        transport_ready = (
+            bool(getattr(plane, "_roi_live_epoch_ready", False))
+            and not bool(getattr(plane, "_roi_live_epoch_suppress_entries", False))
+            and not transport_error
+        )
+    else:
+        decision_cursor = int(cursor) if cursor is not None else None
+        transport_error = getattr(plane, "_last_error", None)
+        transport_ready = bool(getattr(plane, "_caught_up", False)) and not transport_error
+    lag = (
+        max(0, int(latest) - int(decision_cursor))
+        if latest is not None and decision_cursor is not None
+        else None
+    )
+    historical_lag = (
+        max(0, int(latest) - int(cursor))
+        if latest is not None and cursor is not None
+        else None
+    )
+    legacy_requests = int(getattr(plane, "_roi_market_log_legacy_equivalent_requests", 0) or 0)
+    actual_requests = int(getattr(plane, "_roi_market_log_actual_requests", 0) or 0)
+    saved_requests = max(0, legacy_requests - actual_requests)
+    last_error = getattr(plane, "_last_error", None)
+    return {
+        "enabled": bool(getattr(plane, "enabled", True)),
+        "chain": "ROBINHOOD_CHAIN",
+        "chain_id": 4663,
+        "strategy_version": getattr(module, "ROBINHOOD_V5_VERSION", "robinhood-chain-paper"),
+        "paper_only": True,
+        "paper_trading_authority": True,
+        "shadow_only": False,
+        "live_money_authority": False,
+        "signing_available": False,
+        "transaction_submission_available": False,
+        "worker_process_ready": True,
+        "runtime_ready": transport_ready,
+        "failed_closed": False,
+        "cursor_block": cursor,
+        "latest_block": latest,
+        "block_lag": lag,
+        "historical_block_lag": historical_lag,
+        "caught_up_for_paper_decisions": transport_ready,
+        "paper_decision_transport_ready": transport_ready,
+        "last_poll_at": getattr(plane, "_last_poll_at", None),
+        "last_success_at": getattr(plane, "_last_success_at", None),
+        "last_error": last_error,
+        "error": transport_error or None,
+        "rpc_failures": int(getattr(plane, "_rpc_failures", 0) or 0),
+        "tracked_v3_pools": len(getattr(plane, "v3_pools", {}) or {}),
+        "tracked_pons_v2_curves": len(getattr(plane, "v2_curves", {}) or {}),
+        "getlogs_efficiency": {
+            "legacy_equivalent_market_log_requests": legacy_requests,
+            "actual_market_log_requests": actual_requests,
+            "market_log_requests_saved": saved_requests,
+            "market_log_request_savings_pct": (
+                round(saved_requests / legacy_requests * 100.0, 3)
+                if legacy_requests > 0
+                else 0.0
+            ),
+            "block_coverage_reduced": False,
+            "market_coverage_reduced": False,
+        },
+        "live_frontier_verification": {
+            "verified_live_epoch": live_cursor is not None,
+            "live_epoch_ready": transport_ready if live_cursor is not None else False,
+            "live_epoch_anchor_block": getattr(plane, "_roi_live_epoch_anchor_block", None),
+            "live_epoch_cursor_block": live_cursor,
+            "live_epoch_lag_blocks": lag if live_cursor is not None else None,
+            "live_epoch_started_at": getattr(plane, "_roi_live_epoch_started_at", None),
+            "live_epoch_last_success_at": getattr(plane, "_roi_live_epoch_last_success_at", None),
+            "live_epoch_reason": getattr(plane, "_roi_live_epoch_reason", None),
+            "historical_cursor_block": cursor,
+            "historical_block_lag": historical_lag,
+            "historical_backfill_preserved": True,
+            "historical_backfill_can_authorize_entries": False,
+        },
+        "status_read_boundary": {
+            "history_scaled_sqlite_reads": False,
+            "swap_count_scanned_on_heartbeat": False,
+            "outcome_history_scanned_on_heartbeat": False,
+            "nav_history_scanned_on_heartbeat": False,
+            "proof_analytics_published_separately": True,
+        },
+        "production_install": dict(getattr(module, "_STATE", {})),
     }
 
 
@@ -195,33 +316,93 @@ def _seed_cursor_from_canonical(plane: Any, canonical_store: Any) -> int | None:
     return value
 
 
+def _ensure_proof_generation_schema(store: Any) -> int:
+    """Return a durable O(1) generation for proof-relevant evidence changes.
+
+    Raw robinhood_swaps is intentionally excluded: swap ingestion is high-volume raw
+    evidence and does not by itself justify rebuilding the deep economic proof every
+    five seconds. Candidate/trial/outcome/context changes do.
+    """
+    with store._lock, store.db:
+        store.db.execute(
+            f"CREATE TABLE IF NOT EXISTS {_PROOF_GENERATION_TABLE} ("
+            "singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+            "generation INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)"
+        )
+        store.db.execute(
+            f"INSERT OR IGNORE INTO {_PROOF_GENERATION_TABLE}(singleton,generation,updated_at) "
+            "VALUES (1,0,strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        )
+        for table in _PROOF_INPUT_TABLES:
+            exists = store.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+                (table,),
+            ).fetchone()
+            if exists is None:
+                continue
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                trigger = f"trg_robinhood_proof_generation_{table}_{operation.lower()}"
+                store.db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {operation} ON {table} BEGIN "
+                    f"UPDATE {_PROOF_GENERATION_TABLE} SET generation=generation+1, "
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE singleton=1; END"
+                )
+        row = store.db.execute(
+            f"SELECT generation FROM {_PROOF_GENERATION_TABLE} WHERE singleton=1"
+        ).fetchone()
+    return int(row["generation"] if hasattr(row, "keys") else row[0]) if row is not None else 0
+
+
 def _refresh_proof_on_separate_connection(
     store_path: str,
     *,
     store_factory: Callable[..., Any] = ObservationEventStore,
 ) -> dict[str, Any]:
-    """Build v5.1 proof on a separate WAL reader/writer connection, never the live lock."""
+    """Build proof only when durable proof-relevant inputs changed."""
     proof_store: Any | None = None
     try:
+        proof_store = store_factory(store_path)
+        generation_before = _ensure_proof_generation_schema(proof_store)
+        with _PROOF_LOCK:
+            cached_generation = _PROOF_INPUT_GENERATION
+            cached_proof = copy.deepcopy(_PROOF_SNAPSHOT)
+        if cached_proof is not None and cached_generation == generation_before:
+            cached_proof["proof_input_generation"] = generation_before
+            cached_proof["proof_refresh_skipped_unchanged_inputs"] = True
+            cached_proof["deep_proof_rebuilt"] = False
+            cached_proof["proof_refresh_topology"] = "generation_gated_separate_sqlite_connection_in_threadpool"
+            return cached_proof
+
         from .v51_consolidated_strategy import install_v51_consolidated_strategy
         from .v51_robinhood_consolidation import refresh_robinhood_candidate_learning
         from .v51_robinhood_proof import cached_robinhood_proof
 
-        proof_store = store_factory(store_path)
         release = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GITHUB_SHA") or "local"
         install_v51_consolidated_strategy(store=proof_store, release_commit=release)
+        # The v5.1 install may create proof-input tables on a fresh store. Re-run the
+        # constant-size trigger installer before any proof writes so later changes are
+        # observed without a historical scan.
+        generation_before = _ensure_proof_generation_schema(proof_store)
         refresh_robinhood_candidate_learning(proof_store)
         proof = cached_robinhood_proof(proof_store, max_age_seconds=0.0)
+        generation_after = _ensure_proof_generation_schema(proof_store)
         proof["available"] = True
-        proof["proof_refresh_topology"] = "separate_sqlite_connection_in_threadpool"
+        proof["proof_input_generation"] = generation_before
+        proof["proof_inputs_changed_during_build"] = generation_after != generation_before
+        proof["proof_refresh_skipped_unchanged_inputs"] = False
+        proof["deep_proof_rebuilt"] = True
+        proof["proof_refresh_topology"] = "generation_gated_separate_sqlite_connection_in_threadpool"
         proof["live_frontier_blocked_by_proof_refresh"] = False
+        proof["raw_swap_writes_trigger_deep_proof"] = False
+        proof["source_history_deleted"] = False
+        proof["retention_changed"] = False
         return proof
     except Exception as exc:
         return {
             "available": False,
             "reason": "isolated_robinhood_proof_failed_closed",
             "error_type": type(exc).__name__,
-            "proof_refresh_topology": "separate_sqlite_connection_in_threadpool",
+            "proof_refresh_topology": "generation_gated_separate_sqlite_connection_in_threadpool",
             "live_frontier_blocked_by_proof_refresh": False,
             "paper_only": True,
             "live_money_authority": False,
@@ -233,11 +414,13 @@ def _refresh_proof_on_separate_connection(
 
 
 async def _status_publisher(local_stop: asyncio.Event, *, store_path: str) -> None:
-    """Publish only cheap live status on the latency-critical Robinhood event loop."""
+    """Publish live status using in-memory worker state only."""
     while not local_stop.is_set():
         try:
-            if _BASE_STATUS is not None:
-                _publish_snapshot(_BASE_STATUS(), store_path=store_path)
+            module = _runtime_install_module()
+            plane = getattr(module, "_PLANE", None)
+            if plane is not None:
+                _publish_snapshot(_fast_live_status(plane), store_path=store_path)
         except Exception as exc:
             module = _runtime_install_module()
             module._STARTUP_ERROR = f"{type(exc).__name__}: Robinhood status snapshot failed"
@@ -290,11 +473,12 @@ async def _worker_async(
                 "worker_isolation": "dedicated_os_thread_with_private_asyncio_loop",
                 "dedicated_store": str(store_path),
                 "cursor_seeded_from_canonical": seeded_cursor,
-                "proof_refresh_topology": "separate_sqlite_connection_in_threadpool",
+                "proof_refresh_topology": "generation_gated_separate_sqlite_connection_in_threadpool",
+                "fast_status_history_scaled_sqlite_reads": False,
+                "proof_refresh_input_generation_gated": True,
             }
         )
-        if _BASE_STATUS is not None:
-            _publish_snapshot(_BASE_STATUS(), store_path=str(store_path))
+        _publish_snapshot(_fast_live_status(plane), store_path=str(store_path))
         if not plane.enabled:
             return
 
@@ -428,6 +612,8 @@ def install_robinhood_worker_isolation_repair() -> None:
             "worker_isolation_repair": REPAIR_VERSION,
             "worker_isolation": "dedicated_os_thread_with_private_asyncio_loop",
             "proof_refresh_offloaded": True,
+            "fast_status_history_scaled_sqlite_reads": False,
+            "proof_refresh_input_generation_gated": True,
         }
     )
     _INSTALLED = True
@@ -439,6 +625,8 @@ __all__ = [
     "STATUS_STALE_SECONDS",
     "THREAD_JOIN_TIMEOUT_SECONDS",
     "_dedicated_store_path",
+    "_ensure_proof_generation_schema",
+    "_fast_live_status",
     "_nonblocking_status",
     "_refresh_proof_on_separate_connection",
     "_seed_cursor_from_canonical",
