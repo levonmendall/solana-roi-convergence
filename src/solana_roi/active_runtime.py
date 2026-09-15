@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import signal
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +13,7 @@ from typing import Any
 # runtime schemas are validated.
 from . import storage_manifest as _storage_manifest  # noqa: F401
 from .active_storage import ActiveStorage
+from .active_storage_epoch_rollover import request_rollover, rollover_active_epoch_if_needed
 from .durable_engine import DurablePaperTradingEngine, _ENGINE_EVENT_TYPES
 from .observation_store import ObservationEventStore
 from .storage_active_compat_pruning import prune_active_compatibility_database
@@ -29,7 +33,17 @@ class ActiveObservationEventStore(ObservationEventStore):
     active_storage_mode = True
 
     def __init__(self, path: str | Path, *, expected_release_sha: str | None = None):
-        self.transition_checkpoint = load_verified_checkpoint(path, expected_release_sha=expected_release_sha)
+        self.path = Path(path)
+        self.rollover_report: dict[str, Any] | None = None
+        if expected_release_sha:
+            # Runtime composition reaches this constructor before the long-lived
+            # active SQLite connection or production workers exist. That is the
+            # only safe automatic boundary for an active-to-active epoch swap.
+            self.rollover_report = rollover_active_epoch_if_needed(
+                self.path,
+                release_sha=expected_release_sha,
+            )
+        self.transition_checkpoint = load_verified_checkpoint(self.path, expected_release_sha=expected_release_sha)
         event_head = dict(self.transition_checkpoint.get("latest_event_ids", {}).get("events") or {})
         if not event_head:
             raise RuntimeError("active runtime blocked: transition event head missing")
@@ -44,7 +58,9 @@ class ActiveObservationEventStore(ObservationEventStore):
         if len(self.transition_event_head_hash) != 64:
             raise RuntimeError("active runtime blocked: transition lineage hash invalid")
         self._active_write_count = 0
-        super().__init__(path)
+        self._maintenance_stop = threading.Event()
+        self._maintenance_thread: threading.Thread | None = None
+        super().__init__(self.path)
         with self._lock, self.db:
             local = self.db.execute("SELECT id FROM events ORDER BY id LIMIT 1").fetchone()
             if local is not None and int(local["id"]) <= self.transition_event_head_id:
@@ -63,8 +79,67 @@ class ActiveObservationEventStore(ObservationEventStore):
                         "UPDATE sqlite_sequence SET seq=? WHERE name='events'",
                         (self.transition_event_head_id,),
                     )
+        self._start_independent_storage_maintenance()
 
-    def _bounded_maintenance(self) -> None:
+    def _maintenance_interval_seconds(self) -> float:
+        raw = (os.getenv("SOLANA_ROI_ACTIVE_STORAGE_MAINTENANCE_SECONDS") or "60").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 60.0
+        return max(0.0, value)
+
+    def _start_independent_storage_maintenance(self) -> None:
+        interval = self._maintenance_interval_seconds()
+        if interval <= 0:
+            return
+
+        def run() -> None:
+            while not self._maintenance_stop.wait(interval):
+                try:
+                    if self._bounded_maintenance():
+                        return
+                except Exception as exc:
+                    # Maintenance failure cannot be allowed to turn into silent
+                    # unbounded accumulation. Persist a tiny restart-safe marker
+                    # and enter the quiescent rollover path on the next process.
+                    self._request_quiescent_rollover(
+                        reason=f"maintenance_failure:{type(exc).__name__}"
+                    )
+                    return
+
+        self._maintenance_thread = threading.Thread(
+            target=run,
+            name="active-storage-maintenance",
+            daemon=True,
+        )
+        self._maintenance_thread.start()
+
+    def _request_quiescent_rollover(self, *, reason: str) -> None:
+        if self._maintenance_stop.is_set():
+            return
+        storage = ActiveStorage(self.path)
+        sizes = storage.storage_bytes()
+        marker = request_rollover(self.path, reason=reason, sizes=sizes)
+        payload = {
+            "reason": reason,
+            "path": str(self.path),
+            "marker": str(marker),
+            "main_bytes": sizes["main"],
+            "wal_bytes": sizes["wal"],
+            "warning_bytes": storage.budget.warning_bytes,
+            "hard_bytes": storage.budget.hard_bytes,
+            "paper_only": True,
+            "live_money_authority": False,
+        }
+        print("ROI_ACTIVE_STORAGE_ROLLOVER_REQUESTED " + json.dumps(payload, sort_keys=True), flush=True)
+        self._maintenance_stop.set()
+        # SIGTERM lets uvicorn execute its normal graceful shutdown. SQLite
+        # transactions retain their atomicity; the next startup rolls over before
+        # any long-lived DB connection or worker is created.
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def _bounded_maintenance(self) -> bool:
         storage = ActiveStorage(self.path)
         storage.prune_v52_market_validation()
         storage.prune_v52_wallet_forward_alpha()
@@ -73,8 +148,13 @@ class ActiveObservationEventStore(ObservationEventStore):
         storage.prune_expired_diagnostics()
         storage.prune_acknowledged_transport()
         storage.checkpoint_wal()
+        storage.reclaim_free_pages()
         storage.assert_positive_schema()
+        if storage.warning_boundary_exceeded():
+            self._request_quiescent_rollover(reason="warning_boundary_exceeded_after_prune")
+            return True
         storage.enforce_hard_budget()
+        return False
 
     def append(self, event_type: str, observed_at: str, payload: dict[str, Any]) -> str:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -91,7 +171,8 @@ class ActiveObservationEventStore(ObservationEventStore):
                 raise RuntimeError("active event id did not advance beyond transition frontier")
         self._active_write_count += 1
         # Bound maintenance work without turning every evidence write into a
-        # pruning transaction. Explicit v5.2 wrappers also prune after batch writes.
+        # pruning transaction. Independent time-based maintenance above covers
+        # compatibility writers that never pass through append().
         if self._active_write_count % 128 == 0:
             self._bounded_maintenance()
         return lineage
@@ -127,6 +208,13 @@ class ActiveObservationEventStore(ObservationEventStore):
                 if reader is not None:
                     reader.close()
                 self._release_verification_file_cache()
+
+    def close(self) -> None:
+        self._maintenance_stop.set()
+        thread = self._maintenance_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        super().close()
 
 
 class ActiveDurablePaperTradingEngine(DurablePaperTradingEngine):
