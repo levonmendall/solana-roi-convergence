@@ -8,6 +8,7 @@ from . import post104_production_architecture_repair as post104
 from . import post177_forward_pipeline_bottleneck_repair as repair
 from . import post178_e2e_residual_repair as post178
 from . import post178_scout_terminal_classification_fix as post178_scout
+from . import robinhood_provider_efficiency_repair as provider_efficiency
 from . import robinhood_v2_v4_observation as robinhood_v2_v4
 from . import robinhood_v2_v4_observation_resume as robinhood_v2_v4_resume
 from . import unified_strategy_status as unified_status
@@ -15,7 +16,7 @@ from .config import BASELINE
 from .direct_solana import DirectSolanaIngestionPlane
 
 
-COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v3"
+COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v5-provider-efficiency-before-observation"
 _FINAL_DIRECT_STATUS: Callable[..., dict[str, Any]] | None = None
 
 
@@ -106,7 +107,10 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
     final standby-over-background RPC governor, preserve wrapper lineage markers,
     and leave unified-status composition to the repository's existing readiness
     installer before the post-178 residual repair applies its final current-frontier
-    semantics.
+    semantics. Provider-efficiency aliases are bound before the permanent V2/V4
+    observation wrapper captures the live-frontier helper, so the observation lane
+    preserves the combined canonical market query instead of reviving the legacy
+    per-family query path.
     """
 
     global _FINAL_DIRECT_STATUS
@@ -135,10 +139,18 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
     post178.install_post178_e2e_residual_repair(plane_cls)
     post178_scout.install_post178_scout_terminal_classification_fix()
 
+    # robinhood_live_frontier_verification_repair imports _fetch_market_logs by value.
+    # Rebind that alias at the final production composition boundary before the V2/V4
+    # observation wrapper captures it. The observation wrapper then delegates to the
+    # combined helper, preserving exact canonical block/market coverage while avoiding
+    # the legacy split V3/Pons query fan-out.
+    provider_efficiency.install_robinhood_provider_efficiency_repair()
+
     # Permanent V2/V4 observation is composed only after the final current-frontier
-    # repairs. Its fetch wrapper returns the original canonical market list unchanged,
-    # so observation can collect forward evidence without becoming alternate paper
-    # entry authority. Storage remains the existing Robinhood state/event/swap path.
+    # and provider-efficiency repairs. Its fetch wrapper returns the original canonical
+    # market list unchanged, so observation can collect forward evidence without
+    # becoming alternate paper entry authority. Storage remains the existing Robinhood
+    # state/event/swap path.
     robinhood_v2_v4_resume.install_robinhood_v2_v4_observation_resume()
     robinhood_v2_v4.install_robinhood_v2_v4_observation(plane_cls)
 
