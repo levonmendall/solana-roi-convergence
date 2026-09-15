@@ -17,8 +17,10 @@ from solana_roi.storage_retention import RetentionClass, RetentionContract
 
 
 def test_exact_production_observed_legacy_set_is_registered_without_authority(tmp_path: Path) -> None:
-    assert len(LEGACY_RETAINED_DATASETS) == 67
+    assert len(LEGACY_RETAINED_DATASETS) == 69
     assert tuple(sorted(LEGACY_RETAINED_DATASETS)) == LEGACY_RETAINED_DATASETS
+    assert "economic_current_context_probe_audit" in LEGACY_RETAINED_DATASETS
+    assert "scout_economic_movement_observations" in LEGACY_RETAINED_DATASETS
 
     for name in LEGACY_RETAINED_DATASETS:
         contract = storage_manifest.RETENTION_REGISTRY[name]
