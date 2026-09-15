@@ -8,8 +8,13 @@ from . import post104_production_architecture_repair as post104
 from . import post177_forward_pipeline_bottleneck_repair as repair
 from . import post178_e2e_residual_repair as post178
 from . import post178_scout_terminal_classification_fix as post178_scout
+from . import robinhood_research_getlogs_isolation as robinhood_research_getlogs_isolation
+from . import robinhood_research_universe_cache as robinhood_research_universe_cache
+from . import robinhood_request_budget_telemetry as robinhood_request_budget
+from . import robinhood_v2_v4_efficiency_repair as robinhood_v2_v4_efficiency
 from . import robinhood_v2_v4_observation as robinhood_v2_v4
 from . import robinhood_v2_v4_observation_resume as robinhood_v2_v4_resume
+from . import robinhood_v2_v4_pause_guard as robinhood_v2_v4_pause_guard
 from . import unified_strategy_status as unified_status
 from .config import BASELINE
 from .direct_solana import DirectSolanaIngestionPlane
@@ -135,12 +140,39 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
     post178.install_post178_e2e_residual_repair(plane_cls)
     post178_scout.install_post178_scout_terminal_classification_fix()
 
+    # The broad provider-budget research screener explicitly constructs a public
+    # Robinhood RPC client. Keep its getLogs traffic on that public endpoint instead
+    # of allowing the globally-installed Validation Cloud guard to redirect the whole
+    # research universe through a private provider. Private/production acquisition
+    # remains on the governed Validation Cloud/failover path unchanged.
+    robinhood_research_getlogs_isolation.install_robinhood_research_getlogs_isolation()
+
+    # robinhood_launches is append-only within a release. Build the complete broad
+    # research universe once, then load only newly inserted launch rows. This preserves
+    # every paper-eligible market while preventing the five-second research cadence
+    # from rescanning thousands of immutable SQLite rows.
+    robinhood_research_universe_cache.install_robinhood_research_universe_cache()
+
+    # V2/V4 remains fail-closed until the production reactivation gate passes. Attach
+    # that rule to the production plane, not the observer's global enable predicate,
+    # so direct recovery primitives stay deterministic and independently resumable.
+    robinhood_v2_v4_pause_guard.install_robinhood_v2_v4_pause_guard(plane_cls)
+
+    # Install the legacy resume shim first, then make the bounded efficiency observer
+    # the final observer primitive. The repaired primitive owns the same cursor-resume
+    # semantics itself, so no later installer may replace it with the pre-repair path.
+    robinhood_v2_v4_resume.install_robinhood_v2_v4_observation_resume()
+    robinhood_v2_v4_efficiency.install_robinhood_v2_v4_efficiency_repair()
+
     # Permanent V2/V4 observation is composed only after the final current-frontier
     # repairs. Its fetch wrapper returns the original canonical market list unchanged,
     # so observation can collect forward evidence without becoming alternate paper
     # entry authority. Storage remains the existing Robinhood state/event/swap path.
-    robinhood_v2_v4_resume.install_robinhood_v2_v4_observation_resume()
     robinhood_v2_v4.install_robinhood_v2_v4_observation(plane_cls)
+
+    # Make the expected-versus-actual request budget visible on the final composed
+    # runtime after all Robinhood status wrappers have been installed.
+    robinhood_request_budget.install_robinhood_request_budget_telemetry(plane_cls)
 
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_installed", True)
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_version", COMPAT_VERSION)
