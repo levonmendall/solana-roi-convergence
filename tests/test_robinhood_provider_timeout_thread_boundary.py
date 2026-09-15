@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 
@@ -39,6 +41,30 @@ def _configure_alchemy_drpc_pool(monkeypatch) -> None:
     monkeypatch.setenv("ROBINHOOD_PROVIDER_FAILOVER_ERROR_THRESHOLD", "1")
     monkeypatch.setenv("ROBINHOOD_PROVIDER_FAILOVER_COOLDOWN_SECONDS", "30")
     failover.reset_for_tests()
+
+
+def _production_failover_inner_rpc() -> Callable[..., Awaitable[Any]]:
+    """Resolve the RPC seam captured by the installed production failover wrapper.
+
+    Some provider tests intentionally reinstall failover around temporary monkeypatched
+    RPC functions and therefore mutate the module-level `_ORIGINAL_RPC` diagnostic
+    reference. The actual production wrapper chain on `RobinhoodRpc.rpc` is restored by
+    pytest after those tests. Walk that chain and identify the real failover wrapper by
+    its code object, so this stress regression cannot inherit a stale test-only seam.
+    """
+    current: Any = core.RobinhoodRpc.rpc
+    target_file = failover._rpc_wrapper.__code__.co_filename
+    seen: set[int] = set()
+    while callable(current) and id(current) not in seen:
+        seen.add(id(current))
+        code = getattr(current, "__code__", None)
+        wrapped = getattr(current, "__wrapped__", None)
+        if code is not None and code.co_filename == target_file and callable(wrapped):
+            return wrapped
+        current = wrapped
+
+    fallback = failover._ORIGINAL_RPC or core.RobinhoodRpc.rpc
+    return fallback
 
 
 def test_repeated_alchemy_getlogs_timeouts_fail_over_to_drpc_without_thread_growth(
@@ -91,11 +117,10 @@ def test_repeated_alchemy_getlogs_timeouts_fail_over_to_drpc_without_thread_grow
 
         # In the composed production regression suite, RobinhoodRpc.rpc has already
         # been wrapped by the complete provider finalizer. Re-wrapping that public
-        # method with another failover wrapper recursively nests provider authority
-        # and makes this stress regression test-order dependent. Exercise the same
-        # inner RPC seam captured by the installed failover layer instead; isolated
-        # execution falls back to the raw class method before installation.
-        inner_rpc = failover._ORIGINAL_RPC or core.RobinhoodRpc.rpc
+        # method with another failover wrapper recursively nests provider authority.
+        # Resolve the inner seam from the installed wrapper chain itself rather than
+        # the mutable module-level `_ORIGINAL_RPC` test diagnostic reference.
+        inner_rpc = _production_failover_inner_rpc()
         assert not bool(getattr(inner_rpc, "_roi_robinhood_provider_failover_rpc", False))
         wrapped = failover._rpc_wrapper(inner_rpc)
 
