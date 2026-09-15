@@ -5,12 +5,13 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from .storage_retention_policy import POLICIES_BY_TABLE
 from .strategy_v52_authority import target_sizing_policy
 from .v52_wallet_forward_alpha import WalletForwardValidationReport
 
-REPLAY_HISTORY_LIMIT = 5
+REPLAY_HISTORY_LIMIT = int(POLICIES_BY_TABLE["v52_wallet_forward_replay_runs"].value or 5)
 REPLAY_PRUNE_BATCH = 128
-VALIDATION_HEARTBEAT_SECONDS = 3600.0
+VALIDATION_HEARTBEAT_SECONDS = float(POLICIES_BY_TABLE["v52_wallet_forward_validation"].value or 3600.0)
 
 
 def _utc(value: Any) -> datetime:
