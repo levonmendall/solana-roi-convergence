@@ -111,20 +111,17 @@ def inventory_sqlite_pages(
             result["observed_at_least"] = len(rows)
             return result
 
+        # Include SQLite-generated autoindexes in ownership mapping. They are named
+        # ``sqlite_autoindex_*`` and therefore must not be dropped by a sqlite_%
+        # filter or their bytes would appear as an unowned internal object.
+        schema_objects = connection.execute(
+            "SELECT name,tbl_name,type FROM sqlite_master WHERE type IN ('table','index')"
+        ).fetchall()
         owners = {
             str(row[0]): (str(row[1]) if row[1] is not None else str(row[0]))
-            for row in connection.execute(
-                "SELECT name,tbl_name FROM sqlite_master "
-                "WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'"
-            ).fetchall()
+            for row in schema_objects
         }
-        object_types = {
-            str(row[0]): str(row[1])
-            for row in connection.execute(
-                "SELECT name,type FROM sqlite_master "
-                "WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'"
-            ).fetchall()
-        }
+        object_types = {str(row[0]): str(row[2]) for row in schema_objects}
 
         objects: list[dict[str, Any]] = []
         table_totals: dict[str, dict[str, int]] = {}
