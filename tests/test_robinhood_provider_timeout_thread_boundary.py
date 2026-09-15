@@ -7,6 +7,7 @@ import threading
 import httpx
 
 from solana_roi import robinhood_chain_core as core
+from solana_roi import robinhood_provider_capacity_budget as capacity
 from solana_roi import robinhood_provider_failover as failover
 
 
@@ -109,6 +110,13 @@ def test_repeated_alchemy_getlogs_timeouts_fail_over_to_drpc_without_thread_grow
         }
         peak_thread_count = len(baseline_threads)
 
+        # This regression is about timeout/failover thread behavior, not the
+        # production monthly pacing policy. The failover layer's captured inner RPC
+        # includes capacity accounting, where qualification eth_getLogs is
+        # intentionally rate-paced. Use the existing critical-priority context so
+        # all 128 synthetic failovers still traverse the composed RPC wrappers and
+        # monthly accounting without turning this test into a wall-clock quota test.
+        priority_token = capacity.set_priority("critical")
         try:
             for _ in range(_STRESS_ITERATIONS):
                 failover.reset_for_tests()
@@ -135,6 +143,7 @@ def test_repeated_alchemy_getlogs_timeouts_fail_over_to_drpc_without_thread_grow
             assert after_threads - baseline_threads == set()
             assert peak_thread_count == len(baseline_threads)
         finally:
+            capacity.reset_priority(priority_token)
             await rpc.close()
             failover.reset_for_tests()
 
