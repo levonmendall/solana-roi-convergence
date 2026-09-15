@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from . import storage_retention as base
-# These two modules extend the same positive registry with persistence that was
-# added after the original storage branch: current v5.2 validation state and
-# constructor-reachable runtime continuity/transport state.  Importing them here
-# makes the central manifest the single registration boundary used by active
-# schema validation and certification scope.
+# These modules extend the same positive registry with persistence that was
+# added after the original storage branch: current v5.2 validation state,
+# constructor-reachable runtime continuity/transport state, and the exact
+# non-authoritative legacy tables observed in the verified compact successor.
+# Importing them here makes the central manifest the single registration
+# boundary used by active schema validation and certification scope.
 from . import storage_current_v52_reconciliation as _current_v52_reconciliation  # noqa: F401
 from . import storage_runtime_persistence_reconciliation as _runtime_persistence_reconciliation  # noqa: F401
+from . import storage_legacy_schema_reconciliation as _legacy_schema_reconciliation
 
 R = base.RetentionClass
 C = base.RetentionContract
@@ -85,11 +87,24 @@ def certification_table_allowlist() -> tuple[str,...]:
 
 
 def validate_manifest() -> None:
-    for name,contract in RETENTION_REGISTRY.items():
+    exact_legacy = {
+        contract.dataset: contract
+        for contract in _legacy_schema_reconciliation.LEGACY_RETAINED_CONTRACTS
+    }
+    for name, contract in RETENTION_REGISTRY.items():
         if contract.retention_class is RetentionClass.LEGACY_UNCLASSIFIED:
-            raise RuntimeError(f"legacy-unclassified dataset cannot enter active manifest:{name}")
+            expected = exact_legacy.get(name)
+            if expected is None or contract != expected:
+                raise RuntimeError(
+                    f"legacy-unclassified dataset is not an exact approved retained-legacy contract:{name}"
+                )
+            if contract.startup_access or contract.certification_access:
+                raise RuntimeError(f"retained legacy dataset cannot have runtime/certification access:{name}")
+            if contract.hot_or_cold != "cold":
+                raise RuntimeError(f"retained legacy dataset must remain cold/non-authoritative:{name}")
+            continue
         if contract.hot_or_cold != "hot":
-            raise RuntimeError(f"cold dataset cannot enter active database:{name}")
+            raise RuntimeError(f"cold non-legacy dataset cannot enter active database:{name}")
 
 
 validate_manifest()
