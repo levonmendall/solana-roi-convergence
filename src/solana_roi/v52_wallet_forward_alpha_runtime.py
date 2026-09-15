@@ -20,6 +20,7 @@ from .v52_wallet_forward_alpha import (
     WalletIntegritySnapshot,
     WalletPointInTimeObservation,
 )
+from .v52_wallet_forward_retention import prune_replay_history, should_persist_validation
 
 RUNTIME_VERSION = "v52-wallet-forward-alpha-runtime-v1"
 REFERENCE_PORTFOLIO_USD = 500.0
@@ -797,7 +798,8 @@ class WalletForwardAlphaRuntime:
                 ") VALUES (?,?,?,?,?,1,0)",
                 (now.isoformat(), self.started_at.isoformat(), report.status, 1 if report.strategy_influence_enabled else 0, json.dumps(payload, sort_keys=True, default=str)),
             )
-        if persist_if_complete and full_coverage:
+        prune_replay_history(self.store)
+        if persist_if_complete and full_coverage and should_persist_validation(self.store, report, now):
             self.engine.persist_validation(report, evaluated_at=now)
         self.last_validation_at = now
         return payload
