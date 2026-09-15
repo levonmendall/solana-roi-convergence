@@ -9,6 +9,13 @@ from .v52_profit_confidence_completion import report as profit_confidence_report
 from .v52_profit_confidence_finalization import status as profit_confidence_finalization_status
 from .v52_learning_governance import status as learning_governance_status
 from .v52_wallet_forward_alpha_runtime import report as wallet_forward_alpha_report, status as wallet_forward_alpha_status
+from .v52_operational_integrity_repair import install_v52_operational_integrity_repair
+
+# v52_production_authority imports this API module before it executes the
+# Robinhood lifecycle installer. Install the narrow integrity wrapper here so
+# the lifecycle captures the repaired NAV function as its final production
+# binding. This changes evidence/accounting integrity only, not strategy rules.
+install_v52_operational_integrity_repair()
 
 STATUS_PATH = "/v1/strategy/authority"
 V52_STATUS_PATH = "/v1/strategy/v52"
