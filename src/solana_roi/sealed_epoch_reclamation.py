@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import shutil
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -12,13 +15,29 @@ from .active_storage_epoch_rollover import (
     _source_certification_release_commit,
 )
 from .storage_current_state_extractor import LegacyCurrentStateExtractor
-from .storage_file_retention import file_contract_for
+from .storage_file_retention import assert_persistent_file_registered, file_contract_for
 from .storage_retention import RetentionClass
 from .storage_transition import load_verified_checkpoint
+
+RECLAMATION_RECEIPT_DATASET = "sealed_epoch_reclamation_receipt"
+RECLAMATION_RECEIPT_SUFFIX = ".sealed-epoch-reclamation.json"
+RECLAMATION_PROTOCOL_VERSION = "sealed-epoch-reclamation-v1"
 
 
 class SealedEpochReclamationBlocked(RuntimeError):
     """Raised only when destructive eligibility cannot be proven exactly."""
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 @contextmanager
@@ -112,13 +131,7 @@ def preflight_sealed_epoch_reclamation(
     expected_release_sha: str | None = None,
     approved_checkpoint_id: str | None = None,
 ) -> dict[str, Any]:
-    """Prove one sealed predecessor is reclaimable without mutating storage.
-
-    This function deliberately does not unlink, truncate, vacuum, checkpoint or
-    rewrite any database.  It only becomes a future destructive authorization input
-    after the production disk-ownership/full-runtime handshake is independently
-    satisfied and an operator approval is bound to the exact verified checkpoint.
-    """
+    """Prove one sealed predecessor is reclaimable without mutating storage."""
 
     active = Path(active_path)
     if not active.is_file():
@@ -207,7 +220,182 @@ def preflight_sealed_epoch_reclamation(
     }
 
 
+def _receipt_path(active_path: Path) -> Path:
+    return Path(str(active_path) + RECLAMATION_RECEIPT_SUFFIX)
+
+
+def _read_receipt(active_path: Path) -> dict[str, Any] | None:
+    path = _receipt_path(active_path)
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise SealedEpochReclamationBlocked("reclamation receipt is not a regular file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SealedEpochReclamationBlocked("reclamation receipt is unreadable") from exc
+    if not isinstance(payload, dict) or payload.get("protocol_version") != RECLAMATION_PROTOCOL_VERSION:
+        raise SealedEpochReclamationBlocked("reclamation receipt is invalid")
+    return payload
+
+
+def _write_receipt(active_path: Path, payload: dict[str, Any]) -> Path:
+    assert_persistent_file_registered(RECLAMATION_RECEIPT_DATASET)
+    path = _receipt_path(active_path)
+    if path.exists() and path.is_symlink():
+        raise SealedEpochReclamationBlocked("reclamation receipt must not be a symlink")
+    temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
+    raw = dict(payload)
+    raw["protocol_version"] = RECLAMATION_PROTOCOL_VERSION
+    raw["retention_dataset"] = RECLAMATION_RECEIPT_DATASET
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(raw, handle, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    _fsync_dir(path.parent)
+    return path
+
+
+def _identity_matches(candidate: Path, proof: dict[str, Any]) -> bool:
+    try:
+        stat = candidate.stat()
+    except FileNotFoundError:
+        return False
+    return bool(
+        int(stat.st_dev) == int(proof.get("device", -1))
+        and int(stat.st_ino) == int(proof.get("inode", -1))
+        and int(stat.st_nlink) == 1
+        and int(stat.st_size) == int(proof.get("size_bytes", -1))
+    )
+
+
+def execute_sealed_epoch_reclamation(
+    active_path: Path | str,
+    *,
+    expected_release_sha: str,
+    approved_checkpoint_id: str,
+) -> dict[str, Any]:
+    """Unlink exactly one proven predecessor with crash-safe intent/final receipt.
+
+    Cross-process disk ownership and the same-release full-runtime handshake are
+    deliberately enforced by the production cleanup installer before this function
+    may be called.  This executor independently rechecks the active checkpoint and
+    candidate identity immediately before unlinking.
+    """
+
+    assert_persistent_file_registered(RECLAMATION_RECEIPT_DATASET)
+    active = Path(active_path)
+    checkpoint = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
+    checkpoint_id = str(checkpoint.get("checkpoint_id") or "")
+    if not checkpoint_id or checkpoint_id != str(approved_checkpoint_id):
+        raise SealedEpochReclamationBlocked("operator approval is not bound to the current verified checkpoint")
+
+    receipt = _read_receipt(active)
+    if receipt is not None:
+        receipt_checkpoint = str(receipt.get("checkpoint_id") or "")
+        receipt_status = str(receipt.get("status") or "")
+        candidate_path = Path(str(receipt.get("candidate_path") or ""))
+        if receipt_checkpoint == checkpoint_id and receipt_status == "complete":
+            if candidate_path.exists():
+                raise SealedEpochReclamationBlocked("completed reclamation receipt points to a present predecessor")
+            result = dict(receipt)
+            result.update({"idempotent_replay": True, "sealed_source_deleted": True})
+            return result
+        if receipt_checkpoint == checkpoint_id and receipt_status == "intent" and not candidate_path.exists():
+            verified = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
+            if str(verified.get("checkpoint_id") or "") != checkpoint_id:
+                raise SealedEpochReclamationBlocked("active checkpoint changed while recovering reclamation intent")
+            completed = dict(receipt)
+            completed.update(
+                {
+                    "status": "complete",
+                    "completed_at": _utcnow(),
+                    "recovered_after_interrupted_finalize": True,
+                    "sealed_source_deleted": True,
+                    "paper_only": True,
+                    "live_money_authority": False,
+                }
+            )
+            _write_receipt(active, completed)
+            return completed
+        if receipt_status == "intent" and receipt_checkpoint != checkpoint_id:
+            raise SealedEpochReclamationBlocked("unresolved reclamation intent belongs to a different checkpoint")
+
+    proof = preflight_sealed_epoch_reclamation(
+        active,
+        expected_release_sha=expected_release_sha,
+        approved_checkpoint_id=approved_checkpoint_id,
+    )
+    if not bool(proof.get("reclaimable")):
+        raise SealedEpochReclamationBlocked(
+            "sealed predecessor is not exactly reclaimable:" + ",".join(proof.get("blockers") or ())
+        )
+    candidate_proof = dict(proof.get("eligible_candidate") or {})
+    candidate = Path(str(candidate_proof.get("path") or ""))
+    if not candidate.is_file() or candidate.is_symlink():
+        raise SealedEpochReclamationBlocked("approved sealed predecessor is no longer a regular file")
+    if not _identity_matches(candidate, candidate_proof):
+        raise SealedEpochReclamationBlocked("approved sealed predecessor identity changed after preflight")
+
+    intent = {
+        "status": "intent",
+        "created_at": _utcnow(),
+        "active_path": str(active.resolve()),
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_release_sha": str(checkpoint.get("release_sha") or ""),
+        "semantic_hash": str(checkpoint.get("semantic_hash") or ""),
+        "candidate_path": str(candidate.resolve()),
+        "candidate_device": int(candidate_proof["device"]),
+        "candidate_inode": int(candidate_proof["inode"]),
+        "candidate_size_bytes": int(candidate_proof["size_bytes"]),
+        "candidate_allocated_bytes": int(candidate_proof.get("allocated_bytes") or 0),
+        "source_release_commit": candidate_proof.get("source_release_commit"),
+        "paper_only": True,
+        "live_money_authority": False,
+    }
+    receipt_path = _write_receipt(active, intent)
+
+    verified = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
+    if str(verified.get("checkpoint_id") or "") != checkpoint_id:
+        raise SealedEpochReclamationBlocked("active checkpoint changed after reclamation intent")
+    if not _identity_matches(candidate, candidate_proof):
+        raise SealedEpochReclamationBlocked("sealed predecessor identity changed after reclamation intent")
+
+    free_before = int(shutil.disk_usage(active.parent).free)
+    candidate.unlink()
+    _fsync_dir(candidate.parent)
+    if candidate.exists():
+        raise SealedEpochReclamationBlocked("sealed predecessor remained present after unlink")
+
+    verified_after = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
+    if str(verified_after.get("checkpoint_id") or "") != checkpoint_id:
+        raise SealedEpochReclamationBlocked("active checkpoint changed after sealed predecessor unlink")
+    free_after = int(shutil.disk_usage(active.parent).free)
+
+    completed = dict(intent)
+    completed.update(
+        {
+            "status": "complete",
+            "completed_at": _utcnow(),
+            "receipt_path": str(receipt_path),
+            "filesystem_free_bytes_before": free_before,
+            "filesystem_free_bytes_after": free_after,
+            "filesystem_free_bytes_delta": free_after - free_before,
+            "idempotent_replay": False,
+            "sealed_source_deleted": True,
+        }
+    )
+    _write_receipt(active, completed)
+    return completed
+
+
 __all__ = [
+    "RECLAMATION_PROTOCOL_VERSION",
+    "RECLAMATION_RECEIPT_DATASET",
+    "RECLAMATION_RECEIPT_SUFFIX",
     "SealedEpochReclamationBlocked",
+    "execute_sealed_epoch_reclamation",
     "preflight_sealed_epoch_reclamation",
 ]
