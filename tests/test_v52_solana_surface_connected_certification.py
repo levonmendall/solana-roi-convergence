@@ -86,6 +86,17 @@ def _row(*, signature: str, token: str, venue: str, side: str, at: datetime) -> 
     }
 
 
+def _wrapper_lineage(fn) -> list[str]:
+    names: list[str] = []
+    seen: set[int] = set()
+    current = fn
+    while callable(current) and id(current) not in seen:
+        seen.add(id(current))
+        names.append(f"{getattr(current, '__module__', '?')}:{getattr(current, '__name__', '?')}")
+        current = getattr(current, "__wrapped__", None)
+    return names
+
+
 def _build_adapter(monkeypatch, tmp_path, *, hard_flags=()):
     monkeypatch.setenv("RENDER_GIT_COMMIT", "v52-solana-connected-certification")
     install_risk_conditioned_alpha_v5()
@@ -168,8 +179,6 @@ def test_pump_surface_reaches_v52_shared_capital_exit_and_canonical_settlement(
     fraction = float(trial["position_fraction"])
     assert fraction > 0.0
 
-    # The FOMO strategy may independently prefer the same source event, but one
-    # economic opportunity must not reserve the shared paper portfolio twice.
     if fomo is not None:
         assert fomo["decision"] == "no_entry_duplicate_authoritative_solana_opportunity"
         assert float(fomo["position_fraction"] or 0.0) == 0.0
@@ -197,16 +206,16 @@ def test_pump_surface_reaches_v52_shared_capital_exit_and_canonical_settlement(
     assert outcome["paper_only"] == 1
     assert outcome["live_money_authority"] == 0
 
-    assert lifecycle.sync_settlements(adapter) == 1
+    # The lifecycle wrapper automatically reconciles settlement after observe().
+    # A second explicit sync is therefore the idempotent replay proof, not the first settlement.
     settled = capital_reconciliation(store, release_commit=adapter.release_commit)
     assert settled["active_reserved_fraction"] == pytest.approx(0.0)
     assert settled["available_fraction"] == pytest.approx(1.0)
     assert settled["settlement_count"] == 1
     assert settled["realized_return_contribution"] == pytest.approx(fraction * float(outcome["net_return"]))
     assert settled["paper_nav_multiplier"] == pytest.approx(1.0 + fraction * float(outcome["net_return"]))
+    assert lifecycle.sync_settlements(adapter) == 0
 
-    # Entry includes one exact immediate exit quote plus the v5.2 depth quote;
-    # settlement uses another exact token->SOL exit quote.
     assert sum(1 for input_mint, output_mint, _ in route_calls if input_mint == token and output_mint == WSOL_MINT) >= 3
     assert lifecycle.sync_entry_reservations(adapter, str(buy["signature"])) == 0
     assert lifecycle.sync_settlements(adapter) == 0
@@ -225,23 +234,31 @@ def test_pump_surface_mechanical_hard_stop_rejects_before_capital(monkeypatch, t
     asyncio.run(adapter.observe(str(buy["signature"])))
 
     with store._lock:
-        rejections = store.db.execute(
-            "SELECT * FROM risk_conditioned_alpha_v5_trials WHERE release_commit=? AND source_signature=? "
-            "AND decision='reject_mechanical_hard_stop' ORDER BY id",
+        v5_rows = store.db.execute(
+            "SELECT lane,selected,decision,decision_reason,venue,lifecycle,risk_json FROM risk_conditioned_alpha_v5_trials "
+            "WHERE release_commit=? AND source_signature=? ORDER BY id",
             (adapter.release_commit, buy["signature"]),
         ).fetchall()
-        entries = store.db.execute(
-            "SELECT COUNT(*) FROM risk_conditioned_alpha_v5_trials WHERE release_commit=? AND source_signature=? "
-            "AND decision LIKE 'paper_enter%'",
-            (adapter.release_commit, buy["signature"]),
-        ).fetchone()[0]
-    assert rejections
-    assert all(str(row["venue"]) == venue for row in rejections)
-    assert int(entries) == 0
+        rejections = [row for row in v5_rows if str(row["decision"]) == "reject_mechanical_hard_stop"]
+        entries = sum(1 for row in v5_rows if str(row["decision"]).startswith("paper_enter"))
+        final_rows = store.db.execute(
+            "SELECT lane,decision_json,entry_executable,exit_executable FROM profit_first_final_trials "
+            "WHERE epoch_id=? AND source_signature=? ORDER BY id",
+            (adapter.epoch_id, buy["signature"]),
+        ).fetchall()
+    diagnostic = {
+        "v5_rows": [dict(row) for row in v5_rows],
+        "profit_first_rows": [dict(row) for row in final_rows],
+        "route_calls": route_calls,
+        "buy_wrapper_lineage": _wrapper_lineage(FinalProfitFirstResearchAdapter._buy),
+        "v5_choose_lineage": _wrapper_lineage(v5._choose_lane_and_fraction),
+    }
+    assert rejections, diagnostic
+    assert all(str(row["venue"]) == venue for row in rejections), diagnostic
+    assert int(entries) == 0, diagnostic
     assert lifecycle.sync_entry_reservations(adapter, str(buy["signature"])) == 0
     state = capital_reconciliation(store, release_commit=adapter.release_commit)
     assert state["active_reserved_fraction"] == 0.0
     assert state["settlement_count"] == 0
-    # Mechanical hard stops bypass all execution quote work.
-    assert route_calls == []
+    assert route_calls == [], diagnostic
     store.close()
