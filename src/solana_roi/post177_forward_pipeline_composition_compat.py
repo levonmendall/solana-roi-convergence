@@ -9,6 +9,7 @@ from . import post177_forward_pipeline_bottleneck_repair as repair
 from . import post178_e2e_residual_repair as post178
 from . import post178_scout_terminal_classification_fix as post178_scout
 from . import robinhood_research_getlogs_isolation as robinhood_research_getlogs_isolation
+from . import robinhood_research_streaming_memory_repair as robinhood_research_streaming_memory
 from . import robinhood_research_universe_cache as robinhood_research_universe_cache
 from . import robinhood_request_budget_telemetry as robinhood_request_budget
 from . import robinhood_v2_v4_efficiency_repair as robinhood_v2_v4_efficiency
@@ -20,7 +21,7 @@ from .config import BASELINE
 from .direct_solana import DirectSolanaIngestionPlane
 
 
-COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v3"
+COMPAT_VERSION = "post177-forward-pipeline-composition-compat-v4"
 _FINAL_DIRECT_STATUS: Callable[..., dict[str, Any]] | None = None
 
 
@@ -104,15 +105,7 @@ setattr(_truthful_direct_status, "_roi_post177_forward_pipeline_composition_comp
 
 
 def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) -> None:
-    """Restore established composition identities, then install final E2E residuals.
-
-    PR177's follow-up needs new forward semantics, not new strategy or scheduler
-    authority. Keep the canonical 20-second candidate-state lifetime, restore the
-    final standby-over-background RPC governor, preserve wrapper lineage markers,
-    and leave unified-status composition to the repository's existing readiness
-    installer before the post-178 residual repair applies its final current-frontier
-    semantics.
-    """
+    """Restore established composition identities, then install final E2E residuals."""
 
     global _FINAL_DIRECT_STATUS
 
@@ -153,6 +146,12 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
     # from rescanning thousands of immutable SQLite rows.
     robinhood_research_universe_cache.install_robinhood_research_universe_cache()
 
+    # Stream each public research provider response through the existing signal
+    # decoder immediately instead of retaining every raw response for the whole
+    # all-market pass. The compact pending surface preserves the existing 256-event
+    # per-market retention and commits only after the complete pass succeeds.
+    robinhood_research_streaming_memory.install_robinhood_research_streaming_memory_repair(plane_cls)
+
     # V2/V4 remains fail-closed until the production reactivation gate passes. Attach
     # that rule to the production plane, not the observer's global enable predicate,
     # so direct recovery primitives stay deterministic and independently resumable.
@@ -170,8 +169,11 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
     # entry authority. Storage remains the existing Robinhood state/event/swap path.
     robinhood_v2_v4.install_robinhood_v2_v4_observation(plane_cls)
 
-    # Make the expected-versus-actual request budget visible on the final composed
-    # runtime after all Robinhood status wrappers have been installed.
+    # The budget wrapper imported before composition captured the historical research
+    # primitive. Point it at the streaming primitive before installing the final
+    # expected-versus-actual counter wrapper so request accounting and memory repair
+    # compose rather than one silently restoring the old whole-pass accumulator.
+    robinhood_request_budget._ORIGINAL_RESEARCH_PASS = robinhood_research_streaming_memory._streaming_research_pass
     robinhood_request_budget.install_robinhood_request_budget_telemetry(plane_cls)
 
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_installed", True)
