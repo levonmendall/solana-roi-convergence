@@ -13,9 +13,10 @@ from .strategy_v52_authority import (
 )
 from .v51_robinhood_candidate_coverage import _reconcile_durable_entry
 from .v51_robinhood_consolidation import _candidate_id
+from .v52_canonical_portfolio_restart_repair import install_v52_canonical_portfolio_restart_repair
 from .v52_robinhood_shared_capital_repair import install_v52_robinhood_shared_capital_repair
 
-RECONCILIATION_VERSION = "v52-robinhood-post-validation-candidate-reconciliation-2-shared-capital"
+RECONCILIATION_VERSION = "v52-robinhood-post-validation-candidate-reconciliation-3-canonical-capital"
 _INSTALLED = False
 _BASE_VALIDATE: Callable[..., Awaitable[bool]] | None = None
 
@@ -64,14 +65,6 @@ async def _validate_and_reconcile(
     *,
     venue_object: Any,
 ) -> bool:
-    """Reconcile the pre-lane ledger only after a validated v5.2 trial exists.
-
-    The mature Robinhood candidate-coverage wrapper observes the original decision
-    function before this lifecycle layer performs aggregate/stressed exit checks.
-    It therefore cannot see a durable trial during its own after/before comparison.
-    Keep that wrapper unchanged and reuse its existing durable-entry reconciliation
-    immediately after the v5.2 lifecycle commits the trial.
-    """
     if _BASE_VALIDATE is None:
         raise RuntimeError("v5.2 Robinhood candidate reconciliation base validator missing")
 
@@ -122,6 +115,8 @@ def status() -> dict[str, Any]:
         "strategy_version": STRATEGY_VERSION,
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "reconciliation_trigger": "successful_v52_lifecycle_commit_only",
+        "canonical_portfolio_restart_reconciliation_installed": True,
+        "release_sha_is_capital_reset_boundary": False,
         "shared_capital_installed_before_reconciliation": True,
         "changes_economic_decision": False,
         "paper_only": PAPER_ONLY,
@@ -135,10 +130,10 @@ def install_v52_robinhood_candidate_reconciliation() -> None:
     global _INSTALLED, _BASE_VALIDATE
     if _INSTALLED:
         return
-    # The lifecycle installer has already installed its final v5.2 entry and exit
-    # wrappers when production calls this function. Attach the shared-capital repair
-    # now, then let candidate reconciliation wrap the repaired validator. This keeps
-    # one canonical capital authority and does not alter qualification semantics.
+    # v5.2 owns one durable $500 paper portfolio across deployment SHAs. Install
+    # cross-release settlement recovery before the Robinhood shared-capital adapter,
+    # then wrap the final repaired validator with candidate reconciliation.
+    install_v52_canonical_portfolio_restart_repair()
     install_v52_robinhood_shared_capital_repair()
     _BASE_VALIDATE = lifecycle._validate_and_commit
     lifecycle._validate_and_commit = _validate_and_reconcile
