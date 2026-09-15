@@ -1,0 +1,52 @@
+name: Operator PR405 readiness patch
+
+on:
+  push:
+    branches:
+      - repair/robinhood-page-cache-bounded-status
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: repair/robinhood-page-cache-bounded-status
+          fetch-depth: 2
+      - name: Apply exact readiness repair
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/solana_roi/robinhood_worker_isolation_repair.py')
+          text = path.read_text()
+          old = '''    if live_cursor is not None:\n        decision_cursor = int(live_cursor)\n        transport_ready = bool(getattr(plane, "_roi_live_epoch_ready", False)) and not bool(\n            getattr(plane, "_roi_live_epoch_suppress_entries", False)\n        )\n    else:\n        decision_cursor = int(cursor) if cursor is not None else None\n        transport_ready = bool(getattr(plane, "_caught_up", False))\n'''
+          new = '''    if live_cursor is not None:\n        decision_cursor = int(live_cursor)\n        transport_error = getattr(plane, "_roi_live_epoch_last_error_type", None)\n        transport_ready = (\n            bool(getattr(plane, "_roi_live_epoch_ready", False))\n            and not bool(getattr(plane, "_roi_live_epoch_suppress_entries", False))\n            and not transport_error\n        )\n    else:\n        decision_cursor = int(cursor) if cursor is not None else None\n        transport_error = getattr(plane, "_last_error", None)\n        transport_ready = bool(getattr(plane, "_caught_up", False)) and not transport_error\n'''
+          if old not in text:
+              if 'transport_error = getattr(plane, "_roi_live_epoch_last_error_type", None)' in text:
+                  raise SystemExit(0)
+              raise SystemExit('expected readiness block not found')
+          text = text.replace(old, new, 1)
+          old2 = '''        "runtime_ready": True,\n        "failed_closed": False,\n'''
+          new2 = '''        "worker_process_ready": True,\n        "runtime_ready": transport_ready,\n        "failed_closed": False,\n'''
+          if old2 not in text:
+              raise SystemExit('expected runtime readiness fields not found')
+          text = text.replace(old2, new2, 1)
+          old3 = '''        "last_error": last_error,\n        "rpc_failures": int(getattr(plane, "_rpc_failures", 0) or 0),\n'''
+          new3 = '''        "last_error": last_error,\n        "error": transport_error or None,\n        "rpc_failures": int(getattr(plane, "_rpc_failures", 0) or 0),\n'''
+          if old3 not in text:
+              raise SystemExit('expected last_error fields not found')
+          text = text.replace(old3, new3, 1)
+          path.write_text(text)
+          PY
+      - name: Commit branch-only repair
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/solana_roi/robinhood_worker_isolation_repair.py
+          git commit -m 'Fail closed Robinhood cached readiness on live transport errors'
+          git push origin HEAD:repair/robinhood-page-cache-bounded-status
