@@ -5,9 +5,12 @@ from typing import Any
 # Register persistence added by the current v5.2 market-validation and
 # wallet-forward runtimes before the positive certification allowlist is read.
 from . import storage_current_v52_reconciliation as _current_v52_reconciliation  # noqa: F401
+from .certification_replication_protocol import (
+    ACTIVE_MANIFEST_PROTOCOL_SUFFIX,
+    ACTIVE_MANIFEST_VERSION,
+)
 from .storage_manifest import certification_table_allowlist
 
-ACTIVE_MANIFEST_VERSION = "positive-active-manifest-v1"
 _INSTALLED = False
 
 
@@ -19,11 +22,10 @@ def install_active_certification_manifest() -> None:
     same replication helpers, so one scope controls both trigger installation,
     bounded deltas, and bootstrap tables/schema objects.
 
-    The replication version describes the wire/protocol contract, not the set
-    of admitted persistent datasets. Active-storage scope is already fail-closed
-    through the positive allowlist plus the replication epoch/schema fingerprint.
-    Changing the protocol version merely because the allowed table set changes
-    incorrectly makes an otherwise compatible certifier reject the active store.
+    The active manifest is deliberately carried in the replication protocol
+    identity. That prevents a certifier from silently mixing legacy all-history
+    scope with the bounded positive allowlist under one bootstrap/checkpoint/
+    delta stream.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -52,8 +54,6 @@ def install_active_certification_manifest() -> None:
 
     replication._ordinary_tables = _manifest_tables
     replication._schema_objects = _manifest_schema_objects
-    # Intentionally preserve replication.REPLICATION_VERSION. The positive
-    # manifest changes certification data scope, not the bounded replication
-    # wire protocol. Scope identity remains exact through the allowlist-derived
-    # schema fingerprint and replication epoch.
+    if not str(replication.REPLICATION_VERSION).endswith(ACTIVE_MANIFEST_PROTOCOL_SUFFIX):
+        replication.REPLICATION_VERSION = str(replication.REPLICATION_VERSION) + ACTIVE_MANIFEST_PROTOCOL_SUFFIX
     _INSTALLED = True
