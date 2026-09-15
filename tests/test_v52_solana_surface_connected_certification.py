@@ -15,6 +15,9 @@ from solana_roi import risk_conditioned_alpha_v5 as v5
 from solana_roi import v51_paper_lifecycle_runtime as lifecycle
 from solana_roi.v51_atomic_paper_capital import capital_reconciliation
 from solana_roi.strategy_v52_authority import STRATEGY_VERSION
+from solana_roi.v52_cross_lane_paper_certification_repair import (
+    configure_v52_cross_lane_paper_certification_repair,
+)
 
 
 class _Rpc:
@@ -87,6 +90,7 @@ def _build_adapter(monkeypatch, tmp_path, *, hard_flags=()):
     monkeypatch.setenv("RENDER_GIT_COMMIT", "v52-solana-connected-certification")
     install_risk_conditioned_alpha_v5()
     install_v52_authoritative_strategy()
+    configure_v52_cross_lane_paper_certification_repair()
     assert v5._choose_lane_and_fraction.__module__.endswith("v52_authoritative_strategy")
     assert bool(getattr(v5._choose_lane_and_fraction, "_roi_v52_final_authority", False)) is True
 
@@ -146,6 +150,11 @@ def test_pump_surface_reaches_v52_shared_capital_exit_and_canonical_settlement(
             "AND selected=1 ORDER BY id DESC LIMIT 1",
             (adapter.release_commit, buy["signature"]),
         ).fetchone()
+        fomo = store.db.execute(
+            "SELECT decision,position_fraction FROM fomo_paper_trials "
+            "WHERE release_commit=? AND source_signature=? LIMIT 1",
+            (adapter.release_commit, buy["signature"]),
+        ).fetchone()
     assert trial is not None
     trial = dict(trial)
     assert trial["strategy_version"] == STRATEGY_VERSION
@@ -158,6 +167,12 @@ def test_pump_surface_reaches_v52_shared_capital_exit_and_canonical_settlement(
     assert trial["live_money_authority"] == 0
     fraction = float(trial["position_fraction"])
     assert fraction > 0.0
+
+    # The FOMO strategy may independently prefer the same source event, but one
+    # economic opportunity must not reserve the shared paper portfolio twice.
+    if fomo is not None:
+        assert fomo["decision"] == "no_entry_duplicate_authoritative_solana_opportunity"
+        assert float(fomo["position_fraction"] or 0.0) == 0.0
 
     assert lifecycle.sync_entry_reservations(adapter, str(buy["signature"])) == 1
     reserved = capital_reconciliation(store, release_commit=adapter.release_commit)
@@ -210,15 +225,19 @@ def test_pump_surface_mechanical_hard_stop_rejects_before_capital(monkeypatch, t
     asyncio.run(adapter.observe(str(buy["signature"])))
 
     with store._lock:
-        trial = store.db.execute(
+        rejections = store.db.execute(
             "SELECT * FROM risk_conditioned_alpha_v5_trials WHERE release_commit=? AND source_signature=? "
-            "AND selected=1 ORDER BY id DESC LIMIT 1",
+            "AND decision='reject_mechanical_hard_stop' ORDER BY id",
             (adapter.release_commit, buy["signature"]),
-        ).fetchone()
-    assert trial is not None
-    trial = dict(trial)
-    assert trial["venue"] == venue
-    assert trial["decision"] == "reject_mechanical_hard_stop"
+        ).fetchall()
+        entries = store.db.execute(
+            "SELECT COUNT(*) FROM risk_conditioned_alpha_v5_trials WHERE release_commit=? AND source_signature=? "
+            "AND decision LIKE 'paper_enter%'",
+            (adapter.release_commit, buy["signature"]),
+        ).fetchone()[0]
+    assert rejections
+    assert all(str(row["venue"]) == venue for row in rejections)
+    assert int(entries) == 0
     assert lifecycle.sync_entry_reservations(adapter, str(buy["signature"])) == 0
     state = capital_reconciliation(store, release_commit=adapter.release_commit)
     assert state["active_reserved_fraction"] == 0.0
