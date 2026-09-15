@@ -143,6 +143,39 @@ def test_additional_hardlink_blocks_physical_reclamation(tmp_path, monkeypatch):
     assert extra.exists()
 
 
+def test_multiple_exact_candidate_matches_fail_closed(tmp_path, monkeypatch):
+    active, sealed = _paths(tmp_path)
+    second_dir = tmp_path / "active-epochs" / "sealed-proof-two"
+    second_dir.mkdir(parents=True)
+    second = second_dir / active.name
+    second.write_bytes(sealed.read_bytes())
+    checkpoint = _checkpoint(active, sealed)
+    monkeypatch.setattr(reclamation, "load_verified_checkpoint", lambda *_args, **_kwargs: checkpoint)
+    monkeypatch.setattr(
+        reclamation,
+        "_candidate_proof",
+        lambda candidate, **_kwargs: {
+            "path": str(candidate.resolve()),
+            "eligible": True,
+            "source_release_commit": SOURCE_RELEASE_SHA,
+            "semantic_hash": payload_hash(TRUTH),
+        },
+    )
+
+    result = reclamation.preflight_sealed_epoch_reclamation(
+        active,
+        approved_checkpoint_id=CHECKPOINT_ID,
+    )
+
+    assert result["reclaimable"] is False
+    assert result["candidate_count"] == 2
+    assert result["eligible_candidate_count"] == 2
+    assert result["eligible_candidate"] is None
+    assert result["blockers"] == ["multiple_exact_sealed_predecessor_matches"]
+    assert sealed.exists()
+    assert second.exists()
+
+
 def test_missing_sealed_predecessor_is_non_destructive_not_applicable(tmp_path, monkeypatch):
     active = tmp_path / "active.sqlite3"
     active.write_bytes(b"active-successor")
