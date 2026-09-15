@@ -10,8 +10,8 @@ Normal cycles consume bounded, possibly multi-batch deltas transactionally.
 A successfully materialized logical replica is durable catch-up state. Transient
 transport failures and bounded catch-up exhaustion must never throw that exact state
 away and restart the expensive logical scan; the next cycle resumes from the last
-transactionally committed watermark. Only release/schema/epoch invalidation forces a
-fresh bootstrap.
+transactionally committed watermark. Only release/schema/epoch/protocol invalidation
+forces a fresh bootstrap.
 """
 
 import fcntl
@@ -35,6 +35,10 @@ from .certification_incremental_replication import (
     _current_watermark,
 )
 from .certification_logical_bootstrap_client import LogicalBootstrapRestartRequired, logical_bootstrap
+from .certification_replication_protocol import (
+    SUPPORTED_REPLICATION_VERSIONS,
+    is_supported_replication_version,
+)
 
 CLIENT_VERSION = "certification-incremental-replica-client-v6-resumable-catchup"
 DEFAULT_DELTA_TIMEOUT_SECONDS = 30.0
@@ -50,7 +54,7 @@ TRANSACTION_SUBMISSION_AVAILABLE = False
 
 
 class ReplicaBootstrapRequired(RuntimeError):
-    """The authoritative release/schema/epoch identity requires a fresh replica."""
+    """The authoritative release/schema/epoch/protocol identity requires a fresh replica."""
 
 
 class ReplicaDeltaTransportError(RuntimeError):
@@ -184,7 +188,7 @@ def _read_source_replication_identity(path: Path) -> dict[str, Any]:
         fingerprint = str(meta.get("schema_fingerprint") or "")
         version = str(meta.get("replication_version") or "")
         watermark = _current_watermark(connection)
-        if not epoch or not fingerprint or version != REPLICATION_VERSION:
+        if not epoch or not fingerprint or not is_supported_replication_version(version):
             raise RuntimeError("authoritative bootstrap replication identity invalid")
         connection.execute("PRAGMA journal_mode=DELETE")
         triggers = connection.execute(
@@ -243,6 +247,9 @@ def _delta_timeout() -> float:
 
 
 def _fetch_delta(*, base: str, token: str, expected_release: str, state: dict[str, Any]) -> dict[str, Any]:
+    expected_replication_version = str(state.get("replication_version") or "")
+    if not is_supported_replication_version(expected_replication_version):
+        raise ReplicaBootstrapRequired("local certification replication version unsupported")
     query = urllib.parse.urlencode(
         {
             "from_watermark": int(state["watermark"]),
@@ -273,7 +280,7 @@ def _fetch_delta(*, base: str, token: str, expected_release: str, state: dict[st
         raise ReplicaDeltaTransportError("authoritative certification delta returned non-object")
     if str(payload.get("release_commit") or "") != expected_release:
         raise ReplicaDeltaTransportError("authoritative certification delta release mismatch")
-    if str(payload.get("replication_version") or "") != REPLICATION_VERSION:
+    if str(payload.get("replication_version") or "") != expected_replication_version:
         raise ReplicaBootstrapRequired("authoritative certification replication version changed")
     if str(payload.get("epoch") or "") != str(state["epoch"]):
         raise ReplicaBootstrapRequired("authoritative certification replication epoch changed")
@@ -402,6 +409,8 @@ def _bootstrap(replica: Path, *, base: str, token: str, expected_release: str) -
         try:
             try:
                 identity = logical_bootstrap(tmp, base=base, token=token, expected_release=expected_release)
+                if not is_supported_replication_version(identity.get("replication_version")):
+                    raise ReplicaBootstrapRequired("logical bootstrap selected unsupported replication version")
                 actual_bytes = _validate_sqlite(tmp)
             except (LogicalBootstrapRestartRequired, ReplicaBootstrapRequired) as exc:
                 last_error = exc
@@ -496,7 +505,7 @@ def synchronize_replica(*, base: str, token: str, expected_release: str) -> tupl
         state is None
         or not replica.is_file()
         or str(state.get("release_commit") or "") != expected_release
-        or str(state.get("replication_version") or "") != REPLICATION_VERSION
+        or not is_supported_replication_version(state.get("replication_version"))
     ):
         return replica, _bootstrap(replica, base=base, token=token, expected_release=expected_release)
     try:
@@ -574,11 +583,14 @@ def status() -> dict[str, Any]:
         "replica_path_configured": bool(os.getenv("SOLANA_ROI_CERTIFIER_REPLICA_PATH", "").strip()),
         "replica_available": replica.is_file(),
         "replica_release_commit": state.get("release_commit") if state else None,
+        "replica_replication_version": state.get("replication_version") if state else None,
         "replica_epoch": state.get("epoch") if state else None,
         "replica_schema_fingerprint": state.get("schema_fingerprint") if state else None,
         "replica_watermark": state.get("watermark") if state else None,
         "bootstrap_complete": bool(state.get("bootstrap_complete")) if state else False,
         "catchup_complete": bool(state.get("catchup_complete")) if state else False,
+        "supported_replication_versions": sorted(SUPPORTED_REPLICATION_VERSIONS),
+        "exact_replication_version_pinned": True,
         "logical_bootstrap_default": True,
         "full_snapshot_bootstrap_enabled": _allow_full_snapshot_recovery(),
         "full_snapshot_role": "explicit_recovery_only",
@@ -601,9 +613,11 @@ def status() -> dict[str, Any]:
 
 __all__ = [
     "CLIENT_VERSION",
+    "REPLICATION_VERSION",
     "ReplicaBootstrapRequired",
     "ReplicaCatchupPending",
     "ReplicaDeltaTransportError",
+    "SUPPORTED_REPLICATION_VERSIONS",
     "_apply_delta",
     "_atomic_state",
     "_fetch_delta",
