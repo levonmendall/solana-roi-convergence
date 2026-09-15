@@ -8,7 +8,7 @@ from . import robinhood_chain_runtime as runtime
 from . import robinhood_live_frontier_verification_repair as frontier
 
 
-EFFICIENCY_REPAIR_VERSION = "robinhood-provider-efficiency-v2-live-frontier-composed-market-log-batching"
+EFFICIENCY_REPAIR_VERSION = "robinhood-provider-efficiency-v3-composition-safe-rebinding"
 _INSTALLED = False
 _ORIGINAL_FETCH_MARKET_LOGS = catchup._fetch_market_logs
 _ORIGINAL_FRONTIER_FETCH_MARKET_LOGS = frontier._fetch_market_logs
@@ -97,12 +97,14 @@ async def _combined_fetch_market_logs(
 
 def install_robinhood_provider_efficiency_repair() -> None:
     global _INSTALLED
-    if _INSTALLED:
-        return
-    # Both seams matter. The verified live-frontier module imports the catch-up helper
-    # by value, so replacing only catchup._fetch_market_logs leaves the actual
-    # forward-only production lane on the legacy two-query path. Bind the composed
-    # helper to both aliases before the production worker starts.
+    # Reassert both bindings every time instead of returning solely because an earlier
+    # composition marked the repair installed. The production stack intentionally
+    # layers wrappers over this seam, and tests/compatibility installers can also
+    # reload the module. Rebinding is side-effect-free apart from restoring the same
+    # canonical helper and prevents a stale function object or legacy split-query
+    # alias from surviving a later composition step. Final production composition
+    # installs research-only observation *after* this repair so that wrapper captures
+    # this current helper as its canonical delegate.
     catchup._fetch_market_logs = _combined_fetch_market_logs
     frontier._fetch_market_logs = _combined_fetch_market_logs
     _INSTALLED = True
