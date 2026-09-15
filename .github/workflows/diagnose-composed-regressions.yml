@@ -1,0 +1,51 @@
+name: Diagnose composed regressions
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-composed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  composed-regressions:
+    if: github.head_ref == 'repair/robinhood-page-cache-bounded-status'
+    runs-on: ubuntu-latest
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.16'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install exact locked dependencies
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Verbose composed regression run
+        run: |
+          python - <<'PY'
+          import pytest
+          import solana_roi.production  # explicit Phase-18 production composition
+
+          raise SystemExit(pytest.main([
+              '-vv',
+              '--durations=25',
+              '--ignore=tests/test_forward_activation.py',
+              '--ignore=tests/test_candidate_risk_window_repair.py',
+              '--ignore=tests/test_continuity_storage_capacity_repair.py',
+              '--ignore=tests/test_fomo_continuation_shadow.py',
+              '--ignore=tests/test_fomo_feature_boundaries.py',
+              '--ignore=tests/test_fomo_risk_conditioned_v5.py',
+              '--ignore=tests/test_live_poll_redundancy.py',
+              '--ignore=tests/test_observation.py',
+              '--ignore=tests/test_poll_watermark_repair.py',
+              '--ignore=tests/test_prospective_observation.py',
+          ]))
+          PY
