@@ -85,9 +85,22 @@ class ActiveStorage:
     def initialize(self, *, epoch_id: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
+            # New epochs reclaim deleted pages incrementally instead of repeating
+            # the legacy pattern where logical pruning leaves an indefinitely
+            # growing physical file. auto_vacuum must be selected before schema
+            # objects exist, so never rewrite this setting on an existing DB.
+            if not self.ordinary_tables(conn):
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conn.executescript(_SCHEMA_SQL)
             actual = self.ordinary_tables(conn)
             assert_registered(actual)
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            hard_pages = max(1, int(self.budget.hard_bytes) // page_size)
+            effective_max = int(conn.execute(f"PRAGMA max_page_count={hard_pages}").fetchone()[0])
+            if effective_max > hard_pages:
+                raise RuntimeError(
+                    f"active storage page boundary could not be installed: {effective_max} > {hard_pages}"
+                )
             now = _utc_now()
             conn.execute(
                 "INSERT INTO storage_epoch_state(singleton_key,epoch_id,opened_at,warning_bytes,hard_bytes,status,last_checkpoint_id,updated_at) "
@@ -203,6 +216,51 @@ class ActiveStorage:
         wal = Path(str(self.path)+"-wal")
         shm = Path(str(self.path)+"-shm")
         return {"main":main,"wal":wal.stat().st_size if wal.exists() else 0,"shm":shm.stat().st_size if shm.exists() else 0}
+
+    def page_budget_status(self) -> dict[str, int]:
+        with self.connect() as conn:
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            max_page_count = int(conn.execute("PRAGMA max_page_count").fetchone()[0])
+            auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+        return {
+            "page_size": page_size,
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "max_page_count": max_page_count,
+            "auto_vacuum": auto_vacuum,
+            "allocated_bytes": page_size * page_count,
+            "free_bytes": page_size * freelist_count,
+            "configured_hard_bytes": int(self.budget.hard_bytes),
+        }
+
+    def reclaim_free_pages(self, *, max_pages: int = 16_384) -> dict[str, int]:
+        """Bounded incremental physical reclaim for new active epochs.
+
+        This is deliberately a no-op on pre-repair databases that were not born
+        with incremental auto-vacuum. Those stores are compacted by epoch rollover
+        instead of invoking an unbounded in-place VACUUM under production load.
+        """
+        with self.connect() as conn:
+            mode = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+            before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            reclaimed_request = min(max(0, int(max_pages)), before) if mode == 2 else 0
+            if reclaimed_request:
+                conn.execute(f"PRAGMA incremental_vacuum({reclaimed_request})")
+                conn.commit()
+            after = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        return {
+            "auto_vacuum": mode,
+            "freelist_before": before,
+            "freelist_after": after,
+            "pages_requested": reclaimed_request,
+            "pages_reclaimed": max(0, before - after),
+        }
+
+    def warning_boundary_exceeded(self) -> bool:
+        sizes = self.storage_bytes()
+        return sizes["main"] >= self.budget.warning_bytes or sizes["wal"] >= self.budget.max_wal_bytes
 
     def enforce_hard_budget(self) -> None:
         sizes = self.storage_bytes()
