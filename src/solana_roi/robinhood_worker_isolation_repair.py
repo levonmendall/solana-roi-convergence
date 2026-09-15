@@ -168,12 +168,16 @@ def _fast_live_status(plane: Any) -> dict[str, Any]:
     live_cursor = getattr(plane, "_roi_live_epoch_cursor", None)
     if live_cursor is not None:
         decision_cursor = int(live_cursor)
-        transport_ready = bool(getattr(plane, "_roi_live_epoch_ready", False)) and not bool(
-            getattr(plane, "_roi_live_epoch_suppress_entries", False)
+        transport_error = getattr(plane, "_roi_live_epoch_last_error_type", None)
+        transport_ready = (
+            bool(getattr(plane, "_roi_live_epoch_ready", False))
+            and not bool(getattr(plane, "_roi_live_epoch_suppress_entries", False))
+            and not transport_error
         )
     else:
         decision_cursor = int(cursor) if cursor is not None else None
-        transport_ready = bool(getattr(plane, "_caught_up", False))
+        transport_error = getattr(plane, "_last_error", None)
+        transport_ready = bool(getattr(plane, "_caught_up", False)) and not transport_error
     lag = (
         max(0, int(latest) - int(decision_cursor))
         if latest is not None and decision_cursor is not None
@@ -199,7 +203,8 @@ def _fast_live_status(plane: Any) -> dict[str, Any]:
         "live_money_authority": False,
         "signing_available": False,
         "transaction_submission_available": False,
-        "runtime_ready": True,
+        "worker_process_ready": True,
+        "runtime_ready": transport_ready,
         "failed_closed": False,
         "cursor_block": cursor,
         "latest_block": latest,
@@ -210,6 +215,7 @@ def _fast_live_status(plane: Any) -> dict[str, Any]:
         "last_poll_at": getattr(plane, "_last_poll_at", None),
         "last_success_at": getattr(plane, "_last_success_at", None),
         "last_error": last_error,
+        "error": transport_error or None,
         "rpc_failures": int(getattr(plane, "_rpc_failures", 0) or 0),
         "tracked_v3_pools": len(getattr(plane, "v3_pools", {}) or {}),
         "tracked_pons_v2_curves": len(getattr(plane, "v2_curves", {}) or {}),
