@@ -10,6 +10,7 @@ from solana_roi.active_storage import ActiveStorageBudget
 
 
 DiskUsage = namedtuple("DiskUsage", "total used free")
+SOURCE_RELEASE_SHA = "1" * 40
 
 
 def _seed_database(path) -> None:
@@ -17,6 +18,14 @@ def _seed_database(path) -> None:
     try:
         connection.execute("CREATE TABLE truth_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
         connection.execute("INSERT INTO truth_probe(value) VALUES('preserve-me')")
+        connection.execute(
+            "CREATE TABLE certification_release_epochs("
+            "release_commit TEXT PRIMARY KEY,started_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO certification_release_epochs(release_commit,started_at) VALUES(?,?)",
+            (SOURCE_RELEASE_SHA, "2026-09-15T00:00:00+00:00"),
+        )
         connection.commit()
     finally:
         connection.close()

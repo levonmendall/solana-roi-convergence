@@ -125,6 +125,69 @@ def _rollover_headroom(path: Path, budget: ActiveStorageBudget) -> dict[str, int
     }
 
 
+def _source_certification_release_commit(path: Path) -> str:
+    """Resolve the latest persisted certification release from the quiescent source.
+
+    A new deployment cannot require the old source database to already contain a
+    certification epoch for the new release SHA. Migration therefore reads the
+    exact persisted source frontier and never inserts or rewrites a release epoch.
+    """
+    uri = f"file:{path.resolve()}?mode=ro&cache=private"
+    connection = sqlite3.connect(uri, uri=True, timeout=30.0)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='certification_release_epochs'"
+        ).fetchone()
+        if table is None:
+            raise RuntimeError(
+                "active epoch rollover blocked: source certification release epoch table missing"
+            )
+        row = connection.execute(
+            "SELECT release_commit FROM certification_release_epochs "
+            "WHERE TRIM(COALESCE(release_commit,''))<>'' "
+            "ORDER BY started_at DESC, release_commit DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None or not str(row[0] or "").strip():
+        raise RuntimeError(
+            "active epoch rollover blocked: source certification release frontier missing"
+        )
+    return str(row[0]).strip()
+
+
+def _build_shadow_database_for_rollover(
+    *,
+    source: Path,
+    successor: Path,
+    target_release_sha: str,
+):
+    """Build against source certification truth while stamping the target checkpoint.
+
+    `release_commit_from_env()` is used by current-state extraction. Bind only the
+    quiescent migration call to the source release so extraction selects the row
+    that actually exists in the source. The shadow checkpoint still receives the
+    target release SHA explicitly. Restore the deployment environment before any
+    runtime worker can start.
+    """
+    source_release_commit = _source_certification_release_commit(source)
+    prior_override = os.environ.get("SOLANA_ROI_RELEASE_COMMIT")
+    os.environ["SOLANA_ROI_RELEASE_COMMIT"] = source_release_commit
+    try:
+        return build_shadow_database(
+            legacy_path=source,
+            active_path=successor,
+            release_sha=target_release_sha,
+            replace_existing=True,
+        )
+    finally:
+        if prior_override is None:
+            os.environ.pop("SOLANA_ROI_RELEASE_COMMIT", None)
+        else:
+            os.environ["SOLANA_ROI_RELEASE_COMMIT"] = prior_override
+
+
 def rollover_active_epoch_if_needed(
     path: Path | str,
     *,
@@ -174,11 +237,10 @@ def rollover_active_epoch_if_needed(
     token = uuid.uuid4().hex
     successor = active.with_name(f".{active.name}.epoch-next-{token}")
     try:
-        report = build_shadow_database(
-            legacy_path=active,
-            active_path=successor,
-            release_sha=release_sha,
-            replace_existing=True,
+        report = _build_shadow_database_for_rollover(
+            source=active,
+            successor=successor,
+            target_release_sha=release_sha,
         )
         if not report.equivalent:
             raise RuntimeError(
