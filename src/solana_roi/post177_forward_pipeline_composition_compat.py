@@ -8,6 +8,7 @@ from . import post104_production_architecture_repair as post104
 from . import post177_forward_pipeline_bottleneck_repair as repair
 from . import post178_e2e_residual_repair as post178
 from . import post178_scout_terminal_classification_fix as post178_scout
+from . import robinhood_v2_v4_observation as robinhood_v2_v4
 from . import unified_strategy_status as unified_status
 from .config import BASELINE
 from .direct_solana import DirectSolanaIngestionPlane
@@ -132,6 +133,12 @@ def install_post177_forward_pipeline_composition_compat(plane_cls: type[Any]) ->
 
     post178.install_post178_e2e_residual_repair(plane_cls)
     post178_scout.install_post178_scout_terminal_classification_fix()
+
+    # Permanent V2/V4 observation is composed only after the final current-frontier
+    # repairs. Its fetch wrapper returns the original canonical market list unchanged,
+    # so observation can collect forward evidence without becoming alternate paper
+    # entry authority. Storage remains the existing Robinhood state/event/swap path.
+    robinhood_v2_v4.install_robinhood_v2_v4_observation(plane_cls)
 
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_installed", True)
     setattr(plane_cls, "_roi_post177_forward_pipeline_composition_compat_version", COMPAT_VERSION)
