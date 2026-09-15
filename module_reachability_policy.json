@@ -1,5 +1,5 @@
 {
-  "policy_version": "v51-module-reachability-131-v7-sealed-epoch-preflight",
+  "policy_version": "v51-module-reachability-131-v8-sealed-epoch-executor",
   "production_root": "solana_roi.production",
   "non_authoritative_service_roots": [
     "solana_roi.certifier_service",
@@ -21,7 +21,6 @@
   ],
   "migration_only": [
     "solana_roi.cli",
-    "solana_roi.sealed_epoch_reclamation",
     "solana_roi.split_webhooks",
     "solana_roi.v51_architecture_retirement"
   ],

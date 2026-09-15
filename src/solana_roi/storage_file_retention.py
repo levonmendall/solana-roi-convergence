@@ -66,6 +66,20 @@ _FILE_CONTRACTS = (
         startup=False,
         certification=False,
     ),
+    _f(
+        "sealed_epoch_reclamation_receipt",
+        "storage-maintenance",
+        RetentionClass.CURRENT_STATE,
+        "Crash-safe intent/final receipt for the one exact operator-approved sealed epoch reclamation",
+        "production cleanup bootstrap/storage operations",
+        hot_or_cold="hot",
+        age="current checkpoint only",
+        bytes_=1_048_576,
+        archive="none",
+        prune="atomically replace when a later verified checkpoint is explicitly approved for reclamation",
+        startup=True,
+        certification=False,
+    ),
 )
 
 PERSISTENT_FILE_RETENTION_REGISTRY: dict[str, RetentionContract] = {
@@ -97,6 +111,11 @@ def validate_file_registry() -> None:
                 raise ValueError("sealed active epoch must remain legacy-unclassified until independently classified")
             if contract.startup_access or contract.certification_access:
                 raise ValueError("sealed active epoch cannot be a runtime/certification dependency")
+        if contract.dataset == "sealed_epoch_reclamation_receipt":
+            if contract.retention_class is not RetentionClass.CURRENT_STATE:
+                raise ValueError("sealed epoch reclamation receipt must be bounded current state")
+            if not contract.startup_access or contract.certification_access:
+                raise ValueError("sealed epoch reclamation receipt is startup-only operational state")
 
 
 validate_file_registry()

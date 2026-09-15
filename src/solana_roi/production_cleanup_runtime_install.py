@@ -25,9 +25,10 @@ from typing import Any, Awaitable, Callable
 from . import production_data_cleanup_v4 as cleanup
 from . import production_disk_ownership as disk_ownership
 from . import render_runtime_bootstrap_repair as bootstrap
+from . import sealed_epoch_reclamation_runtime as sealed_reclamation
 from .cleanup_target_probe import probe_cleanup_target
 
-INSTALL_VERSION = "production-data-cleanup-runtime-install-v6-full-runtime-worker-proof"
+INSTALL_VERSION = "production-data-cleanup-runtime-install-v7-sealed-epoch-reclamation"
 STATUS_PATH = "/v1/operations/production-data-cleanup"
 _REGISTRATION_ATTR = "roi_production_data_cleanup_runtime_registered"
 _LOG = logging.getLogger("solana_roi.production_data_cleanup")
@@ -147,16 +148,7 @@ def _emit(prefix: str, payload: dict[str, Any]) -> None:
 
 
 async def _runtime_workers_with_full_runtime_marker(runtime: Any, stop: asyncio.Event) -> None:
-    """Publish ``full_runtime`` only after the final composed worker chain stays live.
-
-    The production cleanup installer is registered after the production composition
-    root is complete, so the delegate captured here is the final worker chain: Batch 9,
-    certification publishers/split, WAL lease and the canonical Solana workers. Run
-    that chain as one owned task and require it to remain alive for a short bounded
-    settle interval. A chain that exits or raises during startup never establishes the
-    cleanup eligibility state.
-    """
-
+    """Publish ``full_runtime`` only after the final composed worker chain stays live."""
     original = _ORIGINAL_RUNTIME_WORKERS
     if original is None:
         raise RuntimeError("cleanup full-runtime marker missing canonical worker chain")
@@ -210,7 +202,6 @@ setattr(
 
 def _install_full_runtime_worker_marker() -> None:
     """Wrap the final composed worker chain without changing worker semantics."""
-
     global _ORIGINAL_RUNTIME_WORKERS
     current = bootstrap._run_runtime_workers
     if bool(getattr(current, "_roi_cleanup_full_runtime_worker_marker", False)):
@@ -231,12 +222,7 @@ def _install_full_runtime_worker_marker() -> None:
 
 
 async def _run_target_probe(app: Any, database_path: Path) -> dict[str, Any]:
-    """Emit bounded dependency proof before history-heavy canonical bootstrap.
-
-    The probe opens SQLite read-only, scans schema metadata only, and uses B-tree edge
-    lookups for rowid bounds. A probe failure is visible but does not mutate storage or
-    prevent the normal disabled-cleanup runtime from continuing.
-    """
+    """Emit bounded dependency proof before history-heavy canonical bootstrap."""
     try:
         probe = await asyncio.to_thread(probe_cleanup_target, database_path)
     except Exception as exc:
@@ -256,11 +242,49 @@ async def _run_target_probe(app: Any, database_path: Path) -> dict[str, Any]:
     return probe
 
 
+async def _observe_sealed_reclamation_boundary(app: Any, database_path: Path) -> dict[str, Any]:
+    """Publish a cheap checkpoint/candidate observation only after full runtime."""
+    try:
+        state = await asyncio.to_thread(sealed_reclamation.observe_boundary, database_path)
+    except Exception as exc:
+        state = {
+            "runtime_version": sealed_reclamation.RUNTIME_VERSION,
+            "enabled": False,
+            "status": "observation_failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+            "read_only": True,
+            "paper_only": True,
+            "live_money_authority": False,
+        }
+    app.state.roi_sealed_epoch_reclamation = state
+    _emit("ROI_SEALED_EPOCH_RECLAMATION_OBSERVATION", state)
+    return state
+
+
+async def _run_sealed_reclamation_if_enabled(
+    app: Any,
+    database_path: Path,
+    lease: disk_ownership.RuntimeDiskLease,
+) -> None:
+    if not sealed_reclamation.enabled():
+        return
+    bootstrap._BOOTSTRAP_STATE["state"] = "sealed_epoch_reclamation"
+    result = await asyncio.to_thread(
+        sealed_reclamation.execute_enabled,
+        database_path,
+        lease,
+    )
+    app.state.roi_sealed_epoch_reclamation = result
+    _emit("ROI_SEALED_EPOCH_RECLAMATION", result)
+
+
 def _mark_blocked(app: Any, exc: BaseException, *, phase: str) -> None:
     state = {
         "install_version": INSTALL_VERSION,
         "cleanup_version": cleanup.CLEANUP_VERSION,
         "enabled": _env_true(cleanup.ENABLED_ENV),
+        "sealed_epoch_reclamation_enabled": sealed_reclamation.enabled(),
         "status": "blocked",
         "phase": phase,
         "error_type": type(exc).__name__,
@@ -347,6 +371,8 @@ async def _run_and_establish_disabled_release(
             if stop.is_set():
                 break
             if bootstrap._BOOTSTRAP_STATE.get("state") == "full_runtime":
+                if not sealed_reclamation.enabled():
+                    await _observe_sealed_reclamation_boundary(app, database_path)
                 await _establish_disabled_release(app, database_path, lease)
                 marker_written = True
                 break
@@ -354,6 +380,8 @@ async def _run_and_establish_disabled_release(
         await task
     finally:
         if not marker_written and bootstrap._BOOTSTRAP_STATE.get("state") == "full_runtime":
+            if not sealed_reclamation.enabled():
+                await _observe_sealed_reclamation_boundary(app, database_path)
             await _establish_disabled_release(app, database_path, lease)
 
 
@@ -364,9 +392,6 @@ def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
             getattr(app.state, "roi_production_data_cleanup", _disabled_state())
         )
 
-    # Production composition is complete before this installer runs. Wrap that exact
-    # final worker chain so the same-release cleanup handshake has a real, reachable
-    # full-runtime proof instead of relying on a test-only injected state.
     _install_full_runtime_worker_marker()
     original: BootstrapCallable = bootstrap._bootstrap_and_run
 
@@ -387,9 +412,15 @@ def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
 
         app.state.roi_production_disk_ownership = lease.status()
         try:
-            # Dependency proof must happen before the history-scaled logical bootstrap
-            # that is currently capable of filling the 2 GiB cgroup with file cache.
             await _run_target_probe(app, database_path)
+            try:
+                await _run_sealed_reclamation_if_enabled(app, database_path, lease)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _mark_blocked(app, exc, phase="sealed_epoch_reclamation")
+                return
+
             try:
                 allowed = await _run_cleanup_if_enabled(app, database_path)
             except asyncio.CancelledError:
@@ -425,6 +456,13 @@ def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
     initial["enabled"] = _env_true(cleanup.ENABLED_ENV)
     app.state.roi_production_data_cleanup = initial
     app.state.roi_production_data_cleanup_version = cleanup.CLEANUP_VERSION
+    app.state.roi_sealed_epoch_reclamation = {
+        "runtime_version": sealed_reclamation.RUNTIME_VERSION,
+        "enabled": sealed_reclamation.enabled(),
+        "status": "pending" if sealed_reclamation.enabled() else "awaiting_full_runtime_observation",
+        "paper_only": True,
+        "live_money_authority": False,
+    }
     setattr(app.state, _REGISTRATION_ATTR, True)
 
     routes = {getattr(route, "path", None) for route in getattr(app, "routes", ())}
@@ -443,6 +481,9 @@ def install_production_cleanup_runtime(app: Any) -> dict[str, Any]:
             payload["cleanup_target_probe"] = getattr(
                 app.state, "roi_cleanup_target_probe", None
             )
+            payload["sealed_epoch_reclamation"] = getattr(
+                app.state, "roi_sealed_epoch_reclamation", None
+            )
             payload["full_runtime_at"] = bootstrap._BOOTSTRAP_STATE.get("full_runtime_at")
             return payload
 
@@ -454,7 +495,9 @@ __all__ = [
     "INSTALL_VERSION",
     "STATUS_PATH",
     "_install_full_runtime_worker_marker",
+    "_observe_sealed_reclamation_boundary",
     "_run_cleanup_if_enabled",
+    "_run_sealed_reclamation_if_enabled",
     "_run_target_probe",
     "_runtime_workers_with_full_runtime_marker",
     "install_production_cleanup_runtime",
