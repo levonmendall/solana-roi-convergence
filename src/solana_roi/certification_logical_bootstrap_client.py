@@ -4,8 +4,8 @@ from __future__ import annotations
 
 The logical bootstrap is resumable across transient authoritative transport and
 resource-pressure pauses. Every committed page is checkpointed beside a durable
-partial SQLite replica. Release/schema/epoch identity changes are the only reasons
-that invalidate that partial replica.
+partial SQLite replica. Release/schema/epoch/protocol identity changes are the only
+reasons that invalidate that partial replica.
 """
 
 import base64
@@ -24,6 +24,12 @@ from typing import Any
 
 from .certification_incremental_replication import REPLICATION_VERSION
 from .certification_logical_bootstrap import BOOTSTRAP_VERSION
+from .certification_replication_protocol import (
+    ACTIVE_MANIFEST_REPLICATION_VERSION,
+    BASE_REPLICATION_VERSION,
+    SUPPORTED_REPLICATION_VERSIONS,
+    is_supported_replication_version,
+)
 
 
 CLIENT_VERSION = "certification-logical-bootstrap-client-v5-adaptive-memory-bound"
@@ -221,10 +227,11 @@ def _qident(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
 
-def _validate_manifest(payload: dict[str, Any], expected_release: str) -> tuple[str, str, int]:
+def _validate_manifest(payload: dict[str, Any], expected_release: str) -> tuple[str, str, str, int]:
     if str(payload.get("bootstrap_version") or "") != BOOTSTRAP_VERSION:
         raise RuntimeError("certification logical bootstrap version mismatch")
-    if str(payload.get("replication_version") or "") != REPLICATION_VERSION:
+    replication_version = str(payload.get("replication_version") or "")
+    if not is_supported_replication_version(replication_version):
         raise RuntimeError("certification logical bootstrap replication version mismatch")
     if str(payload.get("release_commit") or "") != expected_release:
         raise RuntimeError("certification logical bootstrap release mismatch")
@@ -238,7 +245,7 @@ def _validate_manifest(payload: dict[str, Any], expected_release: str) -> tuple[
         raise RuntimeError("certification logical bootstrap watermark invalid") from exc
     if watermark < 0:
         raise RuntimeError("certification logical bootstrap watermark invalid")
-    return epoch, fingerprint, watermark
+    return replication_version, epoch, fingerprint, watermark
 
 
 def _restore_sqlite_metadata(
@@ -329,6 +336,7 @@ def _checkpoint_matches(
     state: dict[str, Any] | None,
     *,
     expected_release: str,
+    replication_version: str,
     epoch: str,
     fingerprint: str,
     start_watermark: int,
@@ -342,7 +350,7 @@ def _checkpoint_matches(
     return (
         str(state.get("client_version") or "") == CLIENT_VERSION
         and str(state.get("bootstrap_version") or "") == BOOTSTRAP_VERSION
-        and str(state.get("replication_version") or "") == REPLICATION_VERSION
+        and str(state.get("replication_version") or "") == replication_version
         and str(state.get("release_commit") or "") == expected_release
         and str(state.get("epoch") or "") == epoch
         and str(state.get("schema_fingerprint") or "") == fingerprint
@@ -353,6 +361,7 @@ def _checkpoint_matches(
 def _base_checkpoint(
     *,
     expected_release: str,
+    replication_version: str,
     epoch: str,
     fingerprint: str,
     start_watermark: int,
@@ -360,7 +369,7 @@ def _base_checkpoint(
     return {
         "client_version": CLIENT_VERSION,
         "bootstrap_version": BOOTSTRAP_VERSION,
-        "replication_version": REPLICATION_VERSION,
+        "replication_version": replication_version,
         "release_commit": expected_release,
         "epoch": epoch,
         "schema_fingerprint": fingerprint,
@@ -418,7 +427,7 @@ def logical_bootstrap(
         _request(f"{base}/v1/operations/certification-db-logical-bootstrap", token),
         timeout=30.0,
     )
-    epoch, fingerprint, start_watermark = _validate_manifest(manifest, expected_release)
+    replication_version, epoch, fingerprint, start_watermark = _validate_manifest(manifest, expected_release)
     tables = manifest.get("tables")
     post_schema = manifest.get("post_schema")
     if not isinstance(tables, list) or not isinstance(post_schema, list):
@@ -430,6 +439,7 @@ def logical_bootstrap(
     if not partial.is_file() or not _checkpoint_matches(
         checkpoint,
         expected_release=expected_release,
+        replication_version=replication_version,
         epoch=epoch,
         fingerprint=fingerprint,
         start_watermark=start_watermark,
@@ -437,6 +447,7 @@ def logical_bootstrap(
         _discard_resume(partial, state_path)
         checkpoint = _base_checkpoint(
             expected_release=expected_release,
+            replication_version=replication_version,
             epoch=epoch,
             fingerprint=fingerprint,
             start_watermark=start_watermark,
@@ -553,6 +564,9 @@ def logical_bootstrap(
 
                 if str(payload.get("release_commit") or "") != expected_release:
                     raise LogicalBootstrapRestartRequired("certification logical bootstrap release changed")
+                page_replication_version = str(payload.get("replication_version") or replication_version)
+                if page_replication_version != replication_version:
+                    raise LogicalBootstrapRestartRequired("certification logical bootstrap replication version changed")
                 if str(payload.get("epoch") or "") != epoch or str(payload.get("schema_fingerprint") or "") != fingerprint:
                     raise LogicalBootstrapRestartRequired("certification logical bootstrap identity changed")
                 if str(payload.get("table") or "") != name:
@@ -677,7 +691,7 @@ def logical_bootstrap(
     return {
         "client_version": CLIENT_VERSION,
         "bootstrap_version": BOOTSTRAP_VERSION,
-        "replication_version": REPLICATION_VERSION,
+        "replication_version": replication_version,
         "release_commit": expected_release,
         "epoch": epoch,
         "schema_fingerprint": fingerprint,
@@ -704,10 +718,17 @@ def logical_bootstrap(
 
 
 __all__ = [
+    "ACTIVE_MANIFEST_REPLICATION_VERSION",
+    "BASE_REPLICATION_VERSION",
     "CLIENT_VERSION",
     "LogicalBootstrapPause",
     "LogicalBootstrapRestartRequired",
+    "REPLICATION_VERSION",
+    "SUPPORTED_REPLICATION_VERSIONS",
+    "_base_checkpoint",
+    "_checkpoint_matches",
     "_open_json",
     "_resume_paths",
+    "_validate_manifest",
     "logical_bootstrap",
 ]
