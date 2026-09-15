@@ -1,0 +1,41 @@
+name: PR405 Composed Hang Isolation
+
+on:
+  push:
+    branches:
+      - repair/robinhood-page-cache-bounded-status
+
+permissions:
+  contents: read
+
+jobs:
+  isolate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install locked runtime
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+      - name: Isolate fast-status asyncio shutdown stall
+        env:
+          PYTHONPATH: src
+        run: |
+          timeout --signal=TERM --kill-after=5s 60s python -u - <<'PY'
+          import faulthandler
+          import pytest
+          import solana_roi.production
+
+          faulthandler.enable()
+          faulthandler.dump_traceback_later(5, repeat=True)
+          raise SystemExit(pytest.main([
+              '-vv', '-s',
+              'tests/test_robinhood_sequencer_frontier.py::test_fast_status_publisher_never_calls_proof_wrapped_status',
+          ]))
+          PY
