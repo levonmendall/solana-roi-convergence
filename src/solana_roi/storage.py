@@ -22,6 +22,7 @@ class AppendOnlyEventStore:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
+        self._install_active_page_boundary_if_present()
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS events ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -69,6 +70,33 @@ class AppendOnlyEventStore:
         self.db.execute("CREATE INDEX IF NOT EXISTS ix_entity_links_wallet_a_time ON entity_links(wallet_a, received_at)")
         self.db.execute("CREATE INDEX IF NOT EXISTS ix_entity_links_wallet_b_time ON entity_links(wallet_b, received_at)")
         self.db.commit()
+
+    def _install_active_page_boundary_if_present(self) -> None:
+        """Honor an active epoch's persisted hard budget on this long-lived writer.
+
+        PRAGMA max_page_count is connection-local.  The active storage layer
+        persists its intended hard byte budget in storage_epoch_state, so writers
+        that own their SQLite connection must explicitly inherit it.
+        """
+        table = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_epoch_state'"
+        ).fetchone()
+        if table is None:
+            return
+        row = self.db.execute(
+            "SELECT hard_bytes FROM storage_epoch_state WHERE singleton_key=1"
+        ).fetchone()
+        if row is None:
+            return
+        hard_bytes = int(row[0])
+        page_size = int(self.db.execute("PRAGMA page_size").fetchone()[0])
+        hard_pages = max(1, hard_bytes // page_size)
+        effective_max = int(self.db.execute(f"PRAGMA max_page_count={hard_pages}").fetchone()[0])
+        if effective_max > hard_pages:
+            self.db.close()
+            raise RuntimeError(
+                f"active event-store page boundary could not be installed: {effective_max} > {hard_pages}"
+            )
 
     def append(self, event_type: str, observed_at: str, payload: dict[str, Any]) -> str:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
