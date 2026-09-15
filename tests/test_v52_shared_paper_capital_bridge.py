@@ -133,6 +133,162 @@ def test_near_concurrent_cross_lane_candidates_cannot_double_spend_shared_capaci
     store.close()
 
 
+def test_failed_local_entry_cancels_precommit_reservation(tmp_path, monkeypatch) -> None:
+    store = ObservationEventStore(tmp_path / "entry-failure.sqlite3")
+    owner = _bind(store)
+    monkeypatch.setattr(bridge, "_BASE_PERSIST_LOT", lambda owner, payload, pending: False)
+    monkeypatch.setattr(bridge, "_matching_local_lot", lambda owner, token, evidence: None)
+    committed = bridge._persist_lot_with_shared_capital(
+        owner,
+        {"token": TOKEN, "fraction": 0.20, "lane": "fomo_continuation"},
+        pending={"evidence_fingerprint": "entry-failure"},
+    )
+    assert committed is False
+    reservation_id = bridge._reservation_id(TOKEN, "entry-failure")
+    row = bridge._reservation_row(store, RELEASE, reservation_id)
+    assert row is not None
+    assert row["status"] == "cancelled"
+    assert capital.capital_reconciliation(store, release_commit=RELEASE)["active_reserved_fraction"] == 0.0
+    store.close()
+
+
+def test_partial_exit_releases_only_remaining_fraction_then_terminal_replay_settles_once(tmp_path, monkeypatch) -> None:
+    store = ObservationEventStore(tmp_path / "partial-release.sqlite3")
+    owner = _bind(store)
+    evidence = "partial"
+    reservation_id = bridge._reservation_id(TOKEN, evidence)
+    reserved = bridge.reserve_robinhood_capital(
+        owner,
+        token=TOKEN,
+        evidence_fingerprint=evidence,
+        lane="fomo_continuation",
+        requested_fraction=0.20,
+    )
+    assert reserved["status"] == "active"
+    lot = {
+        "id": 1,
+        "trial_id": 2,
+        "position_id": 3,
+        "token": TOKEN,
+        "lane": "fomo_continuation",
+        "evidence_fingerprint": evidence,
+        "capital_reservation_id": reservation_id,
+        "remaining_fraction": 0.08,
+    }
+    monkeypatch.setattr(bridge, "_local_lots", lambda owner: [dict(lot)])
+    monkeypatch.setattr(bridge, "_ensure_open_lot_reservations", lambda owner, adapter, lots: {reservation_id})
+    monkeypatch.setattr(bridge, "_record_realization_rows", lambda owner, store: 0)
+
+    first = bridge.reconcile_robinhood_capital(owner, cleanup_stale=False)
+    assert first["updated_partial_reservations"] == 1
+    row = bridge._reservation_row(store, RELEASE, reservation_id)
+    assert row is not None
+    assert row["status"] == "active"
+    assert float(row["reserved_fraction"]) == pytest.approx(0.08)
+
+    lot["remaining_fraction"] = 0.0
+    second = bridge.reconcile_robinhood_capital(owner, cleanup_stale=False)
+    assert second["settled_reservations"] == 1
+    bridge.reconcile_robinhood_capital(owner, cleanup_stale=False)
+    row = bridge._reservation_row(store, RELEASE, reservation_id)
+    assert row is not None
+    assert row["status"] == "settled"
+    assert float(row["reserved_fraction"]) == 0.0
+    with store._lock:
+        settlements = store.db.execute(
+            "SELECT COUNT(*) FROM v51_paper_capital_settlements WHERE release_commit=? AND reservation_id=?",
+            (RELEASE, reservation_id),
+        ).fetchone()[0]
+    assert int(settlements) == 1
+    store.close()
+
+
+def test_reconciliation_failure_rolls_back_canonical_reservation_then_retry_converges(tmp_path, monkeypatch) -> None:
+    store = ObservationEventStore(tmp_path / "rollback.sqlite3")
+    owner = _bind(store)
+    evidence = "rollback"
+    reservation_id = bridge._reservation_id(TOKEN, evidence)
+    bridge.reserve_robinhood_capital(
+        owner,
+        token=TOKEN,
+        evidence_fingerprint=evidence,
+        lane="entity_flow_accumulation",
+        requested_fraction=0.20,
+    )
+    lot = {
+        "id": 1,
+        "trial_id": 2,
+        "position_id": 3,
+        "token": TOKEN,
+        "lane": "entity_flow_accumulation",
+        "evidence_fingerprint": evidence,
+        "capital_reservation_id": reservation_id,
+        "remaining_fraction": 0.08,
+    }
+    monkeypatch.setattr(bridge, "_local_lots", lambda owner: [dict(lot)])
+    monkeypatch.setattr(bridge, "_ensure_open_lot_reservations", lambda owner, adapter, lots: {reservation_id})
+
+    def fail_realization(owner, canonical_store):
+        raise RuntimeError("synthetic_reconciliation_failure")
+
+    monkeypatch.setattr(bridge, "_record_realization_rows", fail_realization)
+    with pytest.raises(RuntimeError, match="synthetic_reconciliation_failure"):
+        bridge.reconcile_robinhood_capital(owner, cleanup_stale=False)
+    row = bridge._reservation_row(store, RELEASE, reservation_id)
+    assert row is not None
+    assert row["status"] == "active"
+    assert float(row["reserved_fraction"]) == pytest.approx(0.20)
+
+    monkeypatch.setattr(bridge, "_record_realization_rows", lambda owner, canonical_store: 0)
+    result = bridge.reconcile_robinhood_capital(owner, cleanup_stale=False)
+    assert result["updated_partial_reservations"] == 1
+    row = bridge._reservation_row(store, RELEASE, reservation_id)
+    assert row is not None
+    assert float(row["reserved_fraction"]) == pytest.approx(0.08)
+    store.close()
+
+
+def test_stale_precommit_orphan_is_cancelled_without_touching_other_lanes(tmp_path, monkeypatch) -> None:
+    store = ObservationEventStore(tmp_path / "orphan.sqlite3")
+    owner = _bind(store)
+    orphan = bridge.reserve_robinhood_capital(
+        owner,
+        token=TOKEN,
+        evidence_fingerprint="orphan",
+        lane="fomo_continuation",
+        requested_fraction=0.10,
+    )
+    assert orphan["status"] == "active"
+    solana = capital.reserve_paper_capital(
+        store,
+        release_commit=RELEASE,
+        reservation_id="solana:protected",
+        lane="SOLANA:pumpfun",
+        candidate_id="protected",
+        requested_fraction=0.20,
+        allow_downsize=False,
+        minimum_fraction=0.20,
+    )
+    assert solana["status"] == "active"
+    with store._lock, store.db:
+        store.db.execute(
+            "UPDATE v51_paper_capital_reservations SET created_at='2000-01-01T00:00:00+00:00' "
+            "WHERE release_commit=? AND reservation_id=?",
+            (RELEASE, bridge._reservation_id(TOKEN, "orphan")),
+        )
+    monkeypatch.setattr(bridge, "_local_lots", lambda owner: [])
+    monkeypatch.setattr(bridge, "_ensure_open_lot_reservations", lambda owner, adapter, lots: set())
+    monkeypatch.setattr(bridge, "_record_realization_rows", lambda owner, canonical_store: 0)
+    result = bridge.reconcile_robinhood_capital(owner, cleanup_stale=True)
+    assert result["cancelled_stale_orphans"] == 1
+    orphan_row = bridge._reservation_row(store, RELEASE, bridge._reservation_id(TOKEN, "orphan"))
+    solana_row = bridge._reservation_row(store, RELEASE, "solana:protected")
+    assert orphan_row is not None and orphan_row["status"] == "cancelled"
+    assert solana_row is not None and solana_row["status"] == "active"
+    assert float(solana_row["reserved_fraction"]) == pytest.approx(0.20)
+    store.close()
+
+
 def test_robinhood_realization_contributes_once_to_canonical_nav(tmp_path) -> None:
     store = ObservationEventStore(tmp_path / "nav.sqlite3")
     _bind(store)
@@ -154,7 +310,6 @@ def test_robinhood_realization_contributes_once_to_canonical_nav(tmp_path) -> No
             "live_money_authority": False,
         },
     )
-    # Duplicate event replay is ignored by the canonical unique lifecycle key.
     capital.record_lifecycle_event(
         store,
         release_commit=RELEASE,
