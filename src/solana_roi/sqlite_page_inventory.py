@@ -48,9 +48,9 @@ def inventory_sqlite_pages(
     unavailable, the function reports that explicitly instead of falling back to a
     row scan.
     """
-    path = Path(database_path).expanduser().resolve()
+    supplied_path = Path(database_path).expanduser().absolute()
     result: dict[str, Any] = {
-        "database_path": str(path),
+        "database_path": str(supplied_path),
         "status": "ok",
         "read_only": True,
         "application_rows_read": False,
@@ -65,7 +65,7 @@ def inventory_sqlite_pages(
     }
 
     try:
-        metadata = path.lstat()
+        metadata = supplied_path.lstat()
     except FileNotFoundError:
         result["status"] = "missing"
         return result
@@ -80,6 +80,8 @@ def inventory_sqlite_pages(
         result["status"] = "not_regular_file"
         return result
 
+    path = supplied_path.resolve()
+    result["database_path"] = str(path)
     result["database_bytes"] = int(metadata.st_size)
     connection: sqlite3.Connection | None = None
     try:
