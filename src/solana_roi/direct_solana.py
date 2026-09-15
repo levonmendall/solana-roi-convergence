@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -43,9 +44,25 @@ class WatchTarget:
 class DirectSolanaJournal:
     """Compact durable full-market receipt journal and hydration queue."""
 
-    def __init__(self, store: Any, *, raw_retention_seconds: float = 900.0):
+    def __init__(
+        self,
+        store: Any,
+        *,
+        raw_retention_seconds: float = 900.0,
+        provider_heartbeat_persist_interval_seconds: float = 1.0,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
         self.store = store
         self.raw_retention_seconds = max(120.0, float(raw_retention_seconds))
+        self.provider_heartbeat_persist_interval_seconds = max(
+            0.0, float(provider_heartbeat_persist_interval_seconds)
+        )
+        self._monotonic = monotonic
+        self._provider_last_message_at: dict[str, str] = {}
+        self._provider_last_persisted_monotonic: dict[str, float] = {}
+        self._provider_heartbeat_updates_received = 0
+        self._provider_heartbeat_updates_persisted = 0
+        self._provider_heartbeat_updates_coalesced = 0
         now = utcnow().isoformat()
         with store._lock, store.db:
             store.db.execute(
@@ -244,21 +261,47 @@ class DirectSolanaJournal:
             was_connected = bool(row["connected"]) if row is not None else False
             if connected and row is not None and not was_connected:
                 reconnects += 1
+            latest_message_at = self._provider_last_message_at.get(provider)
+            persisted_message_at = now if connected else latest_message_at
             self.store.db.execute(
                 "INSERT INTO direct_solana_provider_state("
                 "provider, connected, connected_at, last_message_at, reconnect_count, last_error_type) "
                 "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET "
                 "connected=excluded.connected, connected_at=CASE WHEN excluded.connected=1 THEN excluded.connected_at ELSE connected_at END, "
-                "last_message_at=CASE WHEN excluded.connected=1 THEN excluded.last_message_at ELSE last_message_at END, "
+                "last_message_at=CASE "
+                "WHEN excluded.connected=1 THEN excluded.last_message_at "
+                "WHEN excluded.last_message_at IS NOT NULL THEN excluded.last_message_at "
+                "ELSE last_message_at END, "
                 "reconnect_count=excluded.reconnect_count, last_error_type=excluded.last_error_type",
-                (provider, 1 if connected else 0, now if connected else None, now if connected else None, reconnects, error_type),
+                (provider, 1 if connected else 0, now if connected else None, persisted_message_at, reconnects, error_type),
             )
+            if connected:
+                self._provider_last_message_at.pop(provider, None)
+                self._provider_last_persisted_monotonic.pop(provider, None)
+            else:
+                self._provider_last_message_at.pop(provider, None)
+                self._provider_last_persisted_monotonic.pop(provider, None)
 
     def touch_provider(self, provider: str, received_at: datetime) -> None:
-        with self.store._lock, self.store.db:
-            self.store.db.execute(
-                "UPDATE direct_solana_provider_state SET last_message_at=? WHERE provider=?", (received_at.isoformat(), provider)
-            )
+        received_at_iso = received_at.isoformat()
+        observed_monotonic = self._monotonic()
+        with self.store._lock:
+            self._provider_heartbeat_updates_received += 1
+            self._provider_last_message_at[provider] = received_at_iso
+            last_persisted = self._provider_last_persisted_monotonic.get(provider)
+            if (
+                last_persisted is not None
+                and observed_monotonic - last_persisted < self.provider_heartbeat_persist_interval_seconds
+            ):
+                self._provider_heartbeat_updates_coalesced += 1
+                return
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE direct_solana_provider_state SET last_message_at=? WHERE provider=?",
+                    (received_at_iso, provider),
+                )
+            self._provider_last_persisted_monotonic[provider] = observed_monotonic
+            self._provider_heartbeat_updates_persisted += 1
 
     def connected_provider_count(self) -> int:
         with self.store._lock:
@@ -292,6 +335,10 @@ class DirectSolanaJournal:
             providers = [dict(row) for row in self.store.db.execute(
                 "SELECT provider, connected, connected_at, last_message_at, reconnect_count, last_error_type FROM direct_solana_provider_state ORDER BY provider"
             ).fetchall()]
+            for provider_state in providers:
+                latest_message_at = self._provider_last_message_at.get(str(provider_state["provider"]))
+                if latest_message_at is not None:
+                    provider_state["last_message_at"] = latest_message_at
             global_row = self.store.db.execute(
                 "SELECT outage_started_at, unresolved_gap, last_backfill_complete_at, last_backfill_error FROM direct_solana_global_state WHERE id=1"
             ).fetchone()
@@ -303,6 +350,9 @@ class DirectSolanaJournal:
             metrics = [dict(row) for row in self.store.db.execute(
                 "SELECT total_hydration_ms, normalized FROM direct_solana_hydration_metrics WHERE historical_recovery=0 ORDER BY hydrated_at DESC LIMIT 500"
             ).fetchall()]
+            heartbeat_received = self._provider_heartbeat_updates_received
+            heartbeat_persisted = self._provider_heartbeat_updates_persisted
+            heartbeat_coalesced = self._provider_heartbeat_updates_coalesced
         values = sorted(float(row["total_hydration_ms"]) for row in metrics)
         p95 = values[min(len(values) - 1, int((len(values) - 1) * 0.95))] if values else None
         queue = {str(row["status"]): int(row["n"]) for row in queue_rows}
@@ -316,6 +366,10 @@ class DirectSolanaJournal:
             "durable": True,
             "connected_provider_count": connected,
             "provider_states": providers,
+            "provider_heartbeat_persist_interval_seconds": self.provider_heartbeat_persist_interval_seconds,
+            "provider_heartbeat_updates_received": heartbeat_received,
+            "provider_heartbeat_updates_persisted": heartbeat_persisted,
+            "provider_heartbeat_updates_coalesced": heartbeat_coalesced,
             "continuity_ok": connected >= 1 and not unresolved,
             "unresolved_gap": unresolved,
             "outage_started_at": outage_started or None,
@@ -351,7 +405,13 @@ class DirectSolanaIngestionPlane:
         self.candidate_context_deadline_seconds = max(0.5, float(candidate_context_deadline_seconds))
         self.candidate_context_max_signatures = max(50, int(candidate_context_max_signatures))
         self.gap_backfill_max_pages = max(1, int(gap_backfill_max_pages))
-        self.journal = DirectSolanaJournal(store, raw_retention_seconds=float(os.getenv("SOLANA_ROI_DIRECT_RAW_RETENTION_SECONDS", "900")))
+        self.journal = DirectSolanaJournal(
+            store,
+            raw_retention_seconds=float(os.getenv("SOLANA_ROI_DIRECT_RAW_RETENTION_SECONDS", "900")),
+            provider_heartbeat_persist_interval_seconds=float(
+                os.getenv("SOLANA_ROI_DIRECT_PROVIDER_HEARTBEAT_PERSIST_INTERVAL_SECONDS", "1.0")
+            ),
+        )
         self._connection_lock = asyncio.Lock()
         self._connected: set[str] = set()
         self._initial_connection_observed = False
