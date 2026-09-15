@@ -14,7 +14,7 @@ from .v51_atomic_paper_capital import (
     reserve_paper_capital,
 )
 
-REPAIR_VERSION = "v52-robinhood-shared-paper-capital-v1"
+REPAIR_VERSION = "v52-robinhood-shared-paper-capital-v2"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -190,9 +190,6 @@ async def _validate_with_shared_capital(
         return await _BASE_VALIDATE(owner, payload, venue_object=venue_object)
     reservation_id = _entry_reservation_id(owner, payload, evidence)
 
-    # A replay after a crash may find the durable lot before the reconciliation
-    # wrapper had a chance to attach its reservation. Repair that fail-closed state
-    # first instead of creating another position or releasing the held capital.
     if _recover_entry_link(
         owner,
         payload=payload,
@@ -235,8 +232,8 @@ async def _validate_with_shared_capital(
         evidence=evidence,
         reservation_id=reservation_id,
     ):
-        # Do not cancel here: a durable position may now exist. Retaining the
-        # reservation fails closed against overspending until replay can reconcile.
+        # Once the durable entry may exist, retaining the reservation fails closed
+        # against overspending until replay can complete the lineage link.
         raise RuntimeError("v52_robinhood_committed_lot_not_recoverable_for_capital_link")
     return True
 
@@ -290,9 +287,6 @@ def _settle_lot_delta(owner: Any, lot: dict[str, Any], line: dict[str, Any]) -> 
                 owner.store.db.rollback()
                 raise RuntimeError("v52_robinhood_capital_reservation_missing_during_release")
             if str(current["status"]) != "active":
-                # If lineage was not advanced, an already-settled reservation is an
-                # inconsistent partial transaction; fail closed rather than double
-                # release it.
                 owner.store.db.rollback()
                 raise RuntimeError("v52_robinhood_capital_reservation_not_active_during_release")
             held = max(0.0, float(current["reserved_fraction"] or 0.0))
@@ -393,7 +387,21 @@ def _apply_exit_with_shared_capital(owner: Any, **kwargs: Any) -> None:
 
 
 def _paper_nav_with_shared_capital(owner: Any) -> float:
+    if _BASE_NAV is None:
+        raise RuntimeError("v52_robinhood_shared_capital_nav_base_missing")
     _ensure_schema(owner)
+    with owner.store._lock:
+        row = owner.store.db.execute(
+            "SELECT COUNT(*) AS n FROM v52_robinhood_capital_lineage WHERE paper_only=1"
+        ).fetchone()
+    lineage_count = int(row["n"] or 0) if row is not None else 0
+
+    # Release SHA is intentionally not a Robinhood portfolio-reset boundary. Until
+    # a position is governed by the new shared-capital lineage, preserve the exact
+    # durable cross-release NAV implementation that existed before this repair.
+    if lineage_count == 0:
+        return float(_BASE_NAV(owner))
+
     shared = capital_reconciliation(
         owner.store,
         release_commit=str(owner.release_commit),
@@ -401,29 +409,33 @@ def _paper_nav_with_shared_capital(owner: Any) -> float:
     )
     shared_contribution = float(shared.get("realized_return_contribution") or 0.0)
     with owner.store._lock:
-        # Historical Robinhood outcomes without a shared-capital reservation remain
-        # compatibility evidence. Count their portfolio contribution linearly rather
-        # than compounding partial slices as independent portfolios.
-        legacy = owner.store.db.execute(
-            "SELECT COALESCE(SUM(t.position_fraction * o.net_return),0) AS contribution "
-            "FROM robinhood_paper_outcomes o JOIN robinhood_paper_trials t ON t.id=o.trial_id "
-            "LEFT JOIN v52_robinhood_position_lots l ON l.trial_id=t.id "
-            "WHERE t.release_commit=? AND (t.capital_reservation_id IS NULL OR t.capital_reservation_id='') "
-            "AND l.id IS NULL",
-            (str(owner.release_commit),),
-        ).fetchone()
-        unmanaged = owner.store.db.execute(
-            "SELECT COALESCE(SUM(e.position_fraction * e.net_return),0) AS contribution "
-            "FROM v52_robinhood_position_events e "
-            "WHERE e.net_return IS NOT NULL AND NOT EXISTS ("
+        # Closed legacy trials remain governed by their historical multiplier. A
+        # lineaged trial is excluded because the shared capital ledger is now its
+        # accounting authority.
+        legacy_rows = owner.store.db.execute(
+            "SELECT o.paper_nav_multiplier FROM robinhood_paper_outcomes o "
+            "LEFT JOIN v52_robinhood_capital_lineage c ON c.trial_id=o.trial_id "
+            "WHERE o.paper_only=1 AND c.trial_id IS NULL ORDER BY o.id"
+        ).fetchall()
+        # Preserve already-recorded pre-repair v5.2 lifecycle events for positions
+        # that never entered shared-capital lineage. Managed positions are excluded
+        # so staged exit slices cannot be compounded against one another twice.
+        unmanaged_rows = owner.store.db.execute(
+            "SELECT e.paper_nav_multiplier FROM v52_robinhood_position_events e "
+            "WHERE e.paper_nav_multiplier IS NOT NULL AND NOT EXISTS ("
             "SELECT 1 FROM v52_robinhood_position_lots l "
             "JOIN v52_robinhood_capital_lineage c ON c.trial_id=l.trial_id "
-            "WHERE l.position_id=e.position_id)",
-        ).fetchone()
-    legacy_contribution = float(legacy["contribution"] or 0.0) if legacy is not None else 0.0
-    unmanaged_contribution = float(unmanaged["contribution"] or 0.0) if unmanaged is not None else 0.0
-    multiplier = max(0.0, 1.0 + shared_contribution + legacy_contribution + unmanaged_contribution)
-    return float(owner.starting_nav_usd) * multiplier
+            "WHERE l.position_id=e.position_id) ORDER BY e.id"
+        ).fetchall()
+
+    legacy_multiplier = 1.0
+    for item in legacy_rows:
+        legacy_multiplier *= max(0.0, float(item["paper_nav_multiplier"] or 1.0))
+    unmanaged_multiplier = 1.0
+    for item in unmanaged_rows:
+        unmanaged_multiplier *= max(0.0, float(item["paper_nav_multiplier"] or 1.0))
+    shared_multiplier = max(0.0, 1.0 + shared_contribution)
+    return float(owner.starting_nav_usd) * legacy_multiplier * unmanaged_multiplier * shared_multiplier
 
 
 def status(owner: Any | None = None) -> dict[str, Any]:
@@ -437,6 +449,7 @@ def status(owner: Any | None = None) -> dict[str, Any]:
         "partial_exit_residual_reservation": True,
         "partial_exit_exactly_once_lineage": True,
         "partial_exit_nav_is_linear_not_slice_compounded": True,
+        "durable_pre_lineage_nav_preserved": True,
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
         "signing_available": SIGNING_AVAILABLE,
@@ -447,16 +460,23 @@ def status(owner: Any | None = None) -> dict[str, Any]:
             _ensure_schema(owner)
             shared = capital_reconciliation(owner.store, release_commit=str(owner.release_commit))
             with owner.store._lock:
-                unlinked = owner.store.db.execute(
-                    "SELECT COUNT(*) AS n FROM v52_robinhood_position_lots l "
-                    "JOIN robinhood_paper_trials t ON t.id=l.trial_id "
-                    "WHERE t.release_commit=? AND l.remaining_fraction>0 "
-                    "AND (l.capital_reservation_id IS NULL OR l.capital_reservation_id='')",
-                    (str(owner.release_commit),),
+                table = owner.store.db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='v52_robinhood_position_lots' LIMIT 1"
                 ).fetchone()
+                if table is None:
+                    unlinked_count = 0
+                else:
+                    unlinked = owner.store.db.execute(
+                        "SELECT COUNT(*) AS n FROM v52_robinhood_position_lots l "
+                        "JOIN robinhood_paper_trials t ON t.id=l.trial_id "
+                        "WHERE t.release_commit=? AND l.remaining_fraction>0 "
+                        "AND (l.capital_reservation_id IS NULL OR l.capital_reservation_id='')",
+                        (str(owner.release_commit),),
+                    ).fetchone()
+                    unlinked_count = int(unlinked["n"] or 0) if unlinked is not None else 0
             payload["capital_reconciliation"] = shared
-            payload["unlinked_open_lots"] = int(unlinked["n"] or 0) if unlinked is not None else 0
-            payload["failed_closed"] = bool(payload["unlinked_open_lots"])
+            payload["unlinked_open_lots"] = unlinked_count
+            payload["failed_closed"] = bool(unlinked_count)
         except Exception as exc:
             payload["failed_closed"] = True
             payload["status_error"] = f"{type(exc).__name__}: shared capital unavailable"
