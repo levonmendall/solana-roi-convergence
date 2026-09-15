@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from solana_roi.direct_solana import DirectSolanaJournal
+from solana_roi.direct_solana_hydration_status_repair import _bounded_status
 
 
 class _Store:
@@ -58,6 +59,32 @@ def test_provider_heartbeat_coalesces_durable_writes_but_status_stays_current() 
     status = journal.status()
     assert status["provider_heartbeat_updates_received"] == 3
     assert status["provider_heartbeat_updates_persisted"] == 2
+    assert status["provider_heartbeat_updates_coalesced"] == 1
+
+
+def test_bounded_hydration_status_preserves_live_heartbeat_overlay_and_counters() -> None:
+    store = _Store()
+    monotonic_now = [300.0]
+    journal = DirectSolanaJournal(
+        store,
+        provider_heartbeat_persist_interval_seconds=5.0,
+        monotonic=lambda: monotonic_now[0],
+    )
+    journal.set_provider("primary", connected=True)
+
+    first = datetime(2026, 9, 15, 20, 0, 0, tzinfo=timezone.utc)
+    journal.touch_provider("primary", first)
+    monotonic_now[0] += 0.5
+    latest = first + timedelta(milliseconds=500)
+    journal.touch_provider("primary", latest)
+    assert _durable_last_message_at(store, "primary") == first.isoformat()
+
+    status = _bounded_status(journal)
+    provider_state = next(row for row in status["provider_states"] if row["provider"] == "primary")
+    assert provider_state["last_message_at"] == latest.isoformat()
+    assert status["provider_heartbeat_persist_interval_seconds"] == 5.0
+    assert status["provider_heartbeat_updates_received"] == 2
+    assert status["provider_heartbeat_updates_persisted"] == 1
     assert status["provider_heartbeat_updates_coalesced"] == 1
 
 
