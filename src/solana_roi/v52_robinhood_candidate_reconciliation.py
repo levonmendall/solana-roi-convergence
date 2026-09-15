@@ -13,8 +13,9 @@ from .strategy_v52_authority import (
 )
 from .v51_robinhood_candidate_coverage import _reconcile_durable_entry
 from .v51_robinhood_consolidation import _candidate_id
+from .v52_robinhood_shared_capital_repair import install_v52_robinhood_shared_capital_repair
 
-RECONCILIATION_VERSION = "v52-robinhood-post-validation-candidate-reconciliation-1"
+RECONCILIATION_VERSION = "v52-robinhood-post-validation-candidate-reconciliation-2-shared-capital"
 _INSTALLED = False
 _BASE_VALIDATE: Callable[..., Awaitable[bool]] | None = None
 
@@ -72,7 +73,7 @@ async def _validate_and_reconcile(
     immediately after the v5.2 lifecycle commits the trial.
     """
     if _BASE_VALIDATE is None:
-        raise RuntimeError("v52 Robinhood candidate reconciliation base validator missing")
+        raise RuntimeError("v5.2 Robinhood candidate reconciliation base validator missing")
 
     committed = await _BASE_VALIDATE(owner, payload, venue_object=venue_object)
     if not committed:
@@ -121,6 +122,7 @@ def status() -> dict[str, Any]:
         "strategy_version": STRATEGY_VERSION,
         "economic_freeze_epoch": ECONOMIC_FREEZE_EPOCH,
         "reconciliation_trigger": "successful_v52_lifecycle_commit_only",
+        "shared_capital_installed_before_reconciliation": True,
         "changes_economic_decision": False,
         "paper_only": PAPER_ONLY,
         "live_money_authority": LIVE_MONEY_AUTHORITY,
@@ -133,6 +135,11 @@ def install_v52_robinhood_candidate_reconciliation() -> None:
     global _INSTALLED, _BASE_VALIDATE
     if _INSTALLED:
         return
+    # The lifecycle installer has already installed its final v5.2 entry and exit
+    # wrappers when production calls this function. Attach the shared-capital repair
+    # now, then let candidate reconciliation wrap the repaired validator. This keeps
+    # one canonical capital authority and does not alter qualification semantics.
+    install_v52_robinhood_shared_capital_repair()
     _BASE_VALIDATE = lifecycle._validate_and_commit
     lifecycle._validate_and_commit = _validate_and_reconcile
     setattr(lifecycle._validate_and_commit, "_roi_v52_candidate_reconciliation", True)
