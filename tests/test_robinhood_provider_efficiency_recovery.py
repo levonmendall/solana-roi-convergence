@@ -10,6 +10,7 @@ import pytest
 
 from solana_roi import robinhood_catchup_capacity_repair as catchup
 from solana_roi import robinhood_chain_runtime as runtime
+from solana_roi import robinhood_live_frontier_verification_repair as frontier
 from solana_roi import robinhood_provider_efficiency_repair as efficiency
 from solana_roi import robinhood_provider_failover as failover
 from solana_roi import robinhood_provider_runtime_proof as proof
@@ -57,6 +58,24 @@ class _FakeRpc:
                 "transactionIndex": "0x0",
                 "logIndex": "0x1",
             },
+            # A combined provider query could theoretically return a cross-family
+            # topic from an address in the other venue set. Separate legacy queries
+            # would have excluded both rows at the provider boundary, so the repair
+            # must also exclude them locally.
+            {
+                "address": self.v3_address,
+                "topics": [runtime.PONS_V2_CURVE_SELL_TOPIC],
+                "blockNumber": "0x3e8",
+                "transactionIndex": "0x0",
+                "logIndex": "0x2",
+            },
+            {
+                "address": self.v2_address,
+                "topics": [runtime.V3_SWAP_TOPIC],
+                "blockNumber": "0x3e8",
+                "transactionIndex": "0x0",
+                "logIndex": "0x3",
+            },
         ]
 
 
@@ -103,6 +122,7 @@ def test_cross_venue_market_logs_share_one_64_address_request_without_scope_loss
     monkeypatch.delenv("ROBINHOOD_COMBINED_LOG_ADDRESS_BATCH_SIZE", raising=False)
     efficiency.install_robinhood_provider_efficiency_repair()
     assert catchup._fetch_market_logs is efficiency._combined_fetch_market_logs
+    assert frontier._fetch_market_logs is efficiency._combined_fetch_market_logs
     plane = _FakePlane()
 
     asyncio.run(catchup._capacity_poll_once(plane))
@@ -124,6 +144,32 @@ def test_cross_venue_market_logs_share_one_64_address_request_without_scope_loss
     assert plane._roi_market_log_legacy_equivalent_requests == 2
     assert plane._roi_market_log_actual_requests == 1
     assert plane._cursor == 1_000
+
+
+def test_live_frontier_alias_uses_same_composed_batch_and_local_topic_equivalence() -> None:
+    efficiency.install_robinhood_provider_efficiency_repair()
+    plane = _FakePlane()
+
+    rows = asyncio.run(frontier._fetch_market_logs(plane, from_block=999, to_block=1_000))
+
+    assert len(plane.rpc.calls) == 1
+    assert len(plane.rpc.calls[0]["addresses"]) == 64
+    assert [(kind, log["logIndex"]) for kind, _, log in rows] == [
+        ("v3", "0x0"),
+        ("v2", "0x1"),
+    ]
+    assert plane._roi_market_log_legacy_equivalent_requests == 2
+    assert plane._roi_market_log_actual_requests == 1
+
+    status = efficiency.status()
+    assert status["composed_catchup_market_log_batching"] is True
+    assert status["composed_live_frontier_market_log_batching"] is True
+    assert status["venue_specific_topic_zero_revalidated_locally"] is True
+    assert status["block_coverage_reduced"] is False
+    assert status["market_coverage_reduced"] is False
+    assert status["strategy_thresholds_changed"] is False
+    assert status["paper_only"] is True
+    assert status["live_money_authority"] is False
 
 
 def test_cross_venue_batching_fails_closed_on_address_classification_collision() -> None:
