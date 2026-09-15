@@ -18,6 +18,7 @@ LEGACY_PATH_ENV = "SOLANA_ROI_DB_PATH"
 LEGACY_RECORD_ENV = "SOLANA_ROI_LEGACY_DB_PATH"
 ACTIVATE_ENV = "SOLANA_ROI_ACTIVE_STORAGE_ENABLED"
 SHADOW_ENV = "SOLANA_ROI_ACTIVE_STORAGE_SHADOW"
+FINALIZE_ENV = "SOLANA_ROI_ACTIVE_STORAGE_FINALIZE_FROM_LEGACY"
 
 _SEMANTIC_SECTIONS = (
     "strategy",
@@ -45,6 +46,27 @@ def _utc_now() -> str:
 
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1","true","yes","on"}
+
+
+def _running_release_sha() -> str | None:
+    return (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip() or None
+
+
+def _normal_active_release_rollforward(expected_release_sha: str | None) -> bool:
+    """Allow an established verified checkpoint to survive an ordinary deploy.
+
+    The checkpoint release SHA records the release that established the active
+    storage boundary; it is provenance, not a permanent lock on all later code
+    releases.  Release equality remains mandatory everywhere else, including the
+    explicit finalize/cutover startup that creates a new checkpoint.
+    """
+    if expected_release_sha is None:
+        return False
+    return (
+        _truthy(os.getenv(ACTIVATE_ENV))
+        and not _truthy(os.getenv(FINALIZE_ENV))
+        and _running_release_sha() == str(expected_release_sha)
+    )
 
 
 def semantic_projection(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -157,7 +179,8 @@ def load_verified_checkpoint(path: Path | str, *, expected_release_sha: str | No
     if str(row[5]) != str(payload["release_sha"]):
         raise RuntimeError("active checkpoint release metadata mismatch")
     if expected_release_sha is not None and str(payload["release_sha"]) != str(expected_release_sha):
-        raise RuntimeError("active checkpoint release SHA does not match running release")
+        if not _normal_active_release_rollforward(expected_release_sha):
+            raise RuntimeError("active checkpoint release SHA does not match running release")
     return payload
 
 
