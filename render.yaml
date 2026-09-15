@@ -126,7 +126,7 @@ services:
       - key: BLOCKSCOUT_API_KEY
         sync: false
       # Private Robinhood RPC binding. Provider selection must use only configured,
-      # chain-verified non-dRPC endpoints. Failover verifies Robinhood Mainnet chain
+      # chain-verified approved endpoints. Failover verifies Robinhood Mainnet chain
       # id 4663 and reanchors the paired WSS generation before paper-entry authority resumes.
       - key: ROBINHOOD_RPC_URL
         sync: false
