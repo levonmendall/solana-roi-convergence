@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from solana_roi import v52_operational_integrity_repair as repair
+from solana_roi import v52_robinhood_flow_cutoff_context as cutoff_context
 from solana_roi import v52_robinhood_position_lifecycle as lifecycle
 from solana_roi.robinhood_chain_profit_maximizer import RobinhoodProfitMaximizerMixin
 
@@ -77,6 +79,41 @@ def test_late_historical_evidence_before_cutoff_is_preserved() -> None:
     assert metrics["trigger_actor"] == C
 
 
+def test_entry_context_uses_trigger_event_time_and_restores_owner_state(monkeypatch) -> None:
+    owner = SimpleNamespace()
+    pool = SimpleNamespace(recent_swaps=[_swap(900.0, A), _swap(1000.0, B)])
+    observed: list[float] = []
+
+    async def base_flow(self, swaps, *, deployer="", decision_cutoff_ts=None):
+        observed.append(float(decision_cutoff_ts))
+        return {"decision_cutoff_ts": decision_cutoff_ts}
+
+    async def base_v3(self, venue, *, current_block):
+        result = await cutoff_context._flow_with_decision_context(self, venue.recent_swaps)
+        assert result["decision_cutoff_ts"] == pytest.approx(1000.0)
+
+    monkeypatch.setattr(cutoff_context, "_BASE_FLOW", base_flow)
+    monkeypatch.setattr(cutoff_context, "_BASE_V3", base_v3)
+    asyncio.run(cutoff_context._v3_entry_with_cutoff(owner, pool, current_block=5))
+    assert observed == [1000.0]
+    assert not hasattr(owner, cutoff_context._CONTEXT_ATTR)
+
+
+def test_position_management_without_entry_context_uses_wall_clock_aging(monkeypatch) -> None:
+    owner = SimpleNamespace()
+    observed: list[float] = []
+
+    async def base_flow(self, swaps, *, deployer="", decision_cutoff_ts=None):
+        observed.append(float(decision_cutoff_ts))
+        return {"decision_cutoff_ts": decision_cutoff_ts}
+
+    monkeypatch.setattr(cutoff_context, "_BASE_FLOW", base_flow)
+    monkeypatch.setattr(cutoff_context.time, "time", lambda: 2000.0)
+    result = asyncio.run(cutoff_context._flow_with_decision_context(owner, [_swap(1000.0, A)]))
+    assert result["decision_cutoff_ts"] == pytest.approx(2000.0)
+    assert observed == [2000.0]
+
+
 def test_staged_exit_contributions_are_additive_within_one_position() -> None:
     rows = [
         {"position_id": 7, "position_fraction": 0.005, "net_return": 0.20},
@@ -100,11 +137,15 @@ def test_production_import_installs_integrity_wrappers_without_live_money_author
     from solana_roi import v52_strategy_api  # noqa: F401
 
     assert getattr(RobinhoodProfitMaximizerMixin._v5_flow_metrics, "_roi_v52_point_in_time_flow", False) is True
+    assert getattr(RobinhoodProfitMaximizerMixin._v5_flow_metrics, "_roi_v52_entry_cutoff_context", False) is True
     assert getattr(lifecycle._paper_nav_with_lifecycle, "_roi_v52_staged_nav_reconciliation", False) is True
     status = repair.status()
     assert status["installed"] is True
     assert status["future_flow_allowed"] is False
     assert status["changes_strategy_thresholds"] is False
+    cutoff_status = cutoff_context.status()
+    assert cutoff_status["entry_decisions_use_event_time_cutoff"] is True
+    assert cutoff_status["position_management_uses_wall_clock_aging"] is True
     assert status["paper_only"] is True
     assert status["live_money_authority"] is False
     assert status["signing_available"] is False
