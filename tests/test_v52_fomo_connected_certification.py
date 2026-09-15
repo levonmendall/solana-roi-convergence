@@ -11,6 +11,9 @@ from solana_roi import candidate_fomo_runtime_repair as scanner
 from solana_roi import continuation_market_recalibration as continuation
 from solana_roi import v51_paper_lifecycle_runtime as lifecycle
 from solana_roi.v51_atomic_paper_capital import capital_reconciliation
+from solana_roi.v52_cross_lane_paper_certification_repair import (
+    configure_v52_cross_lane_paper_certification_repair,
+)
 
 
 TOKEN = "FomoToken111111111111111111111111111111111"
@@ -75,6 +78,7 @@ def _rows(now: datetime) -> list[dict[str, object]]:
 
 
 def test_normalized_fomo_candidate_reaches_shared_capital_exit_and_canonical_settlement(tmp_path) -> None:
+    configure_v52_cross_lane_paper_certification_repair()
     store = ObservationEventStore(tmp_path / "fomo-connected.sqlite3")
     adapter = _Adapter(store)
     now = datetime.now(timezone.utc)
@@ -158,6 +162,7 @@ def test_normalized_fomo_candidate_reaches_shared_capital_exit_and_canonical_set
 
 
 def test_fomo_threshold_rejection_never_reaches_paper_capital(tmp_path) -> None:
+    configure_v52_cross_lane_paper_certification_repair()
     store = ObservationEventStore(tmp_path / "fomo-reject.sqlite3")
     adapter = _Adapter(store)
     now = datetime.now(timezone.utc)
