@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 
 import pytest
 
+from solana_roi import post177_forward_pipeline_composition_compat as composition
 from solana_roi import robinhood_provider_budget_transport as provider_budget
+from solana_roi import robinhood_request_budget_telemetry as request_budget
 from solana_roi import robinhood_research_streaming_memory_repair as repair
 
 
@@ -147,6 +150,40 @@ def test_staged_signals_are_bounded_to_existing_per_market_retention(monkeypatch
     assert len(pending[address]) == 256
     assert pending[address][0][1] == 44
     assert pending[address][-1][1] == 299
+
+
+def test_final_composition_keeps_request_budget_wrapped_around_streaming_primitive(monkeypatch) -> None:
+    source = inspect.getsource(composition.install_post177_forward_pipeline_composition_compat)
+    streaming_install = source.index(
+        "robinhood_research_streaming_memory.install_robinhood_research_streaming_memory_repair"
+    )
+    budget_rebind = source.index(
+        "robinhood_request_budget._ORIGINAL_RESEARCH_PASS = robinhood_research_streaming_memory._streaming_research_pass"
+    )
+    budget_install = source.index(
+        "robinhood_request_budget.install_robinhood_request_budget_telemetry"
+    )
+    assert streaming_install < budget_rebind < budget_install
+
+    async def historical_pass(_self, _rpc) -> None:
+        return None
+
+    class Plane:
+        def status(self):
+            return {}
+
+    monkeypatch.setattr(provider_budget, "_research_pass", historical_pass)
+    monkeypatch.setattr(request_budget, "_ORIGINAL_RESEARCH_PASS", historical_pass)
+    monkeypatch.setattr(request_budget, "_INSTALLED", False)
+    monkeypatch.setattr(repair, "_INSTALLED", False)
+
+    repair.install_robinhood_research_streaming_memory_repair(Plane)
+    request_budget._ORIGINAL_RESEARCH_PASS = repair._streaming_research_pass
+    request_budget.install_robinhood_request_budget_telemetry(Plane)
+
+    assert request_budget._ORIGINAL_RESEARCH_PASS is repair._streaming_research_pass
+    assert provider_budget._research_pass is request_budget._budgeted_research_pass
+    assert bool(getattr(provider_budget._research_pass, "_roi_robinhood_request_budget_telemetry", False))
 
 
 def test_installer_exposes_fail_safe_memory_contract() -> None:
