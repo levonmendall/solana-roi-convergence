@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-ATOMIC_CAPITAL_VERSION = "v51-atomic-paper-capital-v2-canonical-portfolio"
+# Preserve the existing public contract. The cross-release canonical portfolio
+# repair changes scope/identity semantics, not the frozen v5.1 economic version.
+ATOMIC_CAPITAL_VERSION = "v51-atomic-paper-capital-v1"
 CANONICAL_PORTFOLIO_ID = "roi-convergence-paper-500-v1"
 DEFAULT_CAPACITY_FRACTION = 1.0
 BUSY_RETRY_LIMIT = 8
