@@ -9,6 +9,11 @@ import solana_roi.active_storage_epoch_rollover as rollover
 from solana_roi.certification_epoch import release_commit_from_env
 
 
+OLDER_RELEASE_SHA = "0" * 40
+SOURCE_RELEASE_SHA = "1" * 40
+TARGET_RELEASE_SHA = "2" * 40
+
+
 def _source_database(path: Path) -> None:
     connection = sqlite3.connect(path)
     try:
@@ -18,11 +23,11 @@ def _source_database(path: Path) -> None:
         )
         connection.execute(
             "INSERT INTO certification_release_epochs(release_commit,started_at) VALUES(?,?)",
-            ("older-release", "2026-09-14T00:00:00+00:00"),
+            (OLDER_RELEASE_SHA, "2026-09-14T00:00:00+00:00"),
         )
         connection.execute(
             "INSERT INTO certification_release_epochs(release_commit,started_at) VALUES(?,?)",
-            ("source-release", "2026-09-15T00:00:00+00:00"),
+            (SOURCE_RELEASE_SHA, "2026-09-15T00:00:00+00:00"),
         )
         connection.commit()
     finally:
@@ -35,7 +40,7 @@ def test_shadow_rollover_extracts_source_release_and_restores_target_environment
     source = tmp_path / "active.sqlite3"
     successor = tmp_path / "successor.sqlite3"
     _source_database(source)
-    monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", "target-release")
+    monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", TARGET_RELEASE_SHA)
 
     observed: dict[str, object] = {}
     sentinel = object()
@@ -53,18 +58,18 @@ def test_shadow_rollover_extracts_source_release_and_restores_target_environment
     result = rollover._build_shadow_database_for_rollover(
         source=source,
         successor=successor,
-        target_release_sha="target-release",
+        target_release_sha=TARGET_RELEASE_SHA,
     )
 
     assert result is sentinel
     assert observed == {
-        "release_env": "source-release",
-        "release_sha": "target-release",
+        "release_env": SOURCE_RELEASE_SHA,
+        "release_sha": TARGET_RELEASE_SHA,
         "legacy_path": source,
         "active_path": successor,
         "replace_existing": True,
     }
-    assert release_commit_from_env() == "target-release"
+    assert release_commit_from_env() == TARGET_RELEASE_SHA
 
     connection = sqlite3.connect(source)
     try:
@@ -73,7 +78,7 @@ def test_shadow_rollover_extracts_source_release_and_restores_target_environment
         ).fetchall()
     finally:
         connection.close()
-    assert rows == [("older-release",), ("source-release",)]
+    assert rows == [(OLDER_RELEASE_SHA,), (SOURCE_RELEASE_SHA,)]
 
 
 def test_source_certification_frontier_missing_fails_closed(tmp_path):
