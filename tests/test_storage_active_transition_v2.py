@@ -13,6 +13,7 @@ from solana_roi.active_storage import ActiveStorage
 from solana_roi.certification_active_manifest import install_active_certification_manifest
 from solana_roi.config import BASELINE
 from solana_roi.storage_current_state_extractor import LegacyCurrentStateExtractor
+from solana_roi.storage_legacy_schema_reconciliation import LEGACY_RETAINED_DATASETS, OWNER
 from solana_roi.storage_shadow_migration import build_shadow_database, read_logical_truth
 from solana_roi.storage_transition import (
     ACTIVE_PATH_ENV,
@@ -97,10 +98,22 @@ def _make_active(path: Path) -> ActiveStorage:
     return storage
 
 
-def test_manifest_classifies_v52_and_never_allows_legacy_unclassified() -> None:
+def test_manifest_classifies_v52_and_seals_exact_legacy_unclassified() -> None:
     required={"v52_market_validation_features","v52_market_validation_shadow_outcomes","v52_market_validation_point_in_time","v52_wallet_point_in_time_observations","v52_wallet_forward_outcomes","v52_wallet_integrity_snapshots","v52_wallet_forward_validation","wallet_intelligence_snapshots","paper_engine_checkpoint"}
     assert required <= set(storage_manifest.RETENTION_REGISTRY)
-    assert all(c.retention_class is not storage_manifest.RetentionClass.LEGACY_UNCLASSIFIED for c in storage_manifest.RETENTION_REGISTRY.values())
+    legacy = {
+        name: contract
+        for name, contract in storage_manifest.RETENTION_REGISTRY.items()
+        if contract.retention_class is storage_manifest.RetentionClass.LEGACY_UNCLASSIFIED
+    }
+    assert set(legacy) == set(LEGACY_RETAINED_DATASETS)
+    for name, contract in legacy.items():
+        assert contract.owner == OWNER
+        assert contract.hot_or_cold == "cold"
+        assert contract.startup_access is False
+        assert contract.certification_access is False
+        assert name not in storage_manifest.startup_table_allowlist()
+        assert name not in storage_manifest.certification_table_allowlist()
 
 
 def test_v52_feature_pruning_preserves_exact_latest_250(tmp_path: Path) -> None:
