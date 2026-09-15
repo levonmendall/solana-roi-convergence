@@ -5,6 +5,7 @@ import copy
 import os
 import threading
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -13,7 +14,7 @@ from .certification_generation_coordinator import resource_guard
 from .cgroup_oom_forensics import phase as memory_forensics_phase
 
 
-REPAIR_VERSION = "production-proof-read-boundary-v3-postbuild-memory-guard"
+REPAIR_VERSION = "production-proof-read-boundary-v4-single-read-promotion-records"
 PAPER_ONLY = True
 LIVE_MONEY_AUTHORITY = False
 SIGNING_AVAILABLE = False
@@ -35,8 +36,22 @@ _SNAPSHOT_STATS: dict[str, Any] = {
     "last_duration_seconds": None,
     "last_error_type": None,
 }
+_PROMOTION_STATS_LOCK = threading.Lock()
+_PROMOTION_STATS: dict[str, Any] = {
+    "cycles": 0,
+    "underlying_reads": 0,
+    "cache_hits": 0,
+    "last_cycle_underlying_reads": 0,
+    "last_cycle_cache_hits": 0,
+    "last_cycle_row_count": 0,
+}
+_PROMOTION_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "production_proof_promotion_records_context",
+    default=None,
+)
 _ORIGINAL_RUNTIME_WORKERS: Callable[..., Any] | None = None
 _ORIGINAL_PRODUCTION_PROOF: Callable[[], dict[str, Any]] | None = None
+_ORIGINAL_PROMOTION_RECORDS: Callable[[Any], list[dict[str, Any]]] | None = None
 
 
 def _utcnow() -> str:
@@ -49,6 +64,117 @@ def _release_commit() -> str:
         if value:
             return value
     return "unbound-local-release"
+
+
+def _promotion_cache_state() -> dict[str, Any]:
+    with _PROMOTION_STATS_LOCK:
+        stats = dict(_PROMOTION_STATS)
+    return {
+        "proof_cycle_scoped": True,
+        "ttl_cache": False,
+        "persistent_cache": False,
+        "fresh_row_dict_per_consumer": True,
+        "cycles": int(stats.get("cycles", 0) or 0),
+        "underlying_reads": int(stats.get("underlying_reads", 0) or 0),
+        "cache_hits": int(stats.get("cache_hits", 0) or 0),
+        "last_cycle_underlying_reads": int(stats.get("last_cycle_underlying_reads", 0) or 0),
+        "last_cycle_cache_hits": int(stats.get("last_cycle_cache_hits", 0) or 0),
+        "last_cycle_row_count": int(stats.get("last_cycle_row_count", 0) or 0),
+        "strategy_semantics_changed": False,
+        "economic_thresholds_changed": False,
+    }
+
+
+def _proof_scoped_promotion_records(store: Any) -> list[dict[str, Any]]:
+    """Reuse one immutable promotion-record snapshot only inside one proof call.
+
+    The canonical builder invokes promotion_records through Phase 14, Phase 17 and
+    Batch 6. Those calls are logically read-equivalent within one synchronous proof
+    cycle, but each historically rebuilt the complete audit/cost overlay. Keep one
+    tuple snapshot per store for the duration of the proof and hand each consumer
+    fresh row dictionaries so callers retain the old object-isolation semantics.
+    Outside that explicit proof context this function delegates directly.
+    """
+    original = _ORIGINAL_PROMOTION_RECORDS
+    if original is None:
+        raise RuntimeError("production proof promotion-record delegate is not installed")
+    context = _PROMOTION_CONTEXT.get()
+    if context is None:
+        return original(store)
+
+    records_by_store = context.setdefault("records_by_store", {})
+    key = id(store)
+    cached = records_by_store.get(key)
+    if cached is None:
+        loaded = tuple(dict(row) for row in original(store))
+        records_by_store[key] = loaded
+        context["underlying_reads"] = int(context.get("underlying_reads", 0) or 0) + 1
+        context["row_count"] = int(context.get("row_count", 0) or 0) + len(loaded)
+        cached = loaded
+    else:
+        context["cache_hits"] = int(context.get("cache_hits", 0) or 0) + 1
+    return [dict(row) for row in cached]
+
+
+setattr(_proof_scoped_promotion_records, "_roi_proof_cycle_single_read", True)
+
+
+def _with_proof_scoped_promotion_records(
+    builder: Callable[[], dict[str, Any]],
+) -> Callable[[], dict[str, Any]]:
+    if bool(getattr(builder, "_roi_proof_cycle_single_read", False)):
+        return builder
+
+    def build() -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "records_by_store": {},
+            "underlying_reads": 0,
+            "cache_hits": 0,
+            "row_count": 0,
+        }
+        token = _PROMOTION_CONTEXT.set(context)
+        try:
+            return builder()
+        finally:
+            _PROMOTION_CONTEXT.reset(token)
+            reads = int(context.get("underlying_reads", 0) or 0)
+            hits = int(context.get("cache_hits", 0) or 0)
+            rows = int(context.get("row_count", 0) or 0)
+            with _PROMOTION_STATS_LOCK:
+                _PROMOTION_STATS["cycles"] = int(_PROMOTION_STATS.get("cycles", 0) or 0) + 1
+                _PROMOTION_STATS["underlying_reads"] = int(_PROMOTION_STATS.get("underlying_reads", 0) or 0) + reads
+                _PROMOTION_STATS["cache_hits"] = int(_PROMOTION_STATS.get("cache_hits", 0) or 0) + hits
+                _PROMOTION_STATS["last_cycle_underlying_reads"] = reads
+                _PROMOTION_STATS["last_cycle_cache_hits"] = hits
+                _PROMOTION_STATS["last_cycle_row_count"] = rows
+            print(
+                "ROI_PRODUCTION_PROOF_PROMOTION_RECORDS "
+                f"underlying_reads={reads} cache_hits={hits} row_count={rows}",
+                flush=True,
+            )
+
+    try:
+        build.__dict__.update(getattr(builder, "__dict__", {}))
+    except Exception:
+        pass
+    setattr(build, "_roi_proof_cycle_single_read", True)
+    return build
+
+
+def _install_proof_scoped_promotion_record_reuse() -> None:
+    """Patch only the two proof-plane references that perform duplicate rebuilds."""
+    global _ORIGINAL_PROMOTION_RECORDS
+    from . import v51_batch6_production_proof_release_gate as batch6
+    from . import v51_cross_surface_proof as cross_surface
+    from . import v51_evidence_analytics as evidence
+
+    if _ORIGINAL_PROMOTION_RECORDS is None:
+        _ORIGINAL_PROMOTION_RECORDS = evidence.promotion_records
+
+    if not bool(getattr(cross_surface.promotion_records, "_roi_proof_cycle_single_read", False)):
+        cross_surface.promotion_records = _proof_scoped_promotion_records  # type: ignore[assignment]
+    if not bool(getattr(batch6.promotion_records, "_roi_proof_cycle_single_read", False)):
+        batch6.promotion_records = _proof_scoped_promotion_records  # type: ignore[assignment]
 
 
 def _cache_state() -> dict[str, Any]:
@@ -70,6 +196,7 @@ def _cache_state() -> dict[str, Any]:
         "publication_uses_owned_builder_payload": True,
         "post_build_resource_guard": True,
         "post_build_memory_limit_fraction": 0.90,
+        "promotion_records_reuse": _promotion_cache_state(),
         "attempts": int(stats.get("attempts", 0) or 0),
         "successes": int(stats.get("successes", 0) or 0),
         "failures": int(stats.get("failures", 0) or 0),
@@ -282,7 +409,8 @@ def install_production_proof_read_boundary_repair(app: Any) -> None:
     original = getattr(route, "endpoint", None)
     if not callable(original):
         raise RuntimeError("canonical production proof endpoint is not callable")
-    _ORIGINAL_PRODUCTION_PROOF = original
+    _install_proof_scoped_promotion_record_reuse()
+    _ORIGINAL_PRODUCTION_PROOF = _with_proof_scoped_promotion_records(original)
 
     setattr(_cached_production_proof, "_roi_production_proof_read_boundary", True)
     setattr(_cached_production_proof, "_roi_production_proof_precomputed_snapshot", True)
@@ -322,6 +450,10 @@ __all__ = [
     "_cache_state",
     "_cached_production_proof",
     "_current_worker_chain_already_contains_production_proof",
+    "_install_proof_scoped_promotion_record_reuse",
+    "_proof_scoped_promotion_records",
+    "_promotion_cache_state",
     "_publish_snapshot",
+    "_with_proof_scoped_promotion_records",
     "install_production_proof_read_boundary_repair",
 ]
