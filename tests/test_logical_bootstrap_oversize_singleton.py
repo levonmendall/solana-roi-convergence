@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -93,7 +95,8 @@ def test_checkpoint_current_still_has_a_hard_single_row_cap(monkeypatch: pytest.
 
 def test_normal_page_budget_still_truncates_before_next_row() -> None:
     cursor = _Cursor([(1, "a" * 24), (2, "b" * 24)])
-    first_size = len('{"rowid":1,"values":["' + ("a" * 24) + '"]}')
+    first_record = _record((1, "a" * 24))
+    first_size = len(json.dumps(first_record, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
     rows, payload_bytes, done, next_cursor = bootstrap._stream_page_records(
         cursor,
@@ -104,7 +107,7 @@ def test_normal_page_budget_still_truncates_before_next_row() -> None:
         cursor_for=_cursor_for,
     )
 
-    assert rows == [{"rowid": 1, "values": ["a" * 24]}]
+    assert rows == [first_record]
     assert payload_bytes == first_size
     assert done is False
     assert next_cursor == "1"
