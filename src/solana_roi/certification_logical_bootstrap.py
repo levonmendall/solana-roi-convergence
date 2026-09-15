@@ -27,6 +27,8 @@ DEFAULT_PAGE_ROWS = 250
 MAX_PAGE_ROWS = 500
 DEFAULT_PAGE_BYTES = 4 * 1024 * 1024
 MAX_PAGE_BYTES = 16 * 1024 * 1024
+MAX_SINGLE_ROW_BYTES = 64 * 1024 * 1024
+OVERSIZE_SINGLE_ROW_TABLES = frozenset({"checkpoint_current"})
 READER_CACHE_KIB = 1024
 
 PAPER_ONLY = True
@@ -156,7 +158,7 @@ def _manifest(store: Any) -> dict[str, Any]:
         unsupported = sorted(schema_table_names - table_names)
         if unsupported:
             raise HTTPException(
-                status_code=409,
+                status_code=422,
                 detail="certification_logical_bootstrap_unsupported_table_kind:" + ",".join(unsupported[:8]),
             )
         manifest_tables: list[dict[str, Any]] = []
@@ -166,7 +168,7 @@ def _manifest(store: Any) -> dict[str, Any]:
             visible = [column for column in columns if int(column["hidden"]) == 0]
             primary = replication._primary_columns(visible)
             if bool(table["without_rowid"]) and not primary:
-                raise HTTPException(status_code=409, detail=f"certification_logical_bootstrap_unstable_table:{name}")
+                raise HTTPException(status_code=422, detail=f"certification_logical_bootstrap_unstable_table:{name}")
             manifest_tables.append(
                 {
                     "name": name,
@@ -214,6 +216,8 @@ def _manifest(store: Any) -> dict[str, Any]:
             "page_default_rows": DEFAULT_PAGE_ROWS,
             "page_max_rows": MAX_PAGE_ROWS,
             "page_max_bytes": _page_bytes(),
+            "max_single_row_bytes": MAX_SINGLE_ROW_BYTES,
+            "oversize_single_row_tables": sorted(OVERSIZE_SINGLE_ROW_TABLES),
             "reader_cache_kib": READER_CACHE_KIB,
             "reader_mmap_disabled": True,
             "reader_private_cache": True,
@@ -256,10 +260,15 @@ def _stream_page_records(
             truncated_by_bytes = True
             break
         if not response_rows and size > max_bytes:
-            raise HTTPException(
-                status_code=409,
-                detail=f"certification_logical_bootstrap_row_exceeds_page_bound:{table_name}",
-            )
+            if table_name not in OVERSIZE_SINGLE_ROW_TABLES or size > MAX_SINGLE_ROW_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"certification_logical_bootstrap_row_exceeds_transport_bound:{table_name}",
+                )
+            response_rows.append(record)
+            payload_bytes += size
+            truncated_by_bytes = True
+            break
         response_rows.append(record)
         payload_bytes += size
 
@@ -292,7 +301,7 @@ def _page(
         columns = [column for column in replication._columns(reader, table_name) if int(column["hidden"]) == 0]
         names = [str(column["name"]) for column in columns]
         if not names:
-            raise HTTPException(status_code=409, detail=f"certification_logical_bootstrap_empty_table_schema:{table_name}")
+            raise HTTPException(status_code=422, detail=f"certification_logical_bootstrap_empty_table_schema:{table_name}")
         bounded_limit = min(MAX_PAGE_ROWS, max(1, int(limit)))
         decoded_cursor = _decode_cursor(cursor)
         quoted_table = replication._qident(table_name)
@@ -303,7 +312,7 @@ def _page(
             primary = replication._primary_columns(columns)
             pk_names = [str(column["name"]) for column in primary]
             if not pk_names:
-                raise HTTPException(status_code=409, detail=f"certification_logical_bootstrap_unstable_table:{table_name}")
+                raise HTTPException(status_code=422, detail=f"certification_logical_bootstrap_unstable_table:{table_name}")
             order = ",".join(replication._qident(name) for name in pk_names)
             where = ""
             if decoded_cursor:
