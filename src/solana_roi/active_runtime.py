@@ -100,13 +100,45 @@ class ActiveObservationEventStore(ObservationEventStore):
                     if self._bounded_maintenance():
                         return
                 except Exception as exc:
-                    # Maintenance failure cannot be allowed to turn into silent
-                    # unbounded accumulation. Persist a tiny restart-safe marker
-                    # and enter the quiescent rollover path on the next process.
-                    self._request_quiescent_rollover(
-                        reason=f"maintenance_failure:{type(exc).__name__}"
+                    # A transient SQLite lock or a single pruning failure must
+                    # not create an endless restart loop while the active store
+                    # still has storage headroom. The persisted page ceiling is
+                    # the final fail-closed boundary for independent writers.
+                    try:
+                        storage = ActiveStorage(self.path)
+                        sizes = storage.storage_bytes()
+                        over_warning = storage.warning_boundary_exceeded()
+                        status_readable = True
+                    except Exception as status_exc:
+                        sizes = {}
+                        over_warning = True
+                        status_readable = False
+                        status_error = f"{type(status_exc).__name__}:{status_exc}"
+                    payload = {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "path": str(self.path),
+                        "status_readable": status_readable,
+                        "over_warning": over_warning,
+                        "sizes": sizes,
+                        "paper_only": True,
+                        "live_money_authority": False,
+                    }
+                    if not status_readable:
+                        payload["status_error"] = status_error
+                    print(
+                        "ROI_ACTIVE_STORAGE_MAINTENANCE_FAILED "
+                        + json.dumps(payload, sort_keys=True),
+                        flush=True,
                     )
-                    return
+                    if over_warning:
+                        self._request_quiescent_rollover(
+                            reason=f"maintenance_failure_at_boundary:{type(exc).__name__}"
+                        )
+                        return
+                    # Keep the current process alive and retry at the next
+                    # interval. No strategy/certification state is modified.
+                    continue
 
         self._maintenance_thread = threading.Thread(
             target=run,
