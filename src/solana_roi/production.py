@@ -21,6 +21,7 @@ from .logical_bootstrap_page_cache_repair import configure_logical_bootstrap_pag
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 from .shadow_price_tracking_state_repair import configure_shadow_price_tracking_state_repair
 from .storage_transition_quiesce import configure_storage_transition_quiesce
+from .v52_cross_lane_paper_certification_repair import configure_v52_cross_lane_paper_certification_repair
 from .wallet_discovery_background_status_repair import configure_wallet_discovery_background_status_repair
 
 # Keep authoritative certification-replica requests below the certifier's bounded
@@ -66,6 +67,12 @@ configure_shadow_price_tracking_state_repair()
 # certification remains fail-closed and storage activation still requires the normal
 # verified active-store gates.
 configure_storage_transition_quiesce()
+
+# Repair only portfolio-construction/accounting boundaries before the production
+# graph is composed: qualify the joined FOMO exposure column and prevent the exact
+# same source event from reserving both SOLANA and FOMO paper capital. Independent
+# market-flow FOMO remains active; strategy thresholds and qualification are unchanged.
+configure_v52_cross_lane_paper_certification_repair()
 
 from .production_system import (
     COMPOSITION_STATUS_PATH,
