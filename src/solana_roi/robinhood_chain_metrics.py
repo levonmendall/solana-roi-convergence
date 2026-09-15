@@ -59,8 +59,25 @@ class RobinhoodMetricsMixin:
         now_ts: float,
         entity_map: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        current = [s for s in swaps if now_ts - float(s["observed_ts"]) <= 60.0]
-        prior = [s for s in swaps if 60.0 < now_ts - float(s["observed_ts"]) <= 120.0]
+        # Evidence is evaluated as-of the supplied decision timestamp, not by deque
+        # insertion order.  A late-arriving historical event remains eligible when
+        # its event time belongs to the window, while an event timestamped after the
+        # decision cutoff can never contaminate the earlier decision.
+        eligible = sorted(
+            (
+                s
+                for s in swaps
+                if 0.0 <= now_ts - float(s["observed_ts"]) <= 120.0
+            ),
+            key=lambda s: (
+                float(s["observed_ts"]),
+                int(s.get("block_number") or 0),
+                int(s.get("log_index") or 0),
+                str(s.get("tx_hash") or ""),
+            ),
+        )
+        current = [s for s in eligible if now_ts - float(s["observed_ts"]) <= 60.0]
+        prior = [s for s in eligible if 60.0 < now_ts - float(s["observed_ts"]) <= 120.0]
         buys = [s for s in current if s["side"] == "buy"]
         sells = [s for s in current if s["side"] == "sell"]
         prior_buys = [s for s in prior if s["side"] == "buy"]
