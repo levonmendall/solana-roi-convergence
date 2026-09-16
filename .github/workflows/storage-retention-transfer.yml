@@ -1,0 +1,74 @@
+name: Restore exact storage repair for CI
+
+on:
+  push:
+    branches: [ci/storage-retention-transfer-1b274ed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: storage-retention-transfer-1b274ed
+  cancel-in-progress: false
+
+jobs:
+  restore-exact-commit:
+    if: github.repository == 'levonmendall/solana-roi-convergence' && github.ref == 'refs/heads/ci/storage-retention-transfer-1b274ed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and publish only the exact repaired commit
+        env:
+          BASE: 648c8d9d84604a915ae31994c874b53e8a5898c0
+          EXPECTED: 1b274ed52d688dc3c7ce97a57e27dd48f29a64dd
+          EXPECTED_TREE: 424956b0f420f015cb685c4085cee4a4f19e4a10
+          DEST_REF: refs/heads/repair/storage-total-retention-finalized-ci
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, lzma, os
+          payload = Path('.github/ci-transfer/storage-retention')
+          compressed = b''.join((payload / f'part{n}.xz').read_bytes() for n in (1, 2, 3))
+          assert len(compressed) == 33724
+          assert hashlib.sha256(compressed).hexdigest() == 'fbee3c96dfabe3da85f0bf9294ba94fe46fe048f1b06672f38744587300fd414'
+          patch = lzma.decompress(compressed, memlimit=256 * 1024 * 1024)
+          assert len(patch) == 164646
+          assert hashlib.sha256(patch).hexdigest() == '53900f46998e9f636ab054f3fd6bf970d5dbd2376c52a8cfd777fc0401a836a7'
+          raw = (payload / 'final-commit.raw').read_bytes()
+          assert hashlib.sha1(f'commit {len(raw)}\0'.encode() + raw).hexdigest() == os.environ['EXPECTED']
+          assert raw.startswith(f"tree {os.environ['EXPECTED_TREE']}\nparent {os.environ['BASE']}\n".encode())
+          (Path(os.environ['RUNNER_TEMP']) / 'storage-retention-final.patch').write_bytes(patch)
+          print('Compressed payload, patch, and exact commit bytes verified.')
+          PY
+          test "$(git rev-parse "$BASE^{tree}")" = 7ca1024cc9cf87657bf538efaf84b04b23b3d968
+          worktree="$RUNNER_TEMP/storage-retention-exact-source"
+          git worktree add --detach "$worktree" "$BASE"
+          git -C "$worktree" apply --check --index "$RUNNER_TEMP/storage-retention-final.patch"
+          git -C "$worktree" apply --index "$RUNNER_TEMP/storage-retention-final.patch"
+          test "$(git -C "$worktree" write-tree)" = "$EXPECTED_TREE"
+          test "$(git hash-object -w -t commit .github/ci-transfer/storage-retention/final-commit.raw)" = "$EXPECTED"
+          test "$(git rev-parse "$EXPECTED^{tree}")" = "$EXPECTED_TREE"
+          test "$(git rev-parse "$EXPECTED^1")" = "$BASE"
+          git diff --exit-code "$BASE" "$EXPECTED" -- .github/workflows requirements.lock pyproject.toml
+          git diff --stat "$BASE" "$EXPECTED"
+          test "$DEST_REF" = refs/heads/repair/storage-total-retention-finalized-ci
+          existing="$(git ls-remote --heads origin "$DEST_REF" | cut -f1)"
+          if [ -n "$existing" ] && [ "$existing" != "$EXPECTED" ]; then
+            echo 'Refusing to overwrite an existing different branch head.' >&2
+            exit 1
+          fi
+          git push origin "$EXPECTED:$DEST_REF"
+          test "$(git ls-remote --heads origin "$DEST_REF" | cut -f1)" = "$EXPECTED"
+          {
+            echo '## Exact repair restored for required CI'
+            echo "Commit: $EXPECTED"
+            echo "Tree: $EXPECTED_TREE"
+            echo "Review branch: $DEST_REF"
+            echo 'This transfer is not a CI result. Open the draft review through the authorized connector to trigger the unchanged required workflow.'
+            echo 'No main ref, merge, deployment, production data, provider settings, or strategy authority was changed.'
+          } >> "$GITHUB_STEP_SUMMARY"

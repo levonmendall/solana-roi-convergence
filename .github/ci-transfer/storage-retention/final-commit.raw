@@ -1,0 +1,8 @@
+tree 424956b0f420f015cb685c4085cee4a4f19e4a10
+parent 648c8d9d84604a915ae31994c874b53e8a5898c0
+author Storage Repair Validation <storage-repair-validation@localhost> 1789578600 +0000
+committer Storage Repair Validation <storage-repair-validation@localhost> 1789578600 +0000
+
+Finalize recovered storage retention repair with fail-closed continuity and owned-task verification
+
+Recover the existing baseline-to-head implementation without production changes. Retain the continuity deletion-safety correction and preserve meaningful worker-growth detection when proc task children files are unavailable. Source archive exactly matches upstream baseline. Locked-environment CI remains required; no merge, deployment, deletion, or reactivation performed.
