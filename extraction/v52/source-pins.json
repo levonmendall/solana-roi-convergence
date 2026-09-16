@@ -1,0 +1,22 @@
+{
+  "base_release": "b8d7ee2e672b52ffe314f8b285d00892cf171387",
+  "source_tree": "424956b0f420f015cb685c4085cee4a4f19e4a10",
+  "sources": {
+    "src/solana_roi/profit_first_entity_final.py": "853bb64463eeb8ffff90d175d95934075246b353757db1b727ab60efe91839d3",
+    "src/solana_roi/profit_first_entity_final_research.py": "51e338104e31427ea763462f832af0344503b6238e8453bf032f40cf71dceedd",
+    "src/solana_roi/profit_first_entity_research.py": "f4cc9955e9c4d32fe00ca668af77568e2323bd5357856c8633a41854d995c506",
+    "src/solana_roi/profit_first_entity_strategy.py": "9c59dc126b6c3d958ae3a40bb91f2ff7a767be9fe62d9136071dc55707ad8639",
+    "src/solana_roi/risk_conditioned_alpha_v5.py": "4de4e9976e2814640d9c7f6c143f01df459836fc74a864d60122cc31dfe9a1e4",
+    "src/solana_roi/strategy_v52_authority.py": "6f7ada1e1e0624b27287d3273dd21609c2d91c963edbe6f6ca1c18e5cffc4dcf",
+    "src/solana_roi/v52_adaptive_continuation_refinement.py": "0af38f135556b09c39a01e8e35637835080a504a5beea20edd2b4db9d2318bc8",
+    "src/solana_roi/v52_authoritative_strategy.py": "46d4c9becbf15ae3ee04c2cccf4789d9f7e234755f3838231dbba503f58c22fd",
+    "src/solana_roi/v52_continuous_evolution.py": "8aa809883a1437bf0a60ff8be060f48016f1b7b47827737b8cc70bc62b927c05",
+    "src/solana_roi/v52_lane_contract.py": "63937d6633f9afd9ba46f18b30b0d9dcb2400a04a52457f958b965938f4332ba",
+    "src/solana_roi/v52_profit_confidence_completion.py": "c869ae594968c07a2eade7f575ea8ac6d74a46a82810abb23afb07c52e16306f",
+    "src/solana_roi/v52_profit_confidence_finalization.py": "3aad5b32af5d92c6ce233c0ed20bfeadb5f3f9144380b42018d473de6c92c160",
+    "src/solana_roi/v52_strategy_promotion.py": "3ebb689bcb132e979e9e4ff0bcfa92e2c30992d16003719a3476046d9c5a3e87",
+    "src/solana_roi/v52_wallet_alpha_refinement.py": "4bdf18951e119a48bd8475b5dc69fc808dbb90269cd4f44ea8c8b23416702c5d",
+    "strategy_v52_authority.json": "0bedc3b8528e8ccffd7496312efa4e39bd12b96d5ccf1af728a9d9f6e628705e",
+    "strategy_v52_profit_confidence_completion.json": "2dbe2f9bbac019c6adde4f04dca649b084233ffb51ffe2eca1631fc05629b8ca"
+  }
+}
