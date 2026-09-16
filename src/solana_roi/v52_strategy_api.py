@@ -9,6 +9,19 @@ from .v52_profit_confidence_completion import report as profit_confidence_report
 from .v52_profit_confidence_finalization import status as profit_confidence_finalization_status
 from .v52_learning_governance import status as learning_governance_status
 from .v52_wallet_forward_alpha_runtime import report as wallet_forward_alpha_report, status as wallet_forward_alpha_status
+from .v52_operational_integrity_repair import install_v52_operational_integrity_repair
+from .v52_robinhood_flow_cutoff_context import install_v52_robinhood_flow_cutoff_context
+from .v52_shared_paper_capital_bridge import install_v52_shared_paper_capital_bridge
+
+# v52_production_authority imports this API module before it executes the
+# Robinhood lifecycle installer. Install narrow evidence/accounting repairs at
+# this seam so the lifecycle captures them as its final production bindings.
+# Entry flow gets an event-time cutoff; ongoing position management retains
+# wall-clock aging. None of these installers changes strategy qualification,
+# sizing, or exit semantics.
+install_v52_operational_integrity_repair()
+install_v52_robinhood_flow_cutoff_context()
+install_v52_shared_paper_capital_bridge()
 
 STATUS_PATH = "/v1/strategy/authority"
 V52_STATUS_PATH = "/v1/strategy/v52"

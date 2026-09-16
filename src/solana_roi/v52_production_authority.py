@@ -20,6 +20,7 @@ from .v52_robinhood_exit_authority import install_v52_robinhood_exit_authority, 
 from .v52_robinhood_position_lifecycle import install_v52_robinhood_position_lifecycle, lifecycle_status as robinhood_lifecycle_status
 from .v52_robinhood_candidate_reconciliation import install_v52_robinhood_candidate_reconciliation, status as robinhood_candidate_reconciliation_status
 from .v52_strategy_api import install_v52_strategy_api, status as api_status
+from .v52_shared_paper_capital_runtime_binding import bind_v52_shared_paper_capital_runtime
 from .v52_wallet_alpha_refinement import WalletAlphaRefinementLedger
 from .v52_wallet_intelligence_alignment import install_v52_wallet_intelligence_alignment, status as wallet_alignment_status
 from .v52_adaptive_continuation_refinement import install_v52_adaptive_continuation_refinement, status as adaptive_continuation_status
@@ -86,6 +87,10 @@ def install_v52_production_authority(app: Any, runtime_provider: Callable[[], An
     """Install the single governed v5.2 paper authority in final wrapper order."""
     global _INSTALLED, _RUNTIME, _WALLET_ALPHA
     runtime = _resolve_runtime(runtime_provider)
+    # The canonical production runtime owns the single Solana/FOMO paper-capital
+    # store. Bind Robinhood's isolated market plane to that store before any v5.2
+    # lifecycle method can admit a paper lot.
+    bind_v52_shared_paper_capital_runtime(runtime)
     install_v52_authoritative_strategy()
     install_v52_robinhood_storage_compatibility()
     install_v52_robinhood_exit_authority()
