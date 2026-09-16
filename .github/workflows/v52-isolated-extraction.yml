@@ -1,0 +1,40 @@
+name: v5.2 Isolated Extraction
+
+on:
+  pull_request:
+    paths: ['extraction/v52/**', '.github/workflows/v52-isolated-extraction.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  restart-safe-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.16'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install unchanged locked dependencies for original-function comparison
+        run: python -m pip install -r requirements.lock
+      - name: Extraction, original-function parity, forced-crash and capital tests
+        run: python -m pytest extraction/v52/test_extraction.py -v --junitxml=extraction-tests.xml
+      - name: Build detached artifact and exercise fresh-interpreter paper lifecycle
+        run: |
+          python extraction/v52/build.py --output /tmp/v52-detached
+          PYTHONPATH=/tmp/v52-detached python -B -S -m roi_extracted.demo --directory /tmp/v52-acceptance > /tmp/v52-acceptance-output.json
+          python -m compileall -q extraction/v52 /tmp/v52-detached/roi_extracted
+      - name: Upload synthetic acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-v52-lifecycle-${{ github.sha }}
+          path: |
+            extraction-tests.xml
+            /tmp/v52-detached/extraction-manifest.json
+            /tmp/v52-acceptance/acceptance.json
+            /tmp/v52-acceptance-output.json
+          if-no-files-found: warn
