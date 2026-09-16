@@ -22,7 +22,13 @@ def canonical_json(value: Any) -> str:
 
 
 def payload_hash(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+    # Preserve the exact canonical encoding without allocating another complete
+    # JSON string and UTF-8 copy of a potentially large current-state section.
+    digest = hashlib.sha256()
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    for fragment in encoder.iterencode(value):
+        digest.update(fragment.encode("utf-8"))
+    return digest.hexdigest()
 
 
 _CURRENT_TABLES = (
