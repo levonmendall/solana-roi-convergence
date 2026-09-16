@@ -1,0 +1,43 @@
+name: Publish prepared checkpoint-memory commit
+on:
+  push:
+    branches: [transport/checkpoint-memory-d28d192]
+    paths: [.github/workflows/publish-checkpoint-memory-bundle.yml]
+permissions:
+  contents: write
+jobs:
+  publish-exact-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: b8d7ee2e672b52ffe314f8b285d00892cf171387
+          fetch-depth: 1
+      - name: Recover and verify exact bundle without executing repository code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = b8d7ee2e672b52ffe314f8b285d00892cf171387
+          test "$(git rev-parse HEAD^{tree})" = 424956b0f420f015cb685c4085cee4a4f19e4a10
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = b8d7ee2e672b52ffe314f8b285d00892cf171387
+          gh api repos/levonmendall/solana-roi-convergence/git/blobs/9bc4ce23dea16245c83d9b83d390d92838e63881 --jq .content | base64 --decode > "$RUNNER_TEMP/checkpoint-memory-bound.bundle"
+          echo "a5110e86ccb683212d300fad669900d3bbf00cdc0a06d317b38c787d6412756a  $RUNNER_TEMP/checkpoint-memory-bound.bundle" | sha256sum -c -
+          git bundle verify "$RUNNER_TEMP/checkpoint-memory-bound.bundle"
+          git fetch "$RUNNER_TEMP/checkpoint-memory-bound.bundle" refs/heads/repair/checkpoint-memory-bound:refs/heads/prepared-checkpoint-memory
+          target=d28d19285118ff5bcd4d72bb9babaa2eea3f48d2
+          test "$(git rev-parse prepared-checkpoint-memory)" = "$target"
+          test "$(git rev-parse "$target^{tree}")" = c7284449e4600b8f45b7605f1208a4f7fa7adca4
+          test "$(git rev-parse "$target^")" = b8d7ee2e672b52ffe314f8b285d00892cf171387
+          git diff --check HEAD "$target"
+          test "$(git diff --name-only HEAD "$target" | wc -l)" -eq 5
+          git diff --quiet HEAD "$target" -- .github requirements.lock pyproject.toml .python-version
+          prior="$(git ls-remote origin refs/heads/repair/checkpoint-memory-bound | cut -f1)"
+          test -z "$prior" || test "$prior" = "$target"
+          git push origin "$target:refs/heads/repair/checkpoint-memory-bound"
+          test "$(git ls-remote origin refs/heads/repair/checkpoint-memory-bound | cut -f1)" = "$target"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = b8d7ee2e672b52ffe314f8b285d00892cf171387
+          echo "Published exact prepared commit $target; main unchanged; no deployment or deletion."
+          git diff --stat HEAD "$target"
