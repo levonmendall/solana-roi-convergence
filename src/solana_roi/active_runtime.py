@@ -6,6 +6,8 @@ import os
 import signal
 import sqlite3
 import threading
+import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,17 @@ from .observation_store import ObservationEventStore
 from .storage_active_compat_pruning import prune_active_compatibility_database
 from .storage_current_v52_pruning import prune_current_v52_database
 from .storage_transition import load_verified_checkpoint
+
+
+ACTIVE_VERIFY_CHUNK_ROWS = 2048
+ACTIVE_VERIFY_CACHE_BYTES = 16 * 1024 * 1024
+
+
+def _verification_io() -> dict[str, int]:
+    try:
+        return {key: int(value) for key, value in (line.split(":", 1) for line in Path("/proc/self/io").read_text().splitlines())}
+    except (OSError, ValueError):
+        return {}
 
 
 class ActiveObservationEventStore(ObservationEventStore):
@@ -209,37 +222,141 @@ class ActiveObservationEventStore(ObservationEventStore):
             self._bounded_maintenance()
         return lineage
 
-    def verify(self) -> bool:
-        previous = self.transition_event_head_hash
-        expected_id_floor = self.transition_event_head_id
+    def _release_verification_file_cache(self) -> None:
+        from .durable_bootstrap_memory_repair import _release_sqlite_file_cache
+        _release_sqlite_file_cache(self.path)
+
+    def _verification_reader(self) -> sqlite3.Connection:
+        reader = sqlite3.connect(
+            f"{self.path.resolve().as_uri()}?mode=ro&cache=private",
+            uri=True, timeout=5.0, check_same_thread=False,
+        )
+        try:
+            reader.execute("PRAGMA query_only=ON")
+            reader.execute("PRAGMA cache_size=-2048")
+            reader.execute("PRAGMA mmap_size=0")
+            return reader
+        except Exception:
+            reader.close()
+            raise
+
+    def _verify_active_snapshot(self, *, reason: str) -> tuple[bool, int, int | None]:
+        """Verify every retained row in bounded, independently closed readers.
+
+        The transition anchor seals the removed prefix; no mutable sidecar skips
+        retained events. A read-only data_version witness has no transaction and
+        pins no WAL snapshot. Any commit during the audit fails closed, including
+        changes to rows already scanned. This deliberately never blesses a mixture
+        of snapshots from different database versions.
+        """
+        from .durable_bootstrap_memory_repair import _cgroup_memory
+
         with self._verify_lock:
-            reader: sqlite3.Connection | None = None
+            started = time.monotonic()
+            before = _cgroup_memory()
+            peak = int(before.get("current_bytes") or 0)
+            io_before = _verification_io()
+            invocation = int(getattr(self, "_verification_invocations", 0)) + 1
+            self._verification_invocations = invocation
+            rows_verified = chunks = 0
+            hashed_bytes = cache_bytes = 0
+            last_id = self.transition_event_head_id
+            previous = self.transition_event_head_hash
+            latest_engine = self.transition_engine_event_id
+            verified = False
+            failure = "not_started"
             try:
-                uri = f"{self.path.resolve().as_uri()}?mode=ro&cache=private"
-                reader = sqlite3.connect(uri, uri=True, check_same_thread=False)
-                reader.execute("PRAGMA query_only=ON")
-                reader.execute("BEGIN")
-                rows = reader.execute(
-                    "SELECT id,event_type,observed_at,payload_json,previous_hash,lineage_hash FROM events ORDER BY id"
-                )
-                last_id = expected_id_floor
-                for event_id, event_type, observed_at, raw, recorded_previous, lineage in rows:
-                    if int(event_id) <= expected_id_floor or int(event_id) <= last_id:
-                        return False
-                    if str(recorded_previous) != previous:
-                        return False
-                    expected = hashlib.sha256(
-                        f"{previous}|{event_type}|{observed_at}|{raw}".encode()
-                    ).hexdigest()
-                    if expected != str(lineage):
-                        return False
-                    previous = str(lineage)
-                    last_id = int(event_id)
-                return True
+                identity = self.path.stat()
+                with closing(self._verification_reader()) as witness:
+                    version = witness.execute("PRAGMA data_version").fetchone()[0]
+                    with closing(self._verification_reader()) as reader:
+                        reader.execute("BEGIN")
+                        head = reader.execute("SELECT id,lineage_hash FROM events ORDER BY id DESC LIMIT 1").fetchone()
+                        sequence = reader.execute("SELECT seq FROM sqlite_sequence WHERE name='events'").fetchone()
+                    terminal_id = int(head[0]) if head else last_id
+                    terminal_hash = str(head[1]) if head else previous
+                    if sequence is None or int(sequence[0]) != terminal_id or terminal_id < last_id:
+                        failure = "retained_tail_sequence_mismatch"
+                        return False, 0, None
+                    while last_id < terminal_id:
+                        with closing(self._verification_reader()) as reader:
+                            rows = reader.execute(
+                                "SELECT id,event_type,observed_at,payload_json,previous_hash,lineage_hash "
+                                "FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
+                                (last_id, terminal_id, ACTIVE_VERIFY_CHUNK_ROWS),
+                            ).fetchall()
+                        chunks += 1
+                        if not rows:
+                            failure = "retained_frontier_unreachable"
+                            return False, 0, None
+                        for event_id, event_type, observed_at, raw, recorded_previous, lineage in rows:
+                            if int(event_id) != last_id + 1:
+                                failure = "event_id_discontinuity"
+                                return False, 0, None
+                            if str(recorded_previous) != previous:
+                                failure = "previous_hash_mismatch"
+                                return False, 0, None
+                            encoded = f"{previous}|{event_type}|{observed_at}|{raw}".encode()
+                            expected = hashlib.sha256(encoded).hexdigest()
+                            hashed_bytes += len(encoded)
+                            cache_bytes += len(encoded)
+                            if expected != str(lineage):
+                                failure = "lineage_hash_mismatch"
+                                return False, 0, None
+                            last_id, previous = int(event_id), str(lineage)
+                            rows_verified += 1
+                            if str(event_type) in _ENGINE_EVENT_TYPES:
+                                latest_engine = last_id
+                        del rows
+                        # Keep a bounded read-ahead window instead of discarding
+                        # prefetched pages after every small keyset query.
+                        # No chunk reader or transaction remains during advice.
+                        if cache_bytes >= ACTIVE_VERIFY_CACHE_BYTES:
+                            self._release_verification_file_cache()
+                            cache_bytes = 0
+                        peak = max(peak, int(_cgroup_memory().get("current_bytes") or 0))
+                        if witness.execute("PRAGMA data_version").fetchone()[0] != version:
+                            failure = "database_changed_during_verification"
+                            return False, 0, None
+                    final_identity = self.path.stat()
+                    if (final_identity.st_dev, final_identity.st_ino) != (identity.st_dev, identity.st_ino):
+                        failure = "database_replaced_during_verification"
+                        return False, 0, None
+                    if witness.execute("PRAGMA data_version").fetchone()[0] != version:
+                        failure = "database_changed_during_verification"
+                        return False, 0, None
+                    if last_id != terminal_id or previous != terminal_hash:
+                        failure = "retained_frontier_mismatch"
+                        return False, 0, None
+                    verified, failure = True, None
+                    return True, last_id, latest_engine
+            except Exception as exc:
+                failure = type(exc).__name__
+                raise
             finally:
-                if reader is not None:
-                    reader.close()
                 self._release_verification_file_cache()
+                after = _cgroup_memory()
+                io_after = _verification_io()
+                self.verification_status = {
+                    "invocation": invocation, "reason": reason, "verified": verified,
+                    "failure_reason": failure, "rows": rows_verified, "chunks": chunks,
+                    "chunk_rows": ACTIVE_VERIFY_CHUNK_ROWS,
+                    "event_bytes_hashed": hashed_bytes,
+                    "cache_release_interval_bytes": ACTIVE_VERIFY_CACHE_BYTES,
+                    "verified_through_event_id": last_id if verified else None,
+                    "duration_seconds": time.monotonic() - started,
+                    "memory_before": before, "memory_after": after,
+                    "sampled_peak_memory_current_bytes": max(peak, int(after.get("current_bytes") or 0)),
+                    "process_physical_read_bytes": max(0, io_after.get("read_bytes", 0) - io_before.get("read_bytes", 0)),
+                    "process_read_chars": max(0, io_after.get("rchar", 0) - io_before.get("rchar", 0)),
+                    "io_scope": "process_including_concurrent_workers",
+                    "reader_closed_before_cache_advice": True,
+                    "paper_only": True, "live_money_authority": False,
+                }
+                print("ROI_ACTIVE_LEDGER_VERIFY " + json.dumps(self.verification_status, sort_keys=True), flush=True)
+
+    def verify(self) -> bool:
+        return self._verify_active_snapshot(reason="explicit_full_audit")[0]
 
     def close(self) -> None:
         self._maintenance_stop.set()
@@ -256,18 +373,7 @@ class ActiveDurablePaperTradingEngine(DurablePaperTradingEngine):
         store = self.store
         if not isinstance(store, ActiveObservationEventStore):
             return super()._verify_engine_snapshot()
-        if not store.verify():
-            return False, 0, None
-        with store._lock:
-            head = store.db.execute("SELECT id FROM events ORDER BY id DESC LIMIT 1").fetchone()
-            placeholders = ",".join("?" for _ in _ENGINE_EVENT_TYPES)
-            latest = store.db.execute(
-                f"SELECT id FROM events WHERE event_type IN ({placeholders}) ORDER BY id DESC LIMIT 1",
-                _ENGINE_EVENT_TYPES,
-            ).fetchone()
-        verified_through = int(head["id"]) if head is not None else store.transition_event_head_id
-        latest_engine = int(latest["id"]) if latest is not None else store.transition_engine_event_id
-        return True, verified_through, latest_engine
+        return store._verify_active_snapshot(reason="durable_engine_restore")
 
     def _checkpoint_event_marker_valid(self, event_id: int) -> bool:
         store = self.store
