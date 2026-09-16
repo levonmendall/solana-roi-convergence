@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import storage_manifest
-from .active_storage import ActiveStorage, payload_hash
+from .active_storage import ActiveStorage, decode_current_payload, payload_hash
 from .observation_store import ObservationEventStore
 from .storage_current_state_extractor import LegacyCurrentStateExtractor
 from .storage_current_v52_reconciliation import copy_bounded_current_v52
@@ -279,7 +279,7 @@ def _payload(conn: sqlite3.Connection, table: str, keycol: str, key: str) -> Any
     row = conn.execute(f'SELECT payload_json FROM "{table}" WHERE "{keycol}"=?', (key,)).fetchone()
     if row is None:
         raise RuntimeError(f"active logical truth missing:{table}:{key}")
-    return json.loads(str(row[0]))
+    return decode_current_payload(str(row[0]))
 
 
 def read_logical_truth(path: Path | str) -> dict[str, Any]:

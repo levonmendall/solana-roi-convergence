@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import sqlite3
+import zlib
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +15,11 @@ from typing import Any
 from .storage_retention import RETENTION_REGISTRY, assert_registered, contract_for
 
 ACTIVE_SCHEMA_VERSION = 2
+_CURRENT_PAYLOAD_TAG = "$roi_current_payload"
+_CURRENT_PAYLOAD_CODEC = "zlib-utf8-v1"
+_CURRENT_PAYLOAD_CHUNK_BYTES = 65_536
+# SQLite's existing default maximum value length, not a new retention allowance.
+_MAX_CURRENT_PAYLOAD_BYTES = 1_000_000_000
 
 
 def _utc_now() -> str:
@@ -29,6 +38,69 @@ def payload_hash(value: Any) -> str:
     for fragment in encoder.iterencode(value):
         digest.update(fragment.encode("utf-8"))
     return digest.hexdigest()
+
+
+def encode_current_payload(value: Any) -> tuple[str, int]:
+    """Compact large sealed state without materializing its complete JSON bytes.
+
+    Small rows keep their existing JSON representation. Compression changes only
+    physical encoding; checkpoint section hashes continue to cover decoded truth.
+    """
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    compressor = zlib.compressobj()
+    pending = bytearray()
+    compressed = bytearray()
+    raw_size = 0
+    for fragment in encoder.iterencode(value):
+        for offset in range(0, len(fragment), _CURRENT_PAYLOAD_CHUNK_BYTES):
+            data = fragment[offset:offset + _CURRENT_PAYLOAD_CHUNK_BYTES].encode("utf-8")
+            raw_size += len(data)
+            if raw_size > _MAX_CURRENT_PAYLOAD_BYTES:
+                raise ValueError("current-state payload exceeds SQLite value length limit")
+            pending.extend(data)
+            if len(pending) >= _CURRENT_PAYLOAD_CHUNK_BYTES:
+                compressed.extend(compressor.compress(pending))
+                pending.clear()
+    reserved_key = isinstance(value, dict) and _CURRENT_PAYLOAD_TAG in value
+    if raw_size < _CURRENT_PAYLOAD_CHUNK_BYTES and not reserved_key:
+        return pending.decode("utf-8"), raw_size
+    compressed.extend(compressor.compress(pending))
+    compressed.extend(compressor.flush())
+    body = canonical_json({
+        _CURRENT_PAYLOAD_TAG: _CURRENT_PAYLOAD_CODEC,
+        "utf8_bytes": raw_size,
+        "data": base64.b64encode(compressed).decode("ascii"),
+    })
+    if len(body.encode("utf-8")) >= raw_size and not reserved_key:
+        return canonical_json(value), raw_size
+    return body, raw_size
+
+
+def decode_current_payload(body: str) -> Any:
+    """Read both original JSON rows and strictly bounded compressed rows."""
+    value = json.loads(body)
+    if not isinstance(value, dict) or _CURRENT_PAYLOAD_TAG not in value:
+        return value
+    if (set(value) != {_CURRENT_PAYLOAD_TAG, "utf8_bytes", "data"}
+            or value[_CURRENT_PAYLOAD_TAG] != _CURRENT_PAYLOAD_CODEC
+            or type(value["utf8_bytes"]) is not int
+            or not 0 < value["utf8_bytes"] <= _MAX_CURRENT_PAYLOAD_BYTES):
+        raise RuntimeError("current-state payload encoding is invalid")
+    try:
+        expected_size = value["utf8_bytes"]
+        compressed = base64.b64decode(value["data"], validate=True)
+        del value
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(compressed, expected_size + 1)
+        if (len(raw) != expected_size or not decoder.eof
+                or decoder.unused_data or decoder.unconsumed_tail):
+            raise ValueError("incomplete, oversized, or trailing compressed data")
+        del compressed, decoder
+        text = raw.decode("utf-8")
+        del raw
+        return json.loads(text)
+    except (ValueError, TypeError, UnicodeError, binascii.Error, zlib.error) as exc:
+        raise RuntimeError("current-state payload decoding failed") from exc
 
 
 _CURRENT_TABLES = (
@@ -108,7 +180,7 @@ class ActiveStorage:
 
     def initialize(self, *, epoch_id: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             # New epochs reclaim deleted pages incrementally instead of repeating
             # the legacy pattern where logical pruning leaves an indefinitely
             # growing physical file. auto_vacuum must be selected before schema
@@ -132,7 +204,7 @@ class ActiveStorage:
         return {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
 
     def assert_positive_schema(self) -> None:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             assert_registered(self.ordinary_tables(conn))
 
     def replace_current(self, table: str, key_column: str, key: str, payload: Any, **extra: Any) -> None:
@@ -148,15 +220,21 @@ class ActiveStorage:
         }.get(table, set())
         if set(extra) - allowed_extras:
             raise ValueError(f"unsupported columns for {table}: {sorted(set(extra)-allowed_extras)}")
-        body = canonical_json(payload)
+        body, raw_size = encode_current_payload(payload)
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         columns = [key_column,"payload_json","payload_hash",*extra.keys(),"updated_at"]
         values = [key,body,digest,*extra.values(),_utc_now()]
         placeholders = ",".join("?" for _ in columns)
         updates = ",".join(f"{name}=excluded.{name}" for name in columns if name != key_column)
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             conn.execute(f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders}) ON CONFLICT({key_column}) DO UPDATE SET {updates}", values)
             conn.commit()
+        if raw_size >= _CURRENT_PAYLOAD_CHUNK_BYTES:
+            print("ROI_ACTIVE_CURRENT_PAYLOAD " + json.dumps({
+                "table": table, "key": key, "canonical_utf8_bytes": raw_size,
+                "stored_utf8_bytes": len(body.encode("utf-8")),
+                "paper_only": True, "live_money_authority": False,
+            }, sort_keys=True), flush=True)
 
     def prune_expired_diagnostics(self, *, now_iso: str | None = None, batch_size: int = 5000) -> int:
         now_iso = now_iso or _utc_now()
@@ -167,7 +245,7 @@ class ActiveStorage:
 
     def _delete_ids(self, table: str, id_col: str, where: str, args: tuple[Any,...], batch_size: int) -> int:
         contract_for(table)
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             ids = [int(row[0]) for row in conn.execute(f"SELECT {id_col} FROM {table} WHERE {where} ORDER BY {id_col} LIMIT ?", (*args,int(batch_size)))]
             if not ids:
                 return 0
@@ -179,7 +257,7 @@ class ActiveStorage:
         """Bound validation persistence without changing the 250-sample decision window."""
         cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=31)).isoformat()
         deleted = {"features":0,"shadow":0,"point_in_time":0}
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             tables = self.ordinary_tables(conn)
             if "v52_market_validation_features" in tables:
                 # Keep the newest 250 values for every lane+feature irrespective of age;
@@ -202,7 +280,7 @@ class ActiveStorage:
     def prune_v52_wallet_forward_alpha(self, *, now: datetime | None = None) -> dict[str,int]:
         cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=31)).isoformat()
         deleted = {"observations":0,"outcomes":0,"integrity":0,"validation":0}
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             tables = self.ordinary_tables(conn)
             if "v52_wallet_forward_outcomes" in tables:
                 cur = conn.execute("DELETE FROM v52_wallet_forward_outcomes WHERE available_at<?", (cutoff,))
@@ -236,7 +314,7 @@ class ActiveStorage:
         return {"main":main,"wal":wal.stat().st_size if wal.exists() else 0,"shm":shm.stat().st_size if shm.exists() else 0}
 
     def page_budget_status(self) -> dict[str, int]:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
             page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
             freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
@@ -260,7 +338,7 @@ class ActiveStorage:
         with incremental auto-vacuum. Those stores are compacted by epoch rollover
         instead of invoking an unbounded in-place VACUUM under production load.
         """
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             mode = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
             before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
             reclaimed_request = min(max(0, int(max_pages)), before) if mode == 2 else 0
@@ -288,7 +366,7 @@ class ActiveStorage:
             raise RuntimeError(f"active WAL hard boundary exceeded: {sizes['wal']} >= {self.budget.max_wal_bytes}")
 
     def checkpoint_wal(self) -> tuple[int,int,int]:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
         result = tuple(int(v) for v in row)
         self.enforce_hard_budget()
