@@ -21,6 +21,7 @@ from .incremental_event_integrity_repair import configure_incremental_event_inte
 from .logical_bootstrap_page_cache_repair import configure_logical_bootstrap_page_cache_repair
 from .robinhood_drpc_environment import configure_robinhood_drpc_backup
 from .shadow_price_tracking_state_repair import configure_shadow_price_tracking_state_repair
+from .storage_shadow_copy_bounded_repair import configure_storage_shadow_copy_bounded_repair
 from .storage_transition_quiesce import configure_storage_transition_quiesce
 from .v52_cross_lane_paper_certification_repair import configure_v52_cross_lane_paper_certification_repair
 from .wallet_discovery_background_status_repair import configure_wallet_discovery_background_status_repair
@@ -40,6 +41,11 @@ configure_incremental_event_integrity_repair()
 # keyset chunks.  Each SQLite reader closes before cache eviction/reclaim, so full
 # tamper detection is preserved without pinning one history-sized read snapshot.
 configure_authoritative_event_verify_bounded_repair()
+
+# Keep shadow-migration transport bounded.  This does not alter source predicates,
+# retained rows, schema, semantic truth, checkpoint authority, or post-copy
+# equivalence; it only prevents full query results from being materialized twice.
+configure_storage_shadow_copy_bounded_repair()
 
 # Provider credentials must be materialized before importing the production
 # composition root because the legacy-compatible Robinhood ingestion substrate
