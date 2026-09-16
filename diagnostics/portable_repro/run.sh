@@ -9,6 +9,7 @@ MAX_SECONDS="${PORTABLE_REPRO_MAX_SECONDS:-900}"
 CANONICAL_SHA="92c0c1620f78116e7ecbeade039e9aedaf3a51a9"
 ROBINHOOD_SCENARIO="${PORTABLE_REPRO_ROBINHOOD_SCENARIO:-alchemy-429-then-drpc}"
 ROBINHOOD_FAULT_DELAY="${PORTABLE_REPRO_ROBINHOOD_FAULT_DELAY_SECONDS:-15}"
+CAUSAL_MODE="${PORTABLE_REPRO_CAUSAL_MODE:-normal}"
 
 case "$ROBINHOOD_SCENARIO" in
   drpc-503-then-alchemy|drpc-timeout-then-alchemy) DEFAULT_ROBINHOOD_PRIMARY="drpc" ;;
@@ -79,6 +80,8 @@ export ROBINHOOD_BACKUP_RPC_URL='https://127.0.0.1:19443' ROBINHOOD_BACKUP_WS_UR
 export ROBINHOOD_PROVIDER_PRIMARY="$ROBINHOOD_PRIMARY"
 export ROBINHOOD_PROVIDER_FAILOVER_ERROR_THRESHOLD="${ROBINHOOD_PROVIDER_FAILOVER_ERROR_THRESHOLD:-1}"
 export PYTHONPATH="$ROOT/diagnostics/portable_repro/network_guard${PYTHONPATH:+:$PYTHONPATH}"
+export PORTABLE_REPRO_OUTPUT="$OUT"
+export PORTABLE_REPRO_CAUSAL_MODE="$CAUSAL_MODE"
 
 # Prove the Python guard blocks DNS and direct IP independently of Docker --network=none.
 python - <<'PY' > "$OUT/network-guard-negative-control.json"
@@ -116,4 +119,5 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 timeout --signal=TERM --kill-after=15s "${MAX_SECONDS}s" \
-  uvicorn solana_roi.production:app --host 0.0.0.0 --port "$PORT" 2>&1 | tee "$OUT/application.log"
+  uvicorn --app-dir "$ROOT/diagnostics/portable_repro" causal_target:app \
+  --host 0.0.0.0 --port "$PORT" 2>&1 | tee "$OUT/application.log"
