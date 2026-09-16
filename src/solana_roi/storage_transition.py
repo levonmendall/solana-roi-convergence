@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from .active_storage import ACTIVE_SCHEMA_VERSION, ActiveStorage, canonical_json, payload_hash
+from .active_storage import ACTIVE_SCHEMA_VERSION, ActiveStorage, canonical_json, decode_current_payload, payload_hash
 
 LEGACY_TRANSITION_MIGRATION_VERSION = 2
 TRANSITION_MIGRATION_VERSION = 3
@@ -154,7 +154,7 @@ def _read_current_payload(
     if hashlib.sha256(body.encode("utf-8")).hexdigest() != str(row[1]):
         raise RuntimeError(f"active checkpoint semantic section payload hash mismatch: {section}")
     try:
-        return json.loads(body)
+        return decode_current_payload(body)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"active checkpoint semantic section is not valid JSON: {section}") from exc
 
