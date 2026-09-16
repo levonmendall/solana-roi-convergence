@@ -14,7 +14,7 @@ from solana_roi.certification_active_manifest import install_active_certificatio
 from solana_roi.config import BASELINE
 from solana_roi.storage_current_state_extractor import LegacyCurrentStateExtractor
 from solana_roi.storage_legacy_schema_reconciliation import LEGACY_RETAINED_DATASETS, OWNER
-from solana_roi.storage_shadow_migration import build_shadow_database, read_logical_truth
+from solana_roi.storage_shadow_migration import _write_logical_truth, build_shadow_database, read_logical_truth
 from solana_roi.storage_transition import (
     ACTIVE_PATH_ENV,
     ACTIVATE_ENV,
@@ -94,6 +94,7 @@ def _truth() -> dict[str, object]:
 def _make_active(path: Path) -> ActiveStorage:
     storage = ActiveStorage(path); storage.initialize(epoch_id="test")
     truth = _truth(); checkpoint = build_checkpoint_payload(release_sha=RELEASE,current_truth=truth,provenance={"test":True})
+    _write_logical_truth(storage, truth)
     persist_verified_checkpoint(storage,checkpoint_payload=checkpoint,source_truth=truth)
     return storage
 
@@ -127,8 +128,13 @@ def test_v52_feature_pruning_preserves_exact_latest_250(tmp_path: Path) -> None:
     assert values == [float(i) for i in range(299,49,-1)]
 
 
-def test_semantic_equivalence_is_exact_for_every_section() -> None:
-    source=_truth(); payload=build_checkpoint_payload(release_sha=RELEASE,current_truth=source,provenance={})
+def test_semantic_equivalence_is_exact_for_every_section(tmp_path: Path) -> None:
+    source = _truth()
+    path = tmp_path / "active.sqlite3"
+    _make_active(path)
+    # The compact persisted manifest has no embedded semantic sections. Compare
+    # the verified reconstructed state, exactly as runtime restart consumes it.
+    payload = load_verified_checkpoint(path, expected_release_sha=RELEASE)
     assert verify_semantic_equivalence(source,payload).equivalent
     for section in ("strategy","wallet","wallet_evidence_watermarks","provider_source","freshness","latest_event_ids","active_candidates","active_lifecycles","portfolio","replication_watermarks","certification","continuity"):
         changed=dict(payload); changed[section]={"mismatch":section}

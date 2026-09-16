@@ -20,6 +20,8 @@ from .storage_runtime_persistence_reconciliation import (
 )
 from .storage_transition import build_checkpoint_payload, persist_verified_checkpoint, verify_semantic_equivalence
 
+COPY_BATCH_ROWS = 2_048
+
 
 @dataclass(frozen=True)
 class ShadowMigrationReport:
@@ -82,17 +84,18 @@ def _copy_dict_rows(source: sqlite3.Connection, dest: sqlite3.Connection, table:
         raise RuntimeError(f"migration blocked: synthetic columns selected for {table}:{sorted(set(columns)-real)}")
     qcols = ",".join('"' + c.replace('"', '""') + '"' for c in columns)
     placeholders = ",".join("?" for _ in columns)
-    values: list[tuple[Any, ...]] = []
-    for row in rows:
-        item: list[Any] = []
-        for column in columns:
-            value = row.get(column)
-            if isinstance(value, dict) and set(value) == {"hex"}:
-                value = bytes.fromhex(str(value["hex"]))
-            item.append(value)
-        values.append(tuple(item))
-    dest.executemany(f'INSERT OR REPLACE INTO "{table}"({qcols}) VALUES({placeholders})', values)
-    return len(values)
+    def values():
+        for row in rows:
+            item: list[Any] = []
+            for column in columns:
+                value = row.get(column)
+                if isinstance(value, dict) and set(value) == {"hex"}:
+                    value = bytes.fromhex(str(value["hex"]))
+                item.append(value)
+            yield tuple(item)
+
+    dest.executemany(f'INSERT OR REPLACE INTO "{table}"({qcols}) VALUES({placeholders})', values())
+    return len(rows)
 
 
 def _query_dicts(conn: sqlite3.Connection, sql: str, args: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -100,7 +103,17 @@ def _query_dicts(conn: sqlite3.Connection, sql: str, args: Sequence[Any] = ()) -
 
 
 def _copy_query(source: sqlite3.Connection, dest: sqlite3.Connection, table: str, sql: str, args: Sequence[Any] = ()) -> int:
-    return _copy_dict_rows(source, dest, table, _query_dicts(source, sql, args))
+    cursor = source.execute(sql, tuple(args))
+    copied = 0
+    try:
+        while True:
+            batch = cursor.fetchmany(COPY_BATCH_ROWS)
+            if not batch:
+                return copied
+            copied += _copy_dict_rows(source, dest, table, [dict(row) for row in batch])
+            del batch
+    finally:
+        cursor.close()
 
 
 def _cutoff(days: int = 31) -> str:
@@ -185,11 +198,10 @@ def _copy_latest_250_features(source: sqlite3.Connection, dest: sqlite3.Connecti
         return 0
     columns = _columns(source, table)
     selected = ",".join('ranked."' + c.replace('"', '""') + '"' for c in columns)
-    rows = _query_dicts(
-        source,
+    return _copy_query(
+        source, dest, table,
         "SELECT " + selected + " FROM (SELECT f.*,ROW_NUMBER() OVER(PARTITION BY lane,feature ORDER BY id DESC) AS _roi_rank FROM v52_market_validation_features AS f) AS ranked WHERE ranked._roi_rank<=250 ORDER BY ranked.id",
     )
-    return _copy_dict_rows(source, dest, table, rows)
 
 
 def _copy_bounded_v52(source: sqlite3.Connection, dest: sqlite3.Connection, counts: dict[str, int]) -> None:

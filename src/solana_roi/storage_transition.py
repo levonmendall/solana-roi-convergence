@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,7 +126,7 @@ def verify_semantic_equivalence(
     mismatched = tuple(
         name
         for name in _SEMANTIC_SECTIONS
-        if canonical_json(source.get(name)) != canonical_json(observed.get(name))
+        if payload_hash(source.get(name)) != payload_hash(observed.get(name))
     )
     expected_hash = payload_hash(source)
     observed_hash = payload_hash(observed)
@@ -163,15 +164,6 @@ def _read_active_semantic_sections(conn: sqlite3.Connection) -> dict[str, Any]:
         section: _read_current_payload(conn, table, key_column, key, section)
         for section, (table, key_column, key) in _ACTIVE_SECTION_ROWS.items()
     }
-
-
-def _read_active_semantic_sections_from_path(path: Path | str) -> dict[str, Any]:
-    uri = f"file:{Path(path).resolve()}?mode=ro&cache=private"
-    try:
-        with sqlite3.connect(uri, uri=True, timeout=5.0) as conn:
-            return _read_active_semantic_sections(conn)
-    except sqlite3.Error as exc:
-        raise RuntimeError("active checkpoint semantic sections unreadable") from exc
 
 
 def build_checkpoint_payload(
@@ -256,14 +248,9 @@ def persist_verified_checkpoint(
 ) -> CheckpointVerification:
     migration_version = int(checkpoint_payload.get("migration_version", -1))
     if migration_version == TRANSITION_MIGRATION_VERSION:
-        active_truth = _read_active_semantic_sections_from_path(storage.path)
-        verification = verify_semantic_equivalence(source_truth, active_truth)
-        if not verification.equivalent:
-            raise RuntimeError(
-                "checkpoint semantic equivalence failed: "
-                + ", ".join(verification.mismatched_sections)
-            )
-        _validate_checkpoint_shape(checkpoint_payload, logical_truth=active_truth)
+        _validate_checkpoint_shape(checkpoint_payload, logical_truth=source_truth)
+        expected_hash = str(checkpoint_payload["semantic_hash"])
+        verification = CheckpointVerification(True, expected_hash, expected_hash, ())
     else:
         _validate_checkpoint_shape(checkpoint_payload)
         verification = verify_semantic_equivalence(source_truth, checkpoint_payload)
@@ -275,8 +262,17 @@ def persist_verified_checkpoint(
     body = canonical_json(dict(checkpoint_payload))
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     checkpoint_id = str(checkpoint_payload["checkpoint_id"])
-    with storage.connect() as conn:
+    with closing(storage.connect()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
+        if migration_version == TRANSITION_MIGRATION_VERSION:
+            # Read each persisted section under the SAME writer transaction as
+            # publication. No second full semantic tree is kept in memory, and
+            # a concurrent writer cannot replace a section between proof and seal.
+            for section, (table, key_column, key) in _ACTIVE_SECTION_ROWS.items():
+                value = _read_current_payload(conn, table, key_column, key, section)
+                if payload_hash(value) != checkpoint_payload["section_hashes"][section]:
+                    raise RuntimeError("checkpoint semantic equivalence failed: " + section)
+                del value
         conn.execute("UPDATE checkpoint_current SET verified=0 WHERE verified=1")
         conn.execute(
             "INSERT INTO checkpoint_current(checkpoint_id,created_at,schema_version,migration_version,release_sha,payload_json,payload_hash,semantic_hash,verified) VALUES(?,?,?,?,?,?,?,?,1)",
@@ -307,7 +303,9 @@ def load_verified_checkpoint(
         raise RuntimeError(f"active storage unavailable: {active_path}")
     uri = f"file:{active_path.resolve()}?mode=ro&cache=private"
     try:
-        with sqlite3.connect(uri, uri=True, timeout=5.0) as conn:
+        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
             row = conn.execute(
                 "SELECT payload_json,payload_hash,semantic_hash,schema_version,migration_version,release_sha "
                 "FROM checkpoint_current WHERE verified=1 ORDER BY created_at DESC LIMIT 1"
