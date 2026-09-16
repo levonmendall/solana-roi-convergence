@@ -326,6 +326,13 @@ def build_shadow_database(*, legacy_path: Path | str, active_path: Path | str, r
     source = _connect_ro(legacy)
     dest = storage.connect()
     try:
+        # This successor is private and uninstalled. A single large WAL
+        # transaction would retain another complete body during checkpointing.
+        # Use SQLite's durable rollback journal only for this construction copy;
+        # later ActiveStorage connections restore normal runtime WAL mode.
+        mode = str(dest.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
+        if mode != "delete":
+            raise RuntimeError("shadow copy could not select private rollback journal")
         # One pinned source snapshot owns all exact state, bounded evidence and
         # sequence frontiers.  No second migration pass is allowed to race ahead
         # of the semantic checkpoint.
