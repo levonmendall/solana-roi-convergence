@@ -4,7 +4,7 @@ from __future__ import annotations
 
 The durable paper engine must validate every retained event before restoring authority.
 This repair keeps that complete hash-chain verification, but it no longer pins one
-SQLite read transaction across the entire ledger.  Startup captures a stable terminal
+SQLite read transaction across the entire ledger. Startup captures a stable terminal
 frontier, verifies bounded keyset chunks through that frontier, closes each reader
 before file-cache advice/reclaim, and finally proves that the terminal frontier did
 not move while verification was in progress.
@@ -23,7 +23,8 @@ from typing import Any
 from . import durable_bootstrap_memory_repair as memory
 
 REPAIR_VERSION = "authoritative-event-full-verify-bounded-v1"
-VERIFY_CHUNK_ROWS = 4_096
+DEFAULT_VERIFY_CHUNK_ROWS = 4_096
+VERIFY_CHUNK_ROWS = DEFAULT_VERIFY_CHUNK_ROWS
 ENGINE_EVENT_TYPES = frozenset(
     {"first_touch", "confirmation", "price", "trade_intent", "trade_outcome"}
 )
@@ -46,6 +47,36 @@ _LAST_STATUS: dict[str, Any] = {
     "chunks": 0,
     "failure_reason": None,
 }
+
+
+def _effective_chunk_rows() -> int:
+    """Resolve both the new knob and the pre-existing memory-repair contract.
+
+    Production defaults remain 4,096 rows. Tests/operators that intentionally tune
+    this repair's new knob win when they change it from the default; otherwise the
+    long-standing ``VERIFY_CACHE_RELEASE_ROWS`` setting continues to control how
+    often a reader is closed and clean SQLite pages are reclaimed.
+    """
+
+    try:
+        local_rows = max(1, int(VERIFY_CHUNK_ROWS))
+    except (TypeError, ValueError):
+        local_rows = DEFAULT_VERIFY_CHUNK_ROWS
+    if local_rows != DEFAULT_VERIFY_CHUNK_ROWS:
+        return local_rows
+    try:
+        return max(
+            1,
+            int(
+                getattr(
+                    memory,
+                    "VERIFY_CACHE_RELEASE_ROWS",
+                    DEFAULT_VERIFY_CHUNK_ROWS,
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_VERIFY_CHUNK_ROWS
 
 
 def _reader(path: Path) -> sqlite3.Connection:
@@ -98,7 +129,7 @@ def _persist_non_authoritative_checkpoint(
         )
         incremental._persist_runtime_checkpoint(store, payload)
     except (OSError, sqlite3.Error, TypeError, ValueError, RuntimeError):
-        # The sidecar is optional acceleration/telemetry.  A successful complete
+        # The sidecar is optional acceleration/telemetry. A successful complete
         # retained-history verification must not be converted into a false failure
         # merely because this non-canonical file could not be refreshed.
         return
@@ -118,6 +149,7 @@ def _bounded_authoritative_verify(self: Any) -> tuple[bool, int, int | None]:
     latest_engine_event_id: int | None = None
     terminal_id = 0
     terminal_hash: str | None = None
+    chunk_rows = _effective_chunk_rows()
 
     with store._verify_lock:
         _INVOCATION_COUNT += 1
@@ -126,7 +158,7 @@ def _bounded_authoritative_verify(self: Any) -> tuple[bool, int, int | None]:
         print(
             "ROI_FULL_LEDGER_VERIFY "
             f"stage=start invocation={invocation} reason=durable_engine_start "
-            f"chunk_rows={VERIFY_CHUNK_ROWS} "
+            f"chunk_rows={chunk_rows} "
             f"memory_current={before.get('current_bytes')} file={before.get('file_bytes')}",
             flush=True,
         )
@@ -146,7 +178,7 @@ def _bounded_authoritative_verify(self: Any) -> tuple[bool, int, int | None]:
                         connection.execute(
                             "SELECT id,event_type,observed_at,payload_json,previous_hash,lineage_hash "
                             "FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
-                            (last_id, terminal_id, VERIFY_CHUNK_ROWS),
+                            (last_id, terminal_id, chunk_rows),
                         ).fetchall()
                     )
                 finally:
@@ -195,7 +227,7 @@ def _bounded_authoritative_verify(self: Any) -> tuple[bool, int, int | None]:
                 failure_reason = "terminal_frontier_mismatch"
                 return False, 0, None
 
-            # Startup is expected to be quiescent.  Fail closed rather than silently
+            # Startup is expected to be quiescent. Fail closed rather than silently
             # accepting a ledger that changed between independently bounded snapshots.
             final_id, final_hash = _frontier(store)
             if final_id != terminal_id or final_hash != terminal_hash:
@@ -220,6 +252,7 @@ def _bounded_authoritative_verify(self: Any) -> tuple[bool, int, int | None]:
                 "verified": verified,
                 "rows": rows_processed,
                 "chunks": chunks,
+                "chunk_rows": chunk_rows,
                 "terminal_event_id": terminal_id,
                 "verified_through_event_id": verified_through_event_id,
                 "latest_engine_event_id": latest_engine_event_id,
@@ -250,7 +283,7 @@ def configure_authoritative_event_verify_bounded_repair() -> None:
     from . import incremental_event_integrity_repair as incremental
 
     # production_system.install_durable_bootstrap_memory_repair() assigns this symbol
-    # to DurablePaperTradingEngine._verify_engine_snapshot.  Marking the replacement
+    # to DurablePaperTradingEngine._verify_engine_snapshot. Marking the replacement
     # with the existing bounded attribute preserves that composition contract while
     # changing only the verification transport, not authority or economic behavior.
     setattr(_bounded_authoritative_verify, "_roi_durable_bootstrap_memory_bounded", True)
@@ -267,7 +300,7 @@ def status() -> dict[str, Any]:
     return {
         "repair_version": REPAIR_VERSION,
         "installed": _INSTALLED,
-        "verify_chunk_rows": VERIFY_CHUNK_ROWS,
+        "verify_chunk_rows": _effective_chunk_rows(),
         "invocation_count": _INVOCATION_COUNT,
         "last": dict(_LAST_STATUS),
         "authoritative_startup_verification": "complete_retained_history",
