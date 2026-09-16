@@ -56,20 +56,24 @@ class ActiveObservationEventStore(ObservationEventStore):
                 self.path,
                 release_sha=expected_release_sha,
             )
-        self.transition_checkpoint = load_verified_checkpoint(self.path, expected_release_sha=expected_release_sha)
-        event_head = dict(self.transition_checkpoint.get("latest_event_ids", {}).get("events") or {})
+        checkpoint = load_verified_checkpoint(self.path, expected_release_sha=expected_release_sha)
+        event_head = dict(checkpoint.get("latest_event_ids", {}).get("events") or {})
         if not event_head:
             raise RuntimeError("active runtime blocked: transition event head missing")
         try:
             self.transition_event_head_id = int(event_head["id"])
             self.transition_event_head_hash = str(event_head["lineage_hash"])
-            self.transition_engine_event_id = int(self.transition_checkpoint["portfolio"]["last_engine_event_id"])
+            self.transition_engine_event_id = int(checkpoint["portfolio"]["last_engine_event_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("active runtime blocked: transition event anchor invalid") from exc
         if self.transition_event_head_id < self.transition_engine_event_id:
             raise RuntimeError("active runtime blocked: event head precedes paper checkpoint")
         if len(self.transition_event_head_hash) != 64:
             raise RuntimeError("active runtime blocked: transition lineage hash invalid")
+        # Full semantic verification is complete. Only these scalar anchors are
+        # runtime dependencies; do not retain decoded wallet/continuity history
+        # for the lifetime of the event store or overlap it with schema startup.
+        del checkpoint
         self._active_write_count = 0
         self._maintenance_stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
