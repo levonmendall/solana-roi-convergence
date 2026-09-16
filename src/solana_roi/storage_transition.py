@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import sqlite3
 import uuid
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +21,8 @@ LEGACY_RECORD_ENV = "SOLANA_ROI_LEGACY_DB_PATH"
 ACTIVATE_ENV = "SOLANA_ROI_ACTIVE_STORAGE_ENABLED"
 SHADOW_ENV = "SOLANA_ROI_ACTIVE_STORAGE_SHADOW"
 FINALIZE_ENV = "SOLANA_ROI_ACTIVE_STORAGE_FINALIZE_FROM_LEGACY"
+CHECKPOINT_ENCODING_PREFIX = "zlib-base64-v1:"
+CHECKPOINT_COMPRESSION_LEVEL = 6
 
 _SEMANTIC_SECTIONS = (
     "strategy",
@@ -130,6 +134,22 @@ def _validate_checkpoint_shape(payload: Mapping[str, Any]) -> None:
         raise RuntimeError("active checkpoint semantic hash mismatch")
 
 
+def _encode_checkpoint_body(body: str) -> str:
+    compressed = zlib.compress(body.encode("utf-8"), level=CHECKPOINT_COMPRESSION_LEVEL)
+    return CHECKPOINT_ENCODING_PREFIX + base64.b64encode(compressed).decode("ascii")
+
+
+def _decode_checkpoint_body(stored: str) -> str:
+    if not stored.startswith(CHECKPOINT_ENCODING_PREFIX):
+        return stored
+    encoded = stored[len(CHECKPOINT_ENCODING_PREFIX):]
+    try:
+        compressed = base64.b64decode(encoded.encode("ascii"), validate=True)
+        return zlib.decompress(compressed).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, zlib.error) as exc:
+        raise RuntimeError("active checkpoint compressed payload unreadable") from exc
+
+
 def persist_verified_checkpoint(storage: ActiveStorage, *, checkpoint_payload: Mapping[str, Any], source_truth: Mapping[str, Any]) -> CheckpointVerification:
     _validate_checkpoint_shape(checkpoint_payload)
     verification = verify_semantic_equivalence(source_truth, checkpoint_payload)
@@ -137,13 +157,14 @@ def persist_verified_checkpoint(storage: ActiveStorage, *, checkpoint_payload: M
         raise RuntimeError("checkpoint semantic equivalence failed: " + ", ".join(verification.mismatched_sections))
     body = canonical_json(dict(checkpoint_payload))
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    stored_body = _encode_checkpoint_body(body)
     checkpoint_id = str(checkpoint_payload["checkpoint_id"])
     with storage.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("UPDATE checkpoint_current SET verified=0 WHERE verified=1")
         conn.execute(
             "INSERT INTO checkpoint_current(checkpoint_id,created_at,schema_version,migration_version,release_sha,payload_json,payload_hash,semantic_hash,verified) VALUES(?,?,?,?,?,?,?,?,1)",
-            (checkpoint_id,str(checkpoint_payload["timestamp"]),int(checkpoint_payload["schema_version"]),int(checkpoint_payload["migration_version"]),str(checkpoint_payload["release_sha"]),body,digest,verification.observed_hash),
+            (checkpoint_id,str(checkpoint_payload["timestamp"]),int(checkpoint_payload["schema_version"]),int(checkpoint_payload["migration_version"]),str(checkpoint_payload["release_sha"]),stored_body,digest,verification.observed_hash),
         )
         conn.execute("UPDATE storage_epoch_state SET last_checkpoint_id=?,updated_at=? WHERE singleton_key=1", (checkpoint_id,_utc_now()))
         conn.commit()
@@ -162,7 +183,8 @@ def load_verified_checkpoint(path: Path | str, *, expected_release_sha: str | No
         raise RuntimeError("active storage checkpoint unreadable") from exc
     if row is None:
         raise RuntimeError("active storage has no verified continuation checkpoint")
-    body = str(row[0])
+    stored_body = str(row[0])
+    body = _decode_checkpoint_body(stored_body)
     if hashlib.sha256(body.encode("utf-8")).hexdigest() != str(row[1]):
         raise RuntimeError("active checkpoint payload hash mismatch")
     try:
