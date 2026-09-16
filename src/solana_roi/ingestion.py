@@ -403,7 +403,9 @@ class LiveEvidenceIngestionService:
         )
         if not inserted:
             return self._decision(swap, "duplicate", "normalized swap already persisted")
-        self.store.append("normalized_swap", swap.received_at.isoformat(), asdict(swap))
+        # normalized_swaps is already the canonical exact point-in-time record.
+        # Keep decision events in the lineage ledger, but do not mirror the same
+        # market payload into a second variable-size representation.
 
         profile = self.registry.get(swap.wallet)
         if profile is None:

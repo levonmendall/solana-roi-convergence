@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -52,6 +53,90 @@ def _live_thread_ids() -> set[int]:
     }
 
 
+def _owned_task_ids(
+    *, proc_root: Path = Path("/proc"), root_pid: int | None = None
+) -> set[int]:
+    """Return Linux task IDs owned by this process and its descendants.
+
+    The cgroup-wide PID counter includes unrelated jobs. Build the owned process
+    tree from PPid in proc status files instead: some Linux/sandbox proc mounts
+    omit task/*/children, which must not silently hide child-process worker growth.
+    Task directories include native threads, not only Python threading objects.
+    """
+
+    root = os.getpid() if root_pid is None else int(root_pid)
+    children_by_parent: dict[int, set[int]] = {}
+    try:
+        process_paths = list(proc_root.iterdir())
+    except OSError:
+        return _live_thread_ids()
+    for process_path in process_paths:
+        if not process_path.name.isdigit():
+            continue
+        try:
+            status = (process_path / "status").read_text(encoding="utf-8")
+            parent_line = next(line for line in status.splitlines() if line.startswith("PPid:"))
+            parent = int(parent_line.partition(":")[2].strip())
+        except (OSError, ValueError, StopIteration):
+            # Processes can exit between enumerating proc and reading status.
+            continue
+        children_by_parent.setdefault(parent, set()).add(int(process_path.name))
+
+    pending = [root]
+    processes: set[int] = set()
+    tasks: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in processes:
+            continue
+        processes.add(pid)
+        pending.extend(children_by_parent.get(pid, ()))
+        try:
+            entries = list((proc_root / str(pid) / "task").iterdir())
+        except OSError:
+            continue
+        tasks.update(int(entry.name) for entry in entries if entry.name.isdigit())
+    return tasks or _live_thread_ids()
+
+
+def _fake_proc_process(proc_root: Path, pid: int, parent: int, task_ids: set[int]) -> None:
+    process_path = proc_root / str(pid)
+    process_path.mkdir(parents=True, exist_ok=True)
+    (process_path / "status").write_text(
+        f"Name:\tregression-worker\nPid:\t{pid}\nPPid:\t{parent}\n", encoding="utf-8"
+    )
+    for tid in task_ids:
+        (process_path / "task" / str(tid)).mkdir(parents=True, exist_ok=True)
+    # Intentionally no task/*/children files; the real verification mount omits them.
+
+
+def test_owned_task_measurement_detects_genuine_thread_growth(tmp_path: Path) -> None:
+    _fake_proc_process(tmp_path, 100, 1, {100})
+    baseline = _owned_task_ids(proc_root=tmp_path, root_pid=100)
+    _fake_proc_process(tmp_path, 100, 1, {100, 101, 102, 103})
+    grown = _owned_task_ids(proc_root=tmp_path, root_pid=100)
+    assert baseline == {100}
+    assert grown == {100, 101, 102, 103}
+    assert len(grown) > len(baseline) + 2
+
+
+def test_owned_task_measurement_detects_descendants_without_children_files(tmp_path: Path) -> None:
+    _fake_proc_process(tmp_path, 100, 1, {100})
+    baseline = _owned_task_ids(proc_root=tmp_path, root_pid=100)
+    _fake_proc_process(tmp_path, 200, 100, {200, 201})
+    _fake_proc_process(tmp_path, 300, 200, {300, 301})
+    grown = _owned_task_ids(proc_root=tmp_path, root_pid=100)
+    assert grown == {100, 200, 201, 300, 301}
+    assert len(grown) > len(baseline) + 2
+
+
+def test_owned_task_measurement_excludes_unrelated_shared_cgroup_processes(tmp_path: Path) -> None:
+    _fake_proc_process(tmp_path, 100, 1, {100})
+    _fake_proc_process(tmp_path, 900, 1, {900, 901, 902, 903})
+    _fake_proc_process(tmp_path, 950, 900, {950, 951})
+    assert _owned_task_ids(proc_root=tmp_path, root_pid=100) == {100}
+
+
 def test_wrapped_logical_bootstrap_stays_async_and_recovers_without_thread_growth(
     tmp_path: Path,
     monkeypatch,
@@ -72,6 +157,12 @@ def test_wrapped_logical_bootstrap_stays_async_and_recovers_without_thread_growt
     monkeypatch.setenv("SOLANA_ROI_CERTIFICATION_SHARED_TOKEN", token)
     monkeypatch.setenv("SOLANA_ROI_RELEASE_COMMIT", release)
     monkeypatch.setattr(bootstrap.split, "_release_commit", lambda: release)
+    from solana_roi import durable_bootstrap_memory_repair as durable_memory
+
+    # This regression owns async dispatch and worker lifecycle, not the shared
+    # runner's raw-cgroup pressure. Production memory-guard tests cover that
+    # boundary independently.
+    monkeypatch.setattr(durable_memory, "_guard_raw_cgroup", lambda *_args, **_kwargs: {})
 
     store = _Store(tmp_path / "authoritative.sqlite3")
     runtime = SimpleNamespace(store=store)
@@ -152,9 +243,10 @@ def test_wrapped_logical_bootstrap_stays_async_and_recovers_without_thread_growt
 
     observed_app = _ObservedASGI(app)
 
-    async def exercise() -> tuple[list[int], set[int], set[int]]:
+    async def exercise() -> tuple[list[int], list[int], set[int], set[int]]:
         baseline_threads = _live_thread_ids()
         pids = [_pids_current()]
+        owned_tasks = [len(_owned_task_ids())]
         params = {
             "table": "evidence",
             "epoch": str(identity["epoch"]),
@@ -175,6 +267,7 @@ def test_wrapped_logical_bootstrap_stays_async_and_recovers_without_thread_growt
             assert "deterministic regression guard" in paused.text
             assert cleanup_phases == []
             pids.append(_pids_current())
+            owned_tasks.append(len(_owned_task_ids()))
 
             for _ in range(64):
                 response = await client.get(
@@ -188,12 +281,13 @@ def test_wrapped_logical_bootstrap_stays_async_and_recovers_without_thread_growt
                 assert int(payload["row_count"]) == 16
                 assert send_state["final_sent"] is True
                 pids.append(_pids_current())
+                owned_tasks.append(len(_owned_task_ids()))
 
         await asyncio.sleep(0)
-        return pids, baseline_threads, _live_thread_ids()
+        return pids, owned_tasks, baseline_threads, _live_thread_ids()
 
     try:
-        pids, baseline_threads, final_threads = asyncio.run(exercise())
+        pids, owned_tasks, baseline_threads, final_threads = asyncio.run(exercise())
         assert refresh_calls["count"] == 65
         assert cleanup_phases == ["after_final_send"] * 64
         assert worker_threads, "lease lifecycle never entered bounded AnyIO worker pool"
@@ -206,12 +300,17 @@ def test_wrapped_logical_bootstrap_stays_async_and_recovers_without_thread_growt
             "final_threads": sorted(final_threads),
             "new_threads": sorted(final_threads - baseline_threads),
         }
-        assert max(pids) <= pids[0] + 2, {
+        assert max(owned_tasks) <= owned_tasks[0] + 2, {
+            "baseline_owned_tasks": owned_tasks[0],
+            "peak_owned_tasks": max(owned_tasks),
+            "owned_task_samples": owned_tasks,
             "baseline_pids_current": pids[0],
             "peak_pids_current": max(pids),
-            "samples": pids,
+            "shared_cgroup_samples": pids,
         }
-        assert pids[-1] <= pids[0] + 2, {
+        assert owned_tasks[-1] <= owned_tasks[0] + 2, {
+            "baseline_owned_tasks": owned_tasks[0],
+            "final_owned_tasks": owned_tasks[-1],
             "baseline_pids_current": pids[0],
             "final_pids_current": pids[-1],
         }

@@ -93,7 +93,8 @@ class CollectingLiveEvidenceIngestionService(LiveEvidenceIngestionService):
         )
         if not inserted:
             return self._decision(swap, "duplicate", "normalized swap already persisted; chronology unchanged")
-        self.store.append("normalized_swap", swap.received_at.isoformat(), asdict(swap))
+        # Avoid duplicating the exact normalized row in the generic event ledger;
+        # downstream decision events remain hash chained separately.
         if self.mark_recorder is not None:
             self.mark_recorder.record_swap_mark(swap)
 

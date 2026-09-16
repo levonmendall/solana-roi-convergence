@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -17,6 +17,7 @@ from .direct_transaction import normalize_standard_transaction
 from .ingestion import NormalizedSwap
 from .solana_rpc import RpcEndpoint, SolanaRpcPool, rpc_endpoints_from_env
 from .source_coverage import FROZEN_SUPPORTED_PROGRAM_IDS_BY_SOURCE
+from .raw_receipt_retention import prune_recent_receipts
 
 
 PROGRAM_SOURCE_BY_ID: dict[str, str] = {
@@ -161,9 +162,7 @@ class DirectSolanaJournal:
             if inserted:
                 self._receipt_inserts += 1
                 if self._receipt_inserts % 500 == 0:
-                    self.store.db.execute(
-                        "DELETE FROM direct_solana_recent_receipts WHERE expires_at<?", (received_at.isoformat(),)
-                    )
+                    prune_recent_receipts(self.store.db, now=received_at)
         return inserted
 
     def enqueue(self, *, signature: str, slot: int, trigger_received_at: datetime, source_hint: str | None, priority: int, reason: str) -> None:
@@ -639,8 +638,8 @@ class DirectSolanaIngestionPlane:
             native_amount_sol=swap.native_amount_sol, reference_price_sol=swap.reference_price_sol,
             ingestion_latency_ms=swap.ingestion_latency_ms, source=swap.source,
         )
-        if inserted:
-            self.store.append("normalized_swap", swap.received_at.isoformat(), asdict(swap))
+        # The specialized normalized_swaps row is the durable evidence. Context
+        # prefill has no independent event-ledger consumer.
 
     async def _prefill_launch_context(self, candidate: NormalizedSwap) -> bool:
         parts = candidate.source.split(":")

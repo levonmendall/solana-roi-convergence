@@ -7,6 +7,7 @@ from typing import Any, Mapping, MutableMapping, Sequence
 
 from . import storage_retention as base
 from .certification_epoch import release_commit_from_env
+from .raw_receipt_retention import recent_receipt_acknowledgement_boundary
 
 R = base.RetentionClass
 C = base.RetentionContract
@@ -62,8 +63,9 @@ RUNTIME_CONTRACTS = (
        prune="never drop pending; completed older than 7d", startup=True, certification=True),
     _c("direct_solana_recent_receipts", "direct-solana", R.TEMPORARY,
        "Short raw-receipt frontier used for bounded discovery/context", "DirectSolanaJournal/wallet discovery",
-       age="expires_at", rows=500_000, bytes_=134_217_728,
-       prune="expires_at passed", startup=True, certification=False),
+       age="durable hydration/canonical/wallet acknowledgement or raw cursor + 120s; unresolved continuity gap protected",
+       rows=500_000, bytes_=134_217_728,
+       prune="dependency-aware acknowledged retirement in bounded batches; age/expiry alone never acknowledges", startup=True, certification=False),
     _c("direct_solana_minute_receipts", "direct-solana", R.BOUNDED_WINDOW,
        "Recent per-source receipt continuity aggregates", "DirectSolanaJournal status/certification",
        age="31d", rows=250_000, bytes_=67_108_864,
@@ -293,8 +295,21 @@ def copy_bounded_runtime_evidence(
         if copied:
             counts["helius_webhook_inbox"] = max(counts.get("helius_webhook_inbox", 0), copied)
 
+    receipt_spec: tuple[str, tuple[Any, ...]] = (
+        "SELECT * FROM direct_solana_recent_receipts",
+        (),
+    )
+    if "direct_solana_recent_receipts" in existing:
+        boundary = recent_receipt_acknowledgement_boundary(source, now=instant)
+        receipt_spec = (
+            "SELECT r.* FROM direct_solana_recent_receipts r WHERE NOT ("
+            + str(boundary["eligible_predicate"])
+            + ")",
+            tuple(boundary["eligible_args"]),
+        )
+
     specs: Sequence[tuple[str, str, tuple[Any, ...]]] = (
-        ("direct_solana_recent_receipts", "SELECT * FROM direct_solana_recent_receipts WHERE expires_at>=?", (instant.isoformat(),)),
+        ("direct_solana_recent_receipts", receipt_spec[0], receipt_spec[1]),
         ("direct_solana_minute_receipts", "SELECT * FROM direct_solana_minute_receipts WHERE bucket>=?", (cutoff31,)),
         ("direct_solana_hydration_queue", "SELECT * FROM direct_solana_hydration_queue WHERE status<>'complete' OR updated_at>=?", (cutoff7,)),
         ("direct_solana_hydration_metrics", "SELECT * FROM direct_solana_hydration_metrics WHERE hydrated_at>=?", (cutoff31,)),

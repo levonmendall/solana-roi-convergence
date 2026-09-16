@@ -204,7 +204,6 @@ def test_retention_registry_protects_unproven_and_canonical_evidence() -> None:
 
     for table in (
         "certification_replication_changes",
-        "direct_solana_recent_receipts",
         "direct_solana_minute_receipts",
         "wallet_discovery_broad_samples",
         "wallet_discovery_candidates",
@@ -213,3 +212,10 @@ def test_retention_registry_protects_unproven_and_canonical_evidence() -> None:
         "helius_webhook_inbox",
     ):
         assert POLICIES_BY_TABLE[table].enforcement == "policy_only"
+
+    receipts = POLICIES_BY_TABLE["direct_solana_recent_receipts"]
+    assert receipts.enforcement == "writer_and_maintenance"
+    assert receipts.value == (
+        "durably completed hydration plus canonical normalization/wallet cursor, "
+        "or consumed raw cursor, and 120s; unresolved gap protected"
+    )

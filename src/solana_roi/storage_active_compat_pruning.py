@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .raw_receipt_retention import prune_recent_receipts
+
 
 def prune_active_compatibility_database(
     path: Path | str,
@@ -69,7 +71,9 @@ def prune_active_compatibility_database(
             )
         run(
             "direct_solana_hydration_queue",
-            "DELETE FROM direct_solana_hydration_queue WHERE status NOT IN ('pending','processing') AND updated_at<?",
+            "DELETE FROM direct_solana_hydration_queue WHERE status NOT IN ('pending','processing') "
+            "AND updated_at<? AND NOT EXISTS (SELECT 1 FROM direct_solana_recent_receipts r "
+            "WHERE r.signature=direct_solana_hydration_queue.signature)",
             (cutoff7,),
         )
         run(
@@ -79,11 +83,9 @@ def prune_active_compatibility_database(
         )
 
         # Direct-Solana raw transport and operational measurements.
-        run(
-            "direct_solana_recent_receipts",
-            "DELETE FROM direct_solana_recent_receipts WHERE expires_at<?",
-            (now_iso,),
-        )
+        if "direct_solana_recent_receipts" in tables:
+            receipt_result = prune_recent_receipts(connection, now=instant)
+            deleted["direct_solana_recent_receipts"] = int(receipt_result["deleted"])
         run(
             "direct_solana_minute_receipts",
             "DELETE FROM direct_solana_minute_receipts WHERE bucket<?",
@@ -91,7 +93,9 @@ def prune_active_compatibility_database(
         )
         run(
             "direct_solana_hydration_metrics",
-            "DELETE FROM direct_solana_hydration_metrics WHERE hydrated_at<?",
+            "DELETE FROM direct_solana_hydration_metrics WHERE hydrated_at<? "
+            "AND NOT EXISTS (SELECT 1 FROM direct_solana_recent_receipts r "
+            "WHERE r.signature=direct_solana_hydration_metrics.signature)",
             (cutoff31,),
         )
 

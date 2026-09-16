@@ -179,18 +179,34 @@ def _prune_operational_rows_once(self: Any) -> tuple[int, int]:
     metric_cutoff = (now - timedelta(seconds=HYDRATION_METRIC_RETENTION_SECONDS)).isoformat()
     _ensure_maintenance_state(self)
     with self.store._lock, self.store.db:
+        receipt_table = self.store.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='direct_solana_recent_receipts' LIMIT 1"
+        ).fetchone()
+        receipt_guard = (
+            "AND NOT EXISTS (SELECT 1 FROM direct_solana_recent_receipts r "
+            "WHERE r.signature=direct_solana_hydration_queue.signature) "
+            if receipt_table is not None
+            else ""
+        )
         queue_cur = self.store.db.execute(
             "DELETE FROM direct_solana_hydration_queue WHERE signature IN ("
             "SELECT signature FROM direct_solana_hydration_queue "
             "WHERE status IN ('complete','failed') AND updated_at<? "
-            "ORDER BY updated_at, signature LIMIT ?)",
+            f"{receipt_guard}ORDER BY updated_at, signature LIMIT ?)",
             (queue_cutoff, MAINTENANCE_BATCH_ROWS),
+        )
+        metric_guard = (
+            "AND NOT EXISTS (SELECT 1 FROM direct_solana_recent_receipts r "
+            "WHERE r.signature=direct_solana_hydration_metrics.signature) "
+            if receipt_table is not None
+            else ""
         )
         metric_cur = self.store.db.execute(
             "DELETE FROM direct_solana_hydration_metrics WHERE signature IN ("
             "SELECT signature FROM direct_solana_hydration_metrics "
             "WHERE historical_recovery=0 AND hydrated_at<? "
-            "ORDER BY hydrated_at, signature LIMIT ?)",
+            f"{metric_guard}ORDER BY hydrated_at, signature LIMIT ?)",
             (metric_cutoff, MAINTENANCE_BATCH_ROWS),
         )
         queue_rows = int(queue_cur.rowcount or 0)

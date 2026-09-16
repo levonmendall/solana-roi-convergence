@@ -6,7 +6,7 @@ from typing import Any
 
 from . import production_data_cleanup_v4 as cleanup
 from . import production_disk_ownership as disk_ownership
-from .active_storage_epoch_rollover import SEALED_EPOCH_DIR
+from .active_storage_epoch_rollover import MAX_UNRECLAIMED_SEALED_EPOCHS, SEALED_EPOCH_DIR
 from .sealed_epoch_reclamation import execute_sealed_epoch_reclamation
 from .storage_transition import load_verified_checkpoint
 
@@ -74,6 +74,57 @@ def observe_boundary(database_path: Path | str) -> dict[str, Any]:
     }
 
 
+def _startup_recovery_binding(database_path: Path, release: str) -> dict[str, Any]:
+    """Validate the narrow pre-start recovery exception to same-release startup.
+
+    This does not create or rewrite release identity. It accepts only a durable
+    marker written by a prior full runtime for this exact canonical path, a
+    checkpoint that verifies under the current ordinary release-rollforward
+    rules, and an already-exceeded predecessor ceiling. Exact checkpoint
+    approval and every candidate proof remain enforced by the executor.
+    """
+
+    marker = disk_ownership.read_establishment(database_path)
+    if not isinstance(marker, dict):
+        raise cleanup.CleanupBlocked(
+            "sealed epoch startup recovery requires a prior full-runtime establishment marker"
+        )
+    if marker.get("protocol_version") != disk_ownership.LOCK_PROTOCOL_VERSION:
+        raise cleanup.CleanupBlocked("sealed epoch startup recovery establishment protocol mismatch")
+    if marker.get("database_path") != str(database_path):
+        raise cleanup.CleanupBlocked("sealed epoch startup recovery database identity mismatch")
+    prior_release = str(marker.get("release_commit") or "")
+    if not prior_release or prior_release == release:
+        raise cleanup.CleanupBlocked("sealed epoch startup recovery prior release binding is invalid")
+
+    checkpoint = load_verified_checkpoint(database_path, expected_release_sha=release)
+    checkpoint_id = str(checkpoint.get("checkpoint_id") or "")
+    checkpoint_release = str(checkpoint.get("release_sha") or "")
+    if not checkpoint_id or not checkpoint_release:
+        raise cleanup.CleanupBlocked("sealed epoch startup recovery verified checkpoint binding missing")
+    candidates = _candidate_metadata(database_path)
+    physical_identities = {
+        (int(item["device"]), int(item["inode"]))
+        for item in candidates
+        if bool(item.get("stat_ok"))
+        and not bool(item.get("is_symlink"))
+        and item.get("device") is not None
+        and item.get("inode") is not None
+    }
+    if len(physical_identities) <= MAX_UNRECLAIMED_SEALED_EPOCHS:
+        raise cleanup.CleanupBlocked(
+            "sealed epoch startup recovery is allowed only after the predecessor ceiling is exceeded"
+        )
+    return {
+        "prior_established_release_sha": prior_release,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_release_sha": checkpoint_release,
+        "candidate_path_count_before": len(candidates),
+        "candidate_count_before": len(physical_identities),
+        "ceiling": MAX_UNRECLAIMED_SEALED_EPOCHS,
+    }
+
+
 def execute_enabled(database_path: Path | str, lease: disk_ownership.RuntimeDiskLease) -> dict[str, Any]:
     """Execute only behind the established same-release disk-ownership handshake."""
     database_path = Path(database_path)
@@ -87,13 +138,18 @@ def execute_enabled(database_path: Path | str, lease: disk_ownership.RuntimeDisk
     release = disk_ownership.current_release_commit()
     if not release or lease.release_commit != release:
         raise cleanup.CleanupBlocked("sealed epoch reclamation lease/release identity mismatch")
-    if not disk_ownership.same_release_established(database_path):
-        raise cleanup.CleanupBlocked(
-            "sealed epoch reclamation requires this exact release SHA to have reached full runtime once with reclamation disabled"
-        )
     approved_checkpoint = os.getenv(CHECKPOINT_APPROVAL_ENV, "").strip()
     if not approved_checkpoint:
         raise cleanup.CleanupBlocked("sealed epoch reclamation enabled without exact checkpoint approval")
+
+    same_release = disk_ownership.same_release_established(database_path)
+    recovery_binding: dict[str, Any] | None = None
+    if not same_release:
+        recovery_binding = _startup_recovery_binding(database_path, release)
+        if approved_checkpoint != recovery_binding["checkpoint_id"]:
+            raise cleanup.CleanupBlocked(
+                "sealed epoch startup recovery approval is not bound to the current verified checkpoint"
+            )
 
     result = execute_sealed_epoch_reclamation(
         database_path,
@@ -106,7 +162,9 @@ def execute_enabled(database_path: Path | str, lease: disk_ownership.RuntimeDisk
             "runtime_version": RUNTIME_VERSION,
             "enabled": True,
             "release_sha": release,
-            "same_release_established": True,
+            "same_release_established": same_release,
+            "startup_recovery": recovery_binding is not None,
+            "startup_recovery_binding": recovery_binding,
             "disk_lease_owned": True,
             "approval_environment": CHECKPOINT_APPROVAL_ENV,
             "paper_only": True,

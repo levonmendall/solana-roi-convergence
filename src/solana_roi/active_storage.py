@@ -342,8 +342,15 @@ class ActiveStorage:
             mode = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
             before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
             reclaimed_request = min(max(0, int(max_pages)), before) if mode == 2 else 0
-            if reclaimed_request:
-                conn.execute(f"PRAGMA incremental_vacuum({reclaimed_request})")
+            attempts = 0
+            # SQLite may reclaim only one tail page for a single
+            # incremental_vacuum(N) invocation even when N is large. Repeat the
+            # bounded one-page operation so the configured batch is real rather
+            # than telemetry-only. The transaction remains bounded by max_pages.
+            for _ in range(reclaimed_request):
+                conn.execute("PRAGMA incremental_vacuum(1)")
+                attempts += 1
+            if attempts:
                 conn.commit()
             after = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
         return {
@@ -351,6 +358,7 @@ class ActiveStorage:
             "freelist_before": before,
             "freelist_after": after,
             "pages_requested": reclaimed_request,
+            "vacuum_attempts": attempts,
             "pages_reclaimed": max(0, before - after),
         }
 

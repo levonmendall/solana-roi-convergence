@@ -55,18 +55,22 @@ def main() -> int:
                 "SOLANA_ROI_RELEASE_COMMIT": env.get("GITHUB_SHA", "f" * 40),
             }
         )
+        # This smoke owns a new tiny disposable database and validates the real
+        # production composition/routes. The raw-cgroup guard is covered by its
+        # dedicated tests; letting unrelated shared-runner file cache block this
+        # child would turn the smoke into a cgroup-neighbor measurement.
+        child = (
+            "from solana_roi import durable_bootstrap_memory_repair as memory;"
+            "memory._guard_raw_cgroup=lambda *_args,**_kwargs:{};"
+            "import uvicorn;"
+            f"uvicorn.run('solana_roi.production:app',host='127.0.0.1',"
+            f"port={port},log_level='warning')"
+        )
         process = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "uvicorn",
-                "solana_roi.production:app",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--log-level",
-                "warning",
+                "-c",
+                child,
             ],
             env=env,
             stdout=subprocess.PIPE,

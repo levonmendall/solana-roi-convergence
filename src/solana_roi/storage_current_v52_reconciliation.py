@@ -46,6 +46,47 @@ def _c(
 # original storage-transition branch was cut.  They are intentionally explicit:
 # no table is admitted merely because it exists in the legacy database.
 CURRENT_V52_CONTRACTS = (
+    # These are live decision dependencies, not rebuildable diagnostics. Keep
+    # their exact rows in the semantic seal; exceeding the extraction bound
+    # blocks rollover rather than silently forgetting invalid releases or
+    # immutable challenger/candidate evidence. No age-based deletion is
+    # authorized here.
+    _c(
+        "candidate_execution_plane_snapshots",
+        "candidate-execution-evidence",
+        R.STRATEGY_EVIDENCE,
+        "Point-in-time candidate decision, risk readiness, timing and failure attribution",
+        "candidate execution evidence/certification diagnostics",
+        rows=100_000,
+        bytes_=134_217_728,
+        prune="retain until candidate attribution dependency and reconstruction proof permits removal",
+        startup=True,
+        certification=True,
+    ),
+    _c(
+        "v51_release_compatibility",
+        "measurement-integrity",
+        R.CURRENT_STATE,
+        "Release measurement and execution compatibility, including known invalid epochs",
+        "measurement compatibility filters/exit execution/promotion proof",
+        rows=4096,
+        bytes_=16_777_216,
+        prune="retain until release-reader dependency and reconstruction proof permits removal",
+        startup=True,
+        certification=True,
+    ),
+    _c(
+        "v52_tournament_exact_evidence",
+        "v5.2-learning-governance",
+        R.STRATEGY_EVIDENCE,
+        "Immutable same-stream challenger evidence identities and conflict detection",
+        "record_exact_challenger_outcome/governed tournament",
+        rows=100_000,
+        bytes_=67_108_864,
+        prune="retain until tournament dependency and reconstruction proof permits removal",
+        startup=True,
+        certification=True,
+    ),
     _c(
         "v52_wallet_forward_runtime_state",
         "wallet-forward-alpha",
@@ -327,89 +368,12 @@ def prune_current_v52_database(path: Path | str, *, now: datetime | None = None)
     shadow entries. It is therefore suitable for active-store maintenance but is
     not a legacy purge mechanism.
     """
-    cutoff31 = ((now or datetime.now(timezone.utc)) - timedelta(days=31)).isoformat()
-    cutoff7 = ((now or datetime.now(timezone.utc)) - timedelta(days=7)).isoformat()
-    conn = sqlite3.connect(Path(path), timeout=30.0)
-    try:
-        tables = {
-            str(row[0])
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-        }
-        deleted: dict[str, int] = {}
+    # Keep a single enforcement implementation. The historical copy in this
+    # reconciliation module used a different parent/outcome deletion order and
+    # could erase the proof needed to retire a resolved decision.
+    from .storage_current_v52_pruning import prune_current_v52_database as canonical_prune
 
-        def execute(table: str, sql: str, args: tuple[Any, ...]) -> None:
-            if table not in tables:
-                return
-            cursor = conn.execute(sql, args)
-            deleted[table] = max(0, int(cursor.rowcount))
-
-        execute(
-            "v52_wallet_forward_integrity_seen",
-            "DELETE FROM v52_wallet_forward_integrity_seen WHERE recorded_at<?",
-            (cutoff31,),
-        )
-        execute(
-            "v52_wallet_forward_shadow_outcomes",
-            "DELETE FROM v52_wallet_forward_shadow_outcomes WHERE resolved_at<?",
-            (cutoff31,),
-        )
-        execute(
-            "v52_wallet_forward_shadow_decisions",
-            "DELETE FROM v52_wallet_forward_shadow_decisions WHERE observed_at<? AND EXISTS ("
-            "SELECT 1 FROM v52_wallet_forward_shadow_outcomes o WHERE o.decision_id=v52_wallet_forward_shadow_decisions.id)",
-            (cutoff31,),
-        )
-        if "v52_wallet_forward_replay_runs" in tables:
-            cursor = conn.execute(
-                "DELETE FROM v52_wallet_forward_replay_runs WHERE evaluated_at<? "
-                "AND id<>(SELECT MAX(id) FROM v52_wallet_forward_replay_runs)",
-                (cutoff31,),
-            )
-            deleted["v52_wallet_forward_replay_runs"] = max(0, int(cursor.rowcount))
-
-        execute(
-            "v52_market_validation_lane_events",
-            "DELETE FROM v52_market_validation_lane_events WHERE observed_at<? AND net_return IS NOT NULL",
-            (cutoff31,),
-        )
-        execute(
-            "v52_market_validation_shadow_variants",
-            "DELETE FROM v52_market_validation_shadow_variants WHERE observed_at<? AND net_return IS NOT NULL",
-            (cutoff31,),
-        )
-        execute(
-            "v52_market_validation_continuation_horizons",
-            "DELETE FROM v52_market_validation_continuation_horizons WHERE observed_at<? AND resolved_at IS NOT NULL",
-            (cutoff31,),
-        )
-        execute(
-            "v52_market_validation_component_ablation",
-            "DELETE FROM v52_market_validation_component_ablation WHERE observed_at<? AND resolved_at IS NOT NULL",
-            (cutoff31,),
-        )
-        execute(
-            "v52_market_validation_completion_evaluations",
-            "DELETE FROM v52_market_validation_completion_evaluations WHERE observed_at<?",
-            (cutoff31,),
-        )
-        execute(
-            "v52_market_validation_shadow_entries",
-            "DELETE FROM v52_market_validation_shadow_entries WHERE observed_at<? AND NOT EXISTS ("
-            "SELECT 1 FROM v52_market_validation_shadow_variants v "
-            "WHERE v.candidate_key=v52_market_validation_shadow_entries.candidate_key "
-            "AND v.observed_at=v52_market_validation_shadow_entries.observed_at "
-            "AND v.variant_id=v52_market_validation_shadow_entries.variant_id AND v.net_return IS NULL)",
-            (cutoff31,),
-        )
-        execute(
-            "v52_market_validation_hardening_audit",
-            "DELETE FROM v52_market_validation_hardening_audit WHERE observed_at<?",
-            (cutoff7,),
-        )
-        conn.commit()
-        return deleted
-    finally:
-        conn.close()
+    return canonical_prune(path, now=now)
 
 
 def registered_dataset_names() -> tuple[str, ...]:
