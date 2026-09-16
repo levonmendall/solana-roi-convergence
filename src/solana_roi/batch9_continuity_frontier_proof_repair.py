@@ -411,17 +411,13 @@ def _snapshot_robinhood_proof_refresh(
     snapshot = _proof_snapshot_path(store_path)
     error_type: str | None = None
     try:
-        source_uri = f"file:{Path(store_path).expanduser().resolve().as_posix()}?mode=ro"
-        source = sqlite3.connect(source_uri, uri=True, timeout=5.0)
-        destination = sqlite3.connect(snapshot, timeout=5.0)
-        try:
-            source.execute("PRAGMA query_only=ON")
-            source.execute("PRAGMA busy_timeout=5000")
-            source.backup(destination, pages=512, sleep=0.01)
-            destination.commit()
-        finally:
-            destination.close()
-            source.close()
+        from types import SimpleNamespace
+        from .certification_snapshot_memory_repair import _bounded_snapshot_store_to_file
+
+        # Use the same pinned, deadline/size/headroom-bounded exporter as the
+        # certifier. A second unguarded full backup here can fill the runtime's
+        # cgroup with source and destination page cache before proof work starts.
+        _bounded_snapshot_store_to_file(SimpleNamespace(path=Path(store_path)), snapshot)
 
         proof = _ORIGINAL_PROOF_REFRESH(str(snapshot), store_factory=store_factory)
         proof = dict(proof) if isinstance(proof, dict) else {"available": False}

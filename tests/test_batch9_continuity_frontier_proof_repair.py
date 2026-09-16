@@ -48,6 +48,8 @@ def test_batch9_does_not_expand_continuity_lease_or_recovery_bound() -> None:
 
 
 def test_robinhood_proof_refresh_writes_only_disposable_snapshot(monkeypatch, tmp_path: Path) -> None:
+    from solana_roi import certification_snapshot_memory_repair as bounded
+    monkeypatch.setattr(bounded, "_raw_cgroup_sample", lambda: {"current": 0, "maximum": 2 * 1024**3})
     live_path = tmp_path / "robinhood.sqlite3"
     db = sqlite3.connect(live_path)
     db.execute("PRAGMA journal_mode=WAL")
