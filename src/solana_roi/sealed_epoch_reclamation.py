@@ -18,7 +18,7 @@ from .active_storage_epoch_rollover import (
 from .storage_current_state_extractor import LegacyCurrentStateExtractor
 from .storage_file_retention import assert_persistent_file_registered, file_contract_for
 from .storage_retention import RetentionClass
-from .storage_transition import load_verified_checkpoint
+from .storage_transition import load_verified_checkpoint_shape as load_verified_checkpoint
 
 RECLAMATION_RECEIPT_DATASET = "sealed_epoch_reclamation_receipt"
 RECLAMATION_RECEIPT_SUFFIX = ".sealed-epoch-reclamation.json"
@@ -325,6 +325,9 @@ def preflight_sealed_epoch_reclamation(
     }
     while child_path is not None and remaining:
         try:
+            # The preceding checkpoint is no longer needed after its predecessor
+            # was selected. Do not retain even its shape while loading the next.
+            child_checkpoint = None
             child_checkpoint = load_verified_checkpoint(child_path)
             child_provenance = child_checkpoint.get("provenance")
             if not isinstance(child_provenance, dict):

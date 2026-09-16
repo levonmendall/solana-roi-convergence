@@ -200,9 +200,7 @@ def _validate_legacy_checkpoint_shape(payload: Mapping[str, Any]) -> None:
         raise RuntimeError("active checkpoint semantic hash mismatch")
 
 
-def _validate_compact_checkpoint_shape(
-    payload: Mapping[str, Any], *, logical_truth: Mapping[str, Any]
-) -> None:
+def _validate_compact_checkpoint_metadata(payload: Mapping[str, Any]) -> None:
     missing = sorted(_COMPACT_REQUIRED_CHECKPOINT_FIELDS - set(payload))
     if missing:
         raise RuntimeError("active checkpoint missing required fields: " + ", ".join(missing))
@@ -214,6 +212,13 @@ def _validate_compact_checkpoint_shape(
     section_hashes = payload.get("section_hashes")
     if not isinstance(section_hashes, Mapping):
         raise RuntimeError("active checkpoint section hashes missing")
+
+
+def _validate_compact_checkpoint_shape(
+    payload: Mapping[str, Any], *, logical_truth: Mapping[str, Any]
+) -> None:
+    _validate_compact_checkpoint_metadata(payload)
+    section_hashes = payload["section_hashes"]
     for section in _SEMANTIC_SECTIONS:
         if section not in logical_truth:
             raise RuntimeError(f"active checkpoint semantic section missing: {section}")
@@ -344,6 +349,85 @@ def load_verified_checkpoint(
         if not _normal_active_release_rollforward(expected_release_sha):
             raise RuntimeError("active checkpoint release SHA does not match running release")
     return materialized
+
+
+def load_verified_checkpoint_shape(
+    path: Path | str, *, expected_release_sha: str | None = None
+) -> dict[str, Any]:
+    """Verify the complete checkpoint but retain only metadata and dict shape.
+
+    Reclamation needs the exact original field projection plus its sealed hashes,
+    not arrays/scalar values from every active and predecessor checkpoint at once.
+    Each compact section is validated and hashed in bounded chunks, including the
+    original *combined* canonical semantic hash (not a replacement hash-of-hashes).
+    All reads use one pinned read-only transaction. Legacy embedded checkpoints
+    retain their established validation semantics. Normal runtime restoration
+    continues to use load_verified_checkpoint() and its unchanged full values.
+    """
+    from .checkpoint_payload_stream import dictionary_shape, verify_section_shape
+
+    active_path = Path(path)
+    if not active_path.is_file():
+        raise RuntimeError(f"active storage unavailable: {active_path}")
+    uri = f"file:{active_path.resolve()}?mode=ro&cache=private"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA cache_size=-2048")
+            conn.execute("PRAGMA mmap_size=0")
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT payload_json,payload_hash,semantic_hash,schema_version,migration_version,release_sha "
+                "FROM checkpoint_current WHERE verified=1 ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("active storage has no verified continuation checkpoint")
+            body = str(row[0])
+            if hashlib.sha256(body.encode("utf-8")).hexdigest() != str(row[1]):
+                raise RuntimeError("active checkpoint payload hash mismatch")
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise RuntimeError("active checkpoint has invalid shape")
+            if int(payload.get("schema_version", -1)) != ACTIVE_SCHEMA_VERSION:
+                raise RuntimeError("active checkpoint storage schema version mismatch")
+            migration_version = int(payload.get("migration_version", -1))
+            if migration_version == TRANSITION_MIGRATION_VERSION:
+                _validate_compact_checkpoint_metadata(payload)
+                verified = dict(payload)
+                combined = hashlib.sha256()
+                combined.update(b"{")
+                for index, section in enumerate(sorted(_SEMANTIC_SECTIONS)):
+                    if index:
+                        combined.update(b",")
+                    combined.update(canonical_json(section).encode("utf-8") + b":")
+                    table, key_column, key = _ACTIVE_SECTION_ROWS[section]
+                    shape, combined = verify_section_shape(
+                        conn, table, key_column, key, section,
+                        payload["section_hashes"].get(section, ""), combined,
+                    )
+                    verified[section] = shape
+                combined.update(b"}")
+                observed_semantic_hash = combined.hexdigest()
+                if observed_semantic_hash != str(payload.get("semantic_hash") or ""):
+                    raise RuntimeError("active checkpoint semantic hash mismatch")
+            else:
+                _validate_checkpoint_shape(payload)
+                observed_semantic_hash = semantic_hash(payload)
+                verified = dict(payload)
+                for section in _SEMANTIC_SECTIONS:
+                    verified[section] = dictionary_shape(payload[section])
+    except sqlite3.Error as exc:
+        raise RuntimeError("active storage checkpoint unreadable") from exc
+    if observed_semantic_hash != str(row[2]):
+        raise RuntimeError("active checkpoint stored semantic hash mismatch")
+    if int(row[3]) != ACTIVE_SCHEMA_VERSION or int(row[4]) != migration_version:
+        raise RuntimeError("active checkpoint persisted version mismatch")
+    if str(row[5]) != str(payload["release_sha"]):
+        raise RuntimeError("active checkpoint release metadata mismatch")
+    if expected_release_sha is not None and str(payload["release_sha"]) != str(expected_release_sha):
+        if not _normal_active_release_rollforward(expected_release_sha):
+            raise RuntimeError("active checkpoint release SHA does not match running release")
+    return verified
 
 
 def active_storage_enabled() -> bool:
