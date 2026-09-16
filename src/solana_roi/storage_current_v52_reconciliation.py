@@ -49,7 +49,20 @@ CURRENT_V52_CONTRACTS = (
     # These are live decision dependencies, not rebuildable diagnostics. Keep
     # their exact rows in the semantic seal; exceeding the extraction bound
     # blocks rollover rather than silently forgetting invalid releases or
-    # immutable challenger evidence. No age-based deletion is authorized here.
+    # immutable challenger/candidate evidence. No age-based deletion is
+    # authorized here.
+    _c(
+        "candidate_execution_plane_snapshots",
+        "candidate-execution-evidence",
+        R.STRATEGY_EVIDENCE,
+        "Point-in-time candidate decision, risk readiness, timing and failure attribution",
+        "candidate execution evidence/certification diagnostics",
+        rows=100_000,
+        bytes_=134_217_728,
+        prune="retain until candidate attribution dependency and reconstruction proof permits removal",
+        startup=True,
+        certification=True,
+    ),
     _c(
         "v51_release_compatibility",
         "measurement-integrity",

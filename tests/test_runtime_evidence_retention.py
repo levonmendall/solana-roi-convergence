@@ -11,7 +11,7 @@ from solana_roi.storage_transition import load_verified_checkpoint, semantic_has
 from test_storage_active_transition_v2 import _make_legacy
 
 
-TABLES = ("v51_release_compatibility", "v52_tournament_exact_evidence")
+TABLES = ("v51_release_compatibility", "v52_tournament_exact_evidence", "candidate_execution_plane_snapshots")
 
 
 def _seed(path):
@@ -23,9 +23,12 @@ def _seed(path):
             "CREATE TABLE v52_tournament_exact_evidence("
             "challenger_id TEXT,stream_id TEXT,evidence_ref TEXT,observed_at TEXT,"
             "PRIMARY KEY(challenger_id,stream_id));"
+            "CREATE TABLE candidate_execution_plane_snapshots("
+            "signature TEXT PRIMARY KEY,decision TEXT,completed_at TEXT);"
         )
         conn.execute("INSERT INTO v51_release_compatibility VALUES('old-release','invalid-epoch',0)")
         conn.execute("INSERT INTO v52_tournament_exact_evidence VALUES('challenger','stream','immutable-ref','2000-01-01')")
+        conn.execute("INSERT INTO candidate_execution_plane_snapshots VALUES('signature','reject','2000-01-01')")
 
 
 def test_runtime_evidence_admitted_without_admitting_unknown_tables(tmp_path):
