@@ -27,6 +27,9 @@ SECTION_TABLES: dict[str, tuple[tuple[str,int],...]] = {
         ("strategy_controls", 256),
         ("v52_lane_gate_state", 128),
         ("v52_wallet_forward_validation", 256),
+        ("v51_release_compatibility", 4096),
+        ("v52_tournament_exact_evidence", 100_000),
+        ("candidate_execution_plane_snapshots", 100_000),
     ),
     "wallet": (
         ("wallet_profiles", 250_000),

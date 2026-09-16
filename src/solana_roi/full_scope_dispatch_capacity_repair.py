@@ -274,10 +274,9 @@ def _persist_full_scope_batch(self: Any, items: list[Any]) -> int:
         journal._receipt_inserts = new_count
         if new_count // 500 > old_count // 500:
             newest = max(row["received_at"] for row in parsed)
-            self.store.db.execute(
-                "DELETE FROM direct_solana_recent_receipts WHERE expires_at<?",
-                (newest.isoformat(),),
-            )
+            from .raw_receipt_retention import prune_recent_receipts
+
+            prune_recent_receipts(self.store.db, now=newest)
 
     setattr(
         self,

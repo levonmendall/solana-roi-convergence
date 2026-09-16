@@ -175,7 +175,7 @@ def test_runtime_executor_requires_same_release_establishment(tmp_path, monkeypa
     monkeypatch.setattr(runtime.disk_ownership, "same_release_established", lambda _path: False)
     lease = SimpleNamespace(handle=object(), database_path=active, release_commit=RELEASE_SHA)
 
-    with pytest.raises(runtime.cleanup.CleanupBlocked, match="exact release SHA"):
+    with pytest.raises(runtime.cleanup.CleanupBlocked, match="prior full-runtime establishment marker"):
         runtime.execute_enabled(active, lease)
 
     assert active.exists()

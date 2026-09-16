@@ -196,8 +196,10 @@ class ActiveObservationEventStore(ObservationEventStore):
         prune_active_compatibility_database(self.path)
         storage.prune_expired_diagnostics()
         storage.prune_acknowledged_transport()
-        storage.checkpoint_wal()
         storage.reclaim_free_pages()
+        # Vacuum writes must be checkpointed after reclamation; checkpointing
+        # first leaves the truncation frames in WAL until a later cycle.
+        storage.checkpoint_wal()
         storage.assert_positive_schema()
         if storage.warning_boundary_exceeded():
             self._request_quiescent_rollover(reason="warning_boundary_exceeded_after_prune")

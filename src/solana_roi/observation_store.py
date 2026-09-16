@@ -84,23 +84,9 @@ class ObservationEventStore(AppendOnlyEventStore):
                     raw,
                 ),
             )
-        self.append(
-            "risk_refresh_measurement",
-            completed_at,
-            {
-                "token_mint": token_mint,
-                "trigger_observed_at": trigger_observed_at,
-                "trigger_received_at": trigger_received_at,
-                "started_at": started_at,
-                "completed_at": completed_at,
-                "elapsed_ms": elapsed_ms,
-                "ingestion_latency_ms": ingestion_latency_ms,
-                "end_to_end_ms": end_to_end_ms,
-                "complete": complete,
-                "fresh": fresh,
-                "readiness": readiness,
-            },
-        )
+        # The specialized row is the canonical, indexed diagnostic consumed by
+        # readiness/certification. Mirroring the same payload into the generic
+        # hash ledger doubles variable-size persistence without adding a reader.
 
     def recent_risk_refreshes(self, limit: int = 500) -> list[dict[str, Any]]:
         with self._lock:
@@ -153,19 +139,8 @@ class ObservationEventStore(AppendOnlyEventStore):
                     1 if early_buyers_complete else 0,
                 ),
             )
-        self.append(
-            "program_coverage_observation",
-            assessed_at,
-            {
-                "token_mint": token_mint,
-                "pair_created_at": pair_created_at,
-                "launch_lag_ms": launch_lag_ms,
-                "launch_near_creation": launch_near_creation,
-                "early_buy_count": early_buy_count,
-                "early_buyer_count": early_buyer_count,
-                "early_buyers_complete": early_buyers_complete,
-            },
-        )
+        # This is bounded current state (one row per mint). Consumers query this
+        # table directly; a second append-only representation is unnecessary.
 
     def mark_program_coverage_funding_complete(self, token_mint: str, *, assessed_at: str) -> None:
         with self._lock, self.db:
@@ -173,11 +148,8 @@ class ObservationEventStore(AppendOnlyEventStore):
                 "UPDATE program_coverage_observations SET funding_complete=1, assessed_at=? WHERE token_mint=?",
                 (assessed_at, token_mint),
             )
-        self.append(
-            "program_coverage_funding_complete",
-            assessed_at,
-            {"token_mint": token_mint, "funding_complete": True},
-        )
+        # Funding completion is represented by the same singleton row and is
+        # preserved by transition extraction for every active subject.
 
     def recent_program_coverage(self, limit: int = 500) -> list[dict[str, Any]]:
         with self._lock:

@@ -65,9 +65,9 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy(
         "direct_solana_recent_receipts",
         "time_window",
-        "pending exact recovery-horizon proof",
-        "policy_only",
-        "Receipt history may be bounded only after recovery and reconciliation dependencies are proven.",
+        "durably completed hydration plus canonical normalization/wallet cursor, or consumed raw cursor, and 120s; unresolved gap protected",
+        "writer_and_maintenance",
+        "Time is only a safety floor. Queue completion and canonical consumer cursors acknowledge normalized or negative hydration outcomes.",
     ),
     RetentionPolicy(
         "direct_solana_minute_receipts",

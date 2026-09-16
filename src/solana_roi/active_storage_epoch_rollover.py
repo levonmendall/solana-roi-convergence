@@ -18,6 +18,7 @@ ROLLOVER_MARKER_SUFFIX = ".rollover-requested"
 SEALED_EPOCH_DIR = "active-epochs"
 ROLLOVER_MARKER_DATASET = "active_rollover_request"
 SEALED_EPOCH_DATASET = "sealed_active_epoch"
+MAX_UNRECLAIMED_SEALED_EPOCHS = 2
 
 
 def _utc_stamp() -> str:
@@ -101,6 +102,65 @@ def _remove_successor_family(path: Path) -> None:
             candidate.unlink()
 
 
+def sealed_epoch_physical_inventory(active_path: Path | str) -> dict[str, Any]:
+    """Count retained physical inodes once, even if a path is hard-linked."""
+    active = Path(active_path)
+    root = active.parent / SEALED_EPOCH_DIR
+    paths = tuple(sorted(root.glob(f"sealed-*/{active.name}"))) if root.is_dir() else ()
+    identities: set[tuple[int, int]] = set()
+    allocated = 0
+    logical = 0
+    blockers: list[str] = []
+    for path in paths:
+        if path.is_symlink():
+            blockers.append(f"sealed_epoch_symlink:{path}")
+            continue
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            blockers.append(f"sealed_epoch_unreadable:{path}:{type(exc).__name__}")
+            continue
+        identity = (int(stat.st_dev), int(stat.st_ino))
+        if identity in identities:
+            continue
+        identities.add(identity)
+        logical += int(stat.st_size)
+        allocated += int(getattr(stat, "st_blocks", 0)) * 512
+    return {
+        "path_count": len(paths),
+        "physical_inode_count": len(identities),
+        "logical_bytes": logical,
+        "allocated_bytes": allocated,
+        "blockers": blockers,
+    }
+
+
+def _enforce_sealed_epoch_bound(active_path: Path) -> dict[str, Any]:
+    inventory = sealed_epoch_physical_inventory(active_path)
+    if inventory["blockers"]:
+        raise RuntimeError(
+            "active epoch rollover blocked: sealed epoch inventory uncertain:"
+            + ",".join(inventory["blockers"])
+        )
+    if int(inventory["physical_inode_count"]) >= MAX_UNRECLAIMED_SEALED_EPOCHS:
+        raise RuntimeError(
+            "active epoch rollover blocked: unreclaimed sealed epoch bound reached:"
+            f"count={inventory['physical_inode_count']}:"
+            f"max={MAX_UNRECLAIMED_SEALED_EPOCHS}:"
+            f"allocated_bytes={inventory['allocated_bytes']}"
+        )
+    return inventory
+
+
+def _disk_usage_payload(path: Path, *, prefix: str) -> dict[str, int]:
+    usage = shutil.disk_usage(path.parent)
+    return {
+        f"{prefix}_disk_total_bytes": int(usage.total),
+        f"{prefix}_disk_used_bytes": int(usage.used),
+        f"{prefix}_disk_free_bytes": int(usage.free),
+    }
+
+
 def _rollover_headroom(path: Path, budget: ActiveStorageBudget) -> dict[str, int]:
     """Fail closed unless a bounded shadow build has safe temporary disk headroom.
 
@@ -118,9 +178,12 @@ def _rollover_headroom(path: Path, budget: ActiveStorageBudget) -> dict[str, int
             f"free={free}:required={required}:hard_bytes={int(budget.hard_bytes)}"
         )
     return {
-        "disk_total_bytes": int(usage.total),
-        "disk_used_bytes": int(usage.used),
-        "disk_free_bytes": free,
+        # These values are sampled before the successor exists. Prefix them so
+        # operators cannot mistake the admission measurement for post-rollover
+        # free space after another predecessor has been retained.
+        "prebuild_disk_total_bytes": int(usage.total),
+        "prebuild_disk_used_bytes": int(usage.used),
+        "prebuild_disk_free_bytes": free,
         "required_rollover_free_bytes": required,
     }
 
@@ -225,6 +288,11 @@ def rollover_active_epoch_if_needed(
     if not active.is_file():
         raise RuntimeError(f"active epoch rollover blocked: requested database missing:{active}")
 
+    # Never turn a failed/disabled reclamation path into unbounded successor
+    # generation. Two physical predecessors allow one rollback boundary plus one
+    # operator-approved reclamation window; further rollover fails closed.
+    sealed_inventory = _enforce_sealed_epoch_bound(active)
+
     # Refuse the build before checkpointing or creating any temporary successor
     # when the persistent filesystem cannot safely hold the bounded replacement.
     headroom = _rollover_headroom(active, configured)
@@ -236,6 +304,8 @@ def rollover_active_epoch_if_needed(
 
     token = uuid.uuid4().hex
     successor = active.with_name(f".{active.name}.epoch-next-{token}")
+    sealed_main: Path | None = None
+    swapped = False
     try:
         report = _build_shadow_database_for_rollover(
             source=active,
@@ -291,12 +361,29 @@ def rollover_active_epoch_if_needed(
         _remove_zero_sidecars(active)
         _remove_zero_sidecars(successor)
         os.replace(successor, active)
+        swapped = True
         _fsync_dir(active.parent)
     except Exception:
         # A failed build or pre-swap verification must not consume the remaining
         # persistent disk with an orphaned temporary database/WAL. This never
         # removes the canonical active source or the sealed rollback hard link.
         _remove_successor_family(successor)
+        # If the swap did not occur, the just-created sealed path is only a
+        # second name for the still-canonical active inode. Remove that exact
+        # alias so an interrupted pre-swap attempt cannot consume the bounded
+        # predecessor allowance forever. Never unlink a distinct inode here.
+        if not swapped and sealed_main is not None and sealed_main.exists():
+            try:
+                active_stat = active.stat()
+                sealed_stat = sealed_main.stat()
+                if (active_stat.st_dev, active_stat.st_ino) == (
+                    sealed_stat.st_dev,
+                    sealed_stat.st_ino,
+                ):
+                    sealed_main.unlink()
+                    _fsync_dir(sealed_main.parent)
+            except OSError:
+                pass
         raise
 
     # Re-open only the compact canonical successor and prove its checkpoint after
@@ -306,6 +393,8 @@ def rollover_active_epoch_if_needed(
     post_storage.enforce_hard_budget()
     checkpoint = load_verified_checkpoint(active, expected_release_sha=release_sha)
     after = post_storage.storage_bytes()
+    postrollover_disk = _disk_usage_payload(active, prefix="postrollover")
+    sealed_inventory_after = sealed_epoch_physical_inventory(active)
     if marker.exists():
         marker.unlink()
         _fsync_dir(marker.parent)
@@ -322,9 +411,17 @@ def rollover_active_epoch_if_needed(
         "warning_bytes": configured.warning_bytes,
         "hard_bytes": configured.hard_bytes,
         **headroom,
+        **postrollover_disk,
+        "disk_measurement_timing": {
+            "prebuild": "before_successor_construction",
+            "postrollover": "after_swap_and_checkpoint_verification",
+        },
         "sealed_source_path": str(sealed_main),
         "sealed_source_retention_dataset": SEALED_EPOCH_DATASET,
         "sealed_source_deleted": False,
+        "sealed_epoch_inventory_before": sealed_inventory,
+        "sealed_epoch_inventory_after": sealed_inventory_after,
+        "sealed_epoch_bound": MAX_UNRECLAIMED_SEALED_EPOCHS,
         "checkpoint_id": checkpoint.get("checkpoint_id"),
         "semantic_hash": report.semantic_hash,
         "equivalent": True,
@@ -347,4 +444,5 @@ __all__ = [
     "request_rollover",
     "rollover_active_epoch_if_needed",
     "rollover_marker",
+    "sealed_epoch_physical_inventory",
 ]

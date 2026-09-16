@@ -167,11 +167,21 @@ def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
             ).fetchone()
             queue_cursor = int(cursor_row[0]) if cursor_row is not None else 0
             metric_cursor = int(cursor_row[1]) if cursor_row is not None else 0
+            receipt_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='direct_solana_recent_receipts' LIMIT 1"
+            ).fetchone()
+            queue_receipt_guard = (
+                "AND NOT EXISTS (SELECT 1 FROM direct_solana_recent_receipts r "
+                "WHERE r.signature=direct_solana_hydration_queue.signature) "
+                if receipt_table is not None
+                else ""
+            )
 
             queue_scan_rows = connection.execute(
                 "SELECT rowid, status, updated_at "
                 "FROM direct_solana_hydration_queue WHERE rowid>? "
-                "ORDER BY rowid LIMIT ?",
+                f"{queue_receipt_guard}ORDER BY rowid LIMIT ?",
                 (queue_cursor, storage_capacity.MAINTENANCE_BATCH_ROWS),
             ).fetchall()
             eligible_queue_rowids = [
@@ -192,10 +202,16 @@ def _prune_operational_rows_once_isolated(self: Any) -> tuple[int, int]:
                 else 0
             )
 
+            metric_receipt_guard = (
+                "AND NOT EXISTS (SELECT 1 FROM direct_solana_recent_receipts r "
+                "WHERE r.signature=direct_solana_hydration_metrics.signature) "
+                if receipt_table is not None
+                else ""
+            )
             metric_scan_rows = connection.execute(
                 "SELECT rowid, hydrated_at, historical_recovery "
                 "FROM direct_solana_hydration_metrics WHERE rowid>? "
-                "ORDER BY rowid LIMIT ?",
+                f"{metric_receipt_guard}ORDER BY rowid LIMIT ?",
                 (metric_cursor, storage_capacity.MAINTENANCE_BATCH_ROWS),
             ).fetchall()
             eligible_metric_rowids = [
@@ -425,8 +441,9 @@ def status() -> dict[str, Any]:
         "startup_forced_wal_checkpoint": False,
         "checkpoint_on_backlog_drain_complete": False,
         "wal_checkpoint_interval_seconds": storage_capacity.WAL_CHECKPOINT_INTERVAL_SECONDS,
-        "queue_deletion_predicate_changed": False,
-        "metric_deletion_predicate_changed": False,
+        "queue_deletion_predicate_changed": True,
+        "metric_deletion_predicate_changed": True,
+        "raw_receipt_acknowledgement_dependencies_protected": True,
         "canonical_store_python_lock_acquired_by_retention_prune": False,
         "canonical_store_python_lock_acquired_by_wal_checkpoint": False,
         "canonical_evidence_pruned": CANONICAL_EVIDENCE_PRUNED,

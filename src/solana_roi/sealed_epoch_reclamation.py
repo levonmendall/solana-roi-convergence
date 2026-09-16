@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,16 @@ from .storage_transition import load_verified_checkpoint
 RECLAMATION_RECEIPT_DATASET = "sealed_epoch_reclamation_receipt"
 RECLAMATION_RECEIPT_SUFFIX = ".sealed-epoch-reclamation.json"
 RECLAMATION_PROTOCOL_VERSION = "sealed-epoch-reclamation-v1"
+LATE_REGISTERED_EVIDENCE_TABLES = (
+    "candidate_execution_plane_snapshots",
+    "v51_release_compatibility",
+    "v52_tournament_exact_evidence",
+)
+_SEMANTIC_SECTION_NAMES = {
+    "strategy", "wallet", "wallet_evidence_watermarks", "provider_source",
+    "freshness", "latest_event_ids", "active_candidates", "active_lifecycles",
+    "portfolio", "replication_watermarks", "certification", "continuity",
+}
 
 
 class SealedEpochReclamationBlocked(RuntimeError):
@@ -58,6 +69,86 @@ def _sealed_candidates(active_path: Path) -> tuple[Path, ...]:
     if not root.is_dir():
         return ()
     return tuple(sorted(root.glob(f"sealed-*/{active_path.name}")))
+
+
+def _project_to_checkpoint_shape(observed: Any, expected: Any) -> Any:
+    """Ignore fields unknown to an older receipt without ignoring known fields."""
+    if isinstance(expected, dict) and isinstance(observed, dict):
+        return {
+            key: _project_to_checkpoint_shape(observed.get(key), value)
+            for key, value in expected.items()
+        }
+    return observed
+
+
+def _late_evidence_coverage(active: Path, candidate: Path) -> dict[str, Any]:
+    """Prove evidence registered after old receipts is already in the survivor."""
+    result: dict[str, Any] = {"covered": True, "tables": {}, "blockers": []}
+    try:
+        active_conn = sqlite3.connect(f"file:{active.resolve()}?mode=ro", uri=True)
+        candidate_conn = sqlite3.connect(f"file:{candidate.resolve()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return {
+            "covered": False,
+            "tables": {},
+            "blockers": [f"late_evidence_database_unreadable:{type(exc).__name__}"],
+        }
+    try:
+        active_tables = {
+            str(row[0]) for row in active_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        candidate_tables = {
+            str(row[0]) for row in candidate_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for table in LATE_REGISTERED_EVIDENCE_TABLES:
+            if table not in candidate_tables:
+                result["tables"][table] = {"candidate_rows": 0, "covered_rows": 0}
+                continue
+            candidate_count = int(candidate_conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            if not candidate_count:
+                result["tables"][table] = {"candidate_rows": 0, "covered_rows": 0}
+                continue
+            if table not in active_tables:
+                result["covered"] = False
+                result["blockers"].append(f"late_evidence_missing_table:{table}")
+                continue
+            source_info = candidate_conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            active_info = active_conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            source_columns = [str(row[1]) for row in source_info]
+            if source_columns != [str(row[1]) for row in active_info]:
+                result["covered"] = False
+                result["blockers"].append(f"late_evidence_schema_mismatch:{table}")
+                continue
+            primary = [str(row[1]) for row in sorted(source_info, key=lambda row: int(row[5])) if int(row[5])]
+            if not primary:
+                result["covered"] = False
+                result["blockers"].append(f"late_evidence_primary_key_missing:{table}")
+                continue
+            where = " AND ".join(f'"{column}"=?' for column in primary)
+            primary_indexes = [source_columns.index(column) for column in primary]
+            covered = 0
+            cursor = candidate_conn.execute(f'SELECT * FROM "{table}"')
+            for source_row in cursor:
+                key = tuple(source_row[index] for index in primary_indexes)
+                surviving = active_conn.execute(
+                    f'SELECT * FROM "{table}" WHERE {where}', key
+                ).fetchone()
+                if surviving is None or tuple(surviving) != tuple(source_row):
+                    result["covered"] = False
+                    result["blockers"].append(f"late_evidence_row_missing_or_changed:{table}")
+                    break
+                covered += 1
+            result["tables"][table] = {
+                "candidate_rows": candidate_count,
+                "covered_rows": covered,
+            }
+    except sqlite3.Error as exc:
+        result["covered"] = False
+        result["blockers"].append(f"late_evidence_check_failed:{type(exc).__name__}")
+    finally:
+        active_conn.close()
+        candidate_conn.close()
+    return result
 
 
 def _candidate_proof(
@@ -102,7 +193,17 @@ def _candidate_proof(
     source_release = _source_certification_release_commit(resolved)
     with _source_release_environment(source_release):
         extraction = LegacyCurrentStateExtractor(resolved).extract()
-    observed_semantic_hash = payload_hash(extraction.truth)
+    expected_truth = {
+        key: checkpoint.get(key)
+        for key in _SEMANTIC_SECTION_NAMES
+        if key in checkpoint
+    }
+    observed_truth = (
+        _project_to_checkpoint_shape(extraction.truth, expected_truth)
+        if expected_truth
+        else extraction.truth
+    )
+    observed_semantic_hash = payload_hash(observed_truth)
     expected_semantic_hash = str(checkpoint.get("semantic_hash") or "")
     if int(extraction.source_size_bytes) != int(expected_source_size):
         return {"path": str(candidate), "eligible": False, "blocker": "extracted_source_size_mismatch"}
@@ -197,6 +298,87 @@ def preflight_sealed_epoch_reclamation(
         blockers.append("multiple_exact_sealed_predecessor_matches")
 
     reclaimable = len(eligible) == 1 and not blockers
+    eligible_chain: list[dict[str, Any]] = []
+    protected_blockers: list[str] = []
+    if reclaimable:
+        selected = dict(eligible[0])
+        if any(section in checkpoint for section in _SEMANTIC_SECTION_NAMES):
+            coverage = _late_evidence_coverage(active, Path(str(selected["path"])))
+            selected["late_registered_evidence"] = coverage
+            if not bool(coverage.get("covered")):
+                protected_blockers.extend(str(value) for value in coverage.get("blockers") or ())
+            else:
+                eligible_chain.append(selected)
+        else:
+            # Small isolated tests and legacy-v2 embedded checkpoints already
+            # bind their complete truth directly; there is no late table surface.
+            eligible_chain.append(selected)
+
+    remaining = {
+        str(candidate.resolve()): candidate
+        for candidate in candidates
+        if not eligible_chain or candidate.resolve() != Path(str(eligible_chain[0]["path"])).resolve()
+    }
+    child_path = Path(str(eligible_chain[0]["path"])) if eligible_chain else None
+    seen_identities = {
+        (int(item.get("device", -1)), int(item.get("inode", -1))) for item in eligible_chain
+    }
+    while child_path is not None and remaining:
+        try:
+            child_checkpoint = load_verified_checkpoint(child_path)
+            child_provenance = child_checkpoint.get("provenance")
+            if not isinstance(child_provenance, dict):
+                raise SealedEpochReclamationBlocked("sealed child checkpoint provenance missing")
+            if Path(str(child_provenance.get("legacy_path") or "")).resolve(strict=False) != active.resolve():
+                raise SealedEpochReclamationBlocked("sealed child predecessor path is not canonical")
+            child_size = int(child_provenance["legacy_size_bytes"])
+            child_fingerprint = str(child_provenance.get("legacy_schema_fingerprint") or "")
+            if child_size <= 0 or not child_fingerprint:
+                raise SealedEpochReclamationBlocked("sealed child predecessor provenance incomplete")
+        except Exception as exc:
+            protected_blockers.append(f"sealed_chain_checkpoint_unusable:{type(exc).__name__}:{exc}")
+            break
+
+        matches: list[dict[str, Any]] = []
+        for key, candidate in tuple(remaining.items()):
+            try:
+                candidate_proof = _candidate_proof(
+                    candidate,
+                    active_path=active,
+                    checkpoint=child_checkpoint,
+                    expected_source_size=child_size,
+                    expected_schema_fingerprint=child_fingerprint,
+                )
+            except Exception as exc:
+                candidate_proof = {
+                    "path": str(candidate),
+                    "eligible": False,
+                    "blocker": f"candidate_preflight_error:{type(exc).__name__}:{exc}",
+                }
+            if bool(candidate_proof.get("eligible")):
+                matches.append(candidate_proof)
+        if len(matches) != 1:
+            protected_blockers.append(
+                "sealed_chain_ambiguous" if len(matches) > 1 else "sealed_chain_predecessor_unproven"
+            )
+            break
+        selected = dict(matches[0])
+        identity = (int(selected.get("device", -1)), int(selected.get("inode", -1)))
+        if identity in seen_identities:
+            protected_blockers.append("sealed_chain_identity_cycle")
+            break
+        coverage = _late_evidence_coverage(active, Path(str(selected["path"])))
+        selected["late_registered_evidence"] = coverage
+        if not bool(coverage.get("covered")):
+            protected_blockers.extend(str(value) for value in coverage.get("blockers") or ())
+            break
+        eligible_chain.append(selected)
+        seen_identities.add(identity)
+        remaining.pop(str(Path(str(selected["path"])).resolve()), None)
+        child_path = Path(str(selected["path"]))
+
+    reclaimable = bool(eligible_chain) and not blockers
+    reclaimable_allocated = sum(int(item.get("allocated_bytes") or 0) for item in eligible_chain)
     return {
         "status": "reclaimable" if reclaimable else "blocked",
         "reclaimable": reclaimable,
@@ -210,7 +392,11 @@ def preflight_sealed_epoch_reclamation(
         "certification_dependency": bool(contract.certification_access),
         "candidate_count": len(candidates),
         "eligible_candidate_count": len(eligible),
-        "eligible_candidate": eligible[0] if len(eligible) == 1 else None,
+        "eligible_candidate": eligible_chain[0] if eligible_chain else None,
+        "eligible_candidates": eligible_chain,
+        "eligible_physical_bytes": reclaimable_allocated,
+        "protected_candidate_count": max(0, len(candidates) - len(eligible_chain)),
+        "protected_candidate_blockers": protected_blockers,
         "candidate_proofs": proofs,
         "blockers": blockers,
         "read_only": True,
@@ -271,6 +457,22 @@ def _identity_matches(candidate: Path, proof: dict[str, Any]) -> bool:
     )
 
 
+def _receipt_candidates(receipt: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = receipt.get("candidates")
+    if isinstance(candidates, list) and all(isinstance(item, dict) for item in candidates):
+        return [dict(item) for item in candidates]
+    path = str(receipt.get("candidate_path") or "")
+    if not path:
+        return []
+    return [{
+        "path": path,
+        "device": receipt.get("candidate_device"),
+        "inode": receipt.get("candidate_inode"),
+        "size_bytes": receipt.get("candidate_size_bytes"),
+        "allocated_bytes": receipt.get("candidate_allocated_bytes"),
+    }]
+
+
 def execute_sealed_epoch_reclamation(
     active_path: Path | str,
     *,
@@ -293,65 +495,138 @@ def execute_sealed_epoch_reclamation(
         raise SealedEpochReclamationBlocked("operator approval is not bound to the current verified checkpoint")
 
     receipt = _read_receipt(active)
+    resume_intent: dict[str, Any] | None = None
     if receipt is not None:
         receipt_checkpoint = str(receipt.get("checkpoint_id") or "")
         receipt_status = str(receipt.get("status") or "")
-        candidate_path = Path(str(receipt.get("candidate_path") or ""))
+        receipt_candidates = _receipt_candidates(receipt)
+        present = [Path(str(item.get("path") or "")).exists() for item in receipt_candidates]
         if receipt_checkpoint == checkpoint_id and receipt_status == "complete":
-            if candidate_path.exists():
+            if any(present):
                 raise SealedEpochReclamationBlocked("completed reclamation receipt points to a present predecessor")
             result = dict(receipt)
             result.update({"idempotent_replay": True, "sealed_source_deleted": True})
             return result
-        if receipt_checkpoint == checkpoint_id and receipt_status == "intent" and not candidate_path.exists():
-            verified = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
-            if str(verified.get("checkpoint_id") or "") != checkpoint_id:
-                raise SealedEpochReclamationBlocked("active checkpoint changed while recovering reclamation intent")
-            completed = dict(receipt)
-            completed.update(
-                {
-                    "status": "complete",
-                    "completed_at": _utcnow(),
-                    "recovered_after_interrupted_finalize": True,
-                    "sealed_source_deleted": True,
-                    "paper_only": True,
-                    "live_money_authority": False,
+        if receipt_checkpoint == checkpoint_id and receipt_status == "intent":
+            for item, exists in zip(receipt_candidates, present):
+                candidate = Path(str(item.get("path") or ""))
+                if exists and not _identity_matches(candidate, item):
+                    raise SealedEpochReclamationBlocked(
+                        "sealed predecessor identity changed while recovering reclamation intent"
+                    )
+            if receipt_candidates and not any(present):
+                verified = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
+                if str(verified.get("checkpoint_id") or "") != checkpoint_id:
+                    raise SealedEpochReclamationBlocked("active checkpoint changed while recovering reclamation intent")
+                completed = dict(receipt)
+                free_after = int(shutil.disk_usage(active.parent).free)
+                free_before = receipt.get("filesystem_free_bytes_before")
+                completed.update(
+                    {
+                        "status": "complete",
+                        "completed_at": _utcnow(),
+                        "recovered_after_interrupted_finalize": True,
+                        "sealed_source_deleted": True,
+                        "deleted_candidate_paths": [
+                            str(Path(str(item.get("path") or "")).resolve(strict=False))
+                            for item in receipt_candidates
+                        ],
+                        "deleted_candidate_count": len(receipt_candidates),
+                        "filesystem_free_bytes_after": free_after,
+                        "filesystem_free_bytes_delta": (
+                            free_after - int(free_before)
+                            if free_before is not None
+                            else None
+                        ),
+                        "paper_only": True,
+                        "live_money_authority": False,
+                    }
+                )
+                _write_receipt(active, completed)
+                return completed
+            if any(present):
+                resume_intent = dict(receipt)
+                deleted = {
+                    str(Path(str(value)).resolve(strict=False))
+                    for value in (resume_intent.get("deleted_candidate_paths") or ())
                 }
-            )
-            _write_receipt(active, completed)
-            return completed
+                recovered_missing: list[str] = []
+                for item, exists in zip(receipt_candidates, present):
+                    if exists:
+                        continue
+                    path = str(Path(str(item.get("path") or "")).resolve(strict=False))
+                    deleted.add(path)
+                    recovered_missing.append(path)
+                resume_intent["deleted_candidate_paths"] = sorted(deleted)
+                if recovered_missing:
+                    resume_intent["recovered_missing_candidate_paths"] = recovered_missing
         if receipt_status == "intent" and receipt_checkpoint != checkpoint_id:
             raise SealedEpochReclamationBlocked("unresolved reclamation intent belongs to a different checkpoint")
 
-    proof = preflight_sealed_epoch_reclamation(
-        active,
-        expected_release_sha=expected_release_sha,
-        approved_checkpoint_id=approved_checkpoint_id,
-    )
-    if not bool(proof.get("reclaimable")):
-        raise SealedEpochReclamationBlocked(
-            "sealed predecessor is not exactly reclaimable:" + ",".join(proof.get("blockers") or ())
+    if resume_intent is None:
+        proof = preflight_sealed_epoch_reclamation(
+            active,
+            expected_release_sha=expected_release_sha,
+            approved_checkpoint_id=approved_checkpoint_id,
         )
-    candidate_proof = dict(proof.get("eligible_candidate") or {})
-    candidate = Path(str(candidate_proof.get("path") or ""))
-    if not candidate.is_file() or candidate.is_symlink():
-        raise SealedEpochReclamationBlocked("approved sealed predecessor is no longer a regular file")
-    if not _identity_matches(candidate, candidate_proof):
-        raise SealedEpochReclamationBlocked("approved sealed predecessor identity changed after preflight")
+        if not bool(proof.get("reclaimable")):
+            raise SealedEpochReclamationBlocked(
+                "sealed predecessor is not exactly reclaimable:" + ",".join(proof.get("blockers") or ())
+            )
+        candidate_proofs = [
+            dict(item) for item in (proof.get("eligible_candidates") or ()) if isinstance(item, dict)
+        ]
+        if not candidate_proofs:
+            candidate_proofs = [dict(proof.get("eligible_candidate") or {})]
+    else:
+        candidate_proofs = [
+            item for item in _receipt_candidates(resume_intent)
+            if Path(str(item.get("path") or "")).exists()
+        ]
+    if not candidate_proofs or not candidate_proofs[0].get("path"):
+        raise SealedEpochReclamationBlocked("reclamation proof contains no eligible predecessor")
+    for candidate_proof in candidate_proofs:
+        candidate = Path(str(candidate_proof.get("path") or ""))
+        if not candidate.is_file() or candidate.is_symlink():
+            raise SealedEpochReclamationBlocked("approved sealed predecessor is no longer a regular file")
+        if not _identity_matches(candidate, candidate_proof):
+            raise SealedEpochReclamationBlocked("approved sealed predecessor identity changed after preflight")
 
-    intent = {
+    first = candidate_proofs[0]
+    first_candidate = Path(str(first["path"]))
+
+    initial_free_bytes = int(shutil.disk_usage(active.parent).free)
+    intent = dict(resume_intent) if resume_intent is not None else {
         "status": "intent",
         "created_at": _utcnow(),
         "active_path": str(active.resolve()),
         "checkpoint_id": checkpoint_id,
         "checkpoint_release_sha": str(checkpoint.get("release_sha") or ""),
         "semantic_hash": str(checkpoint.get("semantic_hash") or ""),
-        "candidate_path": str(candidate.resolve()),
-        "candidate_device": int(candidate_proof["device"]),
-        "candidate_inode": int(candidate_proof["inode"]),
-        "candidate_size_bytes": int(candidate_proof["size_bytes"]),
-        "candidate_allocated_bytes": int(candidate_proof.get("allocated_bytes") or 0),
-        "source_release_commit": candidate_proof.get("source_release_commit"),
+        "candidate_path": str(first_candidate.resolve()),
+        "candidate_device": int(first["device"]),
+        "candidate_inode": int(first["inode"]),
+        "candidate_size_bytes": int(first["size_bytes"]),
+        "candidate_allocated_bytes": int(first.get("allocated_bytes") or 0),
+        "source_release_commit": first.get("source_release_commit"),
+        "candidates": [
+            {
+                "path": str(Path(str(item["path"])).resolve()),
+                "device": int(item["device"]),
+                "inode": int(item["inode"]),
+                "size_bytes": int(item["size_bytes"]),
+                "allocated_bytes": int(item.get("allocated_bytes") or 0),
+                "source_release_commit": item.get("source_release_commit"),
+                "semantic_hash": item.get("semantic_hash"),
+            }
+            for item in candidate_proofs
+        ],
+        "candidate_count": len(candidate_proofs),
+        "estimated_reclaimable_physical_bytes": sum(
+            int(item.get("allocated_bytes") or 0) for item in candidate_proofs
+        ),
+        "deleted_candidate_paths": [],
+        "filesystem_free_bytes_before": initial_free_bytes,
         "paper_only": True,
         "live_money_authority": False,
     }
@@ -360,14 +635,27 @@ def execute_sealed_epoch_reclamation(
     verified = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
     if str(verified.get("checkpoint_id") or "") != checkpoint_id:
         raise SealedEpochReclamationBlocked("active checkpoint changed after reclamation intent")
-    if not _identity_matches(candidate, candidate_proof):
-        raise SealedEpochReclamationBlocked("sealed predecessor identity changed after reclamation intent")
+    for candidate_proof in candidate_proofs:
+        candidate = Path(str(candidate_proof["path"]))
+        if not _identity_matches(candidate, candidate_proof):
+            raise SealedEpochReclamationBlocked("sealed predecessor identity changed after reclamation intent")
 
-    free_before = int(shutil.disk_usage(active.parent).free)
-    candidate.unlink()
-    _fsync_dir(candidate.parent)
-    if candidate.exists():
-        raise SealedEpochReclamationBlocked("sealed predecessor remained present after unlink")
+    free_before = int(intent.get("filesystem_free_bytes_before", initial_free_bytes))
+    deleted_paths: list[str] = list(intent.get("deleted_candidate_paths") or ())
+    for candidate_proof in candidate_proofs:
+        candidate = Path(str(candidate_proof["path"]))
+        if not _identity_matches(candidate, candidate_proof):
+            raise SealedEpochReclamationBlocked("sealed predecessor identity changed before unlink")
+        candidate.unlink()
+        _fsync_dir(candidate.parent)
+        if candidate.exists():
+            raise SealedEpochReclamationBlocked("sealed predecessor remained present after unlink")
+        deleted_paths.append(str(candidate.resolve(strict=False)))
+        intent["deleted_candidate_paths"] = list(deleted_paths)
+        _write_receipt(active, intent)
+        verified_during = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
+        if str(verified_during.get("checkpoint_id") or "") != checkpoint_id:
+            raise SealedEpochReclamationBlocked("active checkpoint changed during sealed predecessor unlink")
 
     verified_after = load_verified_checkpoint(active, expected_release_sha=expected_release_sha)
     if str(verified_after.get("checkpoint_id") or "") != checkpoint_id:
@@ -383,6 +671,8 @@ def execute_sealed_epoch_reclamation(
             "filesystem_free_bytes_before": free_before,
             "filesystem_free_bytes_after": free_after,
             "filesystem_free_bytes_delta": free_after - free_before,
+            "deleted_candidate_paths": deleted_paths,
+            "deleted_candidate_count": len(deleted_paths),
             "idempotent_replay": False,
             "sealed_source_deleted": True,
         }

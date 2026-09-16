@@ -341,10 +341,9 @@ def _persist_background_batch(self: Any, items: list[Any]) -> int:
 
             journal._receipt_inserts = int(getattr(journal, "_receipt_inserts", 0) or 0) + 1
             if journal._receipt_inserts % 500 == 0:
-                self.store.db.execute(
-                    "DELETE FROM direct_solana_recent_receipts WHERE expires_at<?",
-                    (received_at.isoformat(),),
-                )
+                from .raw_receipt_retention import prune_recent_receipts
+
+                prune_recent_receipts(self.store.db, now=received_at)
 
         for provider, received_at in provider_last.items():
             self.store.db.execute(
