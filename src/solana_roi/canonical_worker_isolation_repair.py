@@ -169,6 +169,19 @@ async def _isolated_runtime_workers(runtime: Any, stop: asyncio.Event) -> None:
         if not started:
             thread_stop.set()
             await asyncio.to_thread(thread.join, THREAD_JOIN_TIMEOUT_SECONDS)
+            # A timeout does not terminate synchronous SQLite/bootstrap work.
+            # Retain ownership of this generation until its thread exits: a
+            # replacement would otherwise duplicate the entire worker graph on
+            # the same runtime, provider pools and writable SQLite connection.
+            while thread.is_alive() and not stop.is_set():
+                _STATE["state"] = "waiting_for_timed_out_worker_exit"
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=SUPERVISOR_POLL_SECONDS)
+                except asyncio.TimeoutError:
+                    continue
+            if stop.is_set():
+                await _join_worker(thread, thread_stop)
+                return
             _STATE["state"] = "failed_closed_restart_pending"
             try:
                 await asyncio.wait_for(stop.wait(), timeout=RESTART_BACKOFF_SECONDS)
