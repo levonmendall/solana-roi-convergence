@@ -46,6 +46,34 @@ def _c(
 # original storage-transition branch was cut.  They are intentionally explicit:
 # no table is admitted merely because it exists in the legacy database.
 CURRENT_V52_CONTRACTS = (
+    # These are live decision dependencies, not rebuildable diagnostics. Keep
+    # their exact rows in the semantic seal; exceeding the extraction bound
+    # blocks rollover rather than silently forgetting invalid releases or
+    # immutable challenger evidence. No age-based deletion is authorized here.
+    _c(
+        "v51_release_compatibility",
+        "measurement-integrity",
+        R.CURRENT_STATE,
+        "Release measurement and execution compatibility, including known invalid epochs",
+        "measurement compatibility filters/exit execution/promotion proof",
+        rows=4096,
+        bytes_=16_777_216,
+        prune="retain until release-reader dependency and reconstruction proof permits removal",
+        startup=True,
+        certification=True,
+    ),
+    _c(
+        "v52_tournament_exact_evidence",
+        "v5.2-learning-governance",
+        R.STRATEGY_EVIDENCE,
+        "Immutable same-stream challenger evidence identities and conflict detection",
+        "record_exact_challenger_outcome/governed tournament",
+        rows=100_000,
+        bytes_=67_108_864,
+        prune="retain until tournament dependency and reconstruction proof permits removal",
+        startup=True,
+        certification=True,
+    ),
     _c(
         "v52_wallet_forward_runtime_state",
         "wallet-forward-alpha",

@@ -21,6 +21,8 @@ def _iso(value: datetime) -> str:
 def test_current_main_v52_persistence_is_explicitly_classified() -> None:
     names = set(current_v52.registered_dataset_names())
     expected = {
+        "v51_release_compatibility",
+        "v52_tournament_exact_evidence",
         "v52_wallet_forward_runtime_state",
         "v52_wallet_forward_integrity_seen",
         "v52_wallet_forward_shadow_decisions",
