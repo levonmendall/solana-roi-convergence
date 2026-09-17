@@ -21,9 +21,6 @@ from solana_roi.v52_cross_lane_paper_certification_repair import (
 from solana_roi.v52_lane_contract import canonical_lane_for_surface, descriptor
 
 
-ACCEPTANCE_CONTRACT = "continuation-v1"
-
-
 class _Rpc:
     _roi_wallet_research_pool = True
 
@@ -103,6 +100,8 @@ def _build_adapter(monkeypatch, tmp_path):
     install_risk_conditioned_alpha_v5()
     install_v52_authoritative_strategy()
     configure_v52_cross_lane_paper_certification_repair()
+    assert v5._choose_lane_and_fraction.__module__.endswith("v52_authoritative_strategy")
+    assert bool(getattr(v5._choose_lane_and_fraction, "_roi_v52_final_authority", False)) is True
 
     store = ObservationEventStore(tmp_path / "continuation-v1-natural-pump-pumpswap.sqlite3")
     _create_forward_table(store)
@@ -139,8 +138,7 @@ def _build_adapter(monkeypatch, tmp_path):
 def test_continuation_v1_pump_position_naturally_graduates_to_pumpswap_and_settles(
     monkeypatch, tmp_path
 ) -> None:
-    """No graduated flag is injected: the first real-shaped PUMP_AMM event is the graduation evidence."""
-    assert ACCEPTANCE_CONTRACT == "continuation-v1"
+    """Prove one canonical v5.2 Pump position survives natural PumpSwap graduation and settles there."""
     assert STRATEGY_VERSION == "roi-convergence-v5.2-continuation-capture-1"
     assert canonical_lane_for_surface("PUMPSWAP") == "pump_amm"
     pump_swap = descriptor("pump_amm")
@@ -152,12 +150,14 @@ def test_continuation_v1_pump_position_naturally_graduates_to_pumpswap_and_settl
     token = "continuation-v1-natural-graduation-token"
     now = datetime.now(timezone.utc)
 
+    # Match the canonical connected Pump entry window already proven by the existing
+    # v5.2 surface certification. The position is still on Pump.fun at this point.
     entry = _row(
         signature="continuation-v1-entry",
         token=token,
         venue="PUMP_FUN",
         side="buy",
-        at=now - timedelta(seconds=3),
+        at=now - timedelta(seconds=2),
     )
     _record_forward(store, entry)
     asyncio.run(adapter.observe(str(entry["signature"])))
@@ -171,10 +171,17 @@ def test_continuation_v1_pump_position_naturally_graduates_to_pumpswap_and_settl
         ).fetchone()
     assert trial_row is not None
     trial = dict(trial_row)
+    entry_diagnostic = {
+        "decision": trial.get("decision"),
+        "decision_reason": trial.get("decision_reason"),
+        "position_fraction": trial.get("position_fraction"),
+        "venue": trial.get("venue"),
+        "lifecycle": trial.get("lifecycle"),
+    }
     assert trial["strategy_version"] == STRATEGY_VERSION
     assert trial["venue"] == "PUMP_FUN"
     assert trial["lifecycle"] == "pump_bonding_curve"
-    assert str(trial["decision"]).startswith("paper_enter")
+    assert str(trial["decision"]).startswith("paper_enter"), entry_diagnostic
     assert trial["paper_only"] == 1 and trial["live_money_authority"] == 0
     entry_lane = str(trial["lane"])
     entry_fraction = float(trial["position_fraction"])
@@ -185,18 +192,18 @@ def test_continuation_v1_pump_position_naturally_graduates_to_pumpswap_and_settl
     assert opened["active_reserved_fraction"] == pytest.approx(entry_fraction)
     assert opened["settlement_count"] == 0
 
-    # The position begins on the Pump bonding curve. Its first PumpSwap/PUMP_AMM
-    # market observation is a normal source row, not a synthetic `graduated=True`
-    # control. The canonical lifecycle classifier must infer immediate graduation.
+    # No graduated/complete control is injected. A real-shaped PUMP_AMM/PumpSwap
+    # market event for the same mint is the graduation evidence consumed by the
+    # canonical lifecycle classifier. It must not itself close the Pump position.
     graduation_monitor = _row(
         signature="continuation-v1-pumpswap-monitor",
         token=token,
         venue="PUMP_AMM",
         side="sell",
         wallet="unrelated-holder",
-        at=now - timedelta(seconds=2),
+        at=now - timedelta(seconds=1),
     )
-    assert not any("graduat" in str(key).lower() for key in graduation_monitor)
+    assert not any("graduat" in str(key).lower() or "complete" in str(key).lower() for key in graduation_monitor)
     _record_forward(store, graduation_monitor)
     market_state = v5._v5_pre_context(
         adapter,
@@ -220,13 +227,15 @@ def test_continuation_v1_pump_position_naturally_graduates_to_pumpswap_and_settl
     assert monitoring["active_reserved_fraction"] == pytest.approx(entry_fraction)
     assert monitoring["settlement_count"] == 0
 
+    # Only the original trigger wallet's later PumpSwap sell is eligible to become
+    # this position's exit event. Identity must remain anchored to the Pump entry.
     pumpswap_exit = _row(
         signature="continuation-v1-pumpswap-exit",
         token=token,
         venue="PUMP_AMM",
         side="sell",
         wallet="wallet-alpha",
-        at=now - timedelta(seconds=1),
+        at=now - timedelta(milliseconds=250),
     )
     _record_forward(store, pumpswap_exit)
     asyncio.run(adapter.observe(str(pumpswap_exit["signature"])))
@@ -265,8 +274,8 @@ def test_continuation_v1_pump_position_naturally_graduates_to_pumpswap_and_settl
     assert float(outcome["net_return"]) > 0.0
     assert exit_source is not None and str(exit_source["source"]) == "solana-direct:PUMP_AMM:sell"
 
-    # Graduation did not manufacture a second entry or reservation. The one Pump
-    # position identity is the one settled after the PumpSwap exit.
+    # Graduation must not manufacture a second entry/reservation. The exact Pump
+    # position identity is the one released by the PumpSwap settlement.
     assert selected_entries == 1
     assert len(reservations) == 1
     assert len(settlements) == 1
