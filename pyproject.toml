@@ -9,7 +9,7 @@ description = "Paper-only forward-validation and economic-certification engine f
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-  "fastapi==0.141.1",
+  "fastapi==0.142.2",
   "httpx==0.28.1",
   "uvicorn==0.52.4",
   "websockets==17.1",
