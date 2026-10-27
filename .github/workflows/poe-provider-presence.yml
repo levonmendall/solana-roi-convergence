@@ -1,0 +1,63 @@
+name: POE named provider binding presence only
+on:
+  push:
+    branches: [poe-provider-presence-20261027]
+    paths: [.github/workflows/poe-provider-presence.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  repository-bindings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Return only named-binding availability
+        env:
+          POE_SCOPE: repository
+          HAS_SECRET_0: ${{ secrets.SOLANA_ROI_ALCHEMY_API_KEY != '' }}
+          HAS_VARIABLE_0: ${{ vars.SOLANA_ROI_ALCHEMY_API_KEY != '' }}
+          HAS_SECRET_1: ${{ secrets.ALCHEMY_API_KEY != '' }}
+          HAS_VARIABLE_1: ${{ vars.ALCHEMY_API_KEY != '' }}
+          HAS_SECRET_2: ${{ secrets.SOLANA_ROI_RPC_ENDPOINTS_JSON != '' }}
+          HAS_VARIABLE_2: ${{ vars.SOLANA_ROI_RPC_ENDPOINTS_JSON != '' }}
+          HAS_SECRET_3: ${{ secrets.HELIUS_API_KEY != '' }}
+          HAS_VARIABLE_3: ${{ vars.HELIUS_API_KEY != '' }}
+          HAS_SECRET_4: ${{ secrets.ALCHEMY_RPC_URL != '' }}
+          HAS_VARIABLE_4: ${{ vars.ALCHEMY_RPC_URL != '' }}
+          HAS_SECRET_5: ${{ secrets.HELIUS_RPC_URL != '' }}
+          HAS_VARIABLE_5: ${{ vars.HELIUS_RPC_URL != '' }}
+        run: |
+          python3 -I - <<'PY'
+          import json,os
+          names=["SOLANA_ROI_ALCHEMY_API_KEY","ALCHEMY_API_KEY","SOLANA_ROI_RPC_ENDPOINTS_JSON","HELIUS_API_KEY","ALCHEMY_RPC_URL","HELIUS_RPC_URL"]
+          print(json.dumps({"project":"pump-opportunity-engine","presenceOnly":True,"scope":os.environ["POE_SCOPE"],"bindings":{name:{"secretPresent":os.environ["HAS_SECRET_"+str(i)]=="true","variablePresent":os.environ["HAS_VARIABLE_"+str(i)]=="true"} for i,name in enumerate(names)},"secretValuesReadByJob":False,"providerRequests":0,"deployment":False},sort_keys=True))
+          PY
+
+  existing-environment-bindings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    environment:
+      name: main - solana-roi-convergence
+      deployment: false
+    steps:
+      - name: Return only named-binding availability
+        env:
+          POE_SCOPE: environment:main - solana-roi-convergence
+          HAS_SECRET_0: ${{ secrets.SOLANA_ROI_ALCHEMY_API_KEY != '' }}
+          HAS_VARIABLE_0: ${{ vars.SOLANA_ROI_ALCHEMY_API_KEY != '' }}
+          HAS_SECRET_1: ${{ secrets.ALCHEMY_API_KEY != '' }}
+          HAS_VARIABLE_1: ${{ vars.ALCHEMY_API_KEY != '' }}
+          HAS_SECRET_2: ${{ secrets.SOLANA_ROI_RPC_ENDPOINTS_JSON != '' }}
+          HAS_VARIABLE_2: ${{ vars.SOLANA_ROI_RPC_ENDPOINTS_JSON != '' }}
+          HAS_SECRET_3: ${{ secrets.HELIUS_API_KEY != '' }}
+          HAS_VARIABLE_3: ${{ vars.HELIUS_API_KEY != '' }}
+          HAS_SECRET_4: ${{ secrets.ALCHEMY_RPC_URL != '' }}
+          HAS_VARIABLE_4: ${{ vars.ALCHEMY_RPC_URL != '' }}
+          HAS_SECRET_5: ${{ secrets.HELIUS_RPC_URL != '' }}
+          HAS_VARIABLE_5: ${{ vars.HELIUS_RPC_URL != '' }}
+        run: |
+          python3 -I - <<'PY'
+          import json,os
+          names=["SOLANA_ROI_ALCHEMY_API_KEY","ALCHEMY_API_KEY","SOLANA_ROI_RPC_ENDPOINTS_JSON","HELIUS_API_KEY","ALCHEMY_RPC_URL","HELIUS_RPC_URL"]
+          print(json.dumps({"project":"pump-opportunity-engine","presenceOnly":True,"scope":os.environ["POE_SCOPE"],"bindings":{name:{"secretPresent":os.environ["HAS_SECRET_"+str(i)]=="true","variablePresent":os.environ["HAS_VARIABLE_"+str(i)]=="true"} for i,name in enumerate(names)},"secretValuesReadByJob":False,"providerRequests":0,"deployment":False},sort_keys=True))
+          PY
